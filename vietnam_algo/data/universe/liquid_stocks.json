@@ -1,0 +1,846 @@
+{
+  "count": 84,
+  "generatedAt": "2026-08-13T11:28:53Z",
+  "items": [
+    {
+      "avgValue20": 930076735000.0,
+      "avgVolume20": 4338920.0,
+      "companyName": "Tập đoàn Vingroup",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 207900.0,
+      "sectorName": "Bất động sản",
+      "symbol": "VIC"
+    },
+    {
+      "avgValue20": 652561525250.0,
+      "avgVolume20": 55444260.0,
+      "companyName": "Ngân hàng TMCP Sài Gòn - Hà Nội",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 11800.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "SHB"
+    },
+    {
+      "avgValue20": 624675641750.0,
+      "avgVolume20": 47574685.0,
+      "companyName": "CTCP Chứng khoán VIX",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 13900.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "VIX"
+    },
+    {
+      "avgValue20": 565746183250.0,
+      "avgVolume20": 26385900.0,
+      "companyName": "Công ty CP Tập đoàn Hòa Phát",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 21700.0,
+      "sectorName": "Tài nguyên Cơ bản",
+      "symbol": "HPG"
+    },
+    {
+      "avgValue20": 517843682000.0,
+      "avgVolume20": 21773965.0,
+      "companyName": "Công ty CP Chứng khoán SSI",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 25000.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "SSI"
+    },
+    {
+      "avgValue20": 464576174500.0,
+      "avgVolume20": 15470530.0,
+      "companyName": "Ngân hàng TMCP Kỹ Thương Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 31700.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "TCB"
+    },
+    {
+      "avgValue20": 459012846250.0,
+      "avgVolume20": 6363475.0,
+      "companyName": "Công ty CP Vinhomes",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 71800.0,
+      "sectorName": "Bất động sản",
+      "symbol": "VHM"
+    },
+    {
+      "avgValue20": 450692913000.0,
+      "avgVolume20": 6641040.0,
+      "companyName": "Công ty CP FPT",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 69200.0,
+      "sectorName": "Công nghệ Thông tin",
+      "symbol": "FPT"
+    },
+    {
+      "avgValue20": 369412139297.65,
+      "avgVolume20": 5271825.0,
+      "companyName": "Công ty CP Đầu tư Thế Giới Di Động",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 73600.0,
+      "sectorName": "Bán lẻ",
+      "symbol": "MWG"
+    },
+    {
+      "avgValue20": 367610771750.0,
+      "avgVolume20": 14608435.0,
+      "companyName": "Ngân hàng TMCP Việt Nam Thịnh Vượng",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 25350.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "VPB"
+    },
+    {
+      "avgValue20": 350113966500.0,
+      "avgVolume20": 10052835.0,
+      "companyName": "CTCP Vàng bạc Đá quý Phú Nhuận",
+      "exchangeCode": "HoSE",
+      "historyDays": 1826,
+      "lastClose": 36200.0,
+      "sectorName": "Hàng cá nhân & Gia dụng",
+      "symbol": "PNJ"
+    },
+    {
+      "avgValue20": 347197211500.0,
+      "avgVolume20": 5790475.0,
+      "companyName": "Công ty CP Sữa Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 61600.0,
+      "sectorName": "Thực phẩm và đồ uống",
+      "symbol": "VNM"
+    },
+    {
+      "avgValue20": 339174333000.0,
+      "avgVolume20": 14928245.0,
+      "companyName": "Ngân hàng TMCP Quân đội",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 20150.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "MBB"
+    },
+    {
+      "avgValue20": 323690650500.0,
+      "avgVolume20": 14381105.0,
+      "companyName": "Ngân hàng TMCP Á Châu",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 22200.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "ACB"
+    },
+    {
+      "avgValue20": 322390956000.0,
+      "avgVolume20": 13863060.0,
+      "companyName": "CTCP Tập đoàn GELEX",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 25400.0,
+      "sectorName": "Hàng & Dịch vụ Công nghiệp",
+      "symbol": "GEX"
+    },
+    {
+      "avgValue20": 298990797938.15,
+      "avgVolume20": 5184175.0,
+      "companyName": "Ngân hàng TMCP Ngoại thương Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 59500.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "VCB"
+    },
+    {
+      "avgValue20": 283872173000.0,
+      "avgVolume20": 10802205.0,
+      "companyName": "NHTM cổ phần Phát triển thành phố Hồ Chí Minh",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 26700.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "HDB"
+    },
+    {
+      "avgValue20": 279184491500.0,
+      "avgVolume20": 4227520.0,
+      "companyName": "Công ty CP Tập đoàn Masan",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 67600.0,
+      "sectorName": "Thực phẩm và đồ uống",
+      "symbol": "MSN"
+    },
+    {
+      "avgValue20": 277452880000.0,
+      "avgVolume20": 3811425.0,
+      "companyName": "Ngân hàng TMCP Sài Gòn Thương Tín",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 73100.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "STB"
+    },
+    {
+      "avgValue20": 277303204421.85,
+      "avgVolume20": 9003250.0,
+      "companyName": "Ngân hàng TMCP Công Thương Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 32150.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "CTG"
+    },
+    {
+      "avgValue20": 224828989000.0,
+      "avgVolume20": 8971160.0,
+      "companyName": "Công ty CP Lọc Hóa dầu Bình Sơn",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 26500.0,
+      "sectorName": "Dầu khí",
+      "symbol": "BSR"
+    },
+    {
+      "avgValue20": 208058023250.0,
+      "avgVolume20": 9932255.0,
+      "companyName": "Công ty CP Chứng khoán Bản Việt",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 21600.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "VCI"
+    },
+    {
+      "avgValue20": 184697943000.0,
+      "avgVolume20": 3465880.0,
+      "companyName": "NHTM cổ phần Bưu điện Liên Việt",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 53800.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "LPB"
+    },
+    {
+      "avgValue20": 177165918500.0,
+      "avgVolume20": 11453690.0,
+      "companyName": "CTCP Chứng khoán Sài Gòn - Hà Nội",
+      "exchangeCode": "HNX",
+      "historyDays": 1825,
+      "lastClose": 15800.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "SHS"
+    },
+    {
+      "avgValue20": 168477110000.0,
+      "avgVolume20": 4487410.0,
+      "companyName": "Ngân hàng TMCP Đầu tư và Phát triển Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 38850.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "BID"
+    },
+    {
+      "avgValue20": 159172763500.0,
+      "avgVolume20": 1257275.0,
+      "companyName": "Công ty CP Hàng không Vietjet",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 124900.0,
+      "sectorName": "Du lịch và Giải trí",
+      "symbol": "VJC"
+    },
+    {
+      "avgValue20": 154350804250.0,
+      "avgVolume20": 6378440.0,
+      "companyName": "Công ty CP Vincom Retail",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 24600.0,
+      "sectorName": "Bất động sản",
+      "symbol": "VRE"
+    },
+    {
+      "avgValue20": 141957455750.0,
+      "avgVolume20": 10056805.0,
+      "companyName": "CTCP Container Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 14350.0,
+      "sectorName": "Hàng & Dịch vụ Công nghiệp",
+      "symbol": "VSC"
+    },
+    {
+      "avgValue20": 138146313750.0,
+      "avgVolume20": 5389105.0,
+      "companyName": "Công ty CP Chứng khoán TP.HCM",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 25700.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "HCM"
+    },
+    {
+      "avgValue20": 131631214750.0,
+      "avgVolume20": 9146030.0,
+      "companyName": "NHTM cổ phần Tiên Phong",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 14450.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "TPB"
+    },
+    {
+      "avgValue20": 117731398500.0,
+      "avgVolume20": 1889000.0,
+      "companyName": "CTCP Đầu tư Văn Phú - Invest",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 60700.0,
+      "sectorName": "Bất động sản",
+      "symbol": "VPI"
+    },
+    {
+      "avgValue20": 115693228750.0,
+      "avgVolume20": 8370235.0,
+      "companyName": "CTCP Đầu tư Hạ tầng Kỹ thuật Thành phố Hồ Chí Minh",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 13900.0,
+      "sectorName": "Xây dựng và Vật liệu",
+      "symbol": "CII"
+    },
+    {
+      "avgValue20": 115382682100.0,
+      "avgVolume20": 10745585.0,
+      "companyName": "CTCP Tập đoàn Đất Xanh",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 10850.0,
+      "sectorName": "Bất động sản",
+      "symbol": "DXG"
+    },
+    {
+      "avgValue20": 113495169250.0,
+      "avgVolume20": 6439215.0,
+      "companyName": "Ngân hàng TMCP Xuất Nhập khẩu Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 17500.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "EIB"
+    },
+    {
+      "avgValue20": 105257173000.0,
+      "avgVolume20": 6557160.0,
+      "companyName": "NHTM cổ phần Hàng Hải Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1405,
+      "lastClose": 16150.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "MSB"
+    },
+    {
+      "avgValue20": 102792800450.0,
+      "avgVolume20": 9729505.0,
+      "companyName": "Tổng CTCP Đầu tư phát triển xây dựng",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 10650.0,
+      "sectorName": "Bất động sản",
+      "symbol": "DIG"
+    },
+    {
+      "avgValue20": 102535474500.0,
+      "avgVolume20": 1434110.0,
+      "companyName": "Tổng Công ty Khí Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 77900.0,
+      "sectorName": "Điện, nước & xăng dầu khí đốt",
+      "symbol": "GAS"
+    },
+    {
+      "avgValue20": 98185270250.0,
+      "avgVolume20": 7227195.0,
+      "companyName": "Tổng Công ty Điện lực Dầu khí Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 13500.0,
+      "sectorName": "Điện, nước & xăng dầu khí đốt",
+      "symbol": "POW"
+    },
+    {
+      "avgValue20": 96117196000.0,
+      "avgVolume20": 1369210.0,
+      "companyName": "CTCP Thiết bị Điện Gelex",
+      "exchangeCode": "HoSE",
+      "historyDays": 1090,
+      "lastClose": 71500.0,
+      "sectorName": "Hàng & Dịch vụ Công nghiệp",
+      "symbol": "GEE"
+    },
+    {
+      "avgValue20": 94831369250.0,
+      "avgVolume20": 6460010.0,
+      "companyName": "NHTM cổ phần Quốc tế Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 14550.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "VIB"
+    },
+    {
+      "avgValue20": 93410686000.0,
+      "avgVolume20": 2720095.0,
+      "companyName": "Tổng Công ty CP Dịch vụ Kỹ thuật Dầu khí",
+      "exchangeCode": "HNX",
+      "historyDays": 1825,
+      "lastClose": 35000.0,
+      "sectorName": "Dầu khí",
+      "symbol": "PVS"
+    },
+    {
+      "avgValue20": 89446379750.0,
+      "avgVolume20": 7457480.0,
+      "companyName": "CTCP Phát triển Bất động sản Phát Đạt",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 11950.0,
+      "sectorName": "Bất động sản",
+      "symbol": "PDR"
+    },
+    {
+      "avgValue20": 71995366221.5,
+      "avgVolume20": 2139440.0,
+      "companyName": "Tập đoàn Xăng dầu Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 35950.0,
+      "sectorName": "Dầu khí",
+      "symbol": "PLX"
+    },
+    {
+      "avgValue20": 71367327250.0,
+      "avgVolume20": 3912685.0,
+      "companyName": "Tổng CTCP Vận tải Dầu Khí",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 20000.0,
+      "sectorName": "Hàng & Dịch vụ Công nghiệp",
+      "symbol": "PVT"
+    },
+    {
+      "avgValue20": 70877742500.0,
+      "avgVolume20": 6010260.0,
+      "companyName": "CTCP Tập đoàn CEO",
+      "exchangeCode": "HNX",
+      "historyDays": 1825,
+      "lastClose": 11900.0,
+      "sectorName": "Bất động sản",
+      "symbol": "CEO"
+    },
+    {
+      "avgValue20": 64257694500.0,
+      "avgVolume20": 4640970.0,
+      "companyName": "CTCP Chứng khoán Tiên Phong",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 14100.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "ORS"
+    },
+    {
+      "avgValue20": 63782728500.0,
+      "avgVolume20": 2082550.0,
+      "companyName": "CTCP Phân bón Dầu khí Cà Mau",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 30800.0,
+      "sectorName": "Hóa chất",
+      "symbol": "DCM"
+    },
+    {
+      "avgValue20": 61234335270.55,
+      "avgVolume20": 2820180.0,
+      "companyName": "Tổng Công ty Phân bón và Hoá chất Dầu khí - CTCP",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 21900.0,
+      "sectorName": "Hóa chất",
+      "symbol": "DPM"
+    },
+    {
+      "avgValue20": 60651412250.0,
+      "avgVolume20": 3295375.0,
+      "companyName": "Tổng CTCP khoan và dịch vụ khoan dầu khí",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 18300.0,
+      "sectorName": "Dầu khí",
+      "symbol": "PVD"
+    },
+    {
+      "avgValue20": 60254442500.0,
+      "avgVolume20": 5041955.0,
+      "companyName": "CTCP Đầu tư Dịch vụ Tài chính Hoàng Huy",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 11800.0,
+      "sectorName": "Bất động sản",
+      "symbol": "TCH"
+    },
+    {
+      "avgValue20": 56203632000.0,
+      "avgVolume20": 404910.0,
+      "companyName": "Công ty CP Masan Consumer Holdings",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 136900.0,
+      "sectorName": "Thực phẩm và đồ uống",
+      "symbol": "MCH"
+    },
+    {
+      "avgValue20": 56085443250.0,
+      "avgVolume20": 1849535.0,
+      "companyName": "CTCP Nông nghiệp BAF Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1169,
+      "lastClose": 31400.0,
+      "sectorName": "Thực phẩm và đồ uống",
+      "symbol": "BAF"
+    },
+    {
+      "avgValue20": 52637383250.0,
+      "avgVolume20": 2344025.0,
+      "companyName": "CTCP Chứng khoán Ngân hàng Công Thương Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 22700.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "CTS"
+    },
+    {
+      "avgValue20": 51093621750.0,
+      "avgVolume20": 2329660.0,
+      "companyName": "CTCP Đầu tư Nam Long",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 22500.0,
+      "sectorName": "Bất động sản",
+      "symbol": "NLG"
+    },
+    {
+      "avgValue20": 48353573750.0,
+      "avgVolume20": 3077145.0,
+      "companyName": "Tổng CTCP Xuất nhập khẩu và Xây dựng Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 15800.0,
+      "sectorName": "Xây dựng và Vật liệu",
+      "symbol": "VCG"
+    },
+    {
+      "avgValue20": 40850353000.0,
+      "avgVolume20": 1938640.0,
+      "companyName": "CTCP Tập đoàn PC1",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 20700.0,
+      "sectorName": "Xây dựng và Vật liệu",
+      "symbol": "PC1"
+    },
+    {
+      "avgValue20": 37452945250.0,
+      "avgVolume20": 1350440.0,
+      "companyName": "Tổng Công ty Phát triển Đô thị Kinh Bắc-CTCP",
+      "exchangeCode": "HoSE",
+      "historyDays": 1079,
+      "lastClose": 27550.0,
+      "sectorName": "Bất động sản",
+      "symbol": "KBC"
+    },
+    {
+      "avgValue20": 37383912386.5,
+      "avgVolume20": 1121225.0,
+      "companyName": "Tổng Công ty IDICO",
+      "exchangeCode": "HNX",
+      "historyDays": 519,
+      "lastClose": 34200.0,
+      "sectorName": "Bất động sản",
+      "symbol": "IDC"
+    },
+    {
+      "avgValue20": 35345509000.0,
+      "avgVolume20": 2427245.0,
+      "companyName": "CTCP TASCO",
+      "exchangeCode": "HNX",
+      "historyDays": 1825,
+      "lastClose": 13500.0,
+      "sectorName": "Ô tô và phụ tùng",
+      "symbol": "HUT"
+    },
+    {
+      "avgValue20": 33618055000.0,
+      "avgVolume20": 852725.0,
+      "companyName": "Tổng Công ty Đầu tư và Phát triển Công nghiệp  – CTCP",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 45500.0,
+      "sectorName": "Bất động sản",
+      "symbol": "BCM"
+    },
+    {
+      "avgValue20": 33236211750.0,
+      "avgVolume20": 2146030.0,
+      "companyName": "NHTM cổ phần Đông Nam Á",
+      "exchangeCode": "HoSE",
+      "historyDays": 1346,
+      "lastClose": 15200.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "SSB"
+    },
+    {
+      "avgValue20": 32879935500.0,
+      "avgVolume20": 828845.0,
+      "companyName": "CTCP Tập đoàn Hóa chất Đức Giang",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 43900.0,
+      "sectorName": "Hóa chất",
+      "symbol": "DGC"
+    },
+    {
+      "avgValue20": 32835836500.0,
+      "avgVolume20": 1281130.0,
+      "companyName": "CTCP Tập đoàn Nam Mê Kông",
+      "exchangeCode": "HNX",
+      "historyDays": 1825,
+      "lastClose": 25600.0,
+      "sectorName": "Bất động sản",
+      "symbol": "VC3"
+    },
+    {
+      "avgValue20": 32760102250.0,
+      "avgVolume20": 823955.0,
+      "companyName": "CTCP Dược phẩm Cửu Long",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 38900.0,
+      "sectorName": "Y tế",
+      "symbol": "DCL"
+    },
+    {
+      "avgValue20": 32127225500.0,
+      "avgVolume20": 2277040.0,
+      "companyName": "CTCP Hoàng Anh Gia Lai",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 14100.0,
+      "sectorName": "Thực phẩm và đồ uống",
+      "symbol": "HAG"
+    },
+    {
+      "avgValue20": 31763930500.0,
+      "avgVolume20": 1938085.0,
+      "companyName": "CTCP Tập đoàn DABACO Việt Nam",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 16550.0,
+      "sectorName": "Thực phẩm và đồ uống",
+      "symbol": "DBC"
+    },
+    {
+      "avgValue20": 31412922750.0,
+      "avgVolume20": 621250.0,
+      "companyName": "Tổng CTCP Bưu chính Viettel",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 54100.0,
+      "sectorName": "Hàng & Dịch vụ Công nghiệp",
+      "symbol": "VTP"
+    },
+    {
+      "avgValue20": 29355699000.0,
+      "avgVolume20": 1082720.0,
+      "companyName": "CTCP chứng khoán Bảo Việt",
+      "exchangeCode": "HNX",
+      "historyDays": 1825,
+      "lastClose": 27100.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "BVS"
+    },
+    {
+      "avgValue20": 27486564750.0,
+      "avgVolume20": 2618650.0,
+      "companyName": "NHTM cổ phần Phương Đông",
+      "exchangeCode": "HoSE",
+      "historyDays": 1380,
+      "lastClose": 11000.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "OCB"
+    },
+    {
+      "avgValue20": 27243963000.0,
+      "avgVolume20": 2716690.0,
+      "companyName": "CTCP Đầu tư MST",
+      "exchangeCode": "HNX",
+      "historyDays": 1825,
+      "lastClose": 10200.0,
+      "sectorName": "Xây dựng và Vật liệu",
+      "symbol": "MST"
+    },
+    {
+      "avgValue20": 27035930550.0,
+      "avgVolume20": 2681125.0,
+      "companyName": "CTCP Đầu tư hạ tầng giao thông Đèo Cả",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 10150.0,
+      "sectorName": "Xây dựng và Vật liệu",
+      "symbol": "HHV"
+    },
+    {
+      "avgValue20": 26832882750.0,
+      "avgVolume20": 1222200.0,
+      "companyName": "CTCP Chứng khoán FPT",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 21800.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "FTS"
+    },
+    {
+      "avgValue20": 26466128500.0,
+      "avgVolume20": 422085.0,
+      "companyName": "Tập đoàn Bảo Việt",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 65500.0,
+      "sectorName": "Bảo hiểm",
+      "symbol": "BVH"
+    },
+    {
+      "avgValue20": 25022250250.0,
+      "avgVolume20": 1922835.0,
+      "companyName": "Ngân hàng TMCP Bản Việt",
+      "exchangeCode": "HoSE",
+      "historyDays": 1515,
+      "lastClose": 12300.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "BVB"
+    },
+    {
+      "avgValue20": 25012784500.0,
+      "avgVolume20": 417670.0,
+      "companyName": "CTCP Xây dựng Coteccons",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 62300.0,
+      "sectorName": "Xây dựng và Vật liệu",
+      "symbol": "CTD"
+    },
+    {
+      "avgValue20": 24287720000.0,
+      "avgVolume20": 1059785.0,
+      "companyName": "Tổng CT Hàng không Việt Nam - CTCP",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 23850.0,
+      "sectorName": "Du lịch và Giải trí",
+      "symbol": "HVN"
+    },
+    {
+      "avgValue20": 23383012750.0,
+      "avgVolume20": 2188885.0,
+      "companyName": "CTCP Tập đoàn Hoa Sen",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 10700.0,
+      "sectorName": "Tài nguyên Cơ bản",
+      "symbol": "HSG"
+    },
+    {
+      "avgValue20": 23124313750.0,
+      "avgVolume20": 1404895.0,
+      "companyName": "CTCP Tập đoàn Hà Đô",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 16300.0,
+      "sectorName": "Bất động sản",
+      "symbol": "HDG"
+    },
+    {
+      "avgValue20": 22750929000.0,
+      "avgVolume20": 312610.0,
+      "companyName": "Tổng CTCP Công trình Viettel",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 76800.0,
+      "sectorName": "Xây dựng và Vật liệu",
+      "symbol": "CTR"
+    },
+    {
+      "avgValue20": 22209800000.0,
+      "avgVolume20": 1816025.0,
+      "companyName": "Ngân hàng TMCP Nam Á",
+      "exchangeCode": "HoSE",
+      "historyDays": 1452,
+      "lastClose": 11750.0,
+      "sectorName": "Ngân hàng",
+      "symbol": "NAB"
+    },
+    {
+      "avgValue20": 22178361750.0,
+      "avgVolume20": 465460.0,
+      "companyName": "CTCP Nafoods Group",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 48100.0,
+      "sectorName": "Thực phẩm và đồ uống",
+      "symbol": "NAF"
+    },
+    {
+      "avgValue20": 21091526500.0,
+      "avgVolume20": 1362845.0,
+      "companyName": "CTCP Giấy Hoàng Hà Hải Phòng",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 14950.0,
+      "sectorName": "Tài nguyên Cơ bản",
+      "symbol": "HHP"
+    },
+    {
+      "avgValue20": 21021494500.0,
+      "avgVolume20": 1035925.0,
+      "companyName": "CTCP Sản xuất và Thương mại Nhựa Việt Thành",
+      "exchangeCode": "HNX",
+      "historyDays": 1175,
+      "lastClose": 20100.0,
+      "sectorName": "Hóa chất",
+      "symbol": "VTZ"
+    },
+    {
+      "avgValue20": 20442317750.0,
+      "avgVolume20": 1656515.0,
+      "companyName": "Công ty Tài chính Cổ phần Điện lực",
+      "exchangeCode": "HoSE",
+      "historyDays": 1825,
+      "lastClose": 12700.0,
+      "sectorName": "Dịch vụ tài chính",
+      "symbol": "EVF"
+    }
+  ]
+}
