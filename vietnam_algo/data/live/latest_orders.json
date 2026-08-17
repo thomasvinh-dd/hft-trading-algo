@@ -1,0 +1,30 @@
+{
+  "count": 2,
+  "generatedAt": "2026-08-17T05:15:12Z",
+  "items": [
+    {
+      "date": "2026-08-10",
+      "fee": "869428.5599999998",
+      "orderId": "1369",
+      "price": "61661.59999999999",
+      "quantity": "9400",
+      "reason": "top_rank",
+      "side": "BUY",
+      "symbol": "VNM",
+      "value": "579619039.9999999"
+    },
+    {
+      "date": "2026-08-10",
+      "fee": "875344.47",
+      "orderId": "1370",
+      "price": "10310.3",
+      "quantity": "56600",
+      "reason": "top_rank",
+      "side": "BUY",
+      "symbol": "MST",
+      "value": "583562980.0"
+    }
+  ],
+  "source": "/mnt/c/Users/vinh.nguyen/Documents/fin/market-bot/bots/hft-trading-algo/vietnam_algo/data/backtests/liquid_momentum_rotation_orders.csv",
+  "tradeDate": "2026-08-10"
+}

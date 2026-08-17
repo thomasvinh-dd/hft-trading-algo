@@ -8,7 +8,22 @@ from pathlib import Path
 from .config import StrategyConfig
 from .data import DEFAULT_DATA_DIR, PriceBar, utc_now, write_json
 from .indicators import max_drawdown_percent, sma
-from .strategies import MomentumWithBreakoutStrategy, VolumeBreakoutStrategy, bars_until, breakout_symbols, rank_symbols, too_extended_from_sma50
+from .strategies import (
+    MomentumWithBreakoutStrategy,
+    HybridMomentumSectorBreakoutStrategy,
+    MarketRegimeBenchmarkStrategy,
+    PullbackMeanReversionStrategy,
+    SectorMomentumStrategy,
+    VolumeBreakoutStrategy,
+    bars_until,
+    breakout_symbols,
+    pullback_candidates,
+    pullback_exit_signal,
+    rank_symbols,
+    sector_momentum_scores,
+    sector_stock_candidates,
+    too_extended_from_sma50,
+)
 from .universe import load_price_bars, load_symbol_metadata, load_universe_symbols
 
 
@@ -155,6 +170,17 @@ def close_price(symbol: str, date: str, price_table: dict[str, dict[str, PriceBa
     return float(bar.close) if bar else None
 
 
+def open_price(symbol: str, date: str, price_table: dict[str, dict[str, PriceBar]]) -> float | None:
+    bar = price_table.get(symbol, {}).get(date)
+    return float(bar.open) if bar else None
+
+
+def next_execution_date(dates: list[str], index: int) -> tuple[int, str] | None:
+    if index + 1 >= len(dates):
+        return None
+    return index + 1, dates[index + 1]
+
+
 def position_value(position: Position, date: str, price_table: dict[str, dict[str, PriceBar]]) -> float:
     price = close_price(position.symbol, date, price_table)
     if price is None:
@@ -222,6 +248,45 @@ def position_sellable(position: Position, current_index: int, config: StrategyCo
     return current_index - position.entryIndex >= config.sellSettlementDays
 
 
+def sell_next_open(
+    cash: float,
+    position: Position,
+    signal_index: int,
+    dates: list[str],
+    price_table: dict[str, dict[str, PriceBar]],
+    config: StrategyConfig,
+    reason: str,
+) -> tuple[float, Trade | None]:
+    execution = next_execution_date(dates, signal_index)
+    if not execution:
+        return cash, None
+    _, execution_date = execution
+    execution_price = open_price(position.symbol, execution_date, price_table)
+    if execution_price is None:
+        return cash, None
+    return sell_position(cash, position, execution_date, execution_price, config, reason)
+
+
+def buy_next_open(
+    cash: float,
+    symbol: str,
+    signal_index: int,
+    dates: list[str],
+    price_table: dict[str, dict[str, PriceBar]],
+    target_value: float,
+    config: StrategyConfig,
+    reason: str,
+) -> tuple[float, Position | None, Trade | None]:
+    execution = next_execution_date(dates, signal_index)
+    if not execution:
+        return cash, None, None
+    execution_index, execution_date = execution
+    execution_price = open_price(symbol, execution_date, price_table)
+    if execution_price is None:
+        return cash, None, None
+    return buy_position(cash, symbol, execution_date, execution_index, execution_price, target_value, config, reason)
+
+
 def close_below_sma_exit(symbol: str, price_table: dict[str, dict[str, PriceBar]], dates: list[str], index: int, config: StrategyConfig) -> bool:
     bars = bars_until(price_table[symbol], dates, index)
     closes = [bar.close for bar in bars]
@@ -276,9 +341,10 @@ def run_momentum_rotation(
             elif index % config.rebalanceDays == 0 and rank_by_symbol.get(symbol, 999999) > config.exitRank:
                 exit_reason = "rank_exit"
             if exit_reason:
-                cash, trade = sell_position(cash, position, date, price, config, exit_reason)
-                trades.append(trade)
-                positions.pop(symbol)
+                cash, trade = sell_next_open(cash, position, index, dates, price_table, config, exit_reason)
+                if trade:
+                    trades.append(trade)
+                    positions.pop(symbol)
 
         week = week_key(date)
         weekly_breakout_remaining = max(
@@ -329,7 +395,7 @@ def run_momentum_rotation(
                     continue
                 reason = decision.entry_reasons[symbol]
                 order_value = min(target_value, available_exposure)
-                cash, position, trade = buy_position(cash, symbol, date, index, price, order_value, config, reason)
+                cash, position, trade = buy_next_open(cash, symbol, index, dates, price_table, order_value, config, reason)
                 if position and trade:
                     positions[symbol] = position
                     sector_counts[sector] = sector_counts.get(sector, 0) + 1
@@ -399,9 +465,10 @@ def run_volume_breakout(
             elif close_below_sma_exit(symbol, price_table, dates, index, config):
                 exit_reason = "close_below_sma_exit"
             if exit_reason:
-                cash, trade = sell_position(cash, position, date, price, config, exit_reason)
-                trades.append(trade)
-                positions.pop(symbol)
+                cash, trade = sell_next_open(cash, position, index, dates, price_table, config, exit_reason)
+                if trade:
+                    trades.append(trade)
+                    positions.pop(symbol)
 
         week = week_key(date)
         weekly_breakout_remaining = max(config.maxBreakoutEntriesPerWeek - breakout_entries_by_week.get(week, 0), 0)
@@ -443,15 +510,8 @@ def run_volume_breakout(
                 if too_extended_from_sma50(bars, config):
                     continue
                 order_value = min(target_value, available_exposure)
-                cash, position, trade = buy_position(
-                    cash,
-                    symbol,
-                    date,
-                    index,
-                    price,
-                    order_value,
-                    config,
-                    decision.entry_reasons[symbol],
+                cash, position, trade = buy_next_open(
+                    cash, symbol, index, dates, price_table, order_value, config, decision.entry_reasons[symbol]
                 )
                 if position and trade:
                     positions[symbol] = position
@@ -466,6 +526,437 @@ def run_volume_breakout(
     metrics = calculate_metrics(equity_curve, trades, config.initialCash)
     return BacktestResult(
         strategy="volume_breakout",
+        generatedAt=utc_now(),
+        config=asdict(config),
+        symbols=symbols,
+        metrics=metrics,
+        equityCurve=[asdict(point) for point in equity_curve],
+        trades=[asdict(trade) for trade in trades],
+    )
+
+
+def run_pullback_mean_reversion(
+    data_dir: Path = DEFAULT_DATA_DIR,
+    universe_name: str = "liquid_stocks",
+    config: StrategyConfig | None = None,
+) -> BacktestResult:
+    config = config or StrategyConfig()
+    symbols = load_universe_symbols(data_dir, universe_name)
+    price_table = build_price_table(symbols, data_dir)
+    sector_by_symbol = symbol_sector_map(data_dir)
+    dates = sorted_trading_dates(price_table)
+    warmup_days = max(
+        config.smaSlowDays,
+        config.pullbackLookbackDays,
+        config.pullbackVolumeDays,
+        config.rsiWindow,
+        config.marketSmaDays,
+    ) + 1
+
+    cash = config.initialCash
+    positions: dict[str, Position] = {}
+    trades: list[Trade] = []
+    equity_curve: list[EquityPoint] = []
+    entries_by_week: dict[str, int] = {}
+
+    for index, date in enumerate(dates):
+        if index < warmup_days:
+            continue
+
+        regime = market_regime(price_table, dates, index, config)
+        max_positions_today = allowed_positions_for_regime(regime, config)
+
+        for symbol in list(positions):
+            position = positions[symbol]
+            price = close_price(symbol, date, price_table)
+            if price is None:
+                continue
+            position.peakPrice = max(position.peakPrice, price)
+            if not position_sellable(position, index, config):
+                continue
+            holding_days = index - position.entryIndex
+            exit_reason = ""
+            regime_reason = regime_exit_reason(regime, config)
+            trailing_stop = trailing_stop_percent_for_regime(regime, config)
+            if regime_reason:
+                exit_reason = regime_reason
+            elif price <= position.entryPrice * (1 - config.stopLossPercent / 100):
+                exit_reason = "stop_loss"
+            elif price <= position.peakPrice * (1 - trailing_stop / 100):
+                exit_reason = "trailing_stop"
+            elif pullback_exit_signal(bars_until(price_table[symbol], dates, index), config):
+                exit_reason = "pullback_exit"
+            elif holding_days >= config.pullbackMaxHoldingDays:
+                exit_reason = "max_holding_days"
+            if exit_reason:
+                cash, trade = sell_next_open(cash, position, index, dates, price_table, config, exit_reason)
+                if trade:
+                    trades.append(trade)
+                    positions.pop(symbol)
+
+        week = week_key(date)
+        weekly_remaining = max(config.maxPullbackEntriesPerWeek - entries_by_week.get(week, 0), 0)
+        candidates = [] if regime == "bear" or weekly_remaining <= 0 else pullback_candidates(price_table, dates, index, config)
+        if candidates:
+            strategy = PullbackMeanReversionStrategy(candidates)
+            decision = strategy.select_entries(
+                price_table,
+                dates,
+                index,
+                candidates,
+                regime,
+                max_positions_today,
+                weekly_remaining,
+            )
+            current_equity, _ = portfolio_value(cash, positions, date, price_table)
+            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
+            available_exposure = max(exposure_cap - current_positions_value, 0.0)
+            target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
+            sector_counts = sector_position_count(positions, sector_by_symbol)
+
+            for symbol in decision.target_symbols:
+                if symbol in positions or len(positions) >= max_positions_today:
+                    continue
+                if available_exposure <= 0:
+                    break
+                price = close_price(symbol, date, price_table)
+                if price is None:
+                    continue
+                sector = sector_by_symbol.get(symbol, "unknown")
+                if sector_counts.get(sector, 0) >= config.maxSectorPositions:
+                    continue
+                order_value = min(target_value, available_exposure)
+                cash, position, trade = buy_next_open(
+                    cash, symbol, index, dates, price_table, order_value, config, decision.entry_reasons[symbol]
+                )
+                if position and trade:
+                    positions[symbol] = position
+                    sector_counts[sector] = sector_counts.get(sector, 0) + 1
+                    available_exposure = max(available_exposure - trade.value - trade.fee, 0.0)
+                    entries_by_week[week] = entries_by_week.get(week, 0) + 1
+                    trades.append(trade)
+
+        equity, positions_value = portfolio_value(cash, positions, date, price_table)
+        equity_curve.append(EquityPoint(date, equity, cash, positions_value))
+
+    metrics = calculate_metrics(equity_curve, trades, config.initialCash)
+    return BacktestResult(
+        strategy="pullback_mean_reversion",
+        generatedAt=utc_now(),
+        config=asdict(config),
+        symbols=symbols,
+        metrics=metrics,
+        equityCurve=[asdict(point) for point in equity_curve],
+        trades=[asdict(trade) for trade in trades],
+    )
+
+
+def run_sector_momentum(
+    data_dir: Path = DEFAULT_DATA_DIR,
+    universe_name: str = "liquid_stocks",
+    config: StrategyConfig | None = None,
+) -> BacktestResult:
+    config = config or StrategyConfig()
+    symbols = load_universe_symbols(data_dir, universe_name)
+    price_table = build_price_table(symbols, data_dir)
+    sector_by_symbol = symbol_sector_map(data_dir)
+    dates = sorted_trading_dates(price_table)
+    warmup_days = max(config.return6mDays, config.smaSlowDays, config.sectorReturn3mDays, config.marketSmaDays) + 1
+
+    cash = config.initialCash
+    positions: dict[str, Position] = {}
+    trades: list[Trade] = []
+    equity_curve: list[EquityPoint] = []
+
+    for index, date in enumerate(dates):
+        if index < warmup_days:
+            continue
+
+        ranked = rank_symbols(price_table, dates, index, config)
+        rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
+        regime = market_regime(price_table, dates, index, config)
+        max_positions_today = allowed_positions_for_regime(regime, config)
+        top_sector_names = {
+            sector
+            for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config)[: config.sectorExitRank]
+        }
+
+        for symbol in list(positions):
+            position = positions[symbol]
+            price = close_price(symbol, date, price_table)
+            if price is None:
+                continue
+            position.peakPrice = max(position.peakPrice, price)
+            if not position_sellable(position, index, config):
+                continue
+            exit_reason = ""
+            regime_reason = regime_exit_reason(regime, config)
+            trailing_stop = trailing_stop_percent_for_regime(regime, config)
+            sector = sector_by_symbol.get(symbol, "unknown")
+            if regime_reason:
+                exit_reason = regime_reason
+            elif price <= position.entryPrice * (1 - config.stopLossPercent / 100):
+                exit_reason = "stop_loss"
+            elif price <= position.peakPrice * (1 - trailing_stop / 100):
+                exit_reason = "trailing_stop"
+            elif index % config.rebalanceDays == 0 and sector not in top_sector_names:
+                exit_reason = "sector_exit"
+            elif index % config.rebalanceDays == 0 and rank_by_symbol.get(symbol, 999999) > config.exitRank:
+                exit_reason = "rank_exit"
+            if exit_reason:
+                cash, trade = sell_next_open(cash, position, index, dates, price_table, config, exit_reason)
+                if trade:
+                    trades.append(trade)
+                    positions.pop(symbol)
+
+        if index % config.rebalanceDays == 0 and regime != "bear":
+            candidates = sector_stock_candidates(price_table, dates, index, sector_by_symbol, config)
+            strategy = SectorMomentumStrategy(candidates)
+            decision = strategy.select_entries(
+                price_table,
+                dates,
+                index,
+                candidates,
+                regime,
+                max_positions_today,
+                config.maxPositions,
+            )
+            current_equity, _ = portfolio_value(cash, positions, date, price_table)
+            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
+            available_exposure = max(exposure_cap - current_positions_value, 0.0)
+            target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
+            sector_counts = sector_position_count(positions, sector_by_symbol)
+
+            for symbol in decision.target_symbols:
+                if symbol in positions or len(positions) >= max_positions_today:
+                    continue
+                if available_exposure <= 0:
+                    break
+                price = close_price(symbol, date, price_table)
+                if price is None:
+                    continue
+                sector = sector_by_symbol.get(symbol, "unknown")
+                if sector_counts.get(sector, 0) >= config.maxSectorPositions:
+                    continue
+                bars = bars_until(price_table[symbol], dates, index)
+                if too_extended_from_sma50(bars, config):
+                    continue
+                order_value = min(target_value, available_exposure)
+                cash, position, trade = buy_next_open(
+                    cash, symbol, index, dates, price_table, order_value, config, decision.entry_reasons[symbol]
+                )
+                if position and trade:
+                    positions[symbol] = position
+                    sector_counts[sector] = sector_counts.get(sector, 0) + 1
+                    available_exposure = max(available_exposure - trade.value - trade.fee, 0.0)
+                    trades.append(trade)
+
+        equity, positions_value = portfolio_value(cash, positions, date, price_table)
+        equity_curve.append(EquityPoint(date, equity, cash, positions_value))
+
+    metrics = calculate_metrics(equity_curve, trades, config.initialCash)
+    return BacktestResult(
+        strategy="sector_momentum_rotation",
+        generatedAt=utc_now(),
+        config=asdict(config),
+        symbols=symbols,
+        metrics=metrics,
+        equityCurve=[asdict(point) for point in equity_curve],
+        trades=[asdict(trade) for trade in trades],
+    )
+
+
+def run_market_regime_benchmark(
+    data_dir: Path = DEFAULT_DATA_DIR,
+    universe_name: str = "liquid_stocks",
+    config: StrategyConfig | None = None,
+) -> BacktestResult:
+    config = config or StrategyConfig()
+    symbols = load_universe_symbols(data_dir, universe_name)[: config.benchmarkTopSymbols]
+    price_table = build_price_table(symbols, data_dir)
+    dates = sorted_trading_dates(price_table)
+    warmup_days = max(config.marketSmaDays, config.marketBearSmaDays) + 1
+
+    cash = config.initialCash
+    positions: dict[str, Position] = {}
+    trades: list[Trade] = []
+    equity_curve: list[EquityPoint] = []
+
+    for index, date in enumerate(dates):
+        if index < warmup_days:
+            continue
+        regime = market_regime(price_table, dates, index, config)
+        max_positions_today = allowed_positions_for_regime(regime, config)
+
+        for symbol in list(positions):
+            position = positions[symbol]
+            price = close_price(symbol, date, price_table)
+            if price is None or not position_sellable(position, index, config):
+                continue
+            exit_reason = regime_exit_reason(regime, config)
+            if exit_reason or symbol not in symbols[:max_positions_today]:
+                cash, trade = sell_next_open(
+                    cash, position, index, dates, price_table, config, exit_reason or "benchmark_rebalance"
+                )
+                if trade:
+                    trades.append(trade)
+                    positions.pop(symbol)
+
+        if index % config.rebalanceDays == 0 and regime != "bear":
+            strategy = MarketRegimeBenchmarkStrategy(symbols)
+            decision = strategy.select_entries(price_table, dates, index, [], regime, max_positions_today, 0)
+            current_equity, _ = portfolio_value(cash, positions, date, price_table)
+            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
+            available_exposure = max(exposure_cap - current_positions_value, 0.0)
+            target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
+            for symbol in decision.target_symbols:
+                if symbol in positions or len(positions) >= max_positions_today or available_exposure <= 0:
+                    continue
+                price = close_price(symbol, date, price_table)
+                if price is None:
+                    continue
+                order_value = min(target_value, available_exposure)
+                cash, position, trade = buy_next_open(
+                    cash, symbol, index, dates, price_table, order_value, config, decision.entry_reasons[symbol]
+                )
+                if position and trade:
+                    positions[symbol] = position
+                    available_exposure = max(available_exposure - trade.value - trade.fee, 0.0)
+                    trades.append(trade)
+
+        equity, positions_value = portfolio_value(cash, positions, date, price_table)
+        equity_curve.append(EquityPoint(date, equity, cash, positions_value))
+
+    metrics = calculate_metrics(equity_curve, trades, config.initialCash)
+    return BacktestResult(
+        strategy="market_regime_benchmark",
+        generatedAt=utc_now(),
+        config=asdict(config),
+        symbols=symbols,
+        metrics=metrics,
+        equityCurve=[asdict(point) for point in equity_curve],
+        trades=[asdict(trade) for trade in trades],
+    )
+
+
+def run_hybrid_momentum_breakout_sector(
+    data_dir: Path = DEFAULT_DATA_DIR,
+    universe_name: str = "liquid_stocks",
+    config: StrategyConfig | None = None,
+) -> BacktestResult:
+    config = config or StrategyConfig()
+    symbols = load_universe_symbols(data_dir, universe_name)
+    price_table = build_price_table(symbols, data_dir)
+    sector_by_symbol = symbol_sector_map(data_dir)
+    dates = sorted_trading_dates(price_table)
+    warmup_days = max(config.return6mDays, config.smaSlowDays, config.sectorReturn3mDays, config.marketSmaDays) + 1
+
+    cash = config.initialCash
+    positions: dict[str, Position] = {}
+    trades: list[Trade] = []
+    equity_curve: list[EquityPoint] = []
+    breakout_entries_by_week: dict[str, int] = {}
+
+    for index, date in enumerate(dates):
+        if index < warmup_days:
+            continue
+        ranked = rank_symbols(price_table, dates, index, config)
+        rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
+        regime = market_regime(price_table, dates, index, config)
+        max_positions_today = allowed_positions_for_regime(regime, config)
+        sector_candidates = sector_stock_candidates(price_table, dates, index, sector_by_symbol, config)
+        current_breakouts = set() if regime == "bear" else breakout_symbols(price_table, dates, index, config)
+        top_sectors = {
+            sector
+            for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config)[: config.sectorExitRank]
+        }
+
+        for symbol in list(positions):
+            position = positions[symbol]
+            price = close_price(symbol, date, price_table)
+            if price is None:
+                continue
+            position.peakPrice = max(position.peakPrice, price)
+            if not position_sellable(position, index, config):
+                continue
+            sector = sector_by_symbol.get(symbol, "unknown")
+            exit_reason = ""
+            regime_reason = regime_exit_reason(regime, config)
+            trailing_stop = trailing_stop_percent_for_regime(regime, config)
+            if regime_reason:
+                exit_reason = regime_reason
+            elif price <= position.entryPrice * (1 - config.stopLossPercent / 100):
+                exit_reason = "stop_loss"
+            elif price <= position.peakPrice * (1 - trailing_stop / 100):
+                exit_reason = "trailing_stop"
+            elif index % config.rebalanceDays == 0 and sector not in top_sectors:
+                exit_reason = "sector_exit"
+            elif index % config.rebalanceDays == 0 and rank_by_symbol.get(symbol, 999999) > config.exitRank:
+                exit_reason = "rank_exit"
+            if exit_reason:
+                cash, trade = sell_next_open(cash, position, index, dates, price_table, config, exit_reason)
+                if trade:
+                    trades.append(trade)
+                    positions.pop(symbol)
+
+        week = week_key(date)
+        weekly_breakout_remaining = max(config.maxBreakoutEntriesPerWeek - breakout_entries_by_week.get(week, 0), 0)
+        if config.hybridBreakoutRequired:
+            hybrid_candidates = [(symbol, score) for symbol, score in sector_candidates if symbol in current_breakouts]
+        else:
+            hybrid_candidates = sector_candidates
+        strategy = HybridMomentumSectorBreakoutStrategy(hybrid_candidates, current_breakouts)
+        should_rebalance = index % config.rebalanceDays == 0
+        should_enter_breakout = bool(current_breakouts) and weekly_breakout_remaining > 0
+        if regime != "bear" and (should_rebalance or should_enter_breakout):
+            decision = strategy.select_entries(
+                price_table,
+                dates,
+                index,
+                ranked,
+                regime,
+                max_positions_today,
+                weekly_breakout_remaining,
+            )
+            current_equity, _ = portfolio_value(cash, positions, date, price_table)
+            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
+            available_exposure = max(exposure_cap - current_positions_value, 0.0)
+            target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
+            sector_counts = sector_position_count(positions, sector_by_symbol)
+            for symbol in decision.target_symbols:
+                if symbol in positions or len(positions) >= max_positions_today or available_exposure <= 0:
+                    continue
+                price = close_price(symbol, date, price_table)
+                if price is None:
+                    continue
+                sector = sector_by_symbol.get(symbol, "unknown")
+                if sector_counts.get(sector, 0) >= config.maxSectorPositions:
+                    continue
+                bars = bars_until(price_table[symbol], dates, index)
+                if too_extended_from_sma50(bars, config):
+                    continue
+                order_value = min(target_value, available_exposure)
+                cash, position, trade = buy_next_open(
+                    cash, symbol, index, dates, price_table, order_value, config, decision.entry_reasons[symbol]
+                )
+                if position and trade:
+                    positions[symbol] = position
+                    sector_counts[sector] = sector_counts.get(sector, 0) + 1
+                    available_exposure = max(available_exposure - trade.value - trade.fee, 0.0)
+                    if symbol in current_breakouts:
+                        breakout_entries_by_week[week] = breakout_entries_by_week.get(week, 0) + 1
+                    trades.append(trade)
+
+        equity, positions_value = portfolio_value(cash, positions, date, price_table)
+        equity_curve.append(EquityPoint(date, equity, cash, positions_value))
+
+    metrics = calculate_metrics(equity_curve, trades, config.initialCash)
+    return BacktestResult(
+        strategy="hybrid_momentum_breakout_sector",
         generatedAt=utc_now(),
         config=asdict(config),
         symbols=symbols,

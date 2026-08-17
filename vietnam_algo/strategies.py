@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from .config import StrategyConfig
 from .data import PriceBar
-from .indicators import rolling_average_volume, rolling_high, sma, returns, volatility
+from .indicators import rolling_average_volume, rolling_high, rsi, sma, returns, volatility
 
 
 def bars_until(rows: dict[str, PriceBar], dates: list[str], index: int) -> list[PriceBar]:
@@ -107,6 +107,113 @@ def breakout_symbols(
     return symbols
 
 
+def pullback_score(bars: list[PriceBar], config: StrategyConfig) -> float | None:
+    min_days = max(config.smaSlowDays, config.pullbackLookbackDays, config.pullbackVolumeDays, config.rsiWindow) + 1
+    if len(bars) < min_days:
+        return None
+    current = bars[-1]
+    closes = [bar.close for bar in bars]
+    volumes = [bar.volume for bar in bars]
+    slow_sma = sma(closes, config.smaSlowDays)
+    current_rsi = rsi(closes, config.rsiWindow)
+    recent_high = rolling_high(closes[:-1], config.pullbackLookbackDays)
+    avg_volume = rolling_average_volume(volumes[:-1], config.pullbackVolumeDays)
+    if slow_sma is None or current_rsi is None or recent_high is None or avg_volume is None:
+        return None
+    if current.close <= slow_sma or current_rsi >= config.pullbackRsiEntry or avg_volume <= 0:
+        return None
+    pullback_percent = (recent_high / current.close - 1) * 100 if current.close > 0 else 0
+    if pullback_percent < config.pullbackMinPercent or pullback_percent > config.pullbackMaxPercent:
+        return None
+    if current.volume > avg_volume * config.pullbackPanicVolumeMultiplier:
+        return None
+    return pullback_percent + ((config.pullbackRsiEntry - current_rsi) / 10)
+
+
+def pullback_candidates(
+    price_table: dict[str, dict[str, PriceBar]],
+    dates: list[str],
+    index: int,
+    config: StrategyConfig,
+) -> list[tuple[str, float]]:
+    date = dates[index]
+    candidates: list[tuple[str, float]] = []
+    for symbol, rows in price_table.items():
+        if date not in rows:
+            continue
+        score = pullback_score(bars_until(rows, dates, index), config)
+        if score is not None:
+            candidates.append((symbol, score))
+    return sorted(candidates, key=lambda item: item[1], reverse=True)
+
+
+def pullback_exit_signal(bars: list[PriceBar], config: StrategyConfig) -> bool:
+    min_days = max(config.pullbackExitSmaDays, config.rsiWindow) + 1
+    if len(bars) < min_days:
+        return False
+    closes = [bar.close for bar in bars]
+    current_rsi = rsi(closes, config.rsiWindow)
+    exit_sma = sma(closes, config.pullbackExitSmaDays)
+    return bool(
+        current_rsi is not None
+        and exit_sma is not None
+        and (current_rsi >= config.pullbackRsiExit or closes[-1] >= exit_sma)
+    )
+
+
+def sector_momentum_scores(
+    price_table: dict[str, dict[str, PriceBar]],
+    dates: list[str],
+    index: int,
+    sector_by_symbol: dict[str, str],
+    config: StrategyConfig,
+) -> list[tuple[str, float]]:
+    grouped_scores: dict[str, list[float]] = {}
+    date = dates[index]
+    for symbol, rows in price_table.items():
+        if date not in rows:
+            continue
+        bars = bars_until(rows, dates, index)
+        closes = [bar.close for bar in bars]
+        min_days = max(config.sectorReturn1mDays, config.sectorReturn3mDays) + 1
+        if len(closes) < min_days or closes[-config.sectorReturn1mDays] <= 0 or closes[-config.sectorReturn3mDays] <= 0:
+            continue
+        return_1m = closes[-1] / closes[-config.sectorReturn1mDays] - 1
+        return_3m = closes[-1] / closes[-config.sectorReturn3mDays] - 1
+        sector = sector_by_symbol.get(symbol, "unknown")
+        grouped_scores.setdefault(sector, []).append((0.4 * return_1m) + (0.6 * return_3m))
+    sector_scores = [
+        (sector, sum(scores) / len(scores))
+        for sector, scores in grouped_scores.items()
+        if scores
+    ]
+    return sorted(sector_scores, key=lambda item: item[1], reverse=True)
+
+
+def sector_stock_candidates(
+    price_table: dict[str, dict[str, PriceBar]],
+    dates: list[str],
+    index: int,
+    sector_by_symbol: dict[str, str],
+    config: StrategyConfig,
+) -> list[tuple[str, float]]:
+    top_sectors = {sector for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config)[: config.topSectors]}
+    if not top_sectors:
+        return []
+    ranked = rank_symbols(price_table, dates, index, config)
+    per_sector_counts: dict[str, int] = {}
+    candidates: list[tuple[str, float]] = []
+    for symbol, score in ranked:
+        sector = sector_by_symbol.get(symbol, "unknown")
+        if sector not in top_sectors:
+            continue
+        if per_sector_counts.get(sector, 0) >= config.topStocksPerSector:
+            continue
+        candidates.append((symbol, score))
+        per_sector_counts[sector] = per_sector_counts.get(sector, 0) + 1
+    return candidates
+
+
 @dataclass(frozen=True)
 class StrategyDecision:
     target_symbols: list[str]
@@ -203,4 +310,93 @@ class MomentumWithBreakoutStrategy(Strategy):
                     breakout_added += 1
                 if breakout_added >= weekly_breakout_remaining:
                     break
+        return StrategyDecision(target_symbols, reasons)
+
+
+@dataclass(frozen=True)
+class PullbackMeanReversionStrategy(Strategy):
+    candidates: list[tuple[str, float]]
+    name: str = "pullback_mean_reversion"
+
+    def select_entries(
+        self,
+        price_table: dict[str, dict[str, PriceBar]],
+        dates: list[str],
+        index: int,
+        ranked: list[tuple[str, float]],
+        regime: str,
+        max_positions_today: int,
+        weekly_breakout_remaining: int,
+    ) -> StrategyDecision:
+        if regime == "bear" or weekly_breakout_remaining <= 0:
+            return StrategyDecision([], {})
+        target_symbols = [symbol for symbol, _ in self.candidates[:weekly_breakout_remaining]]
+        return StrategyDecision(target_symbols, {symbol: "pullback_mean_reversion" for symbol in target_symbols})
+
+
+@dataclass(frozen=True)
+class SectorMomentumStrategy(Strategy):
+    candidates: list[tuple[str, float]]
+    name: str = "sector_momentum_rotation"
+
+    def select_entries(
+        self,
+        price_table: dict[str, dict[str, PriceBar]],
+        dates: list[str],
+        index: int,
+        ranked: list[tuple[str, float]],
+        regime: str,
+        max_positions_today: int,
+        weekly_breakout_remaining: int,
+    ) -> StrategyDecision:
+        if regime == "bear":
+            return StrategyDecision([], {})
+        target_symbols = [symbol for symbol, _ in self.candidates[:max_positions_today]]
+        return StrategyDecision(target_symbols, {symbol: "sector_momentum" for symbol in target_symbols})
+
+
+@dataclass(frozen=True)
+class MarketRegimeBenchmarkStrategy(Strategy):
+    symbols: list[str]
+    name: str = "market_regime_benchmark"
+
+    def select_entries(
+        self,
+        price_table: dict[str, dict[str, PriceBar]],
+        dates: list[str],
+        index: int,
+        ranked: list[tuple[str, float]],
+        regime: str,
+        max_positions_today: int,
+        weekly_breakout_remaining: int,
+    ) -> StrategyDecision:
+        if regime == "bear":
+            return StrategyDecision([], {})
+        target_symbols = self.symbols[:max_positions_today]
+        return StrategyDecision(target_symbols, {symbol: "market_regime_benchmark" for symbol in target_symbols})
+
+
+@dataclass(frozen=True)
+class HybridMomentumSectorBreakoutStrategy(Strategy):
+    candidates: list[tuple[str, float]]
+    breakout_symbols: set[str]
+    name: str = "hybrid_momentum_breakout_sector"
+
+    def select_entries(
+        self,
+        price_table: dict[str, dict[str, PriceBar]],
+        dates: list[str],
+        index: int,
+        ranked: list[tuple[str, float]],
+        regime: str,
+        max_positions_today: int,
+        weekly_breakout_remaining: int,
+    ) -> StrategyDecision:
+        if regime == "bear":
+            return StrategyDecision([], {})
+        target_symbols = [symbol for symbol, _ in self.candidates[:max_positions_today]]
+        reasons = {
+            symbol: ("hybrid_breakout_sector" if symbol in self.breakout_symbols else "hybrid_momentum_sector")
+            for symbol in target_symbols
+        }
         return StrategyDecision(target_symbols, reasons)
