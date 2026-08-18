@@ -2,6 +2,7 @@
 
 Standalone research/data tools for building a Vietnam stock trading algorithm. This folder is separate from live signal publishing so we can collect local data and backtest safely first.
 
+Session : https://opncd.ai/share/dG8bLg2U
 ## Data Sources
 
 Symbol universe:
