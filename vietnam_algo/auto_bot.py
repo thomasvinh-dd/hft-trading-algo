@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import time
+import os
 from pathlib import Path
 
 from .bot_state import AutoBotState, load_state, save_state
 from .config import StrategyConfig
+from .corporate_actions import sync_corporate_actions_incremental
 from .daily_engine import EngineConfig, generate_live_orders, run_daily_once, trading_token_from_email, update_dataset
 from .dnse_client import DnseClient
-from .schedule import TradingSchedule, local_date, should_refresh_token, should_run_eod, should_submit_orders, vietnam_now
+from .notifier import notify
+from .schedule import TradingSchedule, local_date, should_refresh_token, should_run_eod, should_submit_orders, should_sync_corporate_actions, vietnam_now
 
 
 def run_auto_bot(
@@ -28,6 +31,7 @@ def run_auto_bot(
 
         if should_refresh_token(now, state.tokenDate, schedule):
             print(f"[{now.isoformat()}] Refreshing DNSE trading token")
+            notify(f"Vietnam Algo: refreshing DNSE trading token\ntime: {now.isoformat()}")
             if live_submit:
                 state.tradingToken = trading_token_from_email(client)
             else:
@@ -37,6 +41,7 @@ def run_auto_bot(
 
         if should_submit_orders(now, state.orderSubmitDate, schedule):
             print(f"[{now.isoformat()}] Generating and submitting latest orders")
+            notify(f"Vietnam Algo: submit cycle started\ntime: {now.isoformat()}\nliveSubmit: {live_submit}")
             if not state.tradingToken:
                 if live_submit:
                     state.tradingToken = trading_token_from_email(client)
@@ -57,8 +62,36 @@ def run_auto_bot(
             state.orderSubmitDate = today
             save_state(state, engine_config.dataDir)
 
+        if should_sync_corporate_actions(now, state.corporateActionDate, schedule):
+            print(f"[{now.isoformat()}] Syncing Vietstock corporate actions")
+            notify(f"Vietnam Algo: syncing corporate actions\ntime: {now.isoformat()}")
+            token = os.environ.get("VIETSTOCK_REQUEST_TOKEN", "")
+            cookie = os.environ.get("VIETSTOCK_COOKIE", "")
+            result = sync_corporate_actions_incremental(
+                engine_config.dataDir,
+                request_verification_token=token,
+                cookie=cookie,
+                to_date=today,
+            )
+            print(result)
+            notify(
+                "\n".join(
+                    [
+                        "Vietnam Algo: corporate actions synced",
+                        f"fromDate: {result.get('fromDate')}",
+                        f"toDate: {result.get('toDate')}",
+                        f"fetched: {result.get('fetched')}",
+                        f"added: {result.get('added')}",
+                        f"total: {result.get('total')}",
+                    ]
+                )
+            )
+            state.corporateActionDate = today
+            save_state(state, engine_config.dataDir)
+
         if should_run_eod(now, state.eodDate, schedule):
             print(f"[{now.isoformat()}] Running EOD data update and order generation")
+            notify(f"Vietnam Algo: EOD update started\ntime: {now.isoformat()}")
             update_dataset(engine_config)
             result = generate_live_orders(engine_config, strategy_config)
             print(result)

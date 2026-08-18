@@ -91,11 +91,25 @@ strategies.py    Strategy logic: ranking, breakout detection, entry target selec
 backtest.py      Common order simulation, Vietnam market mechanics, risk controls, metrics, CSV output
 ```
 
-Current safer-best momentum baseline for comparison:
+Current best baseline without corporate-action guard:
 
 ```text
-totalReturnPercent: about 875.40%
-maxDrawdownPercent: about -24.28%
+finalEquity: 7,775,373,862 VND from 1,000,000,000 VND
+totalReturnPercent: 677.54%
+maxDrawdownPercent: -28.55%
+tradeCount: 1370
+```
+
+Current live-safe corporate-action configuration:
+
+```text
+finalEquity: 6,791,966,304 VND from 1,000,000,000 VND
+totalReturnPercent: 579.20%
+maxDrawdownPercent: -29.19%
+tradeCount: 1418
+corporateActionBuyWindowDays: 3
+corporateActionSellWindowDays: 1
+corporateActionRebuyAfterExDate: true
 ```
 
 Run the first baseline strategy:
@@ -164,6 +178,144 @@ The CSV order list is for manual review and contains:
 
 ```text
 orderId, date, symbol, side, price, quantity, value, fee, reason
+```
+
+Reproduce the current best baseline without corporate-action guard:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main backtest-momentum \
+  --max-positions 10 \
+  --bear-max-positions 2 \
+  --max-sector-positions 3 \
+  --exit-rank 30 \
+  --max-breakout-entries-per-week 1 \
+  --breakout-max-rank 15 \
+  --neutral-exposure-percent 60 \
+  --bear-exposure-percent 15 \
+  --trailing-stop-percent 9 \
+  --neutral-trailing-stop-percent 6 \
+  --bear-trailing-stop-percent 4
+```
+
+Reproduce the current live-safe corporate-action version:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main backtest-momentum \
+  --max-positions 10 \
+  --bear-max-positions 2 \
+  --max-sector-positions 3 \
+  --exit-rank 30 \
+  --max-breakout-entries-per-week 1 \
+  --breakout-max-rank 15 \
+  --neutral-exposure-percent 60 \
+  --bear-exposure-percent 15 \
+  --trailing-stop-percent 9 \
+  --neutral-trailing-stop-percent 6 \
+  --bear-trailing-stop-percent 4 \
+  --use-corporate-action-guard \
+  --corporate-action-buy-window-days 3 \
+  --corporate-action-sell-window-days 1 \
+  --corporate-action-rebuy-after-exdate
+```
+
+Saved local env presets:
+
+```text
+bots/hft-trading-algo/vietnam_algo/env/.env.vietnam-algo-best
+bots/hft-trading-algo/vietnam_algo/env/.env.vietnam-algo-best-corporate-action
+bots/hft-trading-algo/vietnam_algo/env/.env.vietnam-algo-aggressive
+```
+
+## Corporate Actions
+
+Corporate actions are stored in:
+
+```text
+bots/hft-trading-algo/vietnam_algo/data/corporate_action.json
+```
+
+The file is built from Vietstock:
+
+```text
+https://finance.vietstock.vn/data/eventstypedata
+```
+
+Vietstock request token/session handling:
+
+```text
+Default behavior:
+  fetch lich-su-kien.htm
+  extract __RequestVerificationToken from the hidden form
+  keep the same CookieJar session
+  post to /data/eventstypedata with that session
+
+Manual override, usually not needed:
+  VIETSTOCK_REQUEST_TOKEN
+  VIETSTOCK_COOKIE
+```
+
+Fetch one page of events:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main sync-corporate-actions \
+  --from-date 2012-07-13 \
+  --to-date 2026-08-13 \
+  --page 1 \
+  --page-size 100
+```
+
+Incrementally fetch new events and merge them into the existing file:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main sync-corporate-actions-incremental
+```
+
+Incremental sync behavior:
+
+```text
+read existing corporate_action.json
+use the latest existing exDate as fDate
+use today as tDate by default
+fetch Vietstock page 1 with pageSize 100
+merge by EventID
+update existing rows if Vietstock changed them
+append only new EventID values
+write corporate_action.json back to disk
+```
+
+Current downloaded coverage after incremental sync:
+
+```text
+count: 13,821 events
+min exDate: 2015-06-08
+max exDate: 2026-08-18
+cash-only events: 10,546
+non-cash events: 3,264
+```
+
+Corporate-action live policy:
+
+```text
+Cash dividend:
+  allow normal trading
+
+Standard non-cash events, such as stock dividend / stock bonus:
+  block new BUY 3 trading days before ex-date because Vietnam settlement is T+2.5
+  force/allow SELL 1 trading day before ex-date
+  allow re-buy after ex-date if the stock is still selected by the strategy
+
+High-risk non-cash events, such as rights offering / issuance / convertible / share swap:
+  block new BUY 5 trading days before ex-date
+  force/allow SELL 3 trading days before ex-date
+  do not force re-buy after ex-date
+```
+
+Reason for this policy:
+
+```text
+Vietnam settlement is T+2.5, approximated as 3 trading days.
+Buying too close to a non-cash ex-date means we may not be able to sell before the event.
+Bonus/new shares may not be immediately tradable, and Vietstock does not reliably provide the tradable date.
 ```
 
 ## Volume Breakout Backtest
@@ -290,7 +442,7 @@ PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main dnse-submit-orders
   --yes
 ```
 
-For order-book-aware execution, add `--monitor`. The engine will submit the order, poll DNSE order detail, fetch latest bid/ask, and replace the order toward the current best matching price when needed:
+For order-book-aware execution, add `--initial-orderbook-pricing` and `--monitor`. The engine fetches DNSE live quote/orderbook before submit, prices initial orders at best ask/bid, polls order detail, fetches latest bid/ask, and replaces the order toward the current best matching price when needed:
 
 ```bash
 PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main dnse-submit-orders \
@@ -298,20 +450,78 @@ PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main dnse-submit-orders
   --loan-package-id 5757 \
   --trade-date 2026-01-02 \
   --limit 1 \
+  --initial-orderbook-pricing \
+  --max-price-drift-percent 2 \
   --monitor \
   --max-checks 3 \
   --check-interval-seconds 5 \
+  --cancel-if-unfilled \
   --yes
 ```
 
-Repricing rule:
+Initial pricing and repricing rule:
 
 ```text
-BUY  -> use latest best ask when current order price does not match the order book
-SELL -> use latest best bid when current order price does not match the order book
+BUY  -> use latest best ask
+SELL -> use latest best bid
 ```
 
-The monitor stops when the order status is filled/cancelled/rejected/closed or after `--max-checks`.
+Price drift protection:
+
+```text
+BUY signal price: 50,000
+best ask: 50,700
+allowed if --max-price-drift-percent 2 because +1.4%
+
+BUY signal price: 50,000
+best ask: 51,500
+kept/skipped from orderbook repricing because +3.0% > 2%
+
+SELL signal price: 50,000
+best bid: 49,400
+allowed because -1.2%
+
+SELL signal price: 50,000
+best bid: 48,800
+kept/skipped from orderbook repricing because -2.4% > 2%
+```
+
+The monitor stops when the order status is filled/cancelled/rejected/closed or after `--max-checks`. If `--cancel-if-unfilled` is set, an open order is cancelled after the final check.
+
+If the monitor reaches `--max-checks` and the order is still open, it records:
+
+```text
+monitor_exhausted_unfilled
+```
+
+If `--cancel-if-unfilled` is enabled, it then cancels the order and records:
+
+```text
+cancelled_unfilled
+```
+
+Telegram notifications include a warning for these cases:
+
+```text
+WARNING: unfilled orders after reprice limit
+NB VCB qty=100 price=50,000 | status=UNFILLED_AFTER_REPRICE_LIMIT
+```
+
+Or if cancelled:
+
+```text
+WARNING: unfilled orders after reprice limit
+NB VCB qty=100 price=50,000 | status=CANCELLED_UNFILLED
+```
+
+Live sell protection:
+
+```text
+Before real submit, the engine reads DNSE positions.
+SELL quantity is capped to DNSE sellableQuantity / availableQuantity.
+Quantity is rounded down to 100-share board lot.
+SELL is skipped if no sellable quantity is available.
+```
 
 Before real submission, check buying/selling power:
 
@@ -379,8 +589,33 @@ Real daily submit requires both `--yes` and either `DNSE_TRADING_TOKEN` or `--au
 PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main daily-submit-orders \
   --account-no YOUR_ACCOUNT_NO \
   --loan-package-id 5757 \
+  --strategy momentum \
+  --max-positions 10 \
+  --bear-max-positions 2 \
+  --max-sector-positions 3 \
+  --exit-rank 30 \
+  --max-breakout-entries-per-week 1 \
+  --breakout-max-rank 15 \
+  --neutral-exposure-percent 60 \
+  --bear-exposure-percent 15 \
+  --trailing-stop-percent 9 \
+  --neutral-trailing-stop-percent 6 \
+  --bear-trailing-stop-percent 4 \
+  --use-corporate-action-guard \
+  --corporate-action-buy-window-days 3 \
+  --corporate-action-sell-window-days 1 \
+  --corporate-action-rebuy-after-exdate \
   --auto-email-otp \
   --yes
+```
+
+`daily-submit-orders` applies these live protections automatically:
+
+```text
+corporate-action guard from corporate_action.json
+DNSE sellable quantity cap for SELL orders
+initial order-book pricing from DNSE latest quote
+max price drift protection, default 2%
 ```
 
 Recommended production flow:
@@ -390,6 +625,189 @@ Recommended production flow:
 2. Inspect latest_orders.csv.
 3. Check PPSE for large orders.
 4. Run daily-submit-orders with --yes only after confirming the order list.
+```
+
+## Telegram Notifications
+
+The bot can report important events to a Telegram chat:
+
+```text
+order generation summary
+submit cycle start
+submitted order summary
+final order status after monitor checks
+matched quantity and average price if DNSE returns them
+reprice count per order
+warning when an order remains unfilled after the reprice limit
+warning when an unfilled order is cancelled
+corporate-action sync start/result
+EOD update start
+DNSE token refresh start
+strategy metrics such as return, final equity, and max drawdown
+corporate-action, sellable quantity, and pricing decision counts
+```
+
+Example Telegram submit status line:
+
+```text
+NB VCB qty=100 price=50,000 | status=FILLED | matchedQty=100 | avgPrice=50,100 | repriceCount=1
+```
+
+Example unfilled warning:
+
+```text
+WARNING: unfilled orders after reprice limit
+NS FPT qty=100 price=100,000 | status=CANCELLED_UNFILLED
+```
+
+Create a Telegram bot with BotFather, then set:
+
+```bash
+export TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+export TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Disable notifications if needed:
+
+```bash
+export TELEGRAM_NOTIFICATIONS=0
+```
+
+Send a test message:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main telegram-test \
+  --message "Vietnam Algo test notification"
+```
+
+If the bot is posting to a group, add the bot to the group and use the group chat ID. Telegram group IDs are often negative numbers.
+
+## Real Environment Test Runbook
+
+Use this sequence before the first real DNSE test.
+
+Set environment variables:
+
+```bash
+export DNSE_API_KEY=your_api_key
+export DNSE_API_SECRET=your_api_secret
+export DNSE_ACCOUNT_NO=your_account_no
+export DNSE_LOAN_PACKAGE_ID=5757
+
+export GMAIL_ADDRESS=your_email@gmail.com
+export GMAIL_APP_PASSWORD=your_gmail_app_password
+export DNSE_OTP_SENDER=dnse
+export DNSE_OTP_SUBJECT=OTP
+export TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+export TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Check DNSE connectivity:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main dnse-accounts
+```
+
+Check positions:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main dnse-positions \
+  --account-no "$DNSE_ACCOUNT_NO"
+```
+
+Generate or refresh orders after EOD data is ready:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main daily-generate-orders \
+  --strategy momentum \
+  --max-positions 10 \
+  --bear-max-positions 2 \
+  --max-sector-positions 3 \
+  --exit-rank 30 \
+  --max-breakout-entries-per-week 1 \
+  --breakout-max-rank 15 \
+  --neutral-exposure-percent 60 \
+  --bear-exposure-percent 15 \
+  --trailing-stop-percent 9 \
+  --neutral-trailing-stop-percent 6 \
+  --bear-trailing-stop-percent 4 \
+  --use-corporate-action-guard \
+  --corporate-action-buy-window-days 3 \
+  --corporate-action-sell-window-days 1 \
+  --corporate-action-rebuy-after-exdate
+```
+
+Inspect generated files:
+
+```text
+bots/hft-trading-algo/vietnam_algo/data/live/latest_orders.csv
+bots/hft-trading-algo/vietnam_algo/data/live/latest_orders.json
+```
+
+Preview DNSE orders with corporate-action decisions:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main dnse-preview-orders \
+  --orders-file bots/hft-trading-algo/vietnam_algo/data/live/latest_orders.csv \
+  --loan-package-id "$DNSE_LOAN_PACKAGE_ID" \
+  --use-corporate-action-guard \
+  --corporate-action-buy-window-days 3 \
+  --corporate-action-sell-window-days 1
+```
+
+Dry-run submit before real money:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main dnse-submit-orders \
+  --orders-file bots/hft-trading-algo/vietnam_algo/data/live/latest_orders.csv \
+  --account-no "$DNSE_ACCOUNT_NO" \
+  --loan-package-id "$DNSE_LOAN_PACKAGE_ID" \
+  --trading-token dry_run_token \
+  --initial-orderbook-pricing \
+  --max-price-drift-percent 2 \
+  --monitor \
+  --max-checks 3 \
+  --check-interval-seconds 5 \
+  --cancel-if-unfilled
+```
+
+Real manual submit at start of the continuous session, after ATO:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main dnse-submit-orders \
+  --orders-file bots/hft-trading-algo/vietnam_algo/data/live/latest_orders.csv \
+  --account-no "$DNSE_ACCOUNT_NO" \
+  --loan-package-id "$DNSE_LOAN_PACKAGE_ID" \
+  --trading-token "$DNSE_TRADING_TOKEN" \
+  --initial-orderbook-pricing \
+  --max-price-drift-percent 2 \
+  --monitor \
+  --max-checks 3 \
+  --check-interval-seconds 5 \
+  --cancel-if-unfilled \
+  --yes
+```
+
+Recommended timing for manual real test:
+
+```text
+08:30 VN: create/refresh DNSE trading token
+09:00-09:15 VN: do not submit during ATO
+09:16 VN: submit during continuous session
+11:30-13:00 VN: do not submit during lunch break
+14:45-15:00 VN: do not submit during ATC
+15:15 VN: update EOD data and generate tomorrow orders
+```
+
+First real-money test recommendations:
+
+```text
+use --limit 1 for the first live submit
+keep --max-price-drift-percent 2 or lower
+keep --max-checks 3
+keep --cancel-if-unfilled
+verify DNSE positions immediately after submit
+verify latest_orders.csv before every real submit
 ```
 
 ## All-Day Auto Trading Bot
@@ -402,6 +820,7 @@ The auto bot runs continuously and follows Vietnam market timing:
 11:30-13:00: no submission during noon break
 13:00-14:45: continuous afternoon session
 14:45-15:00: no submission during ATC
+15:10 VN time: sync new Vietstock corporate actions into corporate_action.json
 15:15 VN time: update dataset and generate next live order file
 ```
 
@@ -425,6 +844,20 @@ export GMAIL_ADDRESS=your_email@gmail.com
 export GMAIL_APP_PASSWORD=your_gmail_app_password
 export DNSE_OTP_SENDER=dnse
 export DNSE_OTP_SUBJECT=OTP
+export TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+export TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Optional Vietstock overrides, normally not needed because the bot auto-fetches a fresh token/session:
+
+```bash
+export VIETSTOCK_REQUEST_TOKEN=your_vietstock_request_token
+export VIETSTOCK_COOKIE=your_vietstock_browser_cookie
+```
+
+Run the auto bot:
+
+```bash
 
 PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main auto-trading-bot \
   --account-no YOUR_ACCOUNT_NO \

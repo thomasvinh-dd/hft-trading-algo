@@ -57,3 +57,13 @@ class StrategyConfig:
     trailingStopPercent: float = 10.0
     feeRate: float = 0.0015
     slippageRate: float = 0.001
+    useCorporateActionGuard: bool = False
+    corporateActionWindowDays: int = 3
+    corporateActionBuyWindowDays: int = 2
+    corporateActionSellWindowDays: int = 3
+    corporateActionRebuyAfterExDate: bool = False
+    corporateActionHighRiskBuyWindowDays: int = 5
+    corporateActionHighRiskSellWindowDays: int = 3
+    corporateActionRebuyBullMaxRank: int = 10
+    corporateActionRebuyNeutralMaxRank: int = 5
+    corporateActionRebuyMinAvgVolume: float = 300_000

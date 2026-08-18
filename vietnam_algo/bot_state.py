@@ -11,6 +11,7 @@ class AutoBotState:
     tokenDate: str | None = None
     orderSubmitDate: str | None = None
     eodDate: str | None = None
+    corporateActionDate: str | None = None
     tradingToken: str = ""
 
 
@@ -27,6 +28,7 @@ def load_state(data_dir: Path = DEFAULT_DATA_DIR) -> AutoBotState:
         tokenDate=payload.get("tokenDate"),
         orderSubmitDate=payload.get("orderSubmitDate"),
         eodDate=payload.get("eodDate"),
+        corporateActionDate=payload.get("corporateActionDate"),
         tradingToken=str(payload.get("tradingToken", "")),
     )
 

@@ -6,6 +6,7 @@ from datetime import date as date_type
 from pathlib import Path
 
 from .config import StrategyConfig
+from .corporate_actions import CorporateAction, corporate_action_path, load_corporate_actions, non_cash_events_in_window
 from .data import DEFAULT_DATA_DIR, PriceBar, utc_now, write_json
 from .indicators import max_drawdown_percent, sma
 from .strategies import (
@@ -80,6 +81,95 @@ def build_price_table(symbols: list[str], data_dir: Path) -> dict[str, dict[str,
         if bars:
             table[symbol] = {bar.time: bar for bar in bars}
     return table
+
+
+def build_corporate_action_table(data_dir: Path, config: StrategyConfig) -> dict[str, dict[str, list[CorporateAction]]]:
+    if not config.useCorporateActionGuard:
+        return {}
+    actions = load_corporate_actions(corporate_action_path(data_dir))
+    table: dict[str, dict[str, list[CorporateAction]]] = {}
+    for action in actions:
+        if not action.exDate or not action.isNonCash:
+            continue
+        table.setdefault(action.symbol, {}).setdefault(action.exDate, []).append(action)
+    return table
+
+
+def risky_corporate_action_symbols(
+    corporate_actions: dict[str, dict[str, list[CorporateAction]]],
+    trade_date: str,
+    window_days: int,
+    high_risk_only: bool = False,
+) -> set[str]:
+    if not corporate_actions:
+        return set()
+    flattened = [event for events_by_date in corporate_actions.values() for events in events_by_date.values() for event in events]
+    if high_risk_only:
+        flattened = [event for event in flattened if corporate_action_risk_type(event) == "high"]
+    return set(non_cash_events_in_window(flattened, trade_date, window_days=window_days).keys())
+
+
+def corporate_action_risk_type(action: CorporateAction) -> str:
+    text = f"{action.name} {action.note} {action.title}".lower()
+    high_risk_terms = (
+        "quyền mua",
+        "phát hành",
+        "trái phiếu chuyển đổi",
+        "hoán đổi",
+        "chuyển đổi",
+        "riêng lẻ",
+    )
+    return "high" if any(term in text for term in high_risk_terms) else "standard"
+
+
+def corporate_action_events_due(
+    symbol: str,
+    date: str,
+    corporate_actions: dict[str, dict[str, list[CorporateAction]]],
+    window_days: int,
+) -> list[CorporateAction]:
+    events = [event for rows in corporate_actions.get(symbol, {}).values() for event in rows]
+    return non_cash_events_in_window(events, date, window_days=window_days).get(symbol, [])
+
+
+def next_corporate_action_ex_date(
+    symbol: str,
+    date: str,
+    corporate_actions: dict[str, dict[str, list[CorporateAction]]],
+    config: StrategyConfig,
+) -> str | None:
+    events = corporate_action_events_due(symbol, date, corporate_actions, config.corporateActionSellWindowDays)
+    symbol_events = [event for event in events if corporate_action_risk_type(event) == "standard"]
+    ex_dates = sorted(event.exDate for event in symbol_events if event.exDate)
+    return ex_dates[0] if ex_dates else None
+
+
+def corporate_action_exit_due(
+    symbol: str,
+    date: str,
+    corporate_actions: dict[str, dict[str, list[CorporateAction]]],
+    config: StrategyConfig,
+) -> bool:
+    standard_due = corporate_action_events_due(symbol, date, corporate_actions, config.corporateActionSellWindowDays)
+    high_risk_due = corporate_action_events_due(symbol, date, corporate_actions, config.corporateActionHighRiskSellWindowDays)
+    return bool(standard_due or high_risk_due)
+
+
+def corporate_action_exit_rebuy_allowed(
+    symbol: str,
+    date: str,
+    corporate_actions: dict[str, dict[str, list[CorporateAction]]],
+    config: StrategyConfig,
+) -> bool:
+    events = corporate_action_events_due(symbol, date, corporate_actions, config.corporateActionSellWindowDays)
+    return bool(events) and all(corporate_action_risk_type(event) == "standard" for event in events)
+
+
+def average_volume(symbol: str, price_table: dict[str, dict[str, PriceBar]], dates: list[str], index: int, window: int = 20) -> float:
+    bars = bars_until(price_table[symbol], dates, index)[-window:]
+    if not bars:
+        return 0.0
+    return sum(bar.volume for bar in bars) / len(bars)
 
 
 def sorted_trading_dates(price_table: dict[str, dict[str, PriceBar]]) -> list[str]:
@@ -302,6 +392,7 @@ def run_momentum_rotation(
     config = config or StrategyConfig()
     symbols = load_universe_symbols(data_dir, universe_name)
     price_table = build_price_table(symbols, data_dir)
+    corporate_actions = build_corporate_action_table(data_dir, config)
     sector_by_symbol = symbol_sector_map(data_dir)
     dates = sorted_trading_dates(price_table)
     warmup_days = max(config.return6mDays, config.smaSlowDays) + 1
@@ -311,6 +402,7 @@ def run_momentum_rotation(
     trades: list[Trade] = []
     equity_curve: list[EquityPoint] = []
     breakout_entries_by_week: dict[str, int] = {}
+    pending_corporate_action_rebuys: dict[str, tuple[float, str]] = {}
 
     for index, date in enumerate(dates):
         if index < warmup_days:
@@ -334,6 +426,8 @@ def run_momentum_rotation(
             trailing_stop = trailing_stop_percent_for_regime(regime, config)
             if regime_reason:
                 exit_reason = regime_reason
+            elif corporate_action_exit_due(symbol, date, corporate_actions, config):
+                exit_reason = "corporate_action_exit"
             elif price <= position.entryPrice * (1 - config.stopLossPercent / 100):
                 exit_reason = "stop_loss"
             elif price <= position.peakPrice * (1 - trailing_stop / 100):
@@ -341,10 +435,15 @@ def run_momentum_rotation(
             elif index % config.rebalanceDays == 0 and rank_by_symbol.get(symbol, 999999) > config.exitRank:
                 exit_reason = "rank_exit"
             if exit_reason:
+                rebuy_ex_date = None
+                if exit_reason == "corporate_action_exit" and corporate_action_exit_rebuy_allowed(symbol, date, corporate_actions, config):
+                    rebuy_ex_date = next_corporate_action_ex_date(symbol, date, corporate_actions, config)
                 cash, trade = sell_next_open(cash, position, index, dates, price_table, config, exit_reason)
                 if trade:
                     trades.append(trade)
                     positions.pop(symbol)
+                    if config.corporateActionRebuyAfterExDate and rebuy_ex_date:
+                        pending_corporate_action_rebuys[symbol] = (trade.value - trade.fee, rebuy_ex_date)
 
         week = week_key(date)
         weekly_breakout_remaining = max(
@@ -374,13 +473,69 @@ def run_momentum_rotation(
                 weekly_breakout_remaining,
             )
             current_equity, _ = portfolio_value(cash, positions, date, price_table)
+            standard_blocked_buys = risky_corporate_action_symbols(corporate_actions, date, config.corporateActionBuyWindowDays)
+            high_risk_blocked_buys = risky_corporate_action_symbols(
+                corporate_actions,
+                date,
+                config.corporateActionHighRiskBuyWindowDays,
+                high_risk_only=True,
+            )
+            blocked_buys = standard_blocked_buys | high_risk_blocked_buys
             exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
             current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
             available_exposure = max(exposure_cap - current_positions_value, 0.0)
             target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
             sector_counts = sector_position_count(positions, sector_by_symbol)
+            if config.corporateActionRebuyAfterExDate and pending_corporate_action_rebuys and index % config.rebalanceDays == 0:
+                rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
+                for symbol, (target_rebuy_value, ex_date) in list(pending_corporate_action_rebuys.items()):
+                    if date <= ex_date or symbol in positions or symbol in blocked_buys or len(positions) >= max_positions_today:
+                        continue
+                    max_rebuy_rank = 0
+                    if regime == "bull":
+                        max_rebuy_rank = config.corporateActionRebuyBullMaxRank
+                    elif regime == "neutral":
+                        max_rebuy_rank = config.corporateActionRebuyNeutralMaxRank
+                    if max_rebuy_rank <= 0 or rank_by_symbol.get(symbol, 999999) > max_rebuy_rank:
+                        pending_corporate_action_rebuys.pop(symbol, None)
+                        continue
+                    price = close_price(symbol, date, price_table)
+                    if price is None:
+                        continue
+                    sector = sector_by_symbol.get(symbol, "unknown")
+                    if sector_counts.get(sector, 0) >= config.maxSectorPositions:
+                        continue
+                    bars = bars_until(price_table[symbol], dates, index)
+                    closes = [bar.close for bar in bars]
+                    if not closes or sma(closes, config.smaFastDays) is None or sma(closes, config.smaSlowDays) is None:
+                        continue
+                    if closes[-1] <= sma(closes, config.smaFastDays) or closes[-1] <= sma(closes, config.smaSlowDays):
+                        continue
+                    if average_volume(symbol, price_table, dates, index) < config.corporateActionRebuyMinAvgVolume:
+                        continue
+                    if too_extended_from_sma50(bars, config):
+                        continue
+                    order_value = min(target_rebuy_value, available_exposure, cash / (1 + config.feeRate))
+                    cash, position, trade = buy_next_open(
+                        cash,
+                        symbol,
+                        index,
+                        dates,
+                        price_table,
+                        order_value,
+                        config,
+                        "corporate_action_rebuy",
+                    )
+                    if position and trade:
+                        positions[symbol] = position
+                        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+                        available_exposure = max(available_exposure - trade.value - trade.fee, 0.0)
+                        trades.append(trade)
+                        pending_corporate_action_rebuys.pop(symbol, None)
             for symbol in decision.target_symbols:
                 if symbol in positions or len(positions) >= max_positions_today:
+                    continue
+                if symbol in blocked_buys:
                     continue
                 if available_exposure <= 0:
                     break

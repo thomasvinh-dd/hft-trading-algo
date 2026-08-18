@@ -17,10 +17,21 @@ from .backtest import (
 )
 from .auto_bot import run_auto_bot
 from .config import StrategyConfig
+from .corporate_actions import fetch_vietstock_events, save_corporate_actions, sync_corporate_actions_incremental
 from .daily_engine import EngineConfig, run_daily_once, trading_token_from_email
 from .data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, load_saved_symbols, sync_prices, sync_symbols
 from .dnse_client import DEFAULT_DNSE_BASE_URL, DnseClient
-from .trading_engine import execute_dnse_orders, execute_dnse_orders_with_monitoring, prepare_dnse_orders
+from .notifier import TelegramConfig, notify
+from .trading_engine import (
+    build_corporate_action_exit_orders,
+    apply_sellable_quantity_cap,
+    execute_dnse_orders,
+    execute_dnse_orders_with_monitoring,
+    extract_sellable_positions,
+    prepare_dnse_orders_with_risk_report,
+    price_orders_from_orderbook,
+    selected_order_date,
+)
 from .universe import build_liquid_universe, save_liquid_universe
 
 
@@ -38,6 +49,21 @@ def build_parser() -> argparse.ArgumentParser:
     prices_parser.add_argument("--price-limit", type=int, default=DEFAULT_PRICE_LIMIT)
     prices_parser.add_argument("--sleep-seconds", type=float, default=0.2)
     prices_parser.add_argument("--no-skip-existing", action="store_true", help="refetch price files that already exist")
+
+    events_parser = subparsers.add_parser("sync-corporate-actions", help="fetch Vietstock events into corporate_action.json")
+    events_parser.add_argument("--from-date", required=True, help="start date YYYY-MM-DD")
+    events_parser.add_argument("--to-date", required=True, help="end date YYYY-MM-DD")
+    events_parser.add_argument("--vietstock-token", default=os.environ.get("VIETSTOCK_REQUEST_TOKEN", ""))
+    events_parser.add_argument("--vietstock-cookie", default=os.environ.get("VIETSTOCK_COOKIE", ""))
+    events_parser.add_argument("--page", type=int, default=1)
+    events_parser.add_argument("--page-size", type=int, default=100)
+    events_parser.add_argument("--symbol", default="", help="optional single stock symbol")
+
+    events_incremental_parser = subparsers.add_parser("sync-corporate-actions-incremental", help="fetch new Vietstock events and merge into corporate_action.json")
+    events_incremental_parser.add_argument("--to-date", default=None, help="end date YYYY-MM-DD; defaults to today")
+    events_incremental_parser.add_argument("--vietstock-token", default=os.environ.get("VIETSTOCK_REQUEST_TOKEN", ""))
+    events_incremental_parser.add_argument("--vietstock-cookie", default=os.environ.get("VIETSTOCK_COOKIE", ""))
+    events_incremental_parser.add_argument("--page-size", type=int, default=100)
 
     all_parser = subparsers.add_parser("sync-all", help="fetch symbols then historical prices")
     all_parser.add_argument("--page-limit", type=int, default=50)
@@ -95,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
     dnse_token.add_argument("--otp-type", choices=["email_otp", "smart_otp"], default="smart_otp")
     dnse_token.add_argument("--passcode", required=True)
 
+    telegram = subparsers.add_parser("telegram-test", help="send a test Telegram notification")
+    telegram.add_argument("--message", default="Vietnam Algo Telegram notification test")
+    telegram.add_argument("--bot-token", default=os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+    telegram.add_argument("--chat-id", default=os.environ.get("TELEGRAM_CHAT_ID", ""))
+
     preview = subparsers.add_parser("dnse-preview-orders", help="preview DNSE orders converted from algo CSV")
     add_order_engine_arguments(preview)
 
@@ -105,6 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--trading-token", default=os.environ.get("DNSE_TRADING_TOKEN", ""))
     submit.add_argument("--yes", action="store_true", help="actually submit orders to DNSE")
     submit.add_argument("--monitor", action="store_true", help="monitor submitted orders and replace price toward current order book")
+    submit.add_argument("--initial-orderbook-pricing", action="store_true", help="price initial orders from best ask/bid before submit")
+    submit.add_argument("--max-price-drift-percent", type=float, default=2.0)
+    submit.add_argument("--cancel-if-unfilled", action="store_true")
     submit.add_argument("--max-checks", type=int, default=3)
     submit.add_argument("--check-interval-seconds", type=float, default=5.0)
 
@@ -151,6 +185,11 @@ def add_order_engine_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--order-type", default="LO")
     parser.add_argument("--board-lot-size", type=int, default=100)
+    parser.add_argument("--corporate-actions-file", type=Path, default=None)
+    parser.add_argument("--corporate-action-window-days", type=int, default=3)
+    parser.add_argument("--corporate-action-buy-window-days", type=int, default=2)
+    parser.add_argument("--corporate-action-sell-window-days", type=int, default=3)
+    parser.add_argument("--no-corporate-action-guard", action="store_true")
 
 
 def add_daily_engine_arguments(parser: argparse.ArgumentParser) -> None:
@@ -165,6 +204,13 @@ def add_daily_engine_arguments(parser: argparse.ArgumentParser) -> None:
 
 def print_json(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def corporate_actions_file_from_args(args: argparse.Namespace) -> Path | None:
+    if getattr(args, "no_corporate_action_guard", False):
+        return None
+    path = getattr(args, "corporate_actions_file", None) or args.data_dir / "corporate_action.json"
+    return path if path.exists() else None
 
 
 def dnse_client_from_args(args: argparse.Namespace) -> DnseClient:
@@ -221,6 +267,16 @@ def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
         benchmarkTopSymbols=args.benchmark_top_symbols,
         hybridTopSectors=args.hybrid_top_sectors,
         hybridBreakoutRequired=args.hybrid_breakout_required,
+        useCorporateActionGuard=args.use_corporate_action_guard,
+        corporateActionWindowDays=args.corporate_action_window_days,
+        corporateActionBuyWindowDays=args.corporate_action_buy_window_days,
+        corporateActionSellWindowDays=args.corporate_action_sell_window_days,
+        corporateActionRebuyAfterExDate=args.corporate_action_rebuy_after_exdate,
+        corporateActionHighRiskBuyWindowDays=args.corporate_action_high_risk_buy_window_days,
+        corporateActionHighRiskSellWindowDays=args.corporate_action_high_risk_sell_window_days,
+        corporateActionRebuyBullMaxRank=args.corporate_action_rebuy_bull_max_rank,
+        corporateActionRebuyNeutralMaxRank=args.corporate_action_rebuy_neutral_max_rank,
+        corporateActionRebuyMinAvgVolume=args.corporate_action_rebuy_min_avg_volume,
     )
 
 
@@ -289,6 +345,16 @@ def add_backtest_arguments(backtest_parser: argparse.ArgumentParser) -> None:
     backtest_parser.add_argument("--benchmark-top-symbols", type=int, default=20)
     backtest_parser.add_argument("--hybrid-top-sectors", type=int, default=3)
     backtest_parser.add_argument("--hybrid-breakout-required", type=int, default=0)
+    backtest_parser.add_argument("--use-corporate-action-guard", action="store_true")
+    backtest_parser.add_argument("--corporate-action-window-days", type=int, default=3)
+    backtest_parser.add_argument("--corporate-action-buy-window-days", type=int, default=2)
+    backtest_parser.add_argument("--corporate-action-sell-window-days", type=int, default=3)
+    backtest_parser.add_argument("--corporate-action-rebuy-after-exdate", action="store_true")
+    backtest_parser.add_argument("--corporate-action-high-risk-buy-window-days", type=int, default=5)
+    backtest_parser.add_argument("--corporate-action-high-risk-sell-window-days", type=int, default=3)
+    backtest_parser.add_argument("--corporate-action-rebuy-bull-max-rank", type=int, default=10)
+    backtest_parser.add_argument("--corporate-action-rebuy-neutral-max-rank", type=int, default=5)
+    backtest_parser.add_argument("--corporate-action-rebuy-min-avg-volume", type=float, default=300_000)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -309,6 +375,39 @@ def main(argv: list[str] | None = None) -> int:
             skip_existing=not args.no_skip_existing,
         )
         print(f"Saved {len(paths)} Vietnam price files under {args.data_dir / 'prices'}")
+        return 0
+
+    if args.command == "sync-corporate-actions":
+        if not args.vietstock_token or not args.vietstock_cookie:
+            raise RuntimeError(
+                "Vietstock token and cookie are required. Pass --vietstock-token/--vietstock-cookie "
+                "or set VIETSTOCK_REQUEST_TOKEN/VIETSTOCK_COOKIE."
+            )
+        actions = fetch_vietstock_events(
+            args.from_date,
+            args.to_date,
+            args.vietstock_token,
+            args.vietstock_cookie,
+            page=args.page,
+            page_size=args.page_size,
+            timeout=args.timeout,
+            code=args.symbol,
+        )
+        path = save_corporate_actions(actions, args.data_dir)
+        print(f"Saved {len(actions)} corporate actions to {path}")
+        return 0
+
+    if args.command == "sync-corporate-actions-incremental":
+        print_json(
+            sync_corporate_actions_incremental(
+                args.data_dir,
+                request_verification_token=args.vietstock_token,
+                cookie=args.vietstock_cookie,
+                to_date=args.to_date,
+                page_size=args.page_size,
+                timeout=args.timeout,
+            )
+        )
         return 0
 
     if args.command == "sync-all":
@@ -393,48 +492,98 @@ def main(argv: list[str] | None = None) -> int:
         print_json({"tradingToken": dnse_client_from_args(args).trading_token(args.otp_type, args.passcode)})
         return 0
 
+    if args.command == "telegram-test":
+        if not args.bot_token or not args.chat_id:
+            raise RuntimeError("Telegram bot token and chat ID are required. Set TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID or pass --bot-token/--chat-id.")
+        print_json(notify(args.message, TelegramConfig(args.bot_token, args.chat_id)) or {"ok": False, "skipped": True})
+        return 0
+
     if args.command == "dnse-preview-orders":
-        orders = prepare_dnse_orders(
+        orders, decisions = prepare_dnse_orders_with_risk_report(
             args.orders_file,
             args.loan_package_id,
             trade_date=args.trade_date,
             limit=args.limit,
             order_type=args.order_type,
             board_lot_size=args.board_lot_size,
+            corporate_actions_path=corporate_actions_file_from_args(args),
+            corporate_action_window_days=args.corporate_action_window_days,
+            corporate_action_buy_window_days=args.corporate_action_buy_window_days,
+            corporate_action_sell_window_days=args.corporate_action_sell_window_days,
         )
-        print_json([order.__dict__ for order in orders])
+        print_json({"orders": [order.__dict__ for order in orders], "corporateActionDecisions": [decision.__dict__ for decision in decisions]})
         return 0
 
     if args.command == "dnse-submit-orders":
         if not args.trading_token:
             raise RuntimeError("DNSE trading token is required. Use --trading-token or set DNSE_TRADING_TOKEN.")
-        orders = prepare_dnse_orders(
+        orders, decisions = prepare_dnse_orders_with_risk_report(
             args.orders_file,
             args.loan_package_id,
             trade_date=args.trade_date,
             limit=args.limit,
             order_type=args.order_type,
             board_lot_size=args.board_lot_size,
+            corporate_actions_path=corporate_actions_file_from_args(args),
+            corporate_action_window_days=args.corporate_action_window_days,
+            corporate_action_buy_window_days=args.corporate_action_buy_window_days,
+            corporate_action_sell_window_days=args.corporate_action_sell_window_days,
         )
+        actions_path = corporate_actions_file_from_args(args)
+        if actions_path:
+            from .corporate_actions import load_corporate_actions
+
+            exit_orders, exit_decisions = build_corporate_action_exit_orders(
+                dnse_client_from_args(args),
+                args.account_no,
+                args.loan_package_id,
+                selected_order_date(args.orders_file, args.trade_date) or args.trade_date,
+                load_corporate_actions(actions_path),
+                orders,
+                order_type=args.order_type,
+                board_lot_size=args.board_lot_size,
+                sell_window_days=args.corporate_action_sell_window_days,
+            )
+            orders.extend(exit_orders)
+            decisions.extend(exit_decisions)
+        client = dnse_client_from_args(args)
+        sellable_decisions: list[dict[str, object]] = []
+        if args.yes:
+            sellable = extract_sellable_positions(client.positions(args.account_no), args.board_lot_size)
+            orders, sellable_decisions = apply_sellable_quantity_cap(orders, sellable, args.board_lot_size)
+        pricing_decisions: list[dict[str, object]] = []
+        signal_prices = {order.sourceOrderId: order.price for order in orders}
+        if args.initial_orderbook_pricing:
+            orders, pricing_decisions = price_orders_from_orderbook(client, orders, max_drift_percent=args.max_price_drift_percent)
         if args.monitor:
             results = execute_dnse_orders_with_monitoring(
-                dnse_client_from_args(args),
+                client,
                 args.account_no,
                 args.trading_token,
                 orders,
                 dry_run=not args.yes,
                 max_checks=args.max_checks,
                 check_interval_seconds=args.check_interval_seconds,
+                signal_prices=signal_prices,
+                max_drift_percent=args.max_price_drift_percent,
+                cancel_if_unfilled=args.cancel_if_unfilled,
             )
         else:
             results = execute_dnse_orders(
-                dnse_client_from_args(args),
+                client,
                 args.account_no,
                 args.trading_token,
                 orders,
                 dry_run=not args.yes,
             )
-        print_json(results)
+        print_json(
+            {
+                "submitResults": results,
+                "corporateActionDecisions": [decision.__dict__ for decision in decisions],
+                "sellableDecisions": sellable_decisions,
+                "pricingDecisions": pricing_decisions,
+            }
+        )
         return 0
 
     if args.command == "daily-generate-orders":

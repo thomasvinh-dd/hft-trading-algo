@@ -13,6 +13,7 @@ class TradingSchedule:
     tokenTime: time = time(8, 30)
     orderSubmitTime: time = time(9, 16)
     eodUpdateTime: time = time(15, 15)
+    corporateActionSyncTime: time = time(15, 10)
     morningStart: time = time(9, 15)
     morningEnd: time = time(11, 30)
     afternoonStart: time = time(13, 0)
@@ -62,3 +63,8 @@ def should_submit_orders(moment: datetime, done_for_date: str | None, schedule: 
 def should_run_eod(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule()) -> bool:
     today = local_date(moment)
     return is_weekday(moment) and done_for_date != today and local_time(moment) >= schedule.eodUpdateTime
+
+
+def should_sync_corporate_actions(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule()) -> bool:
+    today = local_date(moment)
+    return is_weekday(moment) and done_for_date != today and local_time(moment) >= schedule.corporateActionSyncTime

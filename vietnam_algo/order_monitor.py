@@ -65,6 +65,15 @@ def quote_match_price(quote: dict[str, Any] | list[Any], side: str) -> int | Non
     return int(round(value)) if value and value > 0 else None
 
 
+def price_within_drift(signal_price: float, market_price: float, side: str, max_drift_percent: float) -> bool:
+    if signal_price <= 0 or market_price <= 0 or max_drift_percent <= 0:
+        return True
+    drift = max_drift_percent / 100
+    if side == "NB":
+        return market_price <= signal_price * (1 + drift)
+    return market_price >= signal_price * (1 - drift)
+
+
 def order_status(order_detail: dict[str, Any] | list[Any]) -> str:
     if isinstance(order_detail, dict):
         for key in ("status", "orderStatus", "state"):
@@ -78,13 +87,21 @@ def order_status(order_detail: dict[str, Any] | list[Any]) -> str:
     return ""
 
 
-def decide_reprice(order: "DnseOrder", order_detail: dict[str, Any] | list[Any], quote: dict[str, Any] | list[Any]) -> RepriceDecision:
+def decide_reprice(
+    order: "DnseOrder",
+    order_detail: dict[str, Any] | list[Any],
+    quote: dict[str, Any] | list[Any],
+    signal_price: float | None = None,
+    max_drift_percent: float = 0.0,
+) -> RepriceDecision:
     status = order_status(order_detail)
     if status in DONE_ORDER_STATUSES:
         return RepriceDecision("done", None, f"order_status_{status.lower()}")
     market_price = quote_match_price(quote, order.side)
     if market_price is None:
         return RepriceDecision("wait", None, "market_price_unavailable")
+    if signal_price is not None and not price_within_drift(signal_price, market_price, order.side, max_drift_percent):
+        return RepriceDecision("wait", market_price, "market_price_exceeds_max_drift")
     if market_price == order.price:
         return RepriceDecision("wait", market_price, "already_at_best_price")
     return RepriceDecision("replace", market_price, "not_matching_current_orderbook")
@@ -98,11 +115,14 @@ def submit_and_monitor_order(
     dry_run: bool = True,
     max_checks: int = 3,
     check_interval_seconds: float = 5.0,
+    signal_price: float | None = None,
+    max_drift_percent: float = 0.0,
+    cancel_if_unfilled: bool = False,
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     if dry_run:
         quote = client.latest_quote(order.symbol) if not dry_run else {}
-        decision = decide_reprice(order, {}, quote) if quote else RepriceDecision("dry_run", order.price, "not_submitted")
+        decision = decide_reprice(order, {}, quote, signal_price=signal_price, max_drift_percent=max_drift_percent) if quote else RepriceDecision("dry_run", order.price, "not_submitted")
         return [{"event": "dry_run_submit", "order": asdict(order), "decision": asdict(decision)}]
 
     response = client.place_stock_order(
@@ -126,7 +146,7 @@ def submit_and_monitor_order(
         time.sleep(check_interval_seconds)
         detail = client.order_detail(account_no, order_id)
         quote = client.latest_quote(order.symbol)
-        decision = decide_reprice(current_order, detail, quote)
+        decision = decide_reprice(current_order, detail, quote, signal_price=signal_price, max_drift_percent=max_drift_percent)
         events.append({"event": "checked", "orderId": order_id, "detail": detail, "decision": asdict(decision)})
         if decision.action == "done":
             break
@@ -146,4 +166,12 @@ def submit_and_monitor_order(
                 reason=current_order.reason,
             )
             events.append({"event": "replaced", "orderId": order_id, "newPrice": decision.price, "response": response})
+    detail = client.order_detail(account_no, order_id)
+    status = order_status(detail)
+    if status not in DONE_ORDER_STATUSES:
+        events.append({"event": "monitor_exhausted_unfilled", "orderId": order_id, "detail": detail, "status": status or "UNKNOWN"})
+    if cancel_if_unfilled:
+        if status not in DONE_ORDER_STATUSES:
+            response = client.cancel_order(account_no, trading_token, order_id)
+            events.append({"event": "cancelled_unfilled", "orderId": order_id, "detail": detail, "response": response})
     return events

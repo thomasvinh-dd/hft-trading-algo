@@ -18,8 +18,17 @@ from .backtest import (
 from .config import StrategyConfig
 from .data import DEFAULT_DATA_DIR, load_saved_symbols, sync_prices, sync_symbols, utc_now, write_json
 from .dnse_client import DnseClient
+from .notifier import daily_generation_message, notify, submit_message
 from .otp_reader import latest_email_otp
-from .trading_engine import execute_dnse_orders, prepare_dnse_orders
+from .corporate_actions import corporate_action_path, load_corporate_actions
+from .trading_engine import (
+    apply_sellable_quantity_cap,
+    build_corporate_action_exit_orders,
+    execute_dnse_orders,
+    extract_sellable_positions,
+    prepare_dnse_orders_with_risk_report,
+    price_orders_from_orderbook,
+)
 from .universe import build_liquid_universe, save_liquid_universe
 
 
@@ -104,7 +113,7 @@ def generate_live_orders(config: EngineConfig, strategy_config: StrategyConfig, 
         config.dataDir / config.liveDirName,
         trade_date=trade_date,
     )
-    return {
+    result_payload = {
         "result": str(result_path),
         "orders": str(orders_path),
         "latestOrdersCsv": str(csv_path),
@@ -113,6 +122,8 @@ def generate_live_orders(config: EngineConfig, strategy_config: StrategyConfig, 
         "count": count,
         "metrics": result.metrics,
     }
+    notify(daily_generation_message(result_payload))
+    return result_payload
 
 
 def trading_token_from_email(client: DnseClient, otp_type: str = "email_otp") -> str:
@@ -142,6 +153,8 @@ def run_daily_once(
     loan_package_id: int = 0,
     trading_token: str = "",
     client: DnseClient | None = None,
+    initial_orderbook_pricing: bool = True,
+    max_price_drift_percent: float = 2.0,
 ) -> dict[str, object]:
     update_dataset(engine_config)
     generated = generate_live_orders(engine_config, strategy_config, trade_date=trade_date)
@@ -149,6 +162,39 @@ def run_daily_once(
         return {"status": "generated", **generated}
     if not account_no or not loan_package_id or not trading_token or client is None:
         raise RuntimeError("account_no, loan_package_id, trading_token, and DNSE client are required for submit")
-    orders = prepare_dnse_orders(Path(str(generated["latestOrdersCsv"])), loan_package_id)
+    actions_path = corporate_action_path(engine_config.dataDir)
+    orders, decisions = prepare_dnse_orders_with_risk_report(
+        Path(str(generated["latestOrdersCsv"])),
+        loan_package_id,
+        corporate_actions_path=actions_path if actions_path.exists() else None,
+        corporate_action_buy_window_days=strategy_config.corporateActionBuyWindowDays,
+        corporate_action_sell_window_days=strategy_config.corporateActionSellWindowDays,
+    )
+    if actions_path.exists() and generated.get("tradeDate"):
+        exit_orders, exit_decisions = build_corporate_action_exit_orders(
+            client,
+            account_no,
+            loan_package_id,
+            str(generated["tradeDate"]),
+            load_corporate_actions(actions_path),
+            orders,
+            sell_window_days=strategy_config.corporateActionSellWindowDays,
+        )
+        orders.extend(exit_orders)
+        decisions.extend(exit_decisions)
+    sellable = extract_sellable_positions(client.positions(account_no))
+    orders, sellable_decisions = apply_sellable_quantity_cap(orders, sellable)
+    pricing_decisions: list[dict[str, object]] = []
+    if initial_orderbook_pricing:
+        orders, pricing_decisions = price_orders_from_orderbook(client, orders, max_drift_percent=max_price_drift_percent)
     results = execute_dnse_orders(client, account_no, trading_token, orders, dry_run=False)
-    return {"status": "submitted", **generated, "submitResults": results}
+    result_payload = {
+        "status": "submitted",
+        **generated,
+        "submitResults": results,
+        "corporateActionDecisions": [decision.__dict__ for decision in decisions],
+        "sellableDecisions": sellable_decisions,
+        "pricingDecisions": pricing_decisions,
+    }
+    notify(submit_message(result_payload))
+    return result_payload
