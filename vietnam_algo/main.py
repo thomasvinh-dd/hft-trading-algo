@@ -220,6 +220,16 @@ def dnse_client_from_args(args: argparse.Namespace) -> DnseClient:
 
 
 def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
+    from .config import UniverseConfig
+    universe = UniverseConfig(
+        lookbackDays=args.universe_lookback_days,
+        minAvgValue=args.universe_min_avg_value,
+        minAvgVolume=args.universe_min_avg_volume,
+        minPrice=args.universe_min_price,
+        minHistoryDays=args.universe_min_history_days,
+        maxSymbols=args.universe_max_symbols,
+        maxStaleDays=args.universe_max_stale_days,
+    )
     return StrategyConfig(
         initialCash=args.initial_cash,
         maxPositions=args.max_positions,
@@ -277,6 +287,12 @@ def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
         corporateActionRebuyBullMaxRank=args.corporate_action_rebuy_bull_max_rank,
         corporateActionRebuyNeutralMaxRank=args.corporate_action_rebuy_neutral_max_rank,
         corporateActionRebuyMinAvgVolume=args.corporate_action_rebuy_min_avg_volume,
+        universe=universe,
+        usePointInTimeUniverse=args.point_in_time_universe,
+        useVolTargeting=args.use_vol_targeting,
+        volTargetAnnualized=args.vol_target_annualized,
+        volWindowDays=args.vol_window_days,
+        volMaxLeverage=args.vol_max_leverage,
     )
 
 
@@ -355,6 +371,48 @@ def add_backtest_arguments(backtest_parser: argparse.ArgumentParser) -> None:
     backtest_parser.add_argument("--corporate-action-rebuy-bull-max-rank", type=int, default=10)
     backtest_parser.add_argument("--corporate-action-rebuy-neutral-max-rank", type=int, default=5)
     backtest_parser.add_argument("--corporate-action-rebuy-min-avg-volume", type=float, default=300_000)
+    backtest_parser.add_argument(
+        "--point-in-time-universe",
+        dest="point_in_time_universe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="rebuild the liquid universe as of each rebalance date from data available at that time (default on; turn off with --no-point-in-time-universe for legacy biased results)",
+    )
+    backtest_parser.add_argument("--universe-lookback-days", type=int, default=20)
+    backtest_parser.add_argument("--universe-min-avg-value", type=float, default=20_000_000_000)
+    backtest_parser.add_argument("--universe-min-avg-volume", type=float, default=300_000)
+    backtest_parser.add_argument("--universe-min-price", type=float, default=10_000)
+    backtest_parser.add_argument("--universe-min-history-days", type=int, default=252)
+    backtest_parser.add_argument("--universe-max-symbols", type=int, default=100)
+    backtest_parser.add_argument(
+        "--universe-max-stale-days",
+        type=int,
+        default=30,
+        help="exclude symbols whose most recent bar is older than this many days (effectively delisted/suspended)",
+    )
+    backtest_parser.add_argument(
+        "--use-vol-targeting",
+        action="store_true",
+        help="scale position sizes by realized portfolio vol to target an annualized vol",
+    )
+    backtest_parser.add_argument(
+        "--vol-target-annualized",
+        type=float,
+        default=0.25,
+        help="target annualized portfolio vol when --use-vol-targeting is on (e.g. 0.25 = 25%%)",
+    )
+    backtest_parser.add_argument(
+        "--vol-window-days",
+        type=int,
+        default=120,
+        help="rolling window in trading days for realized vol estimation (longer = smoother)",
+    )
+    backtest_parser.add_argument(
+        "--vol-max-leverage",
+        type=float,
+        default=1.5,
+        help="cap on the vol-targeting scalar (e.g. 1.5 means exposure can be up to 1.5x the regime base)",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

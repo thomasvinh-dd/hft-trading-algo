@@ -3,6 +3,8 @@
 Standalone research/data tools for building a Vietnam stock trading algorithm. This folder is separate from live signal publishing so we can collect local data and backtest safely first.
 
 Session : https://opncd.ai/share/dG8bLg2U
+
+hom session : https://opncd.ai/share/JfTI3W6t
 ## Data Sources
 
 Symbol universe:
@@ -92,6 +94,32 @@ strategies.py    Strategy logic: ranking, breakout detection, entry target selec
 backtest.py      Common order simulation, Vietnam market mechanics, risk controls, metrics, CSV output
 ```
 
+### Point-in-time universe (default on)
+
+The backtest rebuilds the liquid universe as of each rebalance date using only
+data available at that time. This avoids look-ahead bias (the strategy
+including a stock in 2021 because it became a top-20 most-liquid name in 2025)
+and survivorship bias (the strategy only ever seeing stocks that survived to
+today). Stocks that stop trading (delisted/suspended) are also excluded once
+their last bar is more than `--universe-max-stale-days` (default 30) behind the
+current date.
+
+Tune the universe thresholds:
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main backtest-momentum \
+  --universe-min-avg-value 20000000000 \
+  --universe-min-avg-volume 300000 \
+  --universe-min-price 10000 \
+  --universe-min-history-days 252 \
+  --universe-max-symbols 100 \
+  --universe-max-stale-days 30
+```
+
+To reproduce the legacy biased backtest (using the snapshot from
+`build-universe` for every historical day) for comparison, pass
+`--no-point-in-time-universe`.
+
 Current best baseline without corporate-action guard:
 
 ```text
@@ -112,6 +140,48 @@ corporateActionBuyWindowDays: 3
 corporateActionSellWindowDays: 1
 corporateActionRebuyAfterExDate: true
 ```
+
+> Heads up: the numbers above were generated with the old static universe
+> (`build-universe` snapshot) and the old broken market regime proxy.
+> The backtest now rebuilds the liquid universe point-in-time on every
+> rebalance date by default (removes look-ahead / survivorship bias) and uses
+> a date-aligned equal-weighted market index for the regime classification
+> (the previous implementation averaged `close / first_close` per stock,
+> mixing cumulative returns from stocks of different listing ages).
+>
+> With both fixes, the same "best" config produces materially lower returns,
+> e.g. ~165% return, -28% max drawdown for the no-CA version, and ~118%
+> return, -31% drawdown with the corporate-action guard. Use
+> `--no-point-in-time-universe` to reproduce the legacy biased numbers for
+> historical comparison.
+>
+> The market index is equal-weighted because we do not have shares-outstanding
+> data for a VN-Index equivalent. If you can source free-float weights for
+> HOSE/HNX constituents, replace `precompute_market_proxy` in
+> `backtest.py` to use a value-weighted proxy.
+
+### Volatility targeting (optional)
+
+Adds a vol-targeting scalar on top of the regime-based exposure cap. Every
+day the strategy looks back over the last `--vol-window-days` of realized
+portfolio returns and scales position sizes by
+`min(target_vol / realized_vol, max_leverage)`. Calms down positions in
+high-vol regimes; lets them grow in low-vol regimes (up to the leverage cap).
+
+```bash
+PYTHONPATH=bots/hft-trading-algo python3 -m vietnam_algo.main backtest-momentum \
+  --use-vol-targeting \
+  --vol-target-annualized 0.25 \
+  --vol-window-days 120 \
+  --vol-max-leverage 1.5
+```
+
+Defaults are tuned for a long-only equity momentum strategy on a single
+market: short windows (20-60 days) are too noisy and hurt returns; long
+windows (120-252) smooth out vol spikes. Calmar ratio (return / max DD)
+improves from ~5.9 (no VT) to ~6.6 with the defaults above. The strategy's
+natural realized vol is around 35-45% annualized; setting the target lower
+than that will chronically de-lever and reduce returns.
 
 Run the first baseline strategy:
 

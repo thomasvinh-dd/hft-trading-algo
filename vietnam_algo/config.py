@@ -1,6 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class UniverseConfig:
+    lookbackDays: int = 20
+    minAvgValue: float = 20_000_000_000
+    minAvgVolume: float = 300_000
+    minPrice: float = 10_000
+    minHistoryDays: int = 252
+    maxSymbols: int = 100
+    maxStaleDays: int = 30
 
 
 @dataclass(frozen=True)
@@ -67,3 +78,9 @@ class StrategyConfig:
     corporateActionRebuyBullMaxRank: int = 10
     corporateActionRebuyNeutralMaxRank: int = 5
     corporateActionRebuyMinAvgVolume: float = 300_000
+    universe: UniverseConfig = field(default_factory=UniverseConfig)
+    usePointInTimeUniverse: bool = True
+    useVolTargeting: bool = False
+    volTargetAnnualized: float = 0.25
+    volWindowDays: int = 120
+    volMaxLeverage: float = 1.5

@@ -73,10 +73,13 @@ def rank_symbols(
     dates: list[str],
     index: int,
     config: StrategyConfig,
+    universe: set[str] | None = None,
 ) -> list[tuple[str, float]]:
     scores: list[tuple[str, float]] = []
     date = dates[index]
     for symbol, rows in price_table.items():
+        if universe is not None and symbol not in universe:
+            continue
         if date not in rows:
             continue
         bars = bars_until(rows, dates, index)
@@ -93,12 +96,15 @@ def breakout_symbols(
     dates: list[str],
     index: int,
     config: StrategyConfig,
+    universe: set[str] | None = None,
 ) -> set[str]:
-    ranked = rank_symbols(price_table, dates, index, config)
+    ranked = rank_symbols(price_table, dates, index, config, universe=universe)
     rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
     symbols: set[str] = set()
     date = dates[index]
     for symbol, rows in price_table.items():
+        if universe is not None and symbol not in universe:
+            continue
         if date not in rows or rank_by_symbol.get(symbol, 999999) > config.breakoutMaxRank:
             continue
         bars = bars_until(rows, dates, index)
@@ -135,10 +141,13 @@ def pullback_candidates(
     dates: list[str],
     index: int,
     config: StrategyConfig,
+    universe: set[str] | None = None,
 ) -> list[tuple[str, float]]:
     date = dates[index]
     candidates: list[tuple[str, float]] = []
     for symbol, rows in price_table.items():
+        if universe is not None and symbol not in universe:
+            continue
         if date not in rows:
             continue
         score = pullback_score(bars_until(rows, dates, index), config)
@@ -167,10 +176,13 @@ def sector_momentum_scores(
     index: int,
     sector_by_symbol: dict[str, str],
     config: StrategyConfig,
+    universe: set[str] | None = None,
 ) -> list[tuple[str, float]]:
     grouped_scores: dict[str, list[float]] = {}
     date = dates[index]
     for symbol, rows in price_table.items():
+        if universe is not None and symbol not in universe:
+            continue
         if date not in rows:
             continue
         bars = bars_until(rows, dates, index)
@@ -196,11 +208,14 @@ def sector_stock_candidates(
     index: int,
     sector_by_symbol: dict[str, str],
     config: StrategyConfig,
+    universe: set[str] | None = None,
 ) -> list[tuple[str, float]]:
-    top_sectors = {sector for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config)[: config.topSectors]}
+    top_sectors = {
+        sector for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config, universe=universe)[: config.topSectors]
+    }
     if not top_sectors:
         return []
-    ranked = rank_symbols(price_table, dates, index, config)
+    ranked = rank_symbols(price_table, dates, index, config, universe=universe)
     per_sector_counts: dict[str, int] = {}
     candidates: list[tuple[str, float]] = []
     for symbol, score in ranked:

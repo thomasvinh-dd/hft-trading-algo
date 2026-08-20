@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import date as date_type
 from pathlib import Path
 
-from .config import StrategyConfig
+from .config import StrategyConfig, UniverseConfig
 from .corporate_actions import CorporateAction, corporate_action_path, load_corporate_actions, non_cash_events_in_window
 from .data import DEFAULT_DATA_DIR, PriceBar, utc_now, write_json
 from .indicators import max_drawdown_percent, sma
@@ -25,7 +25,13 @@ from .strategies import (
     sector_stock_candidates,
     too_extended_from_sma50,
 )
-from .universe import load_price_bars, load_symbol_metadata, load_universe_symbols
+from .universe import (
+    build_candidate_price_table,
+    build_liquid_universe_as_of,
+    load_price_bars,
+    load_symbol_metadata,
+    load_universe_symbols,
+)
 
 
 @dataclass
@@ -179,22 +185,142 @@ def sorted_trading_dates(price_table: dict[str, dict[str, PriceBar]]) -> list[st
     return sorted(dates)
 
 
-def market_proxy_closes(price_table: dict[str, dict[str, PriceBar]], dates: list[str], index: int) -> list[float]:
-    proxy: list[float] = []
-    for date in dates[: index + 1]:
+def resolve_universe_for_date(
+    date: str,
+    candidate_price_table: dict[str, dict[str, PriceBar]],
+    metadata_by_symbol: dict[str, dict[str, object]],
+    universe_config: UniverseConfig,
+    use_point_in_time_universe: bool,
+    cache: dict[str, list[str]],
+    fallback_symbols: list[str] | None = None,
+) -> list[str]:
+    """Return the eligible universe for `date`.
+
+    When `use_point_in_time_universe` is True, compute the universe from data
+    available at `date` and cache it. When False, fall back to a static list
+    (the previous biased behavior) so legacy results stay reproducible.
+    """
+    if not use_point_in_time_universe:
+        return list(fallback_symbols or list(candidate_price_table.keys()))
+    if date in cache:
+        return cache[date]
+    stocks = build_liquid_universe_as_of(
+        candidate_price_table,
+        date,
+        metadata_by_symbol,
+        lookback_days=universe_config.lookbackDays,
+        min_avg_value=universe_config.minAvgValue,
+        min_avg_volume=universe_config.minAvgVolume,
+        min_price=universe_config.minPrice,
+        min_history_days=universe_config.minHistoryDays,
+        max_symbols=universe_config.maxSymbols,
+        max_stale_days=universe_config.maxStaleDays,
+    )
+    cache[date] = [stock.symbol for stock in stocks]
+    return cache[date]
+
+
+@dataclass
+class BacktestContext:
+    candidatePriceTable: dict[str, dict[str, PriceBar]]
+    metadataBySymbol: dict[str, dict[str, object]]
+    priceTable: dict[str, dict[str, PriceBar]]
+    symbols: list[str]
+    fallbackUniverse: list[str] | None
+    universeCache: dict[str, list[str]]
+
+
+def initialize_backtest_context(
+    data_dir: Path,
+    universe_name: str,
+    config: StrategyConfig,
+) -> BacktestContext:
+    """Load all data once and prepare helpers for a backtest run."""
+    candidate_price_table = build_candidate_price_table(data_dir)
+    metadata_by_symbol = load_symbol_metadata(data_dir)
+    fallback_universe: list[str] | None = None
+    if config.usePointInTimeUniverse:
+        initial_symbols = list(candidate_price_table.keys())
+        allowed: set[str] | None = None
+    else:
+        fallback_universe = load_universe_symbols(data_dir, universe_name)
+        initial_symbols = fallback_universe
+        allowed = set(fallback_universe)
+    price_table = {
+        symbol: {bar.time: bar for bar in bars}
+        for symbol, bars in candidate_price_table.items()
+        if allowed is None or symbol in allowed
+    }
+    return BacktestContext(
+        candidatePriceTable=candidate_price_table,
+        metadataBySymbol=metadata_by_symbol,
+        priceTable=price_table,
+        symbols=initial_symbols,
+        fallbackUniverse=fallback_universe,
+        universeCache={},
+    )
+
+
+def precompute_market_proxy(
+    price_table: dict[str, dict[str, PriceBar]],
+    dates: list[str],
+) -> list[float]:
+    """Compute a date-aligned equal-weighted market index.
+
+    For each consecutive pair of dates in `dates`, average the simple return
+    of every stock that has a bar on both dates. Compound from 1.0 to produce
+    an index level for each date.
+
+    This is the proper replacement for the old broken implementation which
+    averaged cumulative-from-inception ratios (mixing stocks of different
+    listing ages). It is an equal-weighted proxy because we do not have
+    shares-outstanding data for a value-weighted VN-Index equivalent.
+
+    Returns a list of length `len(dates)` of cumulative index levels.
+    """
+    per_symbol_dates: dict[str, dict[str, PriceBar]] = {
+        symbol: rows for symbol, rows in price_table.items() if rows
+    }
+    levels: list[float] = [1.0]
+    for i in range(1, len(dates)):
+        prev_date = dates[i - 1]
+        cur_date = dates[i]
         returns: list[float] = []
-        for rows in price_table.values():
-            bar = rows.get(date)
-            first_bar = next(iter(rows.values()), None)
-            if bar and first_bar and first_bar.close > 0:
-                returns.append(bar.close / first_bar.close)
+        for rows in per_symbol_dates.values():
+            prev_bar = rows.get(prev_date)
+            cur_bar = rows.get(cur_date)
+            if prev_bar is None or cur_bar is None:
+                continue
+            if prev_bar.close <= 0 or cur_bar.close <= 0:
+                continue
+            returns.append(float(cur_bar.close) / float(prev_bar.close) - 1.0)
         if returns:
-            proxy.append(sum(returns) / len(returns))
-    return proxy
+            avg_return = sum(returns) / len(returns)
+            levels.append(levels[-1] * (1.0 + avg_return))
+        else:
+            levels.append(levels[-1])
+    return levels
 
 
-def market_regime(price_table: dict[str, dict[str, PriceBar]], dates: list[str], index: int, config: StrategyConfig) -> str:
-    closes = market_proxy_closes(price_table, dates, index)
+def market_proxy_closes(
+    price_table: dict[str, dict[str, PriceBar]],
+    dates: list[str],
+    index: int,
+    precomputed: list[float] | None = None,
+) -> list[float]:
+    if precomputed is None:
+        precomputed = precompute_market_proxy(price_table, dates)
+    return list(precomputed[: index + 1])
+
+
+def market_regime(
+    price_table: dict[str, dict[str, PriceBar]],
+    dates: list[str],
+    index: int,
+    config: StrategyConfig,
+    precomputed: list[float] | None = None,
+) -> str:
+    closes = market_proxy_closes(price_table, dates, index, precomputed=precomputed)
     if len(closes) < config.marketSmaDays:
         return "neutral"
     current = closes[-1]
@@ -221,6 +347,70 @@ def exposure_percent_for_regime(regime: str, config: StrategyConfig) -> float:
     if regime == "neutral":
         return max(config.neutralExposurePercent, 0.0)
     return max(config.bullExposurePercent, 0.0)
+
+
+def compute_realized_vol(equity_values: list[float], window: int) -> float:
+    """Annualized realized portfolio volatility from a series of equity values.
+
+    Returns 0.0 when there is insufficient history to form a meaningful
+    rolling window (so callers can treat it as "no scaling").
+    """
+    if window < 2 or len(equity_values) < window + 1:
+        return 0.0
+    recent = equity_values[-(window + 1):]
+    returns: list[float] = []
+    for i in range(1, len(recent)):
+        prev, cur = recent[i - 1], recent[i]
+        if prev > 0 and cur > 0:
+            returns.append(cur / prev - 1.0)
+    if len(returns) < 2:
+        return 0.0
+    n = len(returns)
+    mean = sum(returns) / n
+    variance = sum((r - mean) ** 2 for r in returns) / (n - 1)
+    daily_vol = variance ** 0.5
+    return daily_vol * (252 ** 0.5)
+
+
+def compute_vol_scalar(realized_vol: float, target_vol: float, max_leverage: float) -> float:
+    """Vol-targeting scale factor.
+
+    Returns a scalar to multiply position sizes by. Caps leverage at
+    `max_leverage`, floors at 0. If inputs are non-positive, returns 1.0
+    (no scaling) so the caller falls back to the regime-based exposure cap.
+    """
+    if target_vol <= 0 or realized_vol <= 0 or max_leverage <= 0:
+        return 1.0
+    raw = target_vol / realized_vol
+    if raw < 0:
+        return 0.0
+    if raw > max_leverage:
+        return max_leverage
+    return raw
+
+
+def compute_exposure_cap(
+    current_equity: float,
+    regime: str,
+    config: StrategyConfig,
+    equity_curve: list[EquityPoint],
+) -> tuple[float, float]:
+    """Compute the exposure cap with optional vol targeting.
+
+    Returns (exposure_cap, vol_scalar). vol_scalar is reported alongside so
+    callers can log it.
+    """
+    base_pct = exposure_percent_for_regime(regime, config) / 100.0
+    vol_scalar = 1.0
+    if config.useVolTargeting:
+        equity_values = [point.equity for point in equity_curve]
+        realized_vol = compute_realized_vol(equity_values, config.volWindowDays)
+        vol_scalar = compute_vol_scalar(
+            realized_vol,
+            config.volTargetAnnualized,
+            config.volMaxLeverage,
+        )
+    return current_equity * base_pct * vol_scalar, vol_scalar
 
 
 def trailing_stop_percent_for_regime(regime: str, config: StrategyConfig) -> float:
@@ -390,11 +580,12 @@ def run_momentum_rotation(
     config: StrategyConfig | None = None,
 ) -> BacktestResult:
     config = config or StrategyConfig()
-    symbols = load_universe_symbols(data_dir, universe_name)
-    price_table = build_price_table(symbols, data_dir)
+    ctx = initialize_backtest_context(data_dir, universe_name, config)
+    price_table = ctx.priceTable
     corporate_actions = build_corporate_action_table(data_dir, config)
     sector_by_symbol = symbol_sector_map(data_dir)
     dates = sorted_trading_dates(price_table)
+    market_proxy = precompute_market_proxy(price_table, dates)
     warmup_days = max(config.return6mDays, config.smaSlowDays) + 1
 
     cash = config.initialCash
@@ -408,9 +599,20 @@ def run_momentum_rotation(
         if index < warmup_days:
             continue
 
-        ranked = rank_symbols(price_table, dates, index, config)
+        current_universe_list = resolve_universe_for_date(
+            date,
+            ctx.candidatePriceTable,
+            ctx.metadataBySymbol,
+            config.universe,
+            config.usePointInTimeUniverse,
+            ctx.universeCache,
+            fallback_symbols=ctx.fallbackUniverse,
+        )
+        current_universe = set(current_universe_list)
+
+        ranked = rank_symbols(price_table, dates, index, config, universe=current_universe)
         rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
-        regime = market_regime(price_table, dates, index, config)
+        regime = market_regime(price_table, dates, index, config, precomputed=market_proxy)
         max_positions_today = allowed_positions_for_regime(regime, config)
 
         for symbol in list(positions):
@@ -450,7 +652,9 @@ def run_momentum_rotation(
             config.maxBreakoutEntriesPerWeek - breakout_entries_by_week.get(week, 0),
             0,
         )
-        daily_breakouts = set() if regime == "bear" else breakout_symbols(price_table, dates, index, config)
+        daily_breakouts = (
+            set() if regime == "bear" else breakout_symbols(price_table, dates, index, config, universe=current_universe)
+        )
         if weekly_breakout_remaining <= 0:
             daily_breakouts = set()
         elif config.maxBreakoutEntriesPerWeek > 0:
@@ -481,7 +685,7 @@ def run_momentum_rotation(
                 high_risk_only=True,
             )
             blocked_buys = standard_blocked_buys | high_risk_blocked_buys
-            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            exposure_cap, _vol_scalar = compute_exposure_cap(current_equity, regime, config, equity_curve)
             current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
             available_exposure = max(exposure_cap - current_positions_value, 0.0)
             target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
@@ -490,6 +694,9 @@ def run_momentum_rotation(
                 rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
                 for symbol, (target_rebuy_value, ex_date) in list(pending_corporate_action_rebuys.items()):
                     if date <= ex_date or symbol in positions or symbol in blocked_buys or len(positions) >= max_positions_today:
+                        continue
+                    if symbol not in current_universe:
+                        pending_corporate_action_rebuys.pop(symbol, None)
                         continue
                     max_rebuy_rank = 0
                     if regime == "bull":
@@ -567,7 +774,7 @@ def run_momentum_rotation(
         strategy="liquid_momentum_rotation",
         generatedAt=utc_now(),
         config=asdict(config),
-        symbols=symbols,
+        symbols=ctx.symbols,
         metrics=metrics,
         equityCurve=[asdict(point) for point in equity_curve],
         trades=[asdict(trade) for trade in trades],
@@ -580,10 +787,11 @@ def run_volume_breakout(
     config: StrategyConfig | None = None,
 ) -> BacktestResult:
     config = config or StrategyConfig()
-    symbols = load_universe_symbols(data_dir, universe_name)
-    price_table = build_price_table(symbols, data_dir)
+    ctx = initialize_backtest_context(data_dir, universe_name, config)
+    price_table = ctx.priceTable
     sector_by_symbol = symbol_sector_map(data_dir)
     dates = sorted_trading_dates(price_table)
+    market_proxy = precompute_market_proxy(price_table, dates)
     warmup_days = max(config.breakoutLookbackDays, config.breakoutVolumeDays, config.smaSlowDays, config.marketSmaDays) + 1
 
     cash = config.initialCash
@@ -596,8 +804,19 @@ def run_volume_breakout(
         if index < warmup_days:
             continue
 
-        ranked = rank_symbols(price_table, dates, index, config)
-        regime = market_regime(price_table, dates, index, config)
+        current_universe_list = resolve_universe_for_date(
+            date,
+            ctx.candidatePriceTable,
+            ctx.metadataBySymbol,
+            config.universe,
+            config.usePointInTimeUniverse,
+            ctx.universeCache,
+            fallback_symbols=ctx.fallbackUniverse,
+        )
+        current_universe = set(current_universe_list)
+
+        ranked = rank_symbols(price_table, dates, index, config, universe=current_universe)
+        regime = market_regime(price_table, dates, index, config, precomputed=market_proxy)
         max_positions_today = allowed_positions_for_regime(regime, config)
 
         for symbol in list(positions):
@@ -630,7 +849,7 @@ def run_volume_breakout(
         if regime == "bear" or weekly_breakout_remaining <= 0:
             daily_breakouts: set[str] = set()
         else:
-            daily_breakouts = breakout_symbols(price_table, dates, index, config)
+            daily_breakouts = breakout_symbols(price_table, dates, index, config, universe=current_universe)
 
         if daily_breakouts and ranked:
             strategy = VolumeBreakoutStrategy(daily_breakouts)
@@ -644,7 +863,7 @@ def run_volume_breakout(
                 weekly_breakout_remaining,
             )
             current_equity, _ = portfolio_value(cash, positions, date, price_table)
-            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            exposure_cap, _vol_scalar = compute_exposure_cap(current_equity, regime, config, equity_curve)
             current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
             available_exposure = max(exposure_cap - current_positions_value, 0.0)
             target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
@@ -683,7 +902,7 @@ def run_volume_breakout(
         strategy="volume_breakout",
         generatedAt=utc_now(),
         config=asdict(config),
-        symbols=symbols,
+        symbols=ctx.symbols,
         metrics=metrics,
         equityCurve=[asdict(point) for point in equity_curve],
         trades=[asdict(trade) for trade in trades],
@@ -696,10 +915,11 @@ def run_pullback_mean_reversion(
     config: StrategyConfig | None = None,
 ) -> BacktestResult:
     config = config or StrategyConfig()
-    symbols = load_universe_symbols(data_dir, universe_name)
-    price_table = build_price_table(symbols, data_dir)
+    ctx = initialize_backtest_context(data_dir, universe_name, config)
+    price_table = ctx.priceTable
     sector_by_symbol = symbol_sector_map(data_dir)
     dates = sorted_trading_dates(price_table)
+    market_proxy = precompute_market_proxy(price_table, dates)
     warmup_days = max(
         config.smaSlowDays,
         config.pullbackLookbackDays,
@@ -718,7 +938,18 @@ def run_pullback_mean_reversion(
         if index < warmup_days:
             continue
 
-        regime = market_regime(price_table, dates, index, config)
+        current_universe_list = resolve_universe_for_date(
+            date,
+            ctx.candidatePriceTable,
+            ctx.metadataBySymbol,
+            config.universe,
+            config.usePointInTimeUniverse,
+            ctx.universeCache,
+            fallback_symbols=ctx.fallbackUniverse,
+        )
+        current_universe = set(current_universe_list)
+
+        regime = market_regime(price_table, dates, index, config, precomputed=market_proxy)
         max_positions_today = allowed_positions_for_regime(regime, config)
 
         for symbol in list(positions):
@@ -751,7 +982,7 @@ def run_pullback_mean_reversion(
 
         week = week_key(date)
         weekly_remaining = max(config.maxPullbackEntriesPerWeek - entries_by_week.get(week, 0), 0)
-        candidates = [] if regime == "bear" or weekly_remaining <= 0 else pullback_candidates(price_table, dates, index, config)
+        candidates = [] if regime == "bear" or weekly_remaining <= 0 else pullback_candidates(price_table, dates, index, config, universe=current_universe)
         if candidates:
             strategy = PullbackMeanReversionStrategy(candidates)
             decision = strategy.select_entries(
@@ -764,7 +995,7 @@ def run_pullback_mean_reversion(
                 weekly_remaining,
             )
             current_equity, _ = portfolio_value(cash, positions, date, price_table)
-            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            exposure_cap, _vol_scalar = compute_exposure_cap(current_equity, regime, config, equity_curve)
             current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
             available_exposure = max(exposure_cap - current_positions_value, 0.0)
             target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
@@ -800,7 +1031,7 @@ def run_pullback_mean_reversion(
         strategy="pullback_mean_reversion",
         generatedAt=utc_now(),
         config=asdict(config),
-        symbols=symbols,
+        symbols=ctx.symbols,
         metrics=metrics,
         equityCurve=[asdict(point) for point in equity_curve],
         trades=[asdict(trade) for trade in trades],
@@ -813,10 +1044,11 @@ def run_sector_momentum(
     config: StrategyConfig | None = None,
 ) -> BacktestResult:
     config = config or StrategyConfig()
-    symbols = load_universe_symbols(data_dir, universe_name)
-    price_table = build_price_table(symbols, data_dir)
+    ctx = initialize_backtest_context(data_dir, universe_name, config)
+    price_table = ctx.priceTable
     sector_by_symbol = symbol_sector_map(data_dir)
     dates = sorted_trading_dates(price_table)
+    market_proxy = precompute_market_proxy(price_table, dates)
     warmup_days = max(config.return6mDays, config.smaSlowDays, config.sectorReturn3mDays, config.marketSmaDays) + 1
 
     cash = config.initialCash
@@ -828,13 +1060,24 @@ def run_sector_momentum(
         if index < warmup_days:
             continue
 
-        ranked = rank_symbols(price_table, dates, index, config)
+        current_universe_list = resolve_universe_for_date(
+            date,
+            ctx.candidatePriceTable,
+            ctx.metadataBySymbol,
+            config.universe,
+            config.usePointInTimeUniverse,
+            ctx.universeCache,
+            fallback_symbols=ctx.fallbackUniverse,
+        )
+        current_universe = set(current_universe_list)
+
+        ranked = rank_symbols(price_table, dates, index, config, universe=current_universe)
         rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
-        regime = market_regime(price_table, dates, index, config)
+        regime = market_regime(price_table, dates, index, config, precomputed=market_proxy)
         max_positions_today = allowed_positions_for_regime(regime, config)
         top_sector_names = {
             sector
-            for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config)[: config.sectorExitRank]
+            for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config, universe=current_universe)[: config.sectorExitRank]
         }
 
         for symbol in list(positions):
@@ -866,7 +1109,7 @@ def run_sector_momentum(
                     positions.pop(symbol)
 
         if index % config.rebalanceDays == 0 and regime != "bear":
-            candidates = sector_stock_candidates(price_table, dates, index, sector_by_symbol, config)
+            candidates = sector_stock_candidates(price_table, dates, index, sector_by_symbol, config, universe=current_universe)
             strategy = SectorMomentumStrategy(candidates)
             decision = strategy.select_entries(
                 price_table,
@@ -878,7 +1121,7 @@ def run_sector_momentum(
                 config.maxPositions,
             )
             current_equity, _ = portfolio_value(cash, positions, date, price_table)
-            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            exposure_cap, _vol_scalar = compute_exposure_cap(current_equity, regime, config, equity_curve)
             current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
             available_exposure = max(exposure_cap - current_positions_value, 0.0)
             target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
@@ -916,7 +1159,7 @@ def run_sector_momentum(
         strategy="sector_momentum_rotation",
         generatedAt=utc_now(),
         config=asdict(config),
-        symbols=symbols,
+        symbols=ctx.symbols,
         metrics=metrics,
         equityCurve=[asdict(point) for point in equity_curve],
         trades=[asdict(trade) for trade in trades],
@@ -929,9 +1172,10 @@ def run_market_regime_benchmark(
     config: StrategyConfig | None = None,
 ) -> BacktestResult:
     config = config or StrategyConfig()
-    symbols = load_universe_symbols(data_dir, universe_name)[: config.benchmarkTopSymbols]
-    price_table = build_price_table(symbols, data_dir)
+    ctx = initialize_backtest_context(data_dir, universe_name, config)
+    price_table = ctx.priceTable
     dates = sorted_trading_dates(price_table)
+    market_proxy = precompute_market_proxy(price_table, dates)
     warmup_days = max(config.marketSmaDays, config.marketBearSmaDays) + 1
 
     cash = config.initialCash
@@ -942,7 +1186,18 @@ def run_market_regime_benchmark(
     for index, date in enumerate(dates):
         if index < warmup_days:
             continue
-        regime = market_regime(price_table, dates, index, config)
+        current_universe_list = resolve_universe_for_date(
+            date,
+            ctx.candidatePriceTable,
+            ctx.metadataBySymbol,
+            config.universe,
+            config.usePointInTimeUniverse,
+            ctx.universeCache,
+            fallback_symbols=ctx.fallbackUniverse,
+        )
+        current_universe = set(current_universe_list)
+        symbols = list(current_universe)[: config.benchmarkTopSymbols]
+        regime = market_regime(price_table, dates, index, config, precomputed=market_proxy)
         max_positions_today = allowed_positions_for_regime(regime, config)
 
         for symbol in list(positions):
@@ -963,7 +1218,7 @@ def run_market_regime_benchmark(
             strategy = MarketRegimeBenchmarkStrategy(symbols)
             decision = strategy.select_entries(price_table, dates, index, [], regime, max_positions_today, 0)
             current_equity, _ = portfolio_value(cash, positions, date, price_table)
-            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            exposure_cap, _vol_scalar = compute_exposure_cap(current_equity, regime, config, equity_curve)
             current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
             available_exposure = max(exposure_cap - current_positions_value, 0.0)
             target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
@@ -990,7 +1245,7 @@ def run_market_regime_benchmark(
         strategy="market_regime_benchmark",
         generatedAt=utc_now(),
         config=asdict(config),
-        symbols=symbols,
+        symbols=ctx.symbols,
         metrics=metrics,
         equityCurve=[asdict(point) for point in equity_curve],
         trades=[asdict(trade) for trade in trades],
@@ -1003,10 +1258,11 @@ def run_hybrid_momentum_breakout_sector(
     config: StrategyConfig | None = None,
 ) -> BacktestResult:
     config = config or StrategyConfig()
-    symbols = load_universe_symbols(data_dir, universe_name)
-    price_table = build_price_table(symbols, data_dir)
+    ctx = initialize_backtest_context(data_dir, universe_name, config)
+    price_table = ctx.priceTable
     sector_by_symbol = symbol_sector_map(data_dir)
     dates = sorted_trading_dates(price_table)
+    market_proxy = precompute_market_proxy(price_table, dates)
     warmup_days = max(config.return6mDays, config.smaSlowDays, config.sectorReturn3mDays, config.marketSmaDays) + 1
 
     cash = config.initialCash
@@ -1018,15 +1274,25 @@ def run_hybrid_momentum_breakout_sector(
     for index, date in enumerate(dates):
         if index < warmup_days:
             continue
-        ranked = rank_symbols(price_table, dates, index, config)
+        current_universe_list = resolve_universe_for_date(
+            date,
+            ctx.candidatePriceTable,
+            ctx.metadataBySymbol,
+            config.universe,
+            config.usePointInTimeUniverse,
+            ctx.universeCache,
+            fallback_symbols=ctx.fallbackUniverse,
+        )
+        current_universe = set(current_universe_list)
+        ranked = rank_symbols(price_table, dates, index, config, universe=current_universe)
         rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
-        regime = market_regime(price_table, dates, index, config)
+        regime = market_regime(price_table, dates, index, config, precomputed=market_proxy)
         max_positions_today = allowed_positions_for_regime(regime, config)
-        sector_candidates = sector_stock_candidates(price_table, dates, index, sector_by_symbol, config)
-        current_breakouts = set() if regime == "bear" else breakout_symbols(price_table, dates, index, config)
+        sector_candidates = sector_stock_candidates(price_table, dates, index, sector_by_symbol, config, universe=current_universe)
+        current_breakouts = set() if regime == "bear" else breakout_symbols(price_table, dates, index, config, universe=current_universe)
         top_sectors = {
             sector
-            for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config)[: config.sectorExitRank]
+            for sector, _ in sector_momentum_scores(price_table, dates, index, sector_by_symbol, config, universe=current_universe)[: config.sectorExitRank]
         }
 
         for symbol in list(positions):
@@ -1077,7 +1343,7 @@ def run_hybrid_momentum_breakout_sector(
                 weekly_breakout_remaining,
             )
             current_equity, _ = portfolio_value(cash, positions, date, price_table)
-            exposure_cap = current_equity * (exposure_percent_for_regime(regime, config) / 100)
+            exposure_cap, _vol_scalar = compute_exposure_cap(current_equity, regime, config, equity_curve)
             current_positions_value = sum(position_value(position, date, price_table) for position in positions.values())
             available_exposure = max(exposure_cap - current_positions_value, 0.0)
             target_value = exposure_cap / max_positions_today if max_positions_today > 0 else 0
@@ -1114,7 +1380,7 @@ def run_hybrid_momentum_breakout_sector(
         strategy="hybrid_momentum_breakout_sector",
         generatedAt=utc_now(),
         config=asdict(config),
-        symbols=symbols,
+        symbols=ctx.symbols,
         metrics=metrics,
         equityCurve=[asdict(point) for point in equity_curve],
         trades=[asdict(trade) for trade in trades],
