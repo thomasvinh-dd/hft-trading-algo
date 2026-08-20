@@ -237,6 +237,17 @@ def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
         boardLotSize=args.board_lot_size,
         sellSettlementDays=args.sell_settlement_days,
         rebalanceDays=args.rebalance_days,
+        return12mDays=args.return_12m_days,
+        skipRecentDays=args.skip_recent_days,
+        momentum3mWeight=args.momentum_3m_weight,
+        momentum6mWeight=args.momentum_6m_weight,
+        momentum12mWeight=args.momentum_12m_weight,
+        useDownsideVolatility=args.use_downside_volatility,
+        volatilityPenaltyWeight=args.volatility_penalty_weight,
+        trendUpWeight=args.trend_up_weight,
+        trendDrawdownPenaltyWeight=args.trend_drawdown_penalty_weight,
+        smaSlopeWeight=args.sma_slope_weight,
+        volumeTrendWeight=args.volume_trend_weight,
         breakoutLookbackDays=args.breakout_lookback_days,
         breakoutVolumeDays=args.breakout_volume_days,
         breakoutVolumeMultiplier=args.breakout_volume_multiplier,
@@ -316,6 +327,17 @@ def add_backtest_arguments(backtest_parser: argparse.ArgumentParser) -> None:
     backtest_parser.add_argument("--board-lot-size", type=int, default=100)
     backtest_parser.add_argument("--sell-settlement-days", type=int, default=3)
     backtest_parser.add_argument("--rebalance-days", type=int, default=5)
+    backtest_parser.add_argument("--return-12m-days", type=int, default=252)
+    backtest_parser.add_argument("--skip-recent-days", type=int, default=0)
+    backtest_parser.add_argument("--momentum-3m-weight", type=float, default=0.6)
+    backtest_parser.add_argument("--momentum-6m-weight", type=float, default=0.4)
+    backtest_parser.add_argument("--momentum-12m-weight", type=float, default=0.0)
+    backtest_parser.add_argument("--use-downside-volatility", action="store_true")
+    backtest_parser.add_argument("--volatility-penalty-weight", type=float, default=0.3)
+    backtest_parser.add_argument("--trend-up-weight", type=float, default=0.0)
+    backtest_parser.add_argument("--trend-drawdown-penalty-weight", type=float, default=0.0)
+    backtest_parser.add_argument("--sma-slope-weight", type=float, default=0.0)
+    backtest_parser.add_argument("--volume-trend-weight", type=float, default=0.0)
     backtest_parser.add_argument("--breakout-lookback-days", type=int, default=55)
     backtest_parser.add_argument("--breakout-volume-days", type=int, default=20)
     backtest_parser.add_argument("--breakout-volume-multiplier", type=float, default=1.5)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from .config import StrategyConfig
 from .data import PriceBar
-from .indicators import rolling_average_volume, rolling_high, rsi, sma, returns, volatility
+from .indicators import max_drawdown_percent, rolling_average_volume, rolling_high, rsi, sma, returns, volatility
 
 
 def bars_until(rows: dict[str, PriceBar], dates: list[str], index: int) -> list[PriceBar]:
@@ -17,23 +17,68 @@ def bars_until(rows: dict[str, PriceBar], dates: list[str], index: int) -> list[
 
 
 def momentum_score(closes: list[float], config: StrategyConfig) -> float | None:
-    min_days = max(config.return6mDays, config.smaSlowDays) + 1
+    lookbacks = []
+    if config.momentum3mWeight:
+        lookbacks.append(config.return3mDays + config.skipRecentDays + 1)
+    if config.momentum6mWeight:
+        lookbacks.append(config.return6mDays + config.skipRecentDays + 1)
+    if config.momentum12mWeight:
+        lookbacks.append(config.return12mDays + config.skipRecentDays + 1)
+    min_days = max([config.smaSlowDays + 1, config.volatilityDays + config.skipRecentDays + 1, *lookbacks])
     if len(closes) < min_days:
         return None
     current = closes[-1]
-    close_3m = closes[-config.return3mDays]
-    close_6m = closes[-config.return6mDays]
-    if current <= 0 or close_3m <= 0 or close_6m <= 0:
+    momentum_end_index = -1 - config.skipRecentDays if config.skipRecentDays > 0 else -1
+    momentum_end = closes[momentum_end_index]
+    if current <= 0 or momentum_end <= 0:
         return None
     sma_fast = sma(closes, config.smaFastDays)
     sma_slow = sma(closes, config.smaSlowDays)
     if sma_fast is None or sma_slow is None or current <= sma_fast or current <= sma_slow:
         return None
     recent_returns = returns(closes[-config.volatilityDays - 1 :])
-    recent_volatility = volatility(recent_returns)
-    return_3m = current / close_3m - 1
-    return_6m = current / close_6m - 1
-    return (0.6 * return_3m) + (0.4 * return_6m) - (0.3 * recent_volatility)
+    if config.useDownsideVolatility:
+        downside_returns = [value for value in recent_returns if value < 0]
+        recent_volatility = volatility(downside_returns) if len(downside_returns) >= 2 else 0.0
+    else:
+        recent_volatility = volatility(recent_returns)
+    score = 0.0
+    total_weight = config.momentum3mWeight + config.momentum6mWeight + config.momentum12mWeight
+    if total_weight <= 0:
+        return None
+    if config.momentum3mWeight:
+        start_index = -config.return3mDays if config.skipRecentDays == 0 else momentum_end_index - config.return3mDays
+        start = closes[start_index]
+        if start <= 0:
+            return None
+        score += config.momentum3mWeight * (momentum_end / start - 1)
+    if config.momentum6mWeight:
+        start_index = -config.return6mDays if config.skipRecentDays == 0 else momentum_end_index - config.return6mDays
+        start = closes[start_index]
+        if start <= 0:
+            return None
+        score += config.momentum6mWeight * (momentum_end / start - 1)
+    if config.momentum12mWeight:
+        start_index = -config.return12mDays if config.skipRecentDays == 0 else momentum_end_index - config.return12mDays
+        start = closes[start_index]
+        if start <= 0:
+            return None
+        score += config.momentum12mWeight * (momentum_end / start - 1)
+    score = (score / total_weight) - (config.volatilityPenaltyWeight * recent_volatility)
+    if config.trendUpWeight:
+        trend_returns = returns(closes[-config.trendUpDays - 1 :])
+        if trend_returns:
+            up_ratio = sum(1 for value in trend_returns if value > 0) / len(trend_returns)
+            score += config.trendUpWeight * up_ratio
+    if config.trendDrawdownPenaltyWeight:
+        drawdown = abs(max_drawdown_percent(closes[-config.trendDrawdownDays :])) / 100
+        score -= config.trendDrawdownPenaltyWeight * drawdown
+    if config.smaSlopeWeight:
+        slow_smas = [sma(closes[: i + 1], config.smaFastDays) for i in range(len(closes))]
+        slow_smas = [value for value in slow_smas if value is not None]
+        if len(slow_smas) > config.smaSlopeDays and slow_smas[-config.smaSlopeDays] > 0:
+            score += config.smaSlopeWeight * (slow_smas[-1] / slow_smas[-config.smaSlopeDays] - 1)
+    return score
 
 
 def volume_breakout(bars: list[PriceBar], config: StrategyConfig) -> bool:
@@ -85,6 +130,12 @@ def rank_symbols(
         bars = bars_until(rows, dates, index)
         score = momentum_score([bar.close for bar in bars], config)
         if score is not None:
+            if config.volumeTrendWeight:
+                volumes = [bar.volume for bar in bars]
+                recent = rolling_average_volume(volumes, max(2, config.volumeTrendDays // 2))
+                previous = rolling_average_volume(volumes[: -max(2, config.volumeTrendDays // 2)], max(2, config.volumeTrendDays // 2))
+                if recent is not None and previous is not None and previous > 0:
+                    score += config.volumeTrendWeight * (recent / previous - 1)
             if volume_breakout(bars, config):
                 score += config.breakoutScoreBonus
             scores.append((symbol, score))

@@ -59,7 +59,19 @@ def run_auto_bot(
                 client=client,
             )
             print(result)
-            state.orderSubmitDate = today
+            if result.get("submitComplete") or not live_submit:
+                state.orderSubmitDate = today
+            else:
+                notify(
+                    "\n".join(
+                        [
+                            "Vietnam Algo: submit not marked complete",
+                            f"date: {today}",
+                            f"status: {result.get('status')}",
+                            "reason: order ledger has unknown/open/pending orders",
+                        ]
+                    )
+                )
             save_state(state, engine_config.dataDir)
 
         if should_sync_corporate_actions(now, state.corporateActionDate, schedule):

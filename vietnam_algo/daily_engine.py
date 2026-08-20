@@ -19,6 +19,17 @@ from .config import StrategyConfig
 from .data import DEFAULT_DATA_DIR, load_saved_symbols, sync_prices, sync_symbols, utc_now, write_json
 from .dnse_client import DnseClient
 from .notifier import daily_generation_message, notify, submit_message
+from .order_ledger import (
+    LedgerOrder,
+    dnse_order_id,
+    ledger_key,
+    load_ledger,
+    normalize_ledger_status,
+    order_status_from_detail,
+    save_ledger,
+    submission_complete,
+    unsafe_existing_orders,
+)
 from .otp_reader import latest_email_otp
 from .corporate_actions import corporate_action_path, load_corporate_actions
 from .trading_engine import (
@@ -144,6 +155,101 @@ def trading_token_from_email(client: DnseClient, otp_type: str = "email_otp") ->
     return client.trading_token(otp_type, otp)
 
 
+def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[str, LedgerOrder]) -> tuple[dict[str, LedgerOrder], list[dict[str, object]]]:
+    updates: list[dict[str, object]] = []
+    now = utc_now()
+    for key, item in list(ledger.items()):
+        if not item.dnseOrderId or item.status not in {"submitted", "open", "partial", "unknown", "submitting"}:
+            continue
+        try:
+            detail = client.order_detail(account_no, item.dnseOrderId)
+            status = normalize_ledger_status(order_status_from_detail(detail))
+            ledger[key] = LedgerOrder(
+                runId=item.runId,
+                sourceOrderId=item.sourceOrderId,
+                sourceDate=item.sourceDate,
+                symbol=item.symbol,
+                side=item.side,
+                quantity=item.quantity,
+                price=item.price,
+                reason=item.reason,
+                status=status,
+                dnseOrderId=item.dnseOrderId,
+                createdAt=item.createdAt,
+                updatedAt=now,
+                lastDetail=detail,
+                error=item.error,
+            )
+            updates.append({"sourceOrderId": item.sourceOrderId, "symbol": item.symbol, "status": status, "dnseOrderId": item.dnseOrderId})
+        except Exception as exc:
+            ledger[key] = LedgerOrder(**{**item.__dict__, "status": "unknown", "updatedAt": now, "error": str(exc)})
+            updates.append({"sourceOrderId": item.sourceOrderId, "symbol": item.symbol, "status": "unknown", "error": str(exc)})
+    return ledger, updates
+
+
+def execute_orders_with_ledger(
+    client: DnseClient,
+    account_no: str,
+    trading_token: str,
+    orders: list[object],
+    data_dir: Path,
+    run_id: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], bool]:
+    from dataclasses import asdict
+
+    ledger = load_ledger(data_dir)
+    ledger, reconciliation = reconcile_ledger_orders(client, account_no, ledger)
+    unsafe = unsafe_existing_orders(ledger, run_id)
+    if unsafe:
+        save_ledger(ledger, data_dir)
+        return [], [*reconciliation, {"action": "blocked_by_unsafe_existing_orders", "count": len(unsafe)}], False
+    now = utc_now()
+    results: list[dict[str, object]] = []
+    for order in orders:
+        payload = asdict(order)
+        key = ledger_key(run_id, int(payload["sourceOrderId"]), str(payload["symbol"]), str(payload["side"]))
+        existing = ledger.get(key)
+        if existing and existing.status in {"filled", "cancelled", "rejected", "expired", "closed", "submitted", "open", "partial"}:
+            results.append({"status": "skipped_existing_ledger", "order": payload, "ledgerStatus": existing.status, "dnseOrderId": existing.dnseOrderId})
+            continue
+        ledger[key] = LedgerOrder(
+            runId=run_id,
+            sourceOrderId=int(payload["sourceOrderId"]),
+            sourceDate=str(payload["sourceDate"]),
+            symbol=str(payload["symbol"]),
+            side=str(payload["side"]),
+            quantity=int(payload["quantity"]),
+            price=int(payload["price"]),
+            reason=str(payload["reason"]),
+            status="submitting",
+            createdAt=now,
+            updatedAt=now,
+        )
+        save_ledger(ledger, data_dir)
+        try:
+            response = client.place_stock_order(
+                account_no=account_no,
+                trading_token=trading_token,
+                symbol=str(payload["symbol"]),
+                side=str(payload["side"]),
+                quantity=int(payload["quantity"]),
+                price=float(payload["price"]),
+                loan_package_id=int(payload["loanPackageId"]),
+                order_type=str(payload["orderType"]),
+            )
+            order_id = dnse_order_id(response)
+            detail = client.order_detail(account_no, order_id) if order_id else response
+            status = normalize_ledger_status(order_status_from_detail(detail)) if order_id else "unknown"
+            ledger[key] = LedgerOrder(**{**ledger[key].__dict__, "status": status, "dnseOrderId": order_id, "updatedAt": utc_now(), "lastDetail": detail})
+            results.append({"status": "submitted", "order": payload, "response": response, "detail": detail})
+        except Exception as exc:
+            ledger[key] = LedgerOrder(**{**ledger[key].__dict__, "status": "unknown", "updatedAt": utc_now(), "error": str(exc)})
+            results.append({"status": "unknown", "order": payload, "error": str(exc)})
+        save_ledger(ledger, data_dir)
+    complete = submission_complete(ledger, run_id)
+    return results, reconciliation, complete
+
+
 def run_daily_once(
     engine_config: EngineConfig,
     strategy_config: StrategyConfig,
@@ -187,11 +293,15 @@ def run_daily_once(
     pricing_decisions: list[dict[str, object]] = []
     if initial_orderbook_pricing:
         orders, pricing_decisions = price_orders_from_orderbook(client, orders, max_drift_percent=max_price_drift_percent)
-    results = execute_dnse_orders(client, account_no, trading_token, orders, dry_run=False)
+    run_id = str(generated.get("tradeDate") or trade_date or latest_order_date(Path(str(generated["latestOrdersCsv"]))) or "unknown")
+    results, reconciliation, submit_complete = execute_orders_with_ledger(client, account_no, trading_token, orders, engine_config.dataDir, run_id)
     result_payload = {
-        "status": "submitted",
+        "status": "submitted" if submit_complete else "submit_unknown_or_pending",
         **generated,
         "submitResults": results,
+        "submitComplete": submit_complete,
+        "runId": run_id,
+        "reconciliation": reconciliation,
         "corporateActionDecisions": [decision.__dict__ for decision in decisions],
         "sellableDecisions": sellable_decisions,
         "pricingDecisions": pricing_decisions,

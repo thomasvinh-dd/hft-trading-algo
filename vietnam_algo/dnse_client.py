@@ -140,6 +140,9 @@ class DnseClient:
     def order_detail(self, account_no: str, order_id: str) -> dict[str, Any] | list[Any]:
         return self.request("GET", f"/accounts/{account_no}/orders/{order_id}")
 
+    def orders(self, account_no: str, page_size: int = 100) -> dict[str, Any] | list[Any]:
+        return self.request("GET", f"/accounts/{account_no}/orders", {"marketType": "STOCK", "pageSize": page_size})
+
     def replace_order(
         self,
         account_no: str,
