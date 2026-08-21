@@ -18,6 +18,8 @@ def bars_until(rows: dict[str, PriceBar], dates: list[str], index: int) -> list[
 
 def momentum_score(closes: list[float], config: StrategyConfig) -> float | None:
     lookbacks = []
+    if config.momentum1mWeight:
+        lookbacks.append(config.return1mDays + config.skipRecentDays + 1)
     if config.momentum3mWeight:
         lookbacks.append(config.return3mDays + config.skipRecentDays + 1)
     if config.momentum6mWeight:
@@ -43,9 +45,15 @@ def momentum_score(closes: list[float], config: StrategyConfig) -> float | None:
     else:
         recent_volatility = volatility(recent_returns)
     score = 0.0
-    total_weight = config.momentum3mWeight + config.momentum6mWeight + config.momentum12mWeight
+    total_weight = config.momentum1mWeight + config.momentum3mWeight + config.momentum6mWeight + config.momentum12mWeight
     if total_weight <= 0:
         return None
+    if config.momentum1mWeight:
+        start_index = -config.return1mDays if config.skipRecentDays == 0 else momentum_end_index - config.return1mDays
+        start = closes[start_index]
+        if start <= 0:
+            return None
+        score += config.momentum1mWeight * (momentum_end / start - 1)
     if config.momentum3mWeight:
         start_index = -config.return3mDays if config.skipRecentDays == 0 else momentum_end_index - config.return3mDays
         start = closes[start_index]
@@ -79,6 +87,48 @@ def momentum_score(closes: list[float], config: StrategyConfig) -> float | None:
         if len(slow_smas) > config.smaSlopeDays and slow_smas[-config.smaSlopeDays] > 0:
             score += config.smaSlopeWeight * (slow_smas[-1] / slow_smas[-config.smaSlopeDays] - 1)
     return score
+
+
+def momentum_score_with_market(closes: list[float], market_levels: list[float], config: StrategyConfig) -> float | None:
+    base_score = momentum_score(closes, config)
+    if base_score is None:
+        return None
+    if not config.relativeStrength3mWeight and not config.relativeStrength6mWeight:
+        return base_score
+    if len(market_levels) != len(closes):
+        market_levels = market_levels[-len(closes) :]
+    if len(market_levels) < max(config.return3mDays, config.return6mDays) + 1:
+        return base_score
+    current = closes[-1]
+    market_current = market_levels[-1]
+    if current <= 0 or market_current <= 0:
+        return base_score
+    relative_score = 0.0
+    relative_weight = 0.0
+    if config.relativeStrength3mWeight:
+        stock_start = closes[-config.return3mDays]
+        market_start = market_levels[-config.return3mDays]
+        if stock_start > 0 and market_start > 0:
+            relative_score += config.relativeStrength3mWeight * ((current / stock_start - 1) - (market_current / market_start - 1))
+            relative_weight += config.relativeStrength3mWeight
+    if config.relativeStrength6mWeight:
+        stock_start = closes[-config.return6mDays]
+        market_start = market_levels[-config.return6mDays]
+        if stock_start > 0 and market_start > 0:
+            relative_score += config.relativeStrength6mWeight * ((current / stock_start - 1) - (market_current / market_start - 1))
+            relative_weight += config.relativeStrength6mWeight
+    if relative_weight <= 0:
+        return base_score
+    relative_score /= relative_weight
+    if config.replaceRawMomentumWithRelative:
+        recent_returns = returns(closes[-config.volatilityDays - 1 :])
+        if config.useDownsideVolatility:
+            downside_returns = [value for value in recent_returns if value < 0]
+            recent_volatility = volatility(downside_returns) if len(downside_returns) >= 2 else 0.0
+        else:
+            recent_volatility = volatility(recent_returns)
+        return relative_score - (config.volatilityPenaltyWeight * recent_volatility)
+    return base_score + relative_score
 
 
 def volume_breakout(bars: list[PriceBar], config: StrategyConfig) -> bool:
@@ -119,6 +169,7 @@ def rank_symbols(
     index: int,
     config: StrategyConfig,
     universe: set[str] | None = None,
+    market_levels: list[float] | None = None,
 ) -> list[tuple[str, float]]:
     scores: list[tuple[str, float]] = []
     date = dates[index]
@@ -128,7 +179,11 @@ def rank_symbols(
         if date not in rows:
             continue
         bars = bars_until(rows, dates, index)
-        score = momentum_score([bar.close for bar in bars], config)
+        closes = [bar.close for bar in bars]
+        if market_levels is not None:
+            score = momentum_score_with_market(closes, market_levels[-len(closes) :], config)
+        else:
+            score = momentum_score(closes, config)
         if score is not None:
             if config.volumeTrendWeight:
                 volumes = [bar.volume for bar in bars]

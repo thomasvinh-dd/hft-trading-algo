@@ -1,0 +1,75 @@
+{
+  "count": 13,
+  "exchangeReference": "HOSE",
+  "holidays": [
+    {
+      "date": "2026-01-01",
+      "name": "New Year's Day",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-01-02",
+      "name": "New Year's Day (Obs)",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-02-16",
+      "name": "Chinese New Year",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-02-17",
+      "name": "Chinese New Year",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-02-18",
+      "name": "Chinese New Year",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-02-19",
+      "name": "Chinese New Year",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-02-20",
+      "name": "Chinese New Year",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-04-27",
+      "name": "Hung King's Festival (Obs)",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-04-30",
+      "name": "Unification Day",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-05-01",
+      "name": "Labor Day",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-08-31",
+      "name": "Market Holiday",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-09-01",
+      "name": "Market Holiday",
+      "type": "Full Close"
+    },
+    {
+      "date": "2026-09-02",
+      "name": "National Day",
+      "type": "Full Close"
+    }
+  ],
+  "market": "Vietnam",
+  "source": "https://market-holiday.com/markets/hose",
+  "timezone": "Asia/Ho_Chi_Minh",
+  "updatedAt": "2026-08-21T04:42:27Z"
+}

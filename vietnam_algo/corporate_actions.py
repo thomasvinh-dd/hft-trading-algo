@@ -218,6 +218,56 @@ def fetch_vietstock_events(
     raise RuntimeError(f"Unexpected Vietstock event payload: {type(payload).__name__}")
 
 
+def fetch_vietstock_events_page_with_total(
+    from_date: str,
+    to_date: str,
+    page: int,
+    page_size: int,
+    request_verification_token: str = "",
+    cookie: str = "",
+    timeout: float = 30.0,
+    session: VietstockSession | None = None,
+) -> tuple[list[CorporateAction], int | None]:
+    session = session or (fetch_vietstock_session(timeout) if not request_verification_token else None)
+    token = request_verification_token or (session.token if session else "")
+    body = urllib.parse.urlencode(
+        {
+            "eventTypeID": 1,
+            "channelID": 0,
+            "code": "",
+            "catID": -1,
+            "fDate": from_date,
+            "tDate": to_date,
+            "page": page,
+            "pageSize": page_size,
+            "orderBy": "Date1",
+            "orderDir": "DESC",
+            "__RequestVerificationToken": token,
+        }
+    ).encode("utf-8")
+    headers = {
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": "https://finance.vietstock.vn",
+        "Referer": VIETSTOCK_REFERER,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(VIETSTOCK_EVENTS_URL, data=body, method="POST", headers=headers)
+    opener = session.opener if session and session.opener else urllib.request
+    with opener.open(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    if isinstance(payload, list) and payload and isinstance(payload[0], list):
+        total = int(payload[1]) if len(payload) > 1 and isinstance(payload[1], int) else None
+        actions = [action for row in payload[0] if isinstance(row, dict) and (action := normalize_vietstock_event(row))]
+        return actions, total
+    if isinstance(payload, list):
+        return [action for row in payload if isinstance(row, dict) and (action := normalize_vietstock_event(row))], None
+    raise RuntimeError(f"Unexpected Vietstock event payload: {type(payload).__name__}")
+
+
 def fetch_vietstock_events_with_curl(body: bytes, cookie: str, timeout: float) -> Any:
     result = subprocess.run(
         [
@@ -317,16 +367,26 @@ def sync_corporate_actions_incremental(
     from_date = latest_corporate_action_date(existing) or "2012-07-13"
     end_date = to_date or datetime.now().date().isoformat()
     session = fetch_vietstock_session(timeout) if not request_verification_token else None
-    fetched = fetch_vietstock_events(
-        from_date,
-        end_date,
-        request_verification_token,
-        cookie,
-        page=1,
-        page_size=page_size,
-        timeout=timeout,
-        session=session,
-    )
+    fetched: list[CorporateAction] = []
+    page = 1
+    total: int | None = None
+    while True:
+        rows, total = fetch_vietstock_events_page_with_total(
+            from_date,
+            end_date,
+            page,
+            page_size,
+            request_verification_token=request_verification_token,
+            cookie=cookie,
+            timeout=timeout,
+            session=session,
+        )
+        fetched.extend(rows)
+        if not rows:
+            break
+        if total is not None and page * page_size >= total:
+            break
+        page += 1
     merged, added = merge_corporate_actions(existing, fetched)
     save_corporate_actions(merged, data_dir)
     return {
@@ -334,6 +394,7 @@ def sync_corporate_actions_incremental(
         "fromDate": from_date,
         "toDate": end_date,
         "fetched": len(fetched),
+        "pages": page,
         "added": added,
         "total": len(merged),
     }
@@ -404,5 +465,30 @@ def non_cash_events_in_window(
         days_until = (ex_date - trade).days
         lower = 0 if include_ex_date else 1
         if lower <= days_until <= window_days:
+            risky.setdefault(action.symbol, []).append(action)
+    return risky
+
+
+def non_cash_events_in_trading_window(
+    actions: list[CorporateAction],
+    trade_date: str,
+    trading_dates: list[str],
+    window_days: int = 3,
+    include_ex_date: bool = True,
+) -> dict[str, list[CorporateAction]]:
+    if trade_date not in trading_dates:
+        return non_cash_events_in_window(actions, trade_date, window_days=window_days, include_ex_date=include_ex_date)
+    trade_index = trading_dates.index(trade_date)
+    risky: dict[str, list[CorporateAction]] = {}
+    for action in actions:
+        if not action.isNonCash or not action.exDate:
+            continue
+        ex_trading_dates = [date for date in trading_dates if date >= action.exDate]
+        if not ex_trading_dates:
+            continue
+        ex_index = trading_dates.index(ex_trading_dates[0])
+        sessions_until = ex_index - trade_index
+        lower = 0 if include_ex_date else 1
+        if lower <= sessions_until <= window_days:
             risky.setdefault(action.symbol, []).append(action)
     return risky

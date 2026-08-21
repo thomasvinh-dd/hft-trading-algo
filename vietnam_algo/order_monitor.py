@@ -87,6 +87,11 @@ def order_status(order_detail: dict[str, Any] | list[Any]) -> str:
     return ""
 
 
+def filled_quantity(order_detail: dict[str, Any] | list[Any]) -> int:
+    value = first_number(order_detail, ("matchedQuantity", "filledQuantity", "matchQuantity", "filledQty", "matchedQty"))
+    return int(value or 0)
+
+
 def decide_reprice(
     order: "DnseOrder",
     order_detail: dict[str, Any] | list[Any],
@@ -151,13 +156,17 @@ def submit_and_monitor_order(
         if decision.action == "done":
             break
         if decision.action == "replace" and decision.price is not None:
-            response = client.replace_order(account_no, trading_token, order_id, decision.price, current_order.quantity, current_order.orderType)
+            remaining_quantity = max(current_order.quantity - filled_quantity(detail), 0)
+            if remaining_quantity <= 0:
+                events.append({"event": "replace_skipped", "orderId": order_id, "reason": "no_remaining_quantity", "detail": detail})
+                break
+            response = client.replace_order(account_no, trading_token, order_id, decision.price, remaining_quantity, current_order.orderType)
             from .trading_engine import DnseOrder
 
             current_order = DnseOrder(
                 symbol=current_order.symbol,
                 side=current_order.side,
-                quantity=current_order.quantity,
+                quantity=remaining_quantity,
                 price=decision.price,
                 loanPackageId=current_order.loanPackageId,
                 orderType=current_order.orderType,
@@ -165,7 +174,7 @@ def submit_and_monitor_order(
                 sourceDate=current_order.sourceDate,
                 reason=current_order.reason,
             )
-            events.append({"event": "replaced", "orderId": order_id, "newPrice": decision.price, "response": response})
+            events.append({"event": "replaced", "orderId": order_id, "newPrice": decision.price, "newQuantity": remaining_quantity, "response": response})
     detail = client.order_detail(account_no, order_id)
     status = order_status(detail)
     if status not in DONE_ORDER_STATUSES:

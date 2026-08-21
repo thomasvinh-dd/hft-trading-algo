@@ -9,6 +9,7 @@ from .config import StrategyConfig
 from .corporate_actions import sync_corporate_actions_incremental
 from .daily_engine import EngineConfig, generate_live_orders, run_daily_once, trading_token_from_email, update_dataset
 from .dnse_client import DnseClient
+from .market_calendar import load_market_holidays, should_sync_market_holidays, sync_market_holidays
 from .notifier import notify
 from .schedule import TradingSchedule, local_date, should_refresh_token, should_run_eod, should_submit_orders, should_sync_corporate_actions, vietnam_now
 
@@ -28,8 +29,16 @@ def run_auto_bot(
         now = vietnam_now()
         today = local_date(now)
         state = load_state(engine_config.dataDir)
+        if should_sync_market_holidays(state.marketHolidaySyncDate, today):
+            print(f"[{now.isoformat()}] Syncing Vietnam market holidays")
+            result = sync_market_holidays(engine_config.dataDir)
+            print(result)
+            notify("\n".join(["Vietnam Algo: market holidays synced", f"count: {result.get('count')}", f"path: {result.get('path')}"]))
+            state.marketHolidaySyncDate = today
+            save_state(state, engine_config.dataDir)
+        holidays = load_market_holidays(engine_config.dataDir)
 
-        if should_refresh_token(now, state.tokenDate, schedule):
+        if should_refresh_token(now, state.tokenDate, schedule, holidays):
             print(f"[{now.isoformat()}] Refreshing DNSE trading token")
             notify(f"Vietnam Algo: refreshing DNSE trading token\ntime: {now.isoformat()}")
             if live_submit:
@@ -39,7 +48,7 @@ def run_auto_bot(
             state.tokenDate = today
             save_state(state, engine_config.dataDir)
 
-        if should_submit_orders(now, state.orderSubmitDate, schedule):
+        if should_submit_orders(now, state.orderSubmitDate, schedule, holidays):
             print(f"[{now.isoformat()}] Generating and submitting latest orders")
             notify(f"Vietnam Algo: submit cycle started\ntime: {now.isoformat()}\nliveSubmit: {live_submit}")
             if not state.tradingToken:
@@ -74,7 +83,7 @@ def run_auto_bot(
                 )
             save_state(state, engine_config.dataDir)
 
-        if should_sync_corporate_actions(now, state.corporateActionDate, schedule):
+        if should_sync_corporate_actions(now, state.corporateActionDate, schedule, holidays):
             print(f"[{now.isoformat()}] Syncing Vietstock corporate actions")
             notify(f"Vietnam Algo: syncing corporate actions\ntime: {now.isoformat()}")
             token = os.environ.get("VIETSTOCK_REQUEST_TOKEN", "")
@@ -101,7 +110,7 @@ def run_auto_bot(
             state.corporateActionDate = today
             save_state(state, engine_config.dataDir)
 
-        if should_run_eod(now, state.eodDate, schedule):
+        if should_run_eod(now, state.eodDate, schedule, holidays):
             print(f"[{now.isoformat()}] Running EOD data update and order generation")
             notify(f"Vietnam Algo: EOD update started\ntime: {now.isoformat()}")
             update_dataset(engine_config)

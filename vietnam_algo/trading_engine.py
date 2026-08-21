@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .corporate_actions import CorporateAction, corporate_action_path, load_corporate_actions, non_cash_events_in_window
+from .corporate_actions import CorporateAction, corporate_action_path, load_corporate_actions, non_cash_events_in_trading_window, non_cash_events_in_window
 from .data import DEFAULT_DATA_DIR
 from .dnse_client import DnseClient
 from .order_monitor import quote_match_price, submit_and_monitor_order
@@ -113,6 +113,7 @@ def prepare_dnse_orders(
     corporate_action_window_days: int = 3,
     corporate_action_buy_window_days: int | None = None,
     corporate_action_sell_window_days: int | None = None,
+    trading_dates: list[str] | None = None,
 ) -> list[DnseOrder]:
     orders = filter_orders(load_algo_orders(orders_path), trade_date=trade_date, limit=limit)
     actions = load_corporate_actions(corporate_actions_path) if corporate_actions_path else []
@@ -121,6 +122,7 @@ def prepare_dnse_orders(
         actions,
         buy_window_days=corporate_action_buy_window_days if corporate_action_buy_window_days is not None else corporate_action_window_days,
         sell_window_days=corporate_action_sell_window_days if corporate_action_sell_window_days is not None else corporate_action_window_days,
+        trading_dates=trading_dates,
     )
     converted: list[DnseOrder] = []
     for order in orders:
@@ -148,6 +150,7 @@ def prepare_dnse_orders_with_risk_report(
     corporate_action_window_days: int = 3,
     corporate_action_buy_window_days: int | None = None,
     corporate_action_sell_window_days: int | None = None,
+    trading_dates: list[str] | None = None,
 ) -> tuple[list[DnseOrder], list[CorporateActionDecision]]:
     orders = filter_orders(load_algo_orders(orders_path), trade_date=trade_date, limit=limit)
     actions = load_corporate_actions(corporate_actions_path) if corporate_actions_path else []
@@ -156,6 +159,7 @@ def prepare_dnse_orders_with_risk_report(
         actions,
         buy_window_days=corporate_action_buy_window_days if corporate_action_buy_window_days is not None else corporate_action_window_days,
         sell_window_days=corporate_action_sell_window_days if corporate_action_sell_window_days is not None else corporate_action_window_days,
+        trading_dates=trading_dates,
     )
     converted: list[DnseOrder] = []
     for order in guarded:
@@ -174,6 +178,7 @@ def apply_corporate_action_guard(
     actions: list[CorporateAction],
     buy_window_days: int = 2,
     sell_window_days: int = 3,
+    trading_dates: list[str] | None = None,
 ) -> tuple[list[AlgoOrder], list[CorporateActionDecision]]:
     if not orders or not actions:
         return orders, []
@@ -181,7 +186,7 @@ def apply_corporate_action_guard(
     decisions: list[CorporateActionDecision] = []
     for order in orders:
         window_days = buy_window_days if order.side == "BUY" else sell_window_days
-        risky_by_symbol = non_cash_events_in_window(actions, order.date, window_days=window_days, include_ex_date=True)
+        risky_by_symbol = corporate_action_window_lookup(actions, order.date, window_days, trading_dates)
         risky_events = risky_by_symbol.get(order.symbol, [])
         if not risky_events:
             guarded.append(order)
@@ -211,6 +216,17 @@ def apply_corporate_action_guard(
             )
         )
     return guarded, decisions
+
+
+def corporate_action_window_lookup(
+    actions: list[CorporateAction],
+    trade_date: str,
+    window_days: int,
+    trading_dates: list[str] | None = None,
+) -> dict[str, list[CorporateAction]]:
+    if trading_dates:
+        return non_cash_events_in_trading_window(actions, trade_date, trading_dates, window_days=window_days, include_ex_date=True)
+    return non_cash_events_in_window(actions, trade_date, window_days=window_days, include_ex_date=True)
 
 
 def corporate_action_event_payload(action: CorporateAction) -> dict[str, Any]:
@@ -288,9 +304,10 @@ def build_corporate_action_exit_orders(
     board_lot_size: int = 100,
     window_days: int = 3,
     sell_window_days: int | None = None,
+    trading_dates: list[str] | None = None,
 ) -> tuple[list[DnseOrder], list[CorporateActionDecision]]:
     exit_window_days = sell_window_days if sell_window_days is not None else window_days
-    risky = non_cash_events_in_window(actions, trade_date, window_days=exit_window_days, include_ex_date=True)
+    risky = corporate_action_window_lookup(actions, trade_date, exit_window_days, trading_dates)
     if not risky:
         return [], []
     existing_sell_symbols = {order.symbol for order in existing_orders if order.side == "NS"}

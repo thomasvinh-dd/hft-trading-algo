@@ -22,10 +22,12 @@ class StrategyConfig:
     boardLotSize: int = 100
     sellSettlementDays: int = 3
     rebalanceDays: int = 5
+    return1mDays: int = 21
     return3mDays: int = 63
     return6mDays: int = 126
     return12mDays: int = 252
     skipRecentDays: int = 0
+    momentum1mWeight: float = 0.0
     momentum3mWeight: float = 0.6
     momentum6mWeight: float = 0.4
     momentum12mWeight: float = 0.0
@@ -40,6 +42,9 @@ class StrategyConfig:
     smaSlopeWeight: float = 0.0
     volumeTrendDays: int = 60
     volumeTrendWeight: float = 0.0
+    relativeStrength3mWeight: float = 0.0
+    relativeStrength6mWeight: float = 0.0
+    replaceRawMomentumWithRelative: bool = False
     smaFastDays: int = 50
     smaSlowDays: int = 100
     breakoutLookbackDays: int = 55
@@ -93,6 +98,10 @@ class StrategyConfig:
     corporateActionRebuyBullMaxRank: int = 10
     corporateActionRebuyNeutralMaxRank: int = 5
     corporateActionRebuyMinAvgVolume: float = 300_000
+    corporateActionReserveCashForRebuy: bool = False
+    corporateActionReserveExpiryDays: int = 10
+    corporateActionForceSellStandardEvents: bool = True
+    corporateActionRebuyAsAdjustment: bool = False
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     usePointInTimeUniverse: bool = True
     useVolTargeting: bool = False

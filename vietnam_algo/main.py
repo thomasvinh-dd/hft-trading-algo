@@ -21,7 +21,9 @@ from .corporate_actions import fetch_vietstock_events, save_corporate_actions, s
 from .daily_engine import EngineConfig, run_daily_once, trading_token_from_email
 from .data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, load_saved_symbols, sync_prices, sync_symbols
 from .dnse_client import DEFAULT_DNSE_BASE_URL, DnseClient
+from .market_calendar import live_trading_dates, sync_market_holidays
 from .notifier import TelegramConfig, notify
+from .risk_controls import live_risk_limits_from_env, validate_live_orders
 from .trading_engine import (
     build_corporate_action_exit_orders,
     apply_sellable_quantity_cap,
@@ -32,6 +34,7 @@ from .trading_engine import (
     price_orders_from_orderbook,
     selected_order_date,
 )
+from .daily_engine import execute_orders_with_ledger
 from .universe import build_liquid_universe, save_liquid_universe
 
 
@@ -64,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     events_incremental_parser.add_argument("--vietstock-token", default=os.environ.get("VIETSTOCK_REQUEST_TOKEN", ""))
     events_incremental_parser.add_argument("--vietstock-cookie", default=os.environ.get("VIETSTOCK_COOKIE", ""))
     events_incremental_parser.add_argument("--page-size", type=int, default=100)
+
+    holiday_parser = subparsers.add_parser("sync-market-holidays", help="fetch Vietnam market holidays from market-holiday.com")
 
     all_parser = subparsers.add_parser("sync-all", help="fetch symbols then historical prices")
     all_parser.add_argument("--page-limit", type=int, default=50)
@@ -139,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--initial-orderbook-pricing", action="store_true", help="price initial orders from best ask/bid before submit")
     submit.add_argument("--max-price-drift-percent", type=float, default=2.0)
     submit.add_argument("--cancel-if-unfilled", action="store_true")
+    submit.add_argument("--skip-live-risk-check", action="store_true")
     submit.add_argument("--max-checks", type=int, default=3)
     submit.add_argument("--check-interval-seconds", type=float, default=5.0)
 
@@ -237,8 +243,10 @@ def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
         boardLotSize=args.board_lot_size,
         sellSettlementDays=args.sell_settlement_days,
         rebalanceDays=args.rebalance_days,
+        return1mDays=args.return_1m_days,
         return12mDays=args.return_12m_days,
         skipRecentDays=args.skip_recent_days,
+        momentum1mWeight=args.momentum_1m_weight,
         momentum3mWeight=args.momentum_3m_weight,
         momentum6mWeight=args.momentum_6m_weight,
         momentum12mWeight=args.momentum_12m_weight,
@@ -248,6 +256,9 @@ def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
         trendDrawdownPenaltyWeight=args.trend_drawdown_penalty_weight,
         smaSlopeWeight=args.sma_slope_weight,
         volumeTrendWeight=args.volume_trend_weight,
+        relativeStrength3mWeight=args.relative_strength_3m_weight,
+        relativeStrength6mWeight=args.relative_strength_6m_weight,
+        replaceRawMomentumWithRelative=args.replace_raw_momentum_with_relative,
         breakoutLookbackDays=args.breakout_lookback_days,
         breakoutVolumeDays=args.breakout_volume_days,
         breakoutVolumeMultiplier=args.breakout_volume_multiplier,
@@ -298,6 +309,10 @@ def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
         corporateActionRebuyBullMaxRank=args.corporate_action_rebuy_bull_max_rank,
         corporateActionRebuyNeutralMaxRank=args.corporate_action_rebuy_neutral_max_rank,
         corporateActionRebuyMinAvgVolume=args.corporate_action_rebuy_min_avg_volume,
+        corporateActionReserveCashForRebuy=args.corporate_action_reserve_cash_for_rebuy,
+        corporateActionReserveExpiryDays=args.corporate_action_reserve_expiry_days,
+        corporateActionForceSellStandardEvents=not args.no_corporate_action_force_sell_standard_events,
+        corporateActionRebuyAsAdjustment=args.corporate_action_rebuy_as_adjustment,
         universe=universe,
         usePointInTimeUniverse=args.point_in_time_universe,
         useVolTargeting=args.use_vol_targeting,
@@ -327,8 +342,10 @@ def add_backtest_arguments(backtest_parser: argparse.ArgumentParser) -> None:
     backtest_parser.add_argument("--board-lot-size", type=int, default=100)
     backtest_parser.add_argument("--sell-settlement-days", type=int, default=3)
     backtest_parser.add_argument("--rebalance-days", type=int, default=5)
+    backtest_parser.add_argument("--return-1m-days", type=int, default=21)
     backtest_parser.add_argument("--return-12m-days", type=int, default=252)
     backtest_parser.add_argument("--skip-recent-days", type=int, default=0)
+    backtest_parser.add_argument("--momentum-1m-weight", type=float, default=0.0)
     backtest_parser.add_argument("--momentum-3m-weight", type=float, default=0.6)
     backtest_parser.add_argument("--momentum-6m-weight", type=float, default=0.4)
     backtest_parser.add_argument("--momentum-12m-weight", type=float, default=0.0)
@@ -338,6 +355,9 @@ def add_backtest_arguments(backtest_parser: argparse.ArgumentParser) -> None:
     backtest_parser.add_argument("--trend-drawdown-penalty-weight", type=float, default=0.0)
     backtest_parser.add_argument("--sma-slope-weight", type=float, default=0.0)
     backtest_parser.add_argument("--volume-trend-weight", type=float, default=0.0)
+    backtest_parser.add_argument("--relative-strength-3m-weight", type=float, default=0.0)
+    backtest_parser.add_argument("--relative-strength-6m-weight", type=float, default=0.0)
+    backtest_parser.add_argument("--replace-raw-momentum-with-relative", action="store_true")
     backtest_parser.add_argument("--breakout-lookback-days", type=int, default=55)
     backtest_parser.add_argument("--breakout-volume-days", type=int, default=20)
     backtest_parser.add_argument("--breakout-volume-multiplier", type=float, default=1.5)
@@ -393,6 +413,10 @@ def add_backtest_arguments(backtest_parser: argparse.ArgumentParser) -> None:
     backtest_parser.add_argument("--corporate-action-rebuy-bull-max-rank", type=int, default=10)
     backtest_parser.add_argument("--corporate-action-rebuy-neutral-max-rank", type=int, default=5)
     backtest_parser.add_argument("--corporate-action-rebuy-min-avg-volume", type=float, default=300_000)
+    backtest_parser.add_argument("--corporate-action-reserve-cash-for-rebuy", action="store_true")
+    backtest_parser.add_argument("--corporate-action-reserve-expiry-days", type=int, default=10)
+    backtest_parser.add_argument("--no-corporate-action-force-sell-standard-events", action="store_true")
+    backtest_parser.add_argument("--corporate-action-rebuy-as-adjustment", action="store_true")
     backtest_parser.add_argument(
         "--point-in-time-universe",
         dest="point_in_time_universe",
@@ -490,6 +514,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "sync-market-holidays":
+        print_json(sync_market_holidays(args.data_dir, timeout=args.timeout))
+        return 0
+
     if args.command == "sync-all":
         symbols_path = sync_symbols(args.data_dir, limit=args.page_limit, timeout=args.timeout)
         symbols = load_saved_symbols(args.data_dir)
@@ -579,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dnse-preview-orders":
+        selected_date = selected_order_date(args.orders_file, args.trade_date) or args.trade_date
+        trading_dates = live_trading_dates(args.data_dir, selected_date, "2030-12-31") if selected_date else None
         orders, decisions = prepare_dnse_orders_with_risk_report(
             args.orders_file,
             args.loan_package_id,
@@ -590,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
             corporate_action_window_days=args.corporate_action_window_days,
             corporate_action_buy_window_days=args.corporate_action_buy_window_days,
             corporate_action_sell_window_days=args.corporate_action_sell_window_days,
+            trading_dates=trading_dates,
         )
         print_json({"orders": [order.__dict__ for order in orders], "corporateActionDecisions": [decision.__dict__ for decision in decisions]})
         return 0
@@ -597,6 +628,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "dnse-submit-orders":
         if not args.trading_token:
             raise RuntimeError("DNSE trading token is required. Use --trading-token or set DNSE_TRADING_TOKEN.")
+        selected_date = selected_order_date(args.orders_file, args.trade_date) or args.trade_date
+        trading_dates = live_trading_dates(args.data_dir, selected_date, "2030-12-31") if selected_date else None
         orders, decisions = prepare_dnse_orders_with_risk_report(
             args.orders_file,
             args.loan_package_id,
@@ -608,6 +641,7 @@ def main(argv: list[str] | None = None) -> int:
             corporate_action_window_days=args.corporate_action_window_days,
             corporate_action_buy_window_days=args.corporate_action_buy_window_days,
             corporate_action_sell_window_days=args.corporate_action_sell_window_days,
+            trading_dates=trading_dates,
         )
         actions_path = corporate_actions_file_from_args(args)
         if actions_path:
@@ -617,12 +651,13 @@ def main(argv: list[str] | None = None) -> int:
                 dnse_client_from_args(args),
                 args.account_no,
                 args.loan_package_id,
-                selected_order_date(args.orders_file, args.trade_date) or args.trade_date,
+                selected_date,
                 load_corporate_actions(actions_path),
                 orders,
                 order_type=args.order_type,
                 board_lot_size=args.board_lot_size,
                 sell_window_days=args.corporate_action_sell_window_days,
+                trading_dates=trading_dates,
             )
             orders.extend(exit_orders)
             decisions.extend(exit_decisions)
@@ -635,7 +670,22 @@ def main(argv: list[str] | None = None) -> int:
         signal_prices = {order.sourceOrderId: order.price for order in orders}
         if args.initial_orderbook_pricing:
             orders, pricing_decisions = price_orders_from_orderbook(client, orders, max_drift_percent=args.max_price_drift_percent)
-        if args.monitor:
+        risk_violations: list[dict[str, object]] = []
+        if args.yes and not args.skip_live_risk_check:
+            risk_violations = validate_live_orders(orders, live_risk_limits_from_env())
+            if risk_violations:
+                print_json({"status": "blocked_by_live_risk_limits", "riskViolations": risk_violations})
+                return 1
+        if args.yes and not args.monitor:
+            results, reconciliation, submit_complete = execute_orders_with_ledger(
+                client,
+                args.account_no,
+                args.trading_token,
+                orders,
+                args.data_dir,
+                selected_date or "unknown",
+            )
+        elif args.monitor:
             results = execute_dnse_orders_with_monitoring(
                 client,
                 args.account_no,
@@ -648,6 +698,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_drift_percent=args.max_price_drift_percent,
                 cancel_if_unfilled=args.cancel_if_unfilled,
             )
+            reconciliation = []
+            submit_complete = False
         else:
             results = execute_dnse_orders(
                 client,
@@ -656,12 +708,17 @@ def main(argv: list[str] | None = None) -> int:
                 orders,
                 dry_run=not args.yes,
             )
+            reconciliation = []
+            submit_complete = not args.yes
         print_json(
             {
                 "submitResults": results,
                 "corporateActionDecisions": [decision.__dict__ for decision in decisions],
                 "sellableDecisions": sellable_decisions,
                 "pricingDecisions": pricing_decisions,
+                "riskViolations": risk_violations,
+                "reconciliation": reconciliation,
+                "submitComplete": submit_complete,
             }
         )
         return 0

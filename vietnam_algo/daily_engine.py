@@ -18,6 +18,7 @@ from .backtest import (
 from .config import StrategyConfig
 from .data import DEFAULT_DATA_DIR, load_saved_symbols, sync_prices, sync_symbols, utc_now, write_json
 from .dnse_client import DnseClient
+from .market_calendar import live_trading_dates
 from .notifier import daily_generation_message, notify, submit_message
 from .order_ledger import (
     LedgerOrder,
@@ -30,6 +31,7 @@ from .order_ledger import (
     submission_complete,
     unsafe_existing_orders,
 )
+from .risk_controls import live_risk_limits_from_env, validate_live_orders
 from .otp_reader import latest_email_otp
 from .corporate_actions import corporate_action_path, load_corporate_actions
 from .trading_engine import (
@@ -269,12 +271,15 @@ def run_daily_once(
     if not account_no or not loan_package_id or not trading_token or client is None:
         raise RuntimeError("account_no, loan_package_id, trading_token, and DNSE client are required for submit")
     actions_path = corporate_action_path(engine_config.dataDir)
+    trade_date_value = str(generated.get("tradeDate") or trade_date or latest_order_date(Path(str(generated["latestOrdersCsv"]))) or "")
+    trading_dates = live_trading_dates(engine_config.dataDir, trade_date_value, "2030-12-31") if trade_date_value else None
     orders, decisions = prepare_dnse_orders_with_risk_report(
         Path(str(generated["latestOrdersCsv"])),
         loan_package_id,
         corporate_actions_path=actions_path if actions_path.exists() else None,
         corporate_action_buy_window_days=strategy_config.corporateActionBuyWindowDays,
         corporate_action_sell_window_days=strategy_config.corporateActionSellWindowDays,
+        trading_dates=trading_dates,
     )
     if actions_path.exists() and generated.get("tradeDate"):
         exit_orders, exit_decisions = build_corporate_action_exit_orders(
@@ -285,6 +290,7 @@ def run_daily_once(
             load_corporate_actions(actions_path),
             orders,
             sell_window_days=strategy_config.corporateActionSellWindowDays,
+            trading_dates=trading_dates,
         )
         orders.extend(exit_orders)
         decisions.extend(exit_decisions)
@@ -293,7 +299,21 @@ def run_daily_once(
     pricing_decisions: list[dict[str, object]] = []
     if initial_orderbook_pricing:
         orders, pricing_decisions = price_orders_from_orderbook(client, orders, max_drift_percent=max_price_drift_percent)
-    run_id = str(generated.get("tradeDate") or trade_date or latest_order_date(Path(str(generated["latestOrdersCsv"]))) or "unknown")
+    risk_violations = validate_live_orders(orders, live_risk_limits_from_env())
+    if risk_violations:
+        result_payload = {
+            "status": "blocked_by_live_risk_limits",
+            **generated,
+            "submitResults": [],
+            "submitComplete": False,
+            "riskViolations": risk_violations,
+            "corporateActionDecisions": [decision.__dict__ for decision in decisions],
+            "sellableDecisions": sellable_decisions,
+            "pricingDecisions": pricing_decisions,
+        }
+        notify(submit_message(result_payload))
+        return result_payload
+    run_id = trade_date_value or "unknown"
     results, reconciliation, submit_complete = execute_orders_with_ledger(client, account_no, trading_token, orders, engine_config.dataDir, run_id)
     result_payload = {
         "status": "submitted" if submit_complete else "submit_unknown_or_pending",
@@ -302,6 +322,7 @@ def run_daily_once(
         "submitComplete": submit_complete,
         "runId": run_id,
         "reconciliation": reconciliation,
+        "riskViolations": [],
         "corporateActionDecisions": [decision.__dict__ for decision in decisions],
         "sellableDecisions": sellable_decisions,
         "pricingDecisions": pricing_decisions,

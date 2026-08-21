@@ -28,6 +28,10 @@ def is_weekday(moment: datetime) -> bool:
     return moment.weekday() < 5
 
 
+def is_trading_day(moment: datetime, holidays: set[str] | None = None) -> bool:
+    return is_weekday(moment) and local_date(moment) not in (holidays or set())
+
+
 def local_time(moment: datetime) -> time:
     return moment.astimezone(VIETNAM_TZ).time()
 
@@ -36,8 +40,8 @@ def local_date(moment: datetime) -> str:
     return moment.astimezone(VIETNAM_TZ).date().isoformat()
 
 
-def is_main_trading_phase(moment: datetime, schedule: TradingSchedule = TradingSchedule()) -> bool:
-    if not is_weekday(moment):
+def is_main_trading_phase(moment: datetime, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
+    if not is_trading_day(moment, holidays):
         return False
     current = local_time(moment)
     return (schedule.morningStart <= current < schedule.morningEnd) or (
@@ -45,26 +49,26 @@ def is_main_trading_phase(moment: datetime, schedule: TradingSchedule = TradingS
     )
 
 
-def should_refresh_token(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule()) -> bool:
+def should_refresh_token(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
     today = local_date(moment)
-    return is_weekday(moment) and done_for_date != today and local_time(moment) >= schedule.tokenTime
+    return is_trading_day(moment, holidays) and done_for_date != today and local_time(moment) >= schedule.tokenTime
 
 
-def should_submit_orders(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule()) -> bool:
+def should_submit_orders(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
     today = local_date(moment)
     return (
-        is_weekday(moment)
+        is_trading_day(moment, holidays)
         and done_for_date != today
         and local_time(moment) >= schedule.orderSubmitTime
-        and is_main_trading_phase(moment, schedule)
+        and is_main_trading_phase(moment, schedule, holidays)
     )
 
 
-def should_run_eod(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule()) -> bool:
+def should_run_eod(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
     today = local_date(moment)
-    return is_weekday(moment) and done_for_date != today and local_time(moment) >= schedule.eodUpdateTime
+    return is_trading_day(moment, holidays) and done_for_date != today and local_time(moment) >= schedule.eodUpdateTime
 
 
-def should_sync_corporate_actions(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule()) -> bool:
+def should_sync_corporate_actions(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
     today = local_date(moment)
-    return is_weekday(moment) and done_for_date != today and local_time(moment) >= schedule.corporateActionSyncTime
+    return is_trading_day(moment, holidays) and done_for_date != today and local_time(moment) >= schedule.corporateActionSyncTime
