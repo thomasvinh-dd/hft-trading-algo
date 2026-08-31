@@ -6,7 +6,20 @@ from datetime import date as date_type
 from pathlib import Path
 
 from .config import StrategyConfig, UniverseConfig
-from .corporate_actions import CorporateAction, corporate_action_path, load_corporate_actions, non_cash_events_in_trading_window, non_cash_events_in_window
+from .corporate_actions import (
+    CorporateAction,
+    build_corporate_action_lookup,
+    closes_since_ex_window,
+    closes_until_date,
+    corporate_action_path,
+    corporate_action_risk_type,
+    evaluate_post_ca_rebuy_signal,
+    evaluate_pre_exit_signal,
+    load_corporate_actions,
+    non_cash_events_in_trading_window,
+    non_cash_events_in_window,
+    rebuy_signal_recovery,
+)
 from .data import DEFAULT_DATA_DIR, PriceBar, utc_now, write_json
 from .indicators import max_drawdown_percent, sma
 from .strategies import (
@@ -90,8 +103,17 @@ def symbol_sector_map(data_dir: Path = DEFAULT_DATA_DIR) -> dict[str, str]:
 
 def build_price_table(symbols: list[str], data_dir: Path) -> dict[str, dict[str, PriceBar]]:
     table: dict[str, dict[str, PriceBar]] = {}
+    try:
+        from .data_investing import load_investing_prices, merge_history_with_prices
+    except ImportError:
+        load_investing_prices = None
+        merge_history_with_prices = None
     for symbol in symbols:
         bars = load_price_bars(symbol, data_dir)
+        if load_investing_prices is not None and merge_history_with_prices is not None:
+            extra = load_investing_prices(symbol, data_dir)
+            if extra:
+                bars = merge_history_with_prices(bars, extra)
         if bars:
             table[symbol] = {bar.time: bar for bar in bars}
     return table
@@ -115,6 +137,7 @@ def risky_corporate_action_symbols(
     window_days: int,
     high_risk_only: bool = False,
     trading_dates: list[str] | None = None,
+    precomputed_ex_index: dict[int, int] | None = None,
 ) -> set[str]:
     if not corporate_actions:
         return set()
@@ -122,21 +145,16 @@ def risky_corporate_action_symbols(
     if high_risk_only:
         flattened = [event for event in flattened if corporate_action_risk_type(event) == "high"]
     if trading_dates:
-        return set(non_cash_events_in_trading_window(flattened, trade_date, trading_dates, window_days=window_days).keys())
+        return set(
+            non_cash_events_in_trading_window(
+                flattened,
+                trade_date,
+                trading_dates,
+                window_days=window_days,
+                precomputed_ex_index=precomputed_ex_index,
+            ).keys()
+        )
     return set(non_cash_events_in_window(flattened, trade_date, window_days=window_days).keys())
-
-
-def corporate_action_risk_type(action: CorporateAction) -> str:
-    text = f"{action.name} {action.note} {action.title}".lower()
-    high_risk_terms = (
-        "quyền mua",
-        "phát hành",
-        "trái phiếu chuyển đổi",
-        "hoán đổi",
-        "chuyển đổi",
-        "riêng lẻ",
-    )
-    return "high" if any(term in text for term in high_risk_terms) else "standard"
 
 
 def corporate_action_events_due(
@@ -145,10 +163,17 @@ def corporate_action_events_due(
     corporate_actions: dict[str, dict[str, list[CorporateAction]]],
     window_days: int,
     trading_dates: list[str] | None = None,
+    precomputed_ex_index: dict[int, int] | None = None,
 ) -> list[CorporateAction]:
     events = [event for rows in corporate_actions.get(symbol, {}).values() for event in rows]
     if trading_dates:
-        return non_cash_events_in_trading_window(events, date, trading_dates, window_days=window_days).get(symbol, [])
+        return non_cash_events_in_trading_window(
+            events,
+            date,
+            trading_dates,
+            window_days=window_days,
+            precomputed_ex_index=precomputed_ex_index,
+        ).get(symbol, [])
     return non_cash_events_in_window(events, date, window_days=window_days).get(symbol, [])
 
 
@@ -158,10 +183,27 @@ def next_corporate_action_ex_date(
     corporate_actions: dict[str, dict[str, list[CorporateAction]]],
     config: StrategyConfig,
     trading_dates: list[str] | None = None,
+    precomputed_ex_index: dict[int, int] | None = None,
 ) -> str | None:
-    events = corporate_action_events_due(symbol, date, corporate_actions, config.corporateActionSellWindowDays, trading_dates)
-    symbol_events = [event for event in events if corporate_action_risk_type(event) == "standard"]
-    ex_dates = sorted(event.exDate for event in symbol_events if event.exDate)
+    """Return the soonest upcoming ex-date for ``symbol``.
+
+    Uses the union of standard + high-risk windows (configurable via
+    ``corporateActionPreExitDays`` and ``corporateActionHighRiskSellWindowDays``)
+    so we don't miss ex-dates that triggered exit via either path. Returns
+    the soonest ex-date regardless of risk_type — the post-CA rebuy is
+    allowed for every forced exit because the adjusted price already
+    reflects rights / swap / dilution.
+    """
+    wider_window = max(config.corporateActionPreExitDays, config.corporateActionHighRiskSellWindowDays)
+    events = corporate_action_events_due(
+        symbol,
+        date,
+        corporate_actions,
+        wider_window,
+        trading_dates,
+        precomputed_ex_index=precomputed_ex_index,
+    )
+    ex_dates = sorted(event.exDate for event in events if event.exDate)
     return ex_dates[0] if ex_dates else None
 
 
@@ -171,18 +213,77 @@ def corporate_action_exit_due(
     corporate_actions: dict[str, dict[str, list[CorporateAction]]],
     config: StrategyConfig,
     trading_dates: list[str] | None = None,
+    precomputed_ex_index: dict[int, int] | None = None,
+    price_table: dict[str, dict[str, PriceBar]] | None = None,
+    date_to_index: dict[str, int] | None = None,
 ) -> bool:
-    standard_due = []
-    if config.corporateActionForceSellStandardEvents:
-        standard_due = [
-            event for event in corporate_action_events_due(symbol, date, corporate_actions, config.corporateActionSellWindowDays, trading_dates)
-            if corporate_action_risk_type(event) == "standard"
-        ]
+    """Decide whether the strategy should exit ``symbol`` today because of
+    an upcoming corporate action.
+
+    High-risk events (rights, additional issuances, swaps): exit when the
+    CA is inside ``corporateActionHighRiskSellWindowDays`` (default 5).
+    These are concentrated near the ex-date so a wide window hurts.
+
+    Standard events (cash dividend, stock dividend, stock bonus): the
+    behaviour depends on ``corporateActionPreExitSignalMode``:
+      - ``fixed_window`` (default): exit on the FIRST day the CA is
+        inside ``corporateActionPreExitDays`` (default 5). Legacy
+        behaviour.
+      - ``drop_from_high``, ``below_ma``, ``momentum_reversal``,
+        ``combined``: stay inside the watch window
+        ``corporateActionPreExitDays`` and only fire when the configured
+        price-action signal triggers. This way the strategy exits when
+        the price shows a topping pattern, not just because a calendar
+        day passed.
+
+    ``price_table`` is only required for the price-signal modes; pass
+    ``None`` for the fixed-window mode.
+    """
     high_risk_due = [
-        event for event in corporate_action_events_due(symbol, date, corporate_actions, config.corporateActionHighRiskSellWindowDays, trading_dates)
+        event
+        for event in corporate_action_events_due(
+            symbol,
+            date,
+            corporate_actions,
+            config.corporateActionHighRiskSellWindowDays,
+            trading_dates,
+            precomputed_ex_index=precomputed_ex_index,
+        )
         if corporate_action_risk_type(event) == "high"
     ]
-    return bool(standard_due or high_risk_due)
+    if high_risk_due:
+        return True
+    if not config.corporateActionForceSellStandardEvents:
+        return False
+    standard_in_window = [
+        event
+        for event in corporate_action_events_due(
+            symbol,
+            date,
+            corporate_actions,
+            config.corporateActionPreExitDays,
+            trading_dates,
+            precomputed_ex_index=precomputed_ex_index,
+        )
+        if corporate_action_risk_type(event) == "standard"
+    ]
+    if not standard_in_window:
+        return False
+    signal_mode = getattr(config, "corporateActionPreExitSignalMode", "fixed_window")
+    if signal_mode == "fixed_window":
+        return True
+    if price_table is None or date_to_index is None or trading_dates is None:
+        return False
+    closes_by_symbol = {
+        sym: {d: float(bar.close) for d, bar in bars.items()}
+        for sym, bars in price_table.items()
+    }
+    closes_window = closes_until_date(
+        symbol, date, trading_dates, closes_by_symbol,
+        lookback=max(14, getattr(config, "corporateActionPreExitSignalLookback", 14)),
+    )
+    triggered, _ = evaluate_pre_exit_signal(closes_window, config)
+    return triggered
 
 
 def corporate_action_exit_rebuy_allowed(
@@ -191,9 +292,33 @@ def corporate_action_exit_rebuy_allowed(
     corporate_actions: dict[str, dict[str, list[CorporateAction]]],
     config: StrategyConfig,
     trading_dates: list[str] | None = None,
+    precomputed_ex_index: dict[int, int] | None = None,
 ) -> bool:
-    events = corporate_action_events_due(symbol, date, corporate_actions, config.corporateActionSellWindowDays, trading_dates)
-    return bool(events) and all(corporate_action_risk_type(event) == "standard" for event in events)
+    """Decide whether the post-CA rebuy is allowed after a forced exit.
+
+    Bug fix: previously this used only `corporateActionSellWindowDays` (default 1)
+    to look for upcoming events. But the exit itself can be triggered by the
+    wider `corporateActionHighRiskSellWindowDays` (default 5) when the ex-date
+    is more than one trading session away. That meant exits caused by *pure
+    standard* events at sessions_until=2..N were considered "no upcoming CA"
+    and silently dropped the rebuy.
+
+    Subsequent fix: the previous version also gated on risk_type ("high" events
+    were refused rebuy). For adjusted prices, the post-ex price already reflects
+    every rights offering / share swap / dilution, so rebuying the same symbol
+    at the adjusted price is always fair. We now always allow rebuy when an
+    upcoming event is in the union of both windows, regardless of risk_type.
+    """
+    wider_window = max(config.corporateActionPreExitDays, config.corporateActionHighRiskSellWindowDays)
+    events = corporate_action_events_due(
+        symbol,
+        date,
+        corporate_actions,
+        wider_window,
+        trading_dates,
+        precomputed_ex_index=precomputed_ex_index,
+    )
+    return bool(events)
 
 
 def average_volume(symbol: str, price_table: dict[str, dict[str, PriceBar]], dates: list[str], index: int, window: int = 20) -> float:
@@ -471,13 +596,28 @@ def week_key(value: str) -> str:
 
 
 def close_price(symbol: str, date: str, price_table: dict[str, dict[str, PriceBar]]) -> float | None:
-    bar = price_table.get(symbol, {}).get(date)
-    return float(bar.close) if bar else None
+    bars = price_table.get(symbol, {})
+    bar = bars.get(date)
+    if bar is not None:
+        return float(bar.close)
+    # Forward-fill: walk backwards through sorted dates to find the most
+    # recent available close. This is critical for DNSE-sourced prices
+    # where small-cap tickers have very sparse daily coverage.
+    for d, b in sorted(bars.items(), reverse=True):
+        if d <= date:
+            return float(b.close)
+    return None
 
 
 def open_price(symbol: str, date: str, price_table: dict[str, dict[str, PriceBar]]) -> float | None:
-    bar = price_table.get(symbol, {}).get(date)
-    return float(bar.open) if bar else None
+    bars = price_table.get(symbol, {})
+    bar = bars.get(date)
+    if bar is not None:
+        return float(bar.open)
+    for d, b in sorted(bars.items(), reverse=True):
+        if d <= date:
+            return float(b.open)
+    return None
 
 
 def next_execution_date(dates: list[str], index: int) -> tuple[int, str] | None:
@@ -613,6 +753,20 @@ def run_momentum_rotation(
     market_proxy = precompute_market_proxy(price_table, dates)
     warmup_days = max(config.return6mDays, config.smaSlowDays) + 1
 
+    # Precompute CA lookup once so per-day trading-window checks are O(1) per action
+    if corporate_actions and config.useCorporateActionGuard:
+        all_ca = [
+            event
+            for by_date in corporate_actions.values()
+            for events in by_date.values()
+            for event in events
+        ]
+        _, ca_ex_index = build_corporate_action_lookup(all_ca, dates)
+    else:
+        ca_ex_index = {}
+
+    date_to_index: dict[str, int] = {d: i for i, d in enumerate(dates)}
+
     cash = config.initialCash
     positions: dict[str, Position] = {}
     trades: list[Trade] = []
@@ -654,7 +808,12 @@ def run_momentum_rotation(
             trailing_stop = trailing_stop_percent_for_regime(regime, config)
             if regime_reason:
                 exit_reason = regime_reason
-            elif corporate_action_exit_due(symbol, date, corporate_actions, config, dates):
+            elif corporate_action_exit_due(
+                symbol, date, corporate_actions, config, dates,
+                precomputed_ex_index=ca_ex_index,
+                price_table=price_table,
+                date_to_index=date_to_index,
+            ):
                 exit_reason = "corporate_action_exit"
             elif price <= position.entryPrice * (1 - config.stopLossPercent / 100):
                 exit_reason = "stop_loss"
@@ -664,14 +823,27 @@ def run_momentum_rotation(
                 exit_reason = "rank_exit"
             if exit_reason:
                 rebuy_ex_date = None
-                if exit_reason == "corporate_action_exit" and corporate_action_exit_rebuy_allowed(symbol, date, corporate_actions, config, dates):
-                    rebuy_ex_date = next_corporate_action_ex_date(symbol, date, corporate_actions, config, dates)
+                if exit_reason == "corporate_action_exit" and corporate_action_exit_rebuy_allowed(symbol, date, corporate_actions, config, dates, precomputed_ex_index=ca_ex_index):
+                    rebuy_ex_date = next_corporate_action_ex_date(symbol, date, corporate_actions, config, dates, precomputed_ex_index=ca_ex_index)
                 cash, trade = sell_next_open(cash, position, index, dates, price_table, config, exit_reason)
                 if trade:
                     trades.append(trade)
                     positions.pop(symbol)
                     if config.corporateActionRebuyAfterExDate and rebuy_ex_date:
-                        pending_corporate_action_rebuys[symbol] = (trade.value - trade.fee, rebuy_ex_date)
+                        exit_event = corporate_action_events_due(
+                            symbol, date, corporate_actions,
+                            max(config.corporateActionSellWindowDays, config.corporateActionHighRiskSellWindowDays),
+                            dates, precomputed_ex_index=ca_ex_index,
+                        )
+                        has_high_risk = any(
+                            corporate_action_risk_type(event) == "high"
+                            for event in (exit_event or [])
+                        )
+                        pending_corporate_action_rebuys[symbol] = (
+                            trade.value - trade.fee,
+                            rebuy_ex_date,
+                            has_high_risk,
+                        )
                         if config.corporateActionReserveCashForRebuy:
                             expiry_index = min(index + config.corporateActionReserveExpiryDays, len(dates) - 1)
                             reserved_corporate_action_cash[symbol] = ReservedCorporateActionCash(
@@ -711,13 +883,20 @@ def run_momentum_rotation(
                 weekly_breakout_remaining,
             )
             current_equity, _ = portfolio_value(cash, positions, date, price_table)
-            standard_blocked_buys = risky_corporate_action_symbols(corporate_actions, date, config.corporateActionBuyWindowDays, trading_dates=dates)
+            standard_blocked_buys = risky_corporate_action_symbols(
+                corporate_actions,
+                date,
+                config.corporateActionBuyWindowDays,
+                trading_dates=dates,
+                precomputed_ex_index=ca_ex_index,
+            )
             high_risk_blocked_buys = risky_corporate_action_symbols(
                 corporate_actions,
                 date,
                 config.corporateActionHighRiskBuyWindowDays,
                 high_risk_only=True,
                 trading_dates=dates,
+                precomputed_ex_index=ca_ex_index,
             )
             blocked_buys = standard_blocked_buys | high_risk_blocked_buys
             exposure_cap, _vol_scalar = compute_exposure_cap(current_equity, regime, config, equity_curve)
@@ -735,7 +914,12 @@ def run_momentum_rotation(
             )
             if should_try_ca_rebuy:
                 rank_by_symbol = {symbol: rank for rank, (symbol, _) in enumerate(ranked, start=1)}
-                for symbol, (target_rebuy_value, ex_date) in list(pending_corporate_action_rebuys.items()):
+                for symbol, pending_entry in list(pending_corporate_action_rebuys.items()):
+                    if len(pending_entry) == 3:
+                        target_rebuy_value, ex_date, has_high_risk = pending_entry
+                    else:  # backward compat for any pickled results from earlier runs
+                        target_rebuy_value, ex_date = pending_entry
+                        has_high_risk = False
                     reserve = reserved_corporate_action_cash.get(symbol)
                     if reserve and index > reserve.expiryIndex:
                         reserved_corporate_action_cash.pop(symbol, None)
@@ -743,9 +927,47 @@ def run_momentum_rotation(
                         continue
                     if date <= ex_date or symbol in positions or symbol in blocked_buys or len(positions) >= max_positions_today:
                         continue
-                    if symbol not in current_universe:
-                        pending_corporate_action_rebuys.pop(symbol, None)
-                        continue
+                    ex_idx = date_to_index.get(ex_date, index)
+                    signal_mode = config.corporateActionRebuySignalMode
+                    if signal_mode != "fixed_delay":
+                        # Signal-based rebuy. The signal can only fire on day
+                        # >= ex_idx + min_days (excludes the ex-date itself if
+                        # min_days=0 the day-after ex is still allowed). If
+                        # the signal never fires by max_days, force rebuy.
+                        min_days = max(0, config.corporateActionRebuySignalMinDays)
+                        max_days = max(min_days + 1, config.corporateActionRebuySignalMaxDays)
+                        if index < ex_idx + min_days:
+                            continue
+                        if index >= ex_idx + max_days:
+                            pass  # fall through to rebuy
+                        else:
+                            closes_by_symbol = {
+                                sym: {d: float(bar.close) for d, bar in bars.items()}
+                                for sym, bars in price_table.items()
+                            }
+                            closes_window = closes_since_ex_window(
+                                symbol, ex_date, dates, closes_by_symbol,
+                            )
+                            triggered, _reason = evaluate_post_ca_rebuy_signal(
+                                closes_window, config,
+                            )
+                            if not triggered:
+                                continue
+                    else:
+                        # Legacy fixed-delay behaviour.
+                        delay_days = config.corporateActionRebuyDelayDays
+                        if delay_days > 0:
+                            if config.corporateActionRebuyDelayHighRiskOnly and not has_high_risk:
+                                pass  # no delay for standard events
+                            else:
+                                earliest_rebuy_idx = ex_idx + delay_days
+                                if index < earliest_rebuy_idx:
+                                    continue
+                    # Note: symbol is allowed to be outside current_universe.
+                    # A forced CA exit always queues a rebuy that bypasses the
+                    # liquid-universe filter, because the post-CA adjusted price
+                    # is fair regardless of where the symbol sits in the
+                    # liquidity ranking. The reserve expiry caps retry windows.
                     if not config.corporateActionRebuyAsAdjustment:
                         max_rebuy_rank = 0
                         if regime == "bull":
