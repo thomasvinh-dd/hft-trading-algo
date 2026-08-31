@@ -1,0 +1,60 @@
+{
+  "generatedAt": "2026-08-31T17:43:08.507758",
+  "source": "https://openapi.dnse.com.vn/price/ohlc",
+  "summary": {
+    "master_tickers": 1417,
+    "files_on_disk": 1411,
+    "tickers_with_bars": 1407,
+    "tickers_empty": 4,
+    "tickers_invalid_symbol": 7,
+    "tickers_extra_to_master": 1,
+    "coverage_pct": 99.29,
+    "total_bars": 2781579
+  },
+  "freshness": {
+    "newest_bar": "2026-08-28",
+    "newest_count": 872,
+    "top5_recent": [
+      {
+        "date": "2026-08-28",
+        "tickers": 872
+      },
+      {
+        "date": "2026-08-27",
+        "tickers": 88
+      },
+      {
+        "date": "2026-08-26",
+        "tickers": 74
+      },
+      {
+        "date": "2026-08-25",
+        "tickers": 39
+      },
+      {
+        "date": "2026-08-21",
+        "tickers": 31
+      }
+    ]
+  },
+  "unfillable": {
+    "invalid_symbol_400": [
+      "BCG",
+      "BCR",
+      "FUCTVGF3",
+      "RDP",
+      "TAN",
+      "VE2",
+      "VTS"
+    ],
+    "empty_200": [
+      "CNA",
+      "UTT",
+      "EGL",
+      "TBW"
+    ]
+  },
+  "extras": [
+    "VND"
+  ]
+}
