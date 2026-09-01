@@ -206,3 +206,108 @@ def submit_message(result: dict[str, Any]) -> str:
             warning_section,
         ]
     )
+
+
+def order_failures_message(submit_results: list[Any], trade_date: str | None = None) -> str | None:
+    """Build a Telegram message for orders that failed to submit.
+
+    Returns None when there are no failures (so the caller can skip notify()).
+    """
+    if not submit_results:
+        return None
+    failures = [r for r in submit_results if isinstance(r, dict) and r.get("status") in {"unknown", "error"}]
+    if not failures:
+        return None
+    lines = ["🚨 Vietnam Algo: ORDER FAILURES"]
+    if trade_date:
+        lines.append(f"tradeDate: {trade_date}")
+    lines.append(f"failureCount: {len(failures)}")
+    for f in failures[:10]:
+        order = f.get("order", {}) if isinstance(f.get("order"), dict) else {}
+        err = (f.get("error") or "").split("\n")[0]
+        lines.append(
+            f"  - {order.get('side')} {order.get('symbol')} qty={order.get('quantity')} "
+            f"price={order.get('price')} reason={order.get('reason')}\n    err: {err[:200]}"
+        )
+    if len(failures) > 10:
+        lines.append(f"  ... and {len(failures) - 10} more failures")
+    return "\n".join(lines)
+
+
+def risk_block_message(result: dict[str, Any]) -> str:
+    """Notify when the live-risk gate rejected a submit cycle."""
+    violations = result.get("riskViolations", []) or []
+    return "\n".join(
+        [
+            "🚨 Vietnam Algo: SUBMIT BLOCKED BY LIVE-RISK GATE",
+            f"tradeDate: {result.get('tradeDate')}",
+            f"violationCount: {len(violations)}",
+            *[
+                f"  - {v.get('symbol')} {v.get('side')} qty={v.get('quantity')} "
+                f"price={v.get('price')} :: {v.get('reason')}"
+                for v in violations[:10]
+            ],
+        ]
+    )
+
+
+def ca_forced_exit_message(decisions: list[Any], trade_date: str | None = None) -> str | None:
+    """Build a Telegram message listing CA-driven forced exits.
+
+    Returns None when no forced exits exist.
+    """
+    if not decisions:
+        return None
+    exits = [
+        d for d in decisions
+        if isinstance(d, dict) and (
+            d.get("action") in {"forced_exit_added", "forced_exit_emitted"}
+            or d.get("reason") == "corporate_action_forced_exit"
+        )
+    ]
+    if not exits:
+        return None
+    lines = ["🚨 Vietnam Algo: CA FORCED EXITS"]
+    if trade_date:
+        lines.append(f"tradeDate: {trade_date}")
+    lines.append(f"exitCount: {len(exits)}")
+    for d in exits[:10]:
+        events = d.get("events") or []
+        ev_titles = []
+        for e in events[:3]:
+            if isinstance(e, dict):
+                ev_titles.append(f"{e.get('symbol')}:{e.get('name', '')}")
+        lines.append(
+            f"  - {d.get('symbol')} {d.get('side')} action={d.get('action')} reason={d.get('reason')} events={', '.join(ev_titles)}"
+        )
+    if len(exits) > 10:
+        lines.append(f"  ... and {len(exits) - 10} more")
+    return "\n".join(lines)
+
+
+def token_refresh_message(account_no: str, live_submit: bool, ok: bool) -> str:
+    status = "✅ refreshed" if ok else "❌ FAILED"
+    label = "live" if live_submit else "dry-run (no DNSE call)"
+    return "\n".join(
+        [
+            f"Vietnam Algo: DNSE trading token {status}",
+            f"account: {account_no}",
+            f"mode: {label}",
+        ]
+    )
+
+
+def eod_summary_message(result: dict[str, Any]) -> str:
+    metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
+    orders_info = result.get("latestOrdersCsv")
+    return "\n".join(
+        [
+            "📊 Vietnam Algo: EOD SUMMARY",
+            f"tradeDate: {result.get('tradeDate')}",
+            f"orderCount: {result.get('count')}",
+            f"totalReturn: {format_percent(metrics.get('totalReturnPercent'))}",
+            f"maxDrawdown: {format_percent(metrics.get('maxDrawdownPercent'))}",
+            f"finalEquity: {format_money(metrics.get('finalEquity'))}",
+            f"ordersFile: {orders_info}",
+        ]
+    )

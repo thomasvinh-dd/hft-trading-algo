@@ -10,7 +10,7 @@ from .corporate_actions import sync_corporate_actions_incremental
 from .daily_engine import EngineConfig, generate_live_orders, run_daily_once, trading_token_from_email, update_dataset
 from .dnse_client import DnseClient
 from .market_calendar import load_market_holidays, should_sync_market_holidays, sync_market_holidays
-from .notifier import notify
+from .notifier import notify, token_refresh_message, eod_summary_message
 from .schedule import TradingSchedule, local_date, should_refresh_token, should_run_eod, should_submit_orders, should_sync_corporate_actions, vietnam_now
 
 
@@ -40,11 +40,26 @@ def run_auto_bot(
 
         if should_refresh_token(now, state.tokenDate, schedule, holidays):
             print(f"[{now.isoformat()}] Refreshing DNSE trading token")
-            notify(f"Vietnam Algo: refreshing DNSE trading token\ntime: {now.isoformat()}")
+            refresh_ok = False
             if live_submit:
-                state.tradingToken = trading_token_from_email(client)
+                try:
+                    state.tradingToken = trading_token_from_email(client)
+                    refresh_ok = True
+                except Exception as exc:
+                    notify(
+                        "\n".join(
+                            [
+                                "🚨 Vietnam Algo: TOKEN REFRESH FAILED",
+                                f"account: {account_no}",
+                                f"err: {str(exc)[:300]}",
+                            ]
+                        )
+                    )
+                    raise
             else:
                 state.tradingToken = "dry-run-token"
+                refresh_ok = True
+            notify(token_refresh_message(account_no, live_submit, refresh_ok))
             state.tokenDate = today
             save_state(state, engine_config.dataDir)
 
@@ -58,15 +73,31 @@ def run_auto_bot(
                     state.tradingToken = "dry-run-token"
                 state.tokenDate = today
                 save_state(state, engine_config.dataDir)
-            result = run_daily_once(
-                engine_config,
-                strategy_config,
-                submit=live_submit,
-                account_no=account_no,
-                loan_package_id=loan_package_id,
-                trading_token=state.tradingToken,
-                client=client,
-            )
+            try:
+                result = run_daily_once(
+                    engine_config,
+                    strategy_config,
+                    submit=live_submit,
+                    account_no=account_no,
+                    loan_package_id=loan_package_id,
+                    trading_token=state.tradingToken,
+                    client=client,
+                )
+            except Exception as exc:
+                notify(
+                    "\n".join(
+                        [
+                            "🚨 Vietnam Algo: SUBMIT CYCLE FAILED",
+                            f"account: {account_no}",
+                            f"tradeDate: {today}",
+                            f"err: {str(exc)[:400]}",
+                        ]
+                    )
+                )
+                print(result if False else f"[{now.isoformat()}] submit cycle failed: {exc}")
+                if once:
+                    raise
+                continue
             print(result)
             if result.get("submitComplete") or not live_submit:
                 state.orderSubmitDate = today
@@ -74,7 +105,7 @@ def run_auto_bot(
                 notify(
                     "\n".join(
                         [
-                            "Vietnam Algo: submit not marked complete",
+                            "⚠️ Vietnam Algo: submit not marked complete",
                             f"date: {today}",
                             f"status: {result.get('status')}",
                             "reason: order ledger has unknown/open/pending orders",
@@ -116,6 +147,8 @@ def run_auto_bot(
             update_dataset(engine_config)
             result = generate_live_orders(engine_config, strategy_config)
             print(result)
+            if isinstance(result, dict):
+                notify(eod_summary_message(result))
             state.eodDate = today
             save_state(state, engine_config.dataDir)
 

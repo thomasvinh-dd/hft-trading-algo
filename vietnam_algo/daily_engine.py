@@ -33,7 +33,13 @@ from .order_ledger import (
 )
 from .risk_controls import live_risk_limits_from_env, validate_live_orders
 from .otp_reader import latest_email_otp
-from .corporate_actions import corporate_action_path, load_corporate_actions
+from .ca_rebuy_state import CaRebuyState
+from .corporate_actions import (
+    build_corporate_action_lookup,
+    corporate_action_path,
+    corporate_action_risk_type,
+    load_corporate_actions,
+)
 from .trading_engine import (
     apply_sellable_quantity_cap,
     build_corporate_action_exit_orders,
@@ -273,13 +279,19 @@ def run_daily_once(
     actions_path = corporate_action_path(engine_config.dataDir)
     trade_date_value = str(generated.get("tradeDate") or trade_date or latest_order_date(Path(str(generated["latestOrdersCsv"]))) or "")
     trading_dates = live_trading_dates(engine_config.dataDir, trade_date_value, "2030-12-31") if trade_date_value else None
+    ca_actions = load_corporate_actions(actions_path) if actions_path.exists() else []
+    _, ca_ex_index = build_corporate_action_lookup(ca_actions, trading_dates or [])
     orders, decisions = prepare_dnse_orders_with_risk_report(
         Path(str(generated["latestOrdersCsv"])),
         loan_package_id,
         corporate_actions_path=actions_path if actions_path.exists() else None,
         corporate_action_buy_window_days=strategy_config.corporateActionBuyWindowDays,
         corporate_action_sell_window_days=strategy_config.corporateActionSellWindowDays,
+        corporate_action_pre_exit_days=strategy_config.corporateActionPreExitDays,
+        corporate_action_high_risk_buy_window_days=strategy_config.corporateActionHighRiskBuyWindowDays,
+        corporate_action_high_risk_sell_window_days=strategy_config.corporateActionHighRiskSellWindowDays,
         trading_dates=trading_dates,
+        precomputed_ex_index=ca_ex_index,
     )
     if actions_path.exists() and generated.get("tradeDate"):
         exit_orders, exit_decisions = build_corporate_action_exit_orders(
@@ -287,13 +299,77 @@ def run_daily_once(
             account_no,
             loan_package_id,
             str(generated["tradeDate"]),
-            load_corporate_actions(actions_path),
+            ca_actions,
             orders,
             sell_window_days=strategy_config.corporateActionSellWindowDays,
+            pre_exit_days=strategy_config.corporateActionPreExitDays,
+            high_risk_sell_window_days=strategy_config.corporateActionHighRiskSellWindowDays,
             trading_dates=trading_dates,
+            precomputed_ex_index=ca_ex_index,
         )
         orders.extend(exit_orders)
         decisions.extend(exit_decisions)
+
+        # Queue post-CA rebays for every force-exit we just emitted, and emit
+        # any rebays from prior cycles whose signal/delay fired today.
+        if strategy_config.corporateActionRebuyAfterExDate and exit_orders:
+            rebuy_state = CaRebuyState.load(engine_config.dataDir)
+            try:
+                current_idx = trading_dates.index(trade_date_value) if trading_dates else 0
+            except ValueError:
+                current_idx = 0
+            symbol_ex_dates: dict[str, str] = {}
+            symbol_high_risk: dict[str, bool] = {}
+            for o in exit_orders:
+                # Pick the soonest ex-date for this symbol from the CA events
+                # sitting in the union window (standard pre-exit + high-risk).
+                risky_for_symbol = corporate_action_window_lookup(
+                    ca_actions,
+                    trade_date_value,
+                    max(
+                        strategy_config.corporateActionPreExitDays,
+                        strategy_config.corporateActionHighRiskSellWindowDays,
+                    ),
+                    trading_dates,
+                    precomputed_ex_index=ca_ex_index,
+                ).get(o.symbol, [])
+                if risky_for_symbol:
+                    symbol_ex_dates[o.symbol] = min(e.exDate for e in risky_for_symbol if e.exDate)
+                    symbol_high_risk[o.symbol] = any(
+                        corporate_action_risk_type(e) == "high" for e in risky_for_symbol
+                    )
+            from .trading_engine import (
+                build_post_ca_rebuy_orders,
+                corporate_action_window_lookup,
+                enqueue_pending_rebuys_from_force_exits,
+            )
+            enqueue_pending_rebuys_from_force_exits(
+                rebuy_state,
+                exit_orders,
+                trading_dates or [],
+                current_idx,
+                strategy_config,
+                symbol_ex_dates,
+                symbol_high_risk,
+            )
+            rebuy_orders, rebuy_decisions = build_post_ca_rebuy_orders(
+                rebuy_state,
+                engine_config.dataDir,
+                trade_date_value,
+                trading_dates or [],
+                current_idx,
+                strategy_config,
+                loan_package_id,
+            )
+            orders.extend(rebuy_orders)
+            decisions.extend(rebuy_decisions)
+            rebuy_state.save(engine_config.dataDir)
+            result_payload_extras = {
+                "pendingRebuysAfter": [p.to_dict() for p in rebuy_state.pendingRebuys],
+                "reservedCashAfter": [r.to_dict() for r in rebuy_state.reservedCash],
+            }
+        else:
+            result_payload_extras = {}
     sellable = extract_sellable_positions(client.positions(account_no))
     orders, sellable_decisions = apply_sellable_quantity_cap(orders, sellable)
     pricing_decisions: list[dict[str, object]] = []
@@ -310,11 +386,40 @@ def run_daily_once(
             "corporateActionDecisions": [decision.__dict__ for decision in decisions],
             "sellableDecisions": sellable_decisions,
             "pricingDecisions": pricing_decisions,
+            **result_payload_extras,
         }
-        notify(submit_message(result_payload))
+        notify(risk_block_message(result_payload))
         return result_payload
     run_id = trade_date_value or "unknown"
     results, reconciliation, submit_complete = execute_orders_with_ledger(client, account_no, trading_token, orders, engine_config.dataDir, run_id)
+
+    # Reconcile any rebuy orders that filled — drop them from the persistent
+    # pending queue. Pending rebays whose BUY did NOT fill (rejected, expired,
+    # still open) remain queued for the next cycle, with the reserve intact.
+    from .trading_engine import mark_pending_rebuys_filled
+    state_after_submit = CaRebuyState.load(engine_config.dataDir)
+    filled_rebuys: dict[str, int] = {}
+    for entry in results:
+        order_payload = entry.get("order") if isinstance(entry, dict) else None
+        if not order_payload:
+            continue
+        reason = str(order_payload.get("reason", ""))
+        if not reason.startswith("corporate_action_rebuy"):
+            continue
+        status = str(entry.get("status", ""))
+        if status == "submitted":
+            sym = str(order_payload.get("symbol", ""))
+            if sym:
+                filled_rebuys[sym] = filled_rebuys.get(sym, 0) + 1
+    dropped_filled = mark_pending_rebuys_filled(state_after_submit, filled_rebuys)
+    state_after_submit.save(engine_config.dataDir)
+    result_payload_extras = {
+        **result_payload_extras,
+        "pendingRebuysDroppedAfterFill": dropped_filled,
+        "pendingRebuysAfter": [p.to_dict() for p in state_after_submit.pendingRebuys],
+        "reservedCashAfter": [r.to_dict() for r in state_after_submit.reservedCash],
+    }
+
     result_payload = {
         "status": "submitted" if submit_complete else "submit_unknown_or_pending",
         **generated,
@@ -326,6 +431,21 @@ def run_daily_once(
         "corporateActionDecisions": [decision.__dict__ for decision in decisions],
         "sellableDecisions": sellable_decisions,
         "pricingDecisions": pricing_decisions,
+        **result_payload_extras,
     }
+    # Failure detection: surface order rejections / unknown statuses to Telegram.
+    order_fail = order_failures_message(
+        results,
+        trade_date=result_payload.get("tradeDate"),
+    )
+    if order_fail:
+        notify(order_fail)
+    # CA forced exits: clearly mark which symbols are exiting today.
+    ca_exit = ca_forced_exit_message(
+        result_payload.get("corporateActionDecisions", []) or [],
+        trade_date=result_payload.get("tradeDate"),
+    )
+    if ca_exit:
+        notify(ca_exit)
     notify(submit_message(result_payload))
     return result_payload
