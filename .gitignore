@@ -1,0 +1,23 @@
+# Local env files (DNS, IMAP, Telegram credentials)
+.env
+.env.*
+*.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Backtest artefacts (large regenerable data)
+/vietnam_algo/data/backtests/_*.json
+
+# Live state (sensitive)
+/vietnam_algo/data/live/*.json
+
+# Session state for opencode
+/.opencode/
