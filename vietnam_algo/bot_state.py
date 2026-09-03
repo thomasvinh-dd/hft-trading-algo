@@ -9,6 +9,7 @@ from .data import DEFAULT_DATA_DIR, read_json, write_json
 @dataclass
 class AutoBotState:
     tokenDate: str | None = None
+    tokenExpiry: str | None = None  # ISO8601 UTC; parsed from JWT `exp`
     orderSubmitDate: str | None = None
     eodDate: str | None = None
     corporateActionDate: str | None = None
@@ -27,6 +28,7 @@ def load_state(data_dir: Path = DEFAULT_DATA_DIR) -> AutoBotState:
     payload = read_json(path)
     return AutoBotState(
         tokenDate=payload.get("tokenDate"),
+        tokenExpiry=payload.get("tokenExpiry"),
         orderSubmitDate=payload.get("orderSubmitDate"),
         eodDate=payload.get("eodDate"),
         corporateActionDate=payload.get("corporateActionDate"),

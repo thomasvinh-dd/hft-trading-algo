@@ -7,11 +7,12 @@ from pathlib import Path
 from .bot_state import AutoBotState, load_state, save_state
 from .config import StrategyConfig
 from .corporate_actions import sync_corporate_actions_incremental
-from .daily_engine import EngineConfig, generate_live_orders, run_daily_once, trading_token_from_email, update_dataset
+from .daily_engine import EngineConfig, generate_live_orders, run_daily_once, update_dataset
 from .dnse_client import DnseClient
 from .market_calendar import load_market_holidays, should_sync_market_holidays, sync_market_holidays
 from .notifier import notify, token_refresh_message, eod_summary_message
-from .schedule import TradingSchedule, local_date, should_refresh_token, should_run_eod, should_submit_orders, should_sync_corporate_actions, vietnam_now
+from .schedule import TradingSchedule, local_date, should_run_eod, should_submit_orders, should_sync_corporate_actions, vietnam_now
+from .token_store import ensure_fresh_trading_token
 
 
 def run_auto_bot(
@@ -38,41 +39,39 @@ def run_auto_bot(
             save_state(state, engine_config.dataDir)
         holidays = load_market_holidays(engine_config.dataDir)
 
-        if should_refresh_token(now, state.tokenDate, schedule, holidays):
-            print(f"[{now.isoformat()}] Refreshing DNSE trading token")
-            refresh_ok = False
-            if live_submit:
-                try:
-                    state.tradingToken = trading_token_from_email(client)
-                    refresh_ok = True
-                except Exception as exc:
-                    notify(
-                        "\n".join(
-                            [
-                                "🚨 Vietnam Algo: TOKEN REFRESH FAILED",
-                                f"account: {account_no}",
-                                f"err: {str(exc)[:300]}",
-                            ]
-                        )
-                    )
-                    raise
-            else:
-                state.tradingToken = "dry-run-token"
-                refresh_ok = True
-            notify(token_refresh_message(account_no, live_submit, refresh_ok))
-            state.tokenDate = today
-            save_state(state, engine_config.dataDir)
-
         if should_submit_orders(now, state.orderSubmitDate, schedule, holidays):
             print(f"[{now.isoformat()}] Generating and submitting latest orders")
             notify(f"Vietnam Algo: submit cycle started\ntime: {now.isoformat()}\nliveSubmit: {live_submit}")
-            if not state.tradingToken:
-                if live_submit:
-                    state.tradingToken = trading_token_from_email(client)
-                else:
-                    state.tradingToken = "dry-run-token"
-                state.tokenDate = today
-                save_state(state, engine_config.dataDir)
+            # Lazy refresh: only fetch a token if (a) live mode AND
+            # (b) we don't have a fresh one. Dry-run just sets a placeholder.
+            def _refresh_and_notify(msg: str) -> None:
+                # Called from inside ensure_fresh_trading_token — keep
+                # the notify path uniform with the rest of the bot.
+                notify(msg)
+            try:
+                token, was_refreshed = ensure_fresh_trading_token(
+                    client=client,
+                    state=state,
+                    account_no=account_no,
+                    live_submit=live_submit,
+                    notify_fn=_refresh_and_notify,
+                )
+                if was_refreshed and live_submit:
+                    notify(token_refresh_message(account_no, live_submit, True))
+                    save_state(state, engine_config.dataDir)
+            except Exception as exc:
+                notify(
+                    "\n".join(
+                        [
+                            "🚨 Vietnam Algo: TOKEN REFRESH FAILED",
+                            f"account: {account_no}",
+                            f"err: {str(exc)[:300]}",
+                        ]
+                    )
+                )
+                if once:
+                    raise
+                continue
             try:
                 result = run_daily_once(
                     engine_config,
@@ -80,7 +79,7 @@ def run_auto_bot(
                     submit=live_submit,
                     account_no=account_no,
                     loan_package_id=loan_package_id,
-                    trading_token=state.tradingToken,
+                    trading_token=token,
                     client=client,
                 )
             except Exception as exc:
