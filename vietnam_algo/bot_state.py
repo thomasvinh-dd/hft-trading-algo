@@ -14,6 +14,7 @@ class AutoBotState:
     eodDate: str | None = None
     corporateActionDate: str | None = None
     marketHolidaySyncDate: str | None = None
+    lastHeartbeatDate: str | None = None
     tradingToken: str = ""
 
 
@@ -33,6 +34,7 @@ def load_state(data_dir: Path = DEFAULT_DATA_DIR) -> AutoBotState:
         eodDate=payload.get("eodDate"),
         corporateActionDate=payload.get("corporateActionDate"),
         marketHolidaySyncDate=payload.get("marketHolidaySyncDate"),
+        lastHeartbeatDate=payload.get("lastHeartbeatDate"),
         tradingToken=str(payload.get("tradingToken", "")),
     )
 

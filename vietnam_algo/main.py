@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 from .backtest import (
@@ -20,10 +23,28 @@ from .config import StrategyConfig
 from .corporate_actions import fetch_vietstock_events, save_corporate_actions, sync_corporate_actions_incremental
 from .daily_engine import EngineConfig, run_daily_once, trading_token_from_email
 from .data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, load_saved_symbols, sync_prices, sync_symbols
-from .dnse_client import DEFAULT_DNSE_BASE_URL, DnseClient
+from .data_investing import (
+    DEFAULT_INVESTING_PRICES_DIR,
+    fetch_investing_history,
+    fetch_investing_symbols,
+    load_investing_id_map,
+    save_investing_id_map,
+    sync_investing_prices,
+)
+from .data_investing import (
+    load_investing_prices as load_investing_prices_func,
+)
+from .dnse_client import (
+    DEFAULT_DNSE_BASE_URL,
+    DEFAULT_DNSE_VERSION,
+    DnseClient,
+    sync_dnse_instruments,
+    sync_dnse_prices,
+)
 from .market_calendar import live_trading_dates, sync_market_holidays
 from .notifier import TelegramConfig, notify
 from .risk_controls import live_risk_limits_from_env, validate_live_orders
+from .schedule import TradingSchedule
 from .trading_engine import (
     build_corporate_action_exit_orders,
     apply_sellable_quantity_cap,
@@ -70,6 +91,72 @@ def build_parser() -> argparse.ArgumentParser:
 
     holiday_parser = subparsers.add_parser("sync-market-holidays", help="fetch Vietnam market holidays from market-holiday.com")
 
+    investing_symbols_parser = subparsers.add_parser(
+        "investing-fetch-symbols",
+        help="scrape vn.investing.com /equities/vietnam and persist a (ticker, pair_id) map",
+    )
+    investing_symbols_parser.add_argument(
+        "--url",
+        default="https://vn.investing.com/equities/vietnam",
+        help="overrides the equities list URL (rarely needed)",
+    )
+
+    investing_history_parser = subparsers.add_parser(
+        "investing-sync-history",
+        help="fetch Investing.com OHLCV history and cache to data/prices_investing/",
+    )
+    investing_history_parser.add_argument(
+        "--id-map",
+        default=None,
+        help="path to investing_id_map.json; defaults to data/investing_id_map.json",
+    )
+    investing_history_parser.add_argument(
+        "--from-date",
+        required=True,
+        help="start date YYYY-MM-DD",
+    )
+    investing_history_parser.add_argument(
+        "--to-date",
+        required=True,
+        help="end date YYYY-MM-DD",
+    )
+    investing_history_parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=None,
+        help="optional subset of tickers; defaults to every ticker in the id map",
+    )
+    investing_history_parser.add_argument(
+        "--time-frame",
+        choices=["Daily", "Weekly", "Monthly"],
+        default="Daily",
+    )
+    investing_history_parser.add_argument(
+        "--chunk-days",
+        type=int,
+        default=365,
+        help="days per request chunk (default 365; Investing.com caps responses)",
+    )
+    investing_history_parser.add_argument(
+        "--sleep-seconds",
+        type=float,
+        default=1.0,
+        help="pause between per-ticker requests to be polite",
+    )
+    investing_history_parser.add_argument(
+        "--no-skip-existing",
+        action="store_true",
+        help="refetch cached tickers",
+    )
+
+    investing_smoke_parser = subparsers.add_parser(
+        "investing-smoke",
+        help="pull a 1-month window of daily bars for one pair_id and print them",
+    )
+    investing_smoke_parser.add_argument("--pair-id", type=int, default=41913)
+    investing_smoke_parser.add_argument("--from-date", default="2026-07-23")
+    investing_smoke_parser.add_argument("--to-date", default="2026-08-23")
+
     all_parser = subparsers.add_parser("sync-all", help="fetch symbols then historical prices")
     all_parser.add_argument("--page-limit", type=int, default=50)
     all_parser.add_argument("--price-limit", type=int, default=DEFAULT_PRICE_LIMIT)
@@ -107,6 +194,47 @@ def build_parser() -> argparse.ArgumentParser:
     dnse_accounts = subparsers.add_parser("dnse-accounts", help="list DNSE trading accounts")
     add_dnse_auth_arguments(dnse_accounts)
 
+    dnse_instruments_parser = subparsers.add_parser(
+        "dnse-sync-instruments",
+        help="fetch the DNSE instrument master list to data/instruments_dnse.json",
+    )
+    add_dnse_auth_arguments(dnse_instruments_parser)
+
+    dnse_prices_parser = subparsers.add_parser(
+        "dnse-sync-prices",
+        help="fetch DNSE OHLC daily bars and cache to data/prices_dnse/",
+    )
+    add_dnse_auth_arguments(dnse_prices_parser)
+    dnse_prices_parser.add_argument("--from-date", default="2015-01-01", help="start date YYYY-MM-DD (DNSE supports deep history)")
+    dnse_prices_parser.add_argument("--to-date", default=None, help="end date YYYY-MM-DD; defaults to today")
+    dnse_prices_parser.add_argument("--symbols", nargs="+", default=None, help="optional subset; defaults to symbols.json")
+    dnse_prices_parser.add_argument("--max-symbols", type=int, default=0, help="limit number of symbols; 0 = all")
+    dnse_prices_parser.add_argument("--sleep-seconds", type=float, default=0.5)
+    dnse_prices_parser.add_argument("--no-skip-existing", action="store_true", help="refetch cached symbols")
+
+    dnse_latest_parser = subparsers.add_parser(
+        "dnse-latest-quotes",
+        help="print latest quotes for one symbol (smoke test)",
+    )
+    add_dnse_auth_arguments(dnse_latest_parser)
+    dnse_latest_parser.add_argument("--symbol", required=True)
+
+    dnse_quote_bbo = subparsers.add_parser(
+        "dnse-quote",
+        help="print the BBO + up to 3-level depth for a symbol",
+    )
+    add_dnse_auth_arguments(dnse_quote_bbo)
+    dnse_quote_bbo.add_argument("--symbol", required=True)
+    dnse_quote_bbo.add_argument("--no-trading-token", action="store_true", help="skip the trading-token header (use only for deeply read-only quotes)")
+
+    dnse_trades = subparsers.add_parser(
+        "dnse-trades",
+        help="print the most recent trade prints for a symbol",
+    )
+    add_dnse_auth_arguments(dnse_trades)
+    dnse_trades.add_argument("--symbol", required=True)
+    dnse_trades.add_argument("--limit", type=int, default=20)
+
     dnse_positions = subparsers.add_parser("dnse-positions", help="list DNSE stock positions")
     add_dnse_auth_arguments(dnse_positions)
     dnse_positions.add_argument("--account-no", required=True)
@@ -118,6 +246,15 @@ def build_parser() -> argparse.ArgumentParser:
     dnse_ppse.add_argument("--price", type=float, required=True)
     dnse_ppse.add_argument("--loan-package-id", type=int, required=True)
 
+    dnse_loan_packages = subparsers.add_parser(
+        "dnse-loan-packages",
+        help="list DNSE margin loan packages available for the account",
+    )
+    add_dnse_auth_arguments(dnse_loan_packages)
+    dnse_loan_packages.add_argument("--account-no", required=True)
+    dnse_loan_packages.add_argument("--market-type", choices=["STOCK", "DERIVATIVE"], default="STOCK")
+    dnse_loan_packages.add_argument("--symbol", default=None, help="if set, list packages for this ticker only")
+
     dnse_otp = subparsers.add_parser("dnse-send-email-otp", help="request DNSE email OTP")
     add_dnse_auth_arguments(dnse_otp)
 
@@ -125,6 +262,63 @@ def build_parser() -> argparse.ArgumentParser:
     add_dnse_auth_arguments(dnse_token)
     dnse_token.add_argument("--otp-type", choices=["email_otp", "smart_otp"], default="smart_otp")
     dnse_token.add_argument("--passcode", required=True)
+
+    dnse_trade_secret = subparsers.add_parser(
+        "dnse-trade-secret",
+        help="end-to-end: send email OTP, poll IMAP, exchange, persist trading token",
+    )
+    add_dnse_auth_arguments(dnse_trade_secret)
+    dnse_trade_secret.add_argument(
+        "--gmail-address",
+        default=os.environ.get("GMAIL_ADDRESS", ""),
+        help="Gmail account receiving DNSE OTPs (default: env GMAIL_ADDRESS)",
+    )
+    dnse_trade_secret.add_argument(
+        "--gmail-app-password",
+        default=os.environ.get("GMAIL_APP_PASSWORD", ""),
+        help="16-char Gmail App Password (default: env GMAIL_APP_PASSWORD)",
+    )
+    dnse_trade_secret.add_argument(
+        "--imaphost",
+        default=os.environ.get("GMAIL_IMAP_HOST", "imap.gmail.com"),
+    )
+    dnse_trade_secret.add_argument(
+        "--imappassword",
+        default=os.environ.get("GMAIL_MAILBOX", "INBOX"),
+        help="mailbox name (default: env GMAIL_MAILBOX)",
+    )
+    dnse_trade_secret.add_argument(
+        "--otp-sender",
+        default=os.environ.get("DNSE_OTP_SENDER", ""),
+    )
+    dnse_trade_secret.add_argument(
+        "--otp-subject",
+        default=os.environ.get("DNSE_OTP_SUBJECT", ""),
+    )
+    dnse_trade_secret.add_argument(
+        "--otp-regex",
+        default=os.environ.get("DNSE_OTP_REGEX", r"\b(\d{6})\b"),
+    )
+    dnse_trade_secret.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=int(os.environ.get("DNSE_OTP_WAIT_SECONDS", "20")),
+    )
+    dnse_trade_secret.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=float(os.environ.get("DNSE_OTP_POLL_SECONDS", "3")),
+    )
+    dnse_trade_secret.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=float(os.environ.get("DNSE_OTP_TIMEOUT_SECONDS", "60")),
+    )
+    dnse_trade_secret.add_argument(
+        "--token-output",
+        type=Path,
+        default=DEFAULT_DATA_DIR / "live" / "dnse_trading_token.json",
+    )
 
     telegram = subparsers.add_parser("telegram-test", help="send a test Telegram notification")
     telegram.add_argument("--message", default="Vietnam Algo Telegram notification test")
@@ -171,6 +365,11 @@ def build_parser() -> argparse.ArgumentParser:
     auto_bot.add_argument("--sleep-seconds", type=int, default=60)
     auto_bot.add_argument("--once", action="store_true", help="evaluate schedule once and exit")
     auto_bot.add_argument("--live-submit", action="store_true", help="enable real DNSE submissions and real email OTP")
+    auto_bot.add_argument(
+        "--heartbeat-time",
+        default=None,
+        help="override heartbeat time HH:MM (default 10:30 ICT)",
+    )
     return parser
 
 
@@ -304,6 +503,13 @@ def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
         corporateActionBuyWindowDays=args.corporate_action_buy_window_days,
         corporateActionSellWindowDays=args.corporate_action_sell_window_days,
         corporateActionRebuyAfterExDate=args.corporate_action_rebuy_after_exdate,
+        corporateActionPreExitDays=args.corporate_action_pre_exit_days,
+        corporateActionPreExitSignalMode=args.corporate_action_pre_exit_signal_mode,
+        corporateActionPreExitSignalDropPct=args.corporate_action_pre_exit_signal_drop_pct,
+        corporateActionPreExitSignalMaPeriod=args.corporate_action_pre_exit_signal_ma_period,
+        corporateActionPreExitSignalLookback=args.corporate_action_pre_exit_signal_lookback,
+        corporateActionPreExitSignalShortPeriod=args.corporate_action_pre_exit_signal_short_period,
+        corporateActionPreExitSignalLongPeriod=args.corporate_action_pre_exit_signal_long_period,
         corporateActionHighRiskBuyWindowDays=args.corporate_action_high_risk_buy_window_days,
         corporateActionHighRiskSellWindowDays=args.corporate_action_high_risk_sell_window_days,
         corporateActionRebuyBullMaxRank=args.corporate_action_rebuy_bull_max_rank,
@@ -313,6 +519,16 @@ def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
         corporateActionReserveExpiryDays=args.corporate_action_reserve_expiry_days,
         corporateActionForceSellStandardEvents=not args.no_corporate_action_force_sell_standard_events,
         corporateActionRebuyAsAdjustment=args.corporate_action_rebuy_as_adjustment,
+        corporateActionRebuyDelayDays=args.corporate_action_rebuy_delay_days,
+        corporateActionRebuyDelayHighRiskOnly=args.corporate_action_rebuy_delay_high_risk_only,
+        corporateActionRebuySignalMode=args.corporate_action_rebuy_signal_mode,
+        corporateActionRebuySignalRecoveryPct=args.corporate_action_rebuy_signal_recovery_pct,
+        corporateActionRebuySignalRangePct=args.corporate_action_rebuy_signal_range_pct,
+        corporateActionRebuySignalMaPeriod=args.corporate_action_rebuy_signal_ma_period,
+        corporateActionRebuySignalLookback=args.corporate_action_rebuy_signal_lookback,
+        corporateActionRebuySignalMaxDays=args.corporate_action_rebuy_signal_max_days,
+        corporateActionRebuySignalConfirmDays=args.corporate_action_rebuy_signal_confirm_days,
+        corporateActionRebuySignalMinDays=args.corporate_action_rebuy_signal_min_days,
         universe=universe,
         usePointInTimeUniverse=args.point_in_time_universe,
         useVolTargeting=args.use_vol_targeting,
@@ -407,16 +623,132 @@ def add_backtest_arguments(backtest_parser: argparse.ArgumentParser) -> None:
     backtest_parser.add_argument("--corporate-action-window-days", type=int, default=3)
     backtest_parser.add_argument("--corporate-action-buy-window-days", type=int, default=2)
     backtest_parser.add_argument("--corporate-action-sell-window-days", type=int, default=3)
-    backtest_parser.add_argument("--corporate-action-rebuy-after-exdate", action="store_true")
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-after-exdate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="after a force-sell for a non-cash CA, queue a post-ex rebuy (default on; turn off with --no-corporate-action-rebuy-after-exdate)",
+    )
     backtest_parser.add_argument("--corporate-action-high-risk-buy-window-days", type=int, default=5)
     backtest_parser.add_argument("--corporate-action-high-risk-sell-window-days", type=int, default=3)
     backtest_parser.add_argument("--corporate-action-rebuy-bull-max-rank", type=int, default=10)
     backtest_parser.add_argument("--corporate-action-rebuy-neutral-max-rank", type=int, default=5)
     backtest_parser.add_argument("--corporate-action-rebuy-min-avg-volume", type=float, default=300_000)
-    backtest_parser.add_argument("--corporate-action-reserve-cash-for-rebuy", action="store_true")
-    backtest_parser.add_argument("--corporate-action-reserve-expiry-days", type=int, default=10)
+    backtest_parser.add_argument(
+        "--corporate-action-reserve-cash-for-rebuy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reserve freed-up cash against the post-CA rebuy (default on; turn off with --no-corporate-action-reserve-cash-for-rebuy)",
+    )
+    backtest_parser.add_argument("--corporate-action-reserve-expiry-days", type=int, default=25)
     backtest_parser.add_argument("--no-corporate-action-force-sell-standard-events", action="store_true")
-    backtest_parser.add_argument("--corporate-action-rebuy-as-adjustment", action="store_true")
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-as-adjustment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="bypass rank/SMA/volume filters for the post-CA rebuy (default on; turn off with --no-corporate-action-rebuy-as-adjustment)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-delay-days",
+        type=int,
+        default=0,
+        help="number of trading days to wait after the ex-date before the post-CA rebuy is allowed (default 0 = rebuy ASAP)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-delay-high-risk-only",
+        action="store_true",
+        help="apply the rebuy delay only to high-risk CA events (rights offerings, share swaps, additional issuances)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-signal-mode",
+        choices=["fixed_delay", "recovery", "stabilization", "new_high", "ma_cross", "no_new_low", "combined", "stabilization_or_no_new_low"],
+        default="fixed_delay",
+        help="post-CA rebuy signal mode: fixed_delay (legacy), recovery (bounce from post-ex low), stabilization (range tightened), new_high (close above all closes since ex), ma_cross (close crossed above N-day MA), no_new_low (no break of recent low), combined (recovery + stabilization), stabilization_or_no_new_low (either stabilization or no new low)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-signal-ma-period",
+        type=int,
+        default=5,
+        help="MA period for the ma_cross signal (default 5)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-signal-recovery-pct",
+        type=float,
+        default=0.005,
+        help="recovery threshold as a fraction of post-ex low (default 0.005 = 0.5%%)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-signal-range-pct",
+        type=float,
+        default=0.025,
+        help="max acceptable range over the lookback window (default 0.025 = 2.5%%)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-pre-exit-days",
+        type=int,
+        default=5,
+        help="number of trading days before ex-date to force-sell a position with an upcoming non-cash CA (default 5)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-pre-exit-signal-mode",
+        choices=["fixed_window", "drop_from_high", "below_ma", "momentum_reversal", "combined"],
+        default="fixed_window",
+        help="pre-exit trigger mode: fixed_window (legacy), drop_from_high (close has dropped X%% from window peak), below_ma (close < N-day MA), momentum_reversal (short MA crossed below long MA), combined (drop + below_ma)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-pre-exit-signal-drop-pct",
+        type=float,
+        default=0.02,
+        help="drop threshold for drop_from_high signal as a fraction (default 0.02 = 2%%)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-pre-exit-signal-ma-period",
+        type=int,
+        default=5,
+        help="MA period for the below_ma signal (default 5)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-pre-exit-signal-lookback",
+        type=int,
+        default=14,
+        help="number of recent closes used to compute the pre-exit signal (default 14)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-pre-exit-signal-short-period",
+        type=int,
+        default=3,
+        help="short-MA period for the momentum_reversal signal (default 3)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-pre-exit-signal-long-period",
+        type=int,
+        default=8,
+        help="long-MA period for the momentum_reversal signal (default 8)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-signal-lookback",
+        type=int,
+        default=3,
+        help="number of recent closes for the stabilization and no_new_low checks (default 3)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-signal-max-days",
+        type=int,
+        default=10,
+        help="fallback: force the rebuy if the signal has not triggered within this many post-ex trading days (default 10)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-signal-confirm-days",
+        type=int,
+        default=1,
+        help="require the signal to be true for N consecutive days before firing (default 1 = single-day)",
+    )
+    backtest_parser.add_argument(
+        "--corporate-action-rebuy-signal-min-days",
+        type=int,
+        default=0,
+        help="earliest post-ex day to consider the signal (default 0 = signal can fire immediately)",
+    )
     backtest_parser.add_argument(
         "--point-in-time-universe",
         dest="point_in_time_universe",
@@ -518,6 +850,73 @@ def main(argv: list[str] | None = None) -> int:
         print_json(sync_market_holidays(args.data_dir, timeout=args.timeout))
         return 0
 
+    if args.command == "investing-fetch-symbols":
+        try:
+            symbols = fetch_investing_symbols(timeout=args.timeout)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to fetch Investing.com equities list. "
+                "Run from a host with vn.investing.com reachable, "
+                "or pass --url to a manually extracted list."
+            ) from exc
+        if not symbols:
+            raise RuntimeError(
+                "No Investing.com symbols parsed. Page layout may have changed; "
+                "share the HTML snippet and we will update the parser."
+            )
+        path = save_investing_id_map(symbols, args.data_dir)
+        print(f"Saved {len(symbols)} Investing.com (ticker, pair_id) pairs to {path}")
+        return 0
+
+    if args.command == "investing-sync-history":
+        id_map_path = Path(args.id_map) if args.id_map else (args.data_dir / "investing_id_map.json")
+        if not id_map_path.exists():
+            raise RuntimeError(
+                f"Investing.com id map not found at {id_map_path}. "
+                "Run `investing-fetch-symbols` first or pass --id-map."
+            )
+        id_map = load_investing_id_map(id_map_path)
+        if args.symbols:
+            requested = {s.strip().upper() for s in args.symbols}
+            id_map = {k: v for k, v in id_map.items() if k in requested}
+            if not id_map:
+                raise RuntimeError(
+                    "None of the requested tickers were in the id map."
+                )
+        if not id_map:
+            raise RuntimeError("id map is empty")
+        paths = sync_investing_prices(
+            id_map=id_map,
+            start_date=args.from_date,
+            end_date=args.to_date,
+            data_dir=args.data_dir,
+            chunk_days=args.chunk_days,
+            sleep_seconds=args.sleep_seconds,
+            skip_existing=not args.no_skip_existing,
+            timeout=args.timeout,
+        )
+        print(
+            f"Saved {len(paths)} Investing.com price files to "
+            f"{args.data_dir / DEFAULT_INVESTING_PRICES_DIR}"
+        )
+        return 0
+
+    if args.command == "investing-smoke":
+        bars = fetch_investing_history(
+            pair_id=args.pair_id,
+            start_date=args.from_date,
+            end_date=args.to_date,
+        )
+        print_json({
+            "pair_id": args.pair_id,
+            "from_date": args.from_date,
+            "to_date": args.to_date,
+            "count": len(bars),
+            "first": asdict(bars[0]) if bars else None,
+            "last": asdict(bars[-1]) if bars else None,
+        })
+        return 0
+
     if args.command == "sync-all":
         symbols_path = sync_symbols(args.data_dir, limit=args.page_limit, timeout=args.timeout)
         symbols = load_saved_symbols(args.data_dir)
@@ -581,15 +980,148 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dnse-accounts":
-        print_json(dnse_client_from_args(args).accounts())
+        print_json(dnse_client_from_args(args).get_accounts())
         return 0
 
     if args.command == "dnse-positions":
-        print_json(dnse_client_from_args(args).positions(args.account_no))
+        print_json(dnse_client_from_args(args).get_positions(args.account_no))
         return 0
 
     if args.command == "dnse-ppse":
-        print_json(dnse_client_from_args(args).ppse(args.account_no, args.symbol, args.loan_package_id, args.price))
+        print_json(dnse_client_from_args(args).get_ppse(args.account_no, "STOCK", args.symbol, args.price, args.loan_package_id))
+        return 0
+
+    if args.command == "dnse-loan-packages":
+        from .dnse_client import load_trading_token
+        token = None
+        saved_token_path = args.data_dir / "live" / "dnse_trading_token.json"
+        if saved_token_path.exists():
+            try:
+                token = load_trading_token(saved_token_path).get("tradingToken")
+            except Exception:
+                token = None
+        client = dnse_client_from_args(args)
+        rows = client.list_loan_packages(args.account_no, args.market_type, args.symbol)
+        print_json({
+            "accountNo": args.account_no,
+            "marketType": args.market_type,
+            "symbol": args.symbol,
+            "count": len(rows),
+            "items": rows,
+        })
+        return 0
+
+    if args.command == "dnse-sync-instruments":
+        client = dnse_client_from_args(args)
+        path = sync_dnse_instruments(client, args.data_dir)
+        print(f"Saved DNSE instruments to {path}")
+        return 0
+
+    if args.command == "dnse-sync-prices":
+        client = dnse_client_from_args(args)
+        if args.symbols:
+            symbols = [s.upper() for s in args.symbols]
+        else:
+            symbols_path = args.data_dir / "symbols.json"
+            if not symbols_path.exists():
+                raise RuntimeError(f"symbols.json not found at {symbols_path}; pass --symbols explicitly")
+            symbols_payload = json.loads(symbols_path.read_text(encoding="utf-8"))
+            symbols = sorted({
+                str(it["ticker"]).upper()
+                for it in symbols_payload.get("items", [])
+                if it.get("ticker")
+            })
+        if args.max_symbols > 0:
+            symbols = symbols[: args.max_symbols]
+        to_date = args.to_date or datetime.now(UTC).date().isoformat()
+        paths = sync_dnse_prices(
+            client=client,
+            symbols=symbols,
+            from_date=args.from_date,
+            to_date=to_date,
+            data_dir=args.data_dir,
+            sleep_seconds=args.sleep_seconds,
+            skip_existing=not args.no_skip_existing,
+        )
+        total_bars = sum(
+            int(json.loads(p.read_text(encoding="utf-8")).get("count", 0))
+            for p in paths.values()
+        )
+        print(f"Saved {len(paths)} DNSE price files ({total_bars} bars total) under {args.data_dir / 'prices_dnse'}")
+        return 0
+
+    if args.command == "dnse-latest-quotes":
+        print_json(dnse_client_from_args(args).get_latest_quote(args.symbol))
+        return 0
+
+    if args.command == "dnse-quote":
+        from .order_monitor import quote_match_price
+        from .dnse_client import load_trading_token
+        client = dnse_client_from_args(args)
+        extra = None
+        if not args.no_trading_token:
+            saved_token = args.data_dir / "live" / "dnse_trading_token.json"
+            if saved_token.exists():
+                try:
+                    tok = load_trading_token(saved_token).get("tradingToken")
+                    if tok:
+                        extra = {"trading-token": tok}
+                except Exception:
+                    extra = None
+        quote = client.get_latest_quote(args.symbol)
+        # DNSE returns: {"quotes": [ {bid, offer, boardId, ...}, ... ]}
+        # Pick the first (or boardId=G1 / HoSE main) board
+        boards = quote.get("quotes", []) if isinstance(quote, dict) else []
+        if not boards and isinstance(quote, list):
+            boards = quote
+        primary = boards[0] if boards else quote
+        bid_levels = primary.get("bid") or [] if isinstance(primary, dict) else []
+        offer_levels = primary.get("offer") or [] if isinstance(primary, dict) else []
+        bbo = {
+            "boardId": primary.get("boardId") if isinstance(primary, dict) else None,
+            "bid": bid_levels[0] if bid_levels else None,
+            "offer": offer_levels[0] if offer_levels else None,
+            "spread": None,
+            "depth": {
+                "bid_levels": len(bid_levels),
+                "offer_levels": len(offer_levels),
+                "total_bid_qty": sum(l["quantity"] for l in bid_levels),
+                "total_offer_qty": sum(l["quantity"] for l in offer_levels),
+            },
+        }
+        if bbo["bid"] and bbo["offer"]:
+            bbo["spread"] = round(bbo["offer"]["price"] - bbo["bid"]["price"], 4)
+        # DNSE side: 'NS' = sell, 'NB' = buy
+        print_json({
+            "symbol": args.symbol,
+            "boards": [
+                {
+                    "boardId": q.get("boardId"),
+                    "bid": q.get("bid", [])[:1] + [{**l, "depth": i + 1} for i, l in enumerate(q.get("bid", [])[1:])],
+                    "offer": q.get("offer", []),
+                }
+                for q in boards
+            ] if boards else None,
+            "primary_bbo": bbo,
+            "matchPriceForBuy": quote_match_price(primary, "NB"),
+            "matchPriceForSell": quote_match_price(primary, "NS"),
+            "ts": primary.get("time") if isinstance(primary, dict) else None,
+        })
+        return 0
+
+    if args.command == "dnse-trades":
+        client = dnse_client_from_args(args)
+        to_date = (datetime.now(timezone.utc)).isoformat()
+        from_date = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        # DNSE trades endpoint expects unix seconds via "from"/"to" query params
+        from_ts = int((datetime.now(timezone.utc) - timedelta(minutes=30)).timestamp())
+        to_ts = int(datetime.now(timezone.utc).timestamp())
+        response = client.request(
+            "GET",
+            f"/price/{args.symbol.upper()}/trades",
+            {"from": from_ts, "to": to_ts, "limit": args.limit, "order": "DESC"},
+        )
+        print_json(response)
         return 0
 
     if args.command == "dnse-send-email-otp":
@@ -598,6 +1130,70 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "dnse-trading-token":
         print_json({"tradingToken": dnse_client_from_args(args).trading_token(args.otp_type, args.passcode)})
+        return 0
+
+    if args.command == "dnse-trade-secret":
+        from .otp_reader import latest_email_otp
+        if not args.gmail_address or not args.gmail_app_password:
+            raise RuntimeError(
+                "dnse-trade-secret requires --gmail-address and --gmail-app-password "
+                "(or env GMAIL_ADDRESS and GMAIL_APP_PASSWORD)."
+            )
+        client = dnse_client_from_args(args)
+        print(f"[1/4] Sending email OTP via {client.base_url} ...")
+        send_result = client.send_email_otp()
+        print(f"  -> {send_result}")
+        wait_seconds = max(0, args.wait_seconds - 2)
+        if wait_seconds:
+            print(f"  sleeping {wait_seconds:.0f}s before first IMAP poll ...")
+            time.sleep(wait_seconds)
+        deadline = time.time() + args.timeout_seconds
+        otp: str | None = None
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                otp = latest_email_otp(
+                    username=args.gmail_address,
+                    app_password=args.gmail_app_password,
+                    mailbox=args.imappassword,
+                    sender_filter=args.otp_sender,
+                    subject_filter=args.otp_subject,
+                    otp_regex=args.otp_regex,
+                    host=args.imaphost,
+                    limit=10,
+                )
+                if otp:
+                    break
+            except Exception as exc:
+                print(f"  poll {attempt}: {type(exc).__name__}: {exc}")
+            time.sleep(args.poll_seconds)
+        if not otp:
+            raise RuntimeError(
+                f"dnse-trade-secret: no OTP email found within {args.timeout_seconds:.0f}s. "
+                f"Check GMAIL_APP_PASSWORD, DNSE_OTP_SENDER, DNSE_OTP_REGEX."
+            )
+        print(f"[2/4] OTP from email: {otp}")
+        print(f"[3/4] Exchanging for trading token (email_otp) ...")
+        token = client.create_trading_token("email_otp", otp)
+        print(f"  token len: {len(token)}")
+        print(f"[4/4] Persisting to {args.token_output} ...")
+        accounts = client.request("GET", "/accounts", extra_headers={"trading-token": token})
+        account_no = None
+        if isinstance(accounts, dict):
+            account_no = (accounts.get("accounts") or [{}])[0].get("id")
+        token_payload = {
+            "tradingToken": token,
+            "otpType": "email_otp",
+            "issuedAt": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=8)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "investorId": accounts.get("investorId") if isinstance(accounts, dict) else None,
+            "accountNo": account_no,
+            "source": client.base_url + "/registration/trading-token",
+        }
+        args.token_output.parent.mkdir(parents=True, exist_ok=True)
+        args.token_output.write_text(json.dumps(token_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(token_payload, indent=2))
         return 0
 
     if args.command == "telegram-test":
@@ -753,6 +1349,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "auto-trading-bot":
         if not args.live_submit:
             print("Running in dry-run mode. Add --live-submit only when ready for real DNSE orders.")
+        schedule = TradingSchedule()
+        if getattr(args, "heartbeat_time", None):
+            from datetime import datetime as _dt, time as _t
+            try:
+                parsed = _dt.strptime(args.heartbeat_time, "%H:%M").time()
+                schedule = TradingSchedule(heartbeatTime=parsed)
+            except ValueError:
+                print(f"--heartbeat-time must be HH:MM, got {args.heartbeat_time!r}; using default")
         run_auto_bot(
             engine_config_from_args(args),
             strategy_config_from_args(args),
@@ -762,6 +1366,7 @@ def main(argv: list[str] | None = None) -> int:
             live_submit=args.live_submit,
             once=args.once,
             sleep_seconds=args.sleep_seconds,
+            schedule=schedule,
         )
         return 0
 

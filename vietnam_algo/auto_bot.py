@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 import os
+import urllib.request
 from pathlib import Path
+from datetime import datetime
 
 from .bot_state import AutoBotState, load_state, save_state
 from .config import StrategyConfig
@@ -10,8 +12,11 @@ from .corporate_actions import sync_corporate_actions_incremental
 from .daily_engine import EngineConfig, generate_live_orders, run_daily_once, update_dataset
 from .dnse_client import DnseClient
 from .market_calendar import load_market_holidays, should_sync_market_holidays, sync_market_holidays
-from .notifier import notify, token_refresh_message, eod_summary_message
-from .schedule import TradingSchedule, local_date, should_run_eod, should_submit_orders, should_sync_corporate_actions, vietnam_now
+from .notifier import notify, token_refresh_message, eod_summary_message, heartbeat_message
+from .schedule import (
+    TradingSchedule, local_date, should_run_eod, should_submit_orders,
+    should_sync_corporate_actions, should_send_heartbeat, vietnam_now,
+)
 from .token_store import ensure_fresh_trading_token
 
 
@@ -26,6 +31,7 @@ def run_auto_bot(
     sleep_seconds: int = 60,
     schedule: TradingSchedule = TradingSchedule(),
 ) -> None:
+    bot_start_time = vietnam_now()
     while True:
         now = vietnam_now()
         today = local_date(now)
@@ -179,6 +185,41 @@ def run_auto_bot(
                         )
                     )
             state.eodDate = today
+            save_state(state, engine_config.dataDir)
+
+        if should_send_heartbeat(now, state.lastHeartbeatDate, schedule, holidays):
+            print(f"[{now.isoformat()}] Sending daily heartbeat")
+            # Quick proxy connectivity check (best-effort, non-fatal on error)
+            proxy_check: dict[str, object] | None = None
+            proxy_url = os.environ.get("DNSE_PROXY_HTTP_URL")
+            if proxy_url:
+                try:
+                    import time as _t
+                    t0 = _t.time()
+                    req = urllib.request.Request(
+                        "https://openapi.dnse.com.vn/accounts",
+                        headers={
+                            "X-API-Key": "heartbeat-probe",
+                            "version": "2026-07-23",
+                        },
+                    )
+                    urllib.request.urlopen(req, timeout=10).read()
+                    proxy_check = {"ok": True, "latency_ms": (_t.time() - t0) * 1000}
+                except Exception as exc:
+                    proxy_check = {"ok": False, "error": str(exc)[:120]}
+            uptime_s = (now - bot_start_time).total_seconds() if bot_start_time else None
+            pid = os.getpid()
+            msg = heartbeat_message(
+                account_no=account_no,
+                live_submit=live_submit,
+                state=state.__dict__,
+                proxy_url=proxy_url,
+                proxy_check=proxy_check,
+                pid=pid,
+                uptime_seconds=uptime_s,
+            )
+            notify(msg)
+            state.lastHeartbeatDate = today
             save_state(state, engine_config.dataDir)
 
         if once:

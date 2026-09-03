@@ -297,6 +297,87 @@ def token_refresh_message(account_no: str, live_submit: bool, ok: bool) -> str:
     )
 
 
+def heartbeat_message(
+    account_no: str,
+    live_submit: bool,
+    state: dict[str, Any] | None,
+    proxy_url: str | None,
+    proxy_check: dict[str, Any] | None,
+    pid: int | None = None,
+    uptime_seconds: float | None = None,
+) -> str:
+    """Daily "I'm alive" notification with current bot status snapshot.
+
+    Includes:
+      - Bot uptime (process start time)
+      - Last successful cycle dates (token, submit, EOD, CA sync, market holidays)
+      - Proxy configuration and (optional) last connectivity check
+      - Account + mode
+    """
+    lines = ["💓 Vietnam Algo: DAILY HEARTBEAT"]
+
+    # uptime
+    if pid is not None:
+        lines.append(f"pid: {pid}")
+    if uptime_seconds is not None:
+        hours, rem = divmod(int(uptime_seconds), 3600)
+        minutes, secs = divmod(rem, 60)
+        days, hours = divmod(hours, 24)
+        if days > 0:
+            uptime_str = f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            uptime_str = f"{hours}h {minutes}m"
+        else:
+            uptime_str = f"{minutes}m {secs}s"
+        lines.append(f"uptime: {uptime_str}")
+
+    lines.append(f"account: {account_no}")
+    lines.append(f"mode: {'live' if live_submit else 'dry-run'}")
+
+    # last cycle dates
+    if isinstance(state, dict):
+        for key, label in [
+            ("marketHolidaySyncDate", "market-holidays"),
+            ("tokenDate", "trading-token"),
+            ("orderSubmitDate", "submit"),
+            ("eodDate", "EOD"),
+            ("corporateActionDate", "CA-sync"),
+            ("lastHeartbeatDate", "heartbeat"),
+        ]:
+            lines.append(f"last-{label}: {state.get(key) or '(none yet)'}")
+
+    # proxy
+    if proxy_url:
+        # strip credentials before displaying
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(proxy_url)
+            host_part = parsed.hostname or "?"
+            port_part = f":{parsed.port}" if parsed.port else ""
+            proxy_label = f"{parsed.scheme}://{host_part}{port_part}"
+        except Exception:
+            proxy_label = "(unparseable)"
+        proxy_line = f"proxy: {proxy_label}"
+        if proxy_check:
+            ok = proxy_check.get("ok")
+            err = proxy_check.get("error")
+            ms = proxy_check.get("latency_ms")
+            extra = []
+            if ok is True:
+                extra.append("ok")
+            elif ok is False:
+                extra.append("FAIL")
+            if err:
+                extra.append(f"err={str(err)[:60]}")
+            if ms is not None:
+                extra.append(f"{ms:.0f}ms")
+            if extra:
+                proxy_line += " (" + ", ".join(extra) + ")"
+        lines.append(proxy_line)
+
+    return "\n".join(lines)
+
+
 def eod_summary_message(result: dict[str, Any]) -> str:
     metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
     orders_info = result.get("latestOrdersCsv")

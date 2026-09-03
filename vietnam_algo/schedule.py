@@ -14,6 +14,7 @@ class TradingSchedule:
     orderSubmitTime: time = time(9, 16)
     eodUpdateTime: time = time(15, 15)
     corporateActionSyncTime: time = time(15, 10)
+    heartbeatTime: time = time(10, 30)
     morningStart: time = time(9, 15)
     morningEnd: time = time(11, 30)
     afternoonStart: time = time(13, 0)
@@ -72,3 +73,14 @@ def should_run_eod(moment: datetime, done_for_date: str | None, schedule: Tradin
 def should_sync_corporate_actions(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
     today = local_date(moment)
     return is_trading_day(moment, holidays) and done_for_date != today and local_time(moment) >= schedule.corporateActionSyncTime
+
+
+def should_send_heartbeat(moment: datetime, last_date: str | None, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
+    """Send a daily heartbeat when we cross the configured heartbeatTime and
+    haven't sent one today yet.
+
+    Note: heartbeat fires even on non-trading days so we always get a "still
+    alive" signal regardless of the market calendar.
+    """
+    today = local_date(moment)
+    return today != last_date and local_time(moment) >= schedule.heartbeatTime
