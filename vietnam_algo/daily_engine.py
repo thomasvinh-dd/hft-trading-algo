@@ -19,7 +19,7 @@ from .config import StrategyConfig
 from .data import DEFAULT_DATA_DIR, load_saved_symbols, sync_prices, sync_symbols, utc_now, write_json
 from .dnse_client import DnseClient
 from .market_calendar import live_trading_dates
-from .notifier import daily_generation_message, notify, submit_message
+from .notifier import daily_generation_message, notify, submit_message, portfolio_snapshot_message
 from .order_ledger import (
     LedgerOrder,
     dnse_order_id,
@@ -272,8 +272,19 @@ def run_daily_once(
 ) -> dict[str, object]:
     update_dataset(engine_config)
     generated = generate_live_orders(engine_config, strategy_config, trade_date=trade_date)
+    # Always fetch portfolio snapshot (works in both dry-run and live mode)
+    portfolio_snapshot: dict[str, object] = {}
+    if client is not None and account_no:
+        try:
+            from .portfolio import build_portfolio_snapshot
+            portfolio_snapshot = build_portfolio_snapshot(client, account_no)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            portfolio_snapshot = {"errors": [f"build_portfolio_snapshot: {exc!r}"]}
     if not submit:
-        return {"status": "generated", **generated}
+        result = {"status": "generated", **generated}
+        if portfolio_snapshot:
+            result["portfolio"] = portfolio_snapshot
+        return result
     if not account_no or not loan_package_id or not trading_token or client is None:
         raise RuntimeError("account_no, loan_package_id, trading_token, and DNSE client are required for submit")
     actions_path = corporate_action_path(engine_config.dataDir)
@@ -431,6 +442,7 @@ def run_daily_once(
         "corporateActionDecisions": [decision.__dict__ for decision in decisions],
         "sellableDecisions": sellable_decisions,
         "pricingDecisions": pricing_decisions,
+        "portfolio": portfolio_snapshot,
         **result_payload_extras,
     }
     # Failure detection: surface order rejections / unknown statuses to Telegram.
@@ -447,5 +459,8 @@ def run_daily_once(
     )
     if ca_exit:
         notify(ca_exit)
+    # Portfolio snapshot: cash, holdings, P&L
+    if portfolio_snapshot:
+        notify(portfolio_snapshot_message(portfolio_snapshot))
     notify(submit_message(result_payload))
     return result_payload

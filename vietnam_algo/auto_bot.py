@@ -164,6 +164,21 @@ def run_auto_bot(
             print(result)
             if isinstance(result, dict):
                 notify(eod_summary_message(result))
+                # Pull live portfolio snapshot alongside EOD summary (best-effort)
+                try:
+                    from .portfolio import build_portfolio_snapshot
+                    from .notifier import portfolio_snapshot_message
+                    snap = build_portfolio_snapshot(client, account_no)
+                    notify(portfolio_snapshot_message(snap))
+                except Exception as exc:
+                    notify(
+                        "\n".join(
+                            [
+                                "⚠️ Vietnam Algo: portfolio snapshot FAILED at EOD",
+                                f"err: {str(exc)[:200]}",
+                            ]
+                        )
+                    )
             state.eodDate = today
             save_state(state, engine_config.dataDir)
 

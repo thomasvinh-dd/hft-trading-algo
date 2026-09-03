@@ -311,3 +311,77 @@ def eod_summary_message(result: dict[str, Any]) -> str:
             f"ordersFile: {orders_info}",
         ]
     )
+
+
+def portfolio_snapshot_message(snap: dict[str, Any], top_n: int = 8) -> str:
+    """Format a Telegram message for a live DNSE portfolio snapshot.
+
+    Best-effort: never raises. Shows:
+      - Account info, cash, withdrawable
+      - Top N positions with live market value + unrealized P&L
+      - Portfolio totals
+      - Endpoints that failed (if any)
+    """
+    if not isinstance(snap, dict):
+        return "❌ Vietnam Algo: portfolio snapshot unavailable"
+
+    bal = snap.get("balance", {}) or {}
+    totals = snap.get("totals", {}) or {}
+    positions = snap.get("positions", []) or []
+    errors = snap.get("errors", []) or []
+
+    name = snap.get("name") or "?"
+    account = snap.get("account") or "?"
+
+    lines = [
+        "💼 Vietnam Algo: PORTFOLIO SNAPSHOT",
+        f"account: {account} ({name})",
+        f"fetchedAt: {snap.get('fetchedAt', '?')}",
+        "",
+        "💰 CASH",
+        f"  totalCash:        {format_money(bal.get('totalCash'))} VND",
+        f"  availableCash:    {format_money(bal.get('availableCash'))} VND",
+        f"  withdrawableCash: {format_money(bal.get('withdrawableCash'))} VND",
+        f"  secureAmount:     {format_money(bal.get('secureAmount'))} VND",
+        f"  orderSecured:     {format_money(bal.get('orderSecured'))} VND",
+        f"  totalDebt:        {format_money(bal.get('totalDebt'))} VND",
+        "",
+        f"📈 POSITIONS ({totals.get('positionCount', 0)})",
+    ]
+
+    if positions:
+        for p in positions[:top_n]:
+            sym = p.get("symbol", "?")
+            qty = p.get("quantity", 0)
+            avg = p.get("avgPrice")
+            mkt = p.get("marketPrice")
+            mv = p.get("marketValue", 0)
+            upnl = p.get("unrealizedPnl", 0)
+            upct = p.get("unrealizedPnlPct", 0)
+            avg_str = f"{avg:>10.1f}" if avg else "       N/A"
+            mkt_str = f"{mkt:>10.1f}" if mkt else "       N/A"
+            lines.append(
+                f"  {sym:<6} qty={qty:>5}  avg={avg_str}  mkt={mkt_str}\n"
+                f"          value={format_money(mv)} VND  "
+                f"PnL={format_money(upnl)} ({upct:+.2f}%)"
+            )
+        if len(positions) > top_n:
+            lines.append(f"  ... and {len(positions) - top_n} more positions")
+    else:
+        lines.append("  (no positions)")
+
+    lines += [
+        "",
+        "💵 TOTALS",
+        f"  stockValue:        {format_money(totals.get('stockValue'))} VND",
+        f"  portfolioValue:    {format_money(totals.get('portfolioValue'))} VND  "
+        f"(cash + stocks)",
+        f"  unrealizedPnL:     {format_money(totals.get('totalUnrealizedPnl'))} VND  "
+        f"({totals.get('totalUnrealizedPnlPct', 0):+.2f}%)",
+    ]
+
+    if errors:
+        lines.append("")
+        lines.append(f"⚠️ endpoint errors: {', '.join(errors)}")
+
+    return "\n".join(lines)
