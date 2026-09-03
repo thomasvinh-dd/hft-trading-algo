@@ -119,12 +119,27 @@ def run_auto_bot(
             notify(f"Vietnam Algo: syncing corporate actions\ntime: {now.isoformat()}")
             token = os.environ.get("VIETSTOCK_REQUEST_TOKEN", "")
             cookie = os.environ.get("VIETSTOCK_COOKIE", "")
-            result = sync_corporate_actions_incremental(
-                engine_config.dataDir,
-                request_verification_token=token,
+            try:
+                result = sync_corporate_actions_incremental(
+                    engine_config.dataDir,
+                    request_verification_token=token,
                 cookie=cookie,
                 to_date=today,
-            )
+                )
+            except Exception as exc:
+                notify(
+                    "\n".join(
+                        [
+                            "⚠️ Vietnam Algo: corporate-action sync FAILED",
+                            f"err: {str(exc)[:300]}",
+                            "continuing without updated CA data",
+                        ]
+                    )
+                )
+                print(f"[{now.isoformat()}] CA sync failed: {exc}")
+                state.corporateActionDate = today  # don't retry on same day
+                save_state(state, engine_config.dataDir)
+                continue
             print(result)
             notify(
                 "\n".join(
