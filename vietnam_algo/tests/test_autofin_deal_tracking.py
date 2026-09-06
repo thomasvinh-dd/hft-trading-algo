@@ -5,7 +5,13 @@ import sys
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
 import vietnam_algo.strategies_impl.autofin_signal as mod
-from vietnam_algo.strategies_impl.autofin_signal import _deal_id, _plan_close_orders, _plan_orders_for_new_positions
+from vietnam_algo.strategies_impl.autofin_signal import (
+    _deal_id,
+    _parse_partial_close,
+    _plan_close_orders,
+    _plan_orders_for_new_positions,
+    _plan_partial_close_orders,
+)
 
 
 def _make_signal(
@@ -99,3 +105,153 @@ def test_deal_id_extraction_handles_underscore_or_code():
     assert _deal_id(raw1) == "12345"
     assert _deal_id(raw2) == "88888"
     assert _deal_id(raw3) == ""
+
+
+# ── Partial-close (lastRecomment) ──────────────────────────────────────────
+
+
+def test_parse_partial_close_take_profit_lap_with_price():
+    a = _parse_partial_close("💰 Chốt lãi lần 1 mức giá 26,900")
+    assert a.action == "take_profit_lap"
+    assert a.lap == 1
+    assert a.price == 26900.0
+
+
+def test_parse_partial_close_take_profit_lap_no_price():
+    a = _parse_partial_close("💰 Chốt lãi lần 2 mức giá 17,100")
+    assert a.action == "take_profit_lap"
+    assert a.lap == 2
+    assert a.price == 17100.0
+
+
+def test_parse_partial_close_reduce_lap():
+    a = _parse_partial_close("⚠️ Hạ tỷ trọng lần 2")
+    assert a.action == "reduce_lap"
+    assert a.lap == 2
+    assert a.price == 0.0
+
+
+def test_parse_partial_close_capital_protect():
+    a = _parse_partial_close("🛡️ Chốt lãi 28.57 % bảo toàn vốn")
+    assert a.action == "capital_protect"
+    assert abs(a.percent - 28.57) < 1e-6
+
+
+def test_parse_partial_close_full_close():
+    a = _parse_partial_close("Đóng DEAL chạm điểm chặn lãi (Lãi: 230.32 %)")
+    assert a.action == "full_close"
+
+
+def test_parse_partial_close_unknown():
+    a = _parse_partial_close("Khuyến nghị đầu tư")
+    assert a.action == "unknown"
+
+
+def test_partial_close_bootstrap_records_only_no_orders():
+    """First time seeing the deal → record nP, do NOT issue partial close."""
+    our_deals = {"111": {"symbol": "HCM", "_our_qty": 300}}
+    autofin_holding = [{
+        "_id": 111, "symbol": "HCM", "numberOfProfit": 1,
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 26,900",
+        "tP_F": 26.9, "sL_F": 22.7,
+    }]
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert rows == []
+    assert our_deals["111"]["_last_numberOfProfit"] == 1
+    assert our_deals["111"]["_last_recomment"].startswith("💰")
+
+
+def test_partial_close_emits_sell_on_numberOfProfit_bump():
+    """nP went 0→1 → emit SELL 1/3 at recomment price."""
+    our_deals = {
+        "111": {"symbol": "HCM", "_our_qty": 300, "_last_numberOfProfit": 0},
+    }
+    autofin_holding = [{
+        "_id": 111, "symbol": "HCM", "numberOfProfit": 1,
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 26,900",
+        "tP_F": 26.9, "sL_F": 22.7,
+    }]
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["symbol"] == "HCM"
+    assert r["side"] == "NS"
+    assert r["price"] == 26900  # from recomment
+    assert r["quantity"] == 100  # 300 // 3
+    assert "take_profit_lap" in r["reason"]
+    assert "deal#111" in r["reason"]
+    assert our_deals["111"]["_last_numberOfProfit"] == 1
+    assert our_deals["111"]["_our_qty"] == 200  # 300 - 100
+
+
+def test_partial_close_uses_tpF_when_no_price_in_recomment():
+    """'Hạ tỷ trọng' has no price → fall back to tP_F from autofin."""
+    our_deals = {
+        "222": {"symbol": "POW", "_our_qty": 300, "_last_numberOfProfit": 0},
+    }
+    autofin_holding = [{
+        "_id": 222, "symbol": "POW", "numberOfProfit": 1,
+        "lastRecomment": "⚠️ Hạ tỷ trọng lần 2",
+        "tP_F": 15.1, "sL_F": 12.7,  # in thousands
+    }]
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["price"] == 15100  # tP_F * 1000
+
+
+def test_partial_close_capital_protect_uses_pct():
+    """'bảo toàn vốn 28.57%' → sell 28.57% of current."""
+    our_deals = {
+        "333": {"symbol": "HSL", "_our_qty": 700, "_last_numberOfProfit": 3},
+    }
+    autofin_holding = [{
+        "_id": 333, "symbol": "HSL", "numberOfProfit": 4,
+        "lastRecomment": "🛡️ Chốt lãi 28.57 % bảo toàn vốn",
+        "tP_F": 0,
+    }]
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert len(rows) == 1
+    r = rows[0]
+    # 700 * 0.2857 = 200.0 (within rounding)
+    assert r["quantity"] in (200, 100)  # rounded to lots of 100
+    assert r["price"] == 0  # no price, no tP_F → market
+    assert "capital_protect" in r["reason"]
+
+
+def test_partial_close_skips_when_numberOfProfit_unchanged():
+    our_deals = {
+        "444": {"symbol": "VPI", "_our_qty": 300, "_last_numberOfProfit": 1},
+    }
+    autofin_holding = [{
+        "_id": 444, "symbol": "VPI", "numberOfProfit": 1,  # unchanged
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 64,900",
+        "tP_F": 64.9,
+    }]
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert rows == []
+
+
+def test_partial_close_skips_deal_autofin_no_longer_holds():
+    our_deals = {
+        "555": {"symbol": "L40", "_our_qty": 100, "_last_numberOfProfit": 0},
+    }
+    # autofin has fully closed — L40 not in holding list
+    autofin_holding = []
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert rows == []  # full close handled by _plan_close_orders
+
+
+def test_partial_close_sub_lot_qty_skipped():
+    """If delta < 1 board lot, skip the partial close."""
+    our_deals = {
+        "666": {"symbol": "X", "_our_qty": 200, "_last_numberOfProfit": 0},
+    }
+    autofin_holding = [{
+        "_id": 666, "symbol": "X", "numberOfProfit": 1,
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 10,000",
+        "tP_F": 10.0,
+    }]
+    # 200 // 3 = 66, rounded to 100 lots = 0 → skipped
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert rows == []

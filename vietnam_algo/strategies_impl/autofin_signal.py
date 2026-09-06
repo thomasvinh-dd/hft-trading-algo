@@ -1,11 +1,13 @@
 """Autofin signal strategy — mirror autofin.vn signals to DNSE orders via deal-ID tracking.
 
-Per user spec (2026-09-04):
+Per user spec (2026-09-04 / 2026-09-06):
   - track our own positions using deal_id (autofin's unique deal identifier)
   - the order may not be listed in /signal-static-suggest anymore once
     taken; use /signal-static-holding as the source of truth
   - use /signal-static-risk for risk-flagged positions
   - use /closing-signals to detect exits and SELL to mirror autofin
+  - mirror partial close signals (`lastRecomment`) by issuing a partial SELL
+    when `numberOfProfit` increases since the previous cycle
 
 Per cycle:
   1. Login to autofin.vn (cached, refreshes ~weekly)
@@ -16,8 +18,10 @@ Per cycle:
   6. Compute plan:
      a. for each deal in holding NOT in our_state → BUY + TP + SL
         (with target size = NAV * rateForNav)
-     b. for each deal in our_state NOT in holding → SELL (autofin exited)
-     c. for each deal in risk      → notify telegram with risk signal
+     b. for each deal we hold that autofin still holds AND whose
+        numberOfProfit has increased → partial SELL (mirror trim / TP step)
+     c. for each deal in our_state NOT in holding → SELL (autofin exited)
+     d. for each deal in risk      → notify telegram with risk signal
   7. Write orders + state diff
 """
 from __future__ import annotations
@@ -25,6 +29,8 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -188,6 +194,144 @@ def _plan_close_orders(
     return rows
 
 
+@dataclass(frozen=True)
+class PartialCloseAction:
+    """Parsed partial-close signal from autofin's lastRecomment text."""
+
+    action: str  # "take_profit_lap" | "reduce_lap" | "capital_protect" | "full_close" | "unknown"
+    lap: int = 0          # 1, 2, 3 — for lap variants
+    price: float = 0.0    # VND; explicit price (e.g. 26900) for take_profit_lap
+    percent: float = 0.0  # 0..1; for capital_protect (e.g. 0.2857 for 28.57%)
+
+
+_PARTIAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"Chốt lãi lần\s*(\d+)(?:\s*mức giá\s*([\d,\.]+))?", re.IGNORECASE), "take_profit_lap"),
+    (re.compile(r"Hạ tỷ trọng lần\s*(\d+)", re.IGNORECASE), "reduce_lap"),
+    (re.compile(r"Chốt lãi\s*([\d,\.]+)\s*%\s*bảo toàn vốn", re.IGNORECASE), "capital_protect"),
+    (re.compile(r"Đóng DEAL", re.IGNORECASE), "full_close"),
+)
+
+
+def _parse_vnd(s: str) -> float:
+    """Parse '26,900' → 26900.0 (Vietnamese thousands separator).
+
+    Strips dots and commas to recover the raw number; e.g. "1,234,500"
+    becomes 1234500.0.
+    """
+    return float(s.replace(".", "").replace(",", "").strip() or "0")
+
+
+def _parse_percent(s: str) -> float:
+    """Parse '28.57' → 28.57 (Vietnamese percent uses '.' as decimal)."""
+    return float(s.replace(",", "").strip() or "0")
+
+
+def _parse_partial_close(recomment: str) -> PartialCloseAction:
+    """Parse the Vietnamese `lastRecomment` text into a typed action.
+
+    Returns ``PartialCloseAction("unknown")`` when the text does not match
+    any known partial-close pattern.
+    """
+    rec = (recomment or "").strip()
+    for pat, action in _PARTIAL_PATTERNS:
+        m = pat.search(rec)
+        if not m:
+            continue
+        if action == "take_profit_lap":
+            lap = int(m.group(1))
+            price = _parse_vnd(m.group(2)) if m.group(2) else 0.0
+            return PartialCloseAction(action=action, lap=lap, price=price)
+        if action == "reduce_lap":
+            return PartialCloseAction(action=action, lap=int(m.group(1)))
+        if action == "capital_protect":
+            pct = _parse_percent(m.group(1))
+            return PartialCloseAction(action=action, percent=pct)
+        if action == "full_close":
+            return PartialCloseAction(action=action)
+    return PartialCloseAction(action="unknown")
+
+
+def _plan_partial_close_orders(
+    our_held_deals: dict[str, dict[str, Any]],
+    autofin_holding: list[dict[str, Any]],
+    board_lot: int = DEFAULT_BOARD_LOT,
+) -> list[dict[str, Any]]:
+    """Emit partial SELL orders for deals we hold that autofin still holds
+    but whose ``numberOfProfit`` has increased since the previous cycle.
+
+    Per user spec (2026-09-06):
+      - Sizing: 1/3 of current qty per ``lần`` step (take_profit_lap /
+        reduce_lap), X% of current qty for ``bảo toàn vốn X%`` events
+      - Price: explicit price from recomment → else ``tP_F`` → else market
+      - Bootstrap: on first cycle (no ``_last_numberOfProfit`` in state),
+        record the current value but do NOT issue any partial close
+
+    Mutates the deal dicts in-place to update ``_last_numberOfProfit`` and
+    ``_our_qty`` so the next cycle plans from the correct baseline.
+    """
+    autofin_by_id: dict[str, dict[str, Any]] = {}
+    for d in autofin_holding:
+        did = _deal_id(d)
+        if did:
+            autofin_by_id[did] = d
+
+    rows: list[dict[str, Any]] = []
+    for did, sig in our_held_deals.items():
+        if did not in autofin_by_id:
+            continue
+        h = autofin_by_id[did]
+        rec = str(h.get("lastRecomment") or "")
+        action = _parse_partial_close(rec)
+        if action.action in ("unknown", "full_close"):
+            continue
+
+        cur_nP = int(h.get("numberOfProfit") or 0)
+        last_nP = int(sig.get("_last_numberOfProfit", -1))
+        if last_nP < 0:
+            sig["_last_numberOfProfit"] = cur_nP
+            sig["_last_recomment"] = rec
+            continue
+        if cur_nP <= last_nP:
+            continue
+
+        our_qty = int(sig.get("_our_qty", 0))
+        if our_qty <= 0:
+            continue
+
+        if action.action in ("take_profit_lap", "reduce_lap"):
+            delta = our_qty // 3
+        elif action.action == "capital_protect":
+            # action.percent is in % (e.g. 28.57) → convert to fraction
+            delta = int(our_qty * action.percent / 100)
+        else:
+            continue
+
+        delta = _round_to_lots(delta, board_lot)
+        if delta < board_lot:
+            continue
+
+        price = action.price if action.price > 0 else 0
+        if price <= 0:
+            tp_f = float(h.get("tP_F") or 0) * 1000
+            price = int(round(tp_f)) if tp_f > 0 else 0
+
+        rows.append({
+            "symbol": sig.get("symbol", "?"),
+            "side": "NS",
+            "price": price,
+            "quantity": delta,
+            "reason": (
+                f"autofin_partial:deal#{did}:{action.action}:"
+                f"lap{action.lap}:pct{int(round(action.percent * 100))}:{rec[:60]}"
+            ),
+        })
+        sig["_last_numberOfProfit"] = cur_nP
+        sig["_last_recomment"] = rec
+        sig["_our_qty"] = max(0, our_qty - delta)
+
+    return rows
+
+
 class AutofinSignalAdapter(StrategyAdapter):
     """Mirror autofin.vn signals to DNSE orders, tracked by autofin deal_id."""
 
@@ -304,7 +448,12 @@ class AutofinSignalAdapter(StrategyAdapter):
         # 7. new entries (BUY + TP + SL)
         new_orders = _plan_orders_for_new_positions(selected, nav, positions)
 
-        # 8. close positions autofin no longer holds
+        # 8. partial close (mirror autofin's trim / take-profit step)
+        # Only for deals we actually hold; reads + mutates self._our_deals
+        # to update _last_numberOfProfit and decrement _our_qty.
+        partial_orders = _plan_partial_close_orders(self._our_deals, holding)
+
+        # 9. close positions autofin no longer holds
         # Filter out deals we never actually opened (NAV=0 caused zero orders)
         our_real_deals = {
             did: sig for did, sig in self._our_deals.items()
@@ -313,7 +462,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         close_orders = _plan_close_orders(our_real_deals, holding)
         # merge — close orders first so any new BUY on same symbol replaces
 
-        # 9. update our tracked deals
+        # 10. update our tracked deals
         # for each new selected deal that we now hold, add to our_deals
         for s in selected:
             did = s.raw.get("_id")
@@ -333,8 +482,8 @@ class AutofinSignalAdapter(StrategyAdapter):
                     self._our_deals.pop(did, None)
                     break
 
-        # 10. assemble final order list (close first, then new)
-        all_orders = close_orders + new_orders
+        # 11. assemble final order list (close → partial → new)
+        all_orders = close_orders + partial_orders + new_orders
 
         # 11. write outputs
         today = trade_date or datetime.now(timezone.utc).date().isoformat()
@@ -374,6 +523,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             "dealsTracked": len(self._our_deals),
             "newOrders": len(new_orders),
             "closeOrders": len(close_orders),
+            "partialOrders": len(partial_orders),
             "items": [{
                 "orderId": i + 1,
                 "date": today,
@@ -396,7 +546,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             f"NAV: {nav:,.0f} VND",
             f"autofin holding: {len(holding)}  risk: {len(risk)}  closing: {len(closing)}",
             f"signals fetched: {len(signals)}  deals tracked: {len(self._our_deals)}",
-            f"new entries: {len(new_orders)}  closes: {len(close_orders)}",
+            f"new: {len(new_orders)}  partial: {len(partial_orders)}  closes: {len(close_orders)}",
             f"ordersFile: {csv_path}",
         ]
         if risk_alerts:
@@ -423,8 +573,10 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "deals_tracked": len(self._our_deals),
                 "new_count": len(new_orders),
                 "close_count": len(close_orders),
+                "partial_count": len(partial_orders),
                 "new_symbols": [r["symbol"] for r in new_orders],
                 "close_symbols": [r["symbol"] for r in close_orders],
+                "partial_symbols": [r["symbol"] for r in partial_orders],
             },
         }
 
@@ -438,8 +590,9 @@ class AutofinSignalAdapter(StrategyAdapter):
                 f"signals fetched: {sig.get('fetched', 0)}",
                 f"deals tracked: {sig.get('deals_tracked', 0)}",
                 f"orderCount: {result.get('count')}",
-                f"new entries:  {sig.get('new_count', 0)} → {', '.join(sig.get('new_symbols', []) or []) or '(none)'}",
-                f"closes:        {sig.get('close_count', 0)} → {', '.join(sig.get('close_symbols', []) or []) or '(none)'}",
+                f"new entries:    {sig.get('new_count', 0)} → {', '.join(sig.get('new_symbols', []) or []) or '(none)'}",
+                f"partial closes: {sig.get('partial_count', 0)} → {', '.join(sig.get('partial_symbols', []) or []) or '(none)'}",
+                f"full closes:    {sig.get('close_count', 0)} → {', '.join(sig.get('close_symbols', []) or []) or '(none)'}",
                 f"ordersFile: {result.get('latestOrdersCsv')}",
             ]
         )
