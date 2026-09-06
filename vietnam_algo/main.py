@@ -191,6 +191,46 @@ def build_parser() -> argparse.ArgumentParser:
     hybrid_parser = subparsers.add_parser("backtest-hybrid", help="backtest hybrid momentum, breakout, and sector strategy")
     add_backtest_arguments(hybrid_parser)
 
+    autofin_bt = subparsers.add_parser(
+        "backtest-autofin-signal",
+        help="backtest autofin.vn signal mirroring using /closing-signals",
+    )
+    autofin_bt.add_argument(
+        "--initial-nav",
+        type=float,
+        default=1_000_000_000,
+        help="starting NAV in VND (default 1B)",
+    )
+    autofin_bt.add_argument(
+        "--fee-per-share",
+        type=float,
+        default=0.0,
+        help="flat fee per share, applied on BUY+SELL (default 0)",
+    )
+    autofin_bt.add_argument(
+        "--slippage-pct",
+        type=float,
+        default=0.0,
+        help="round-trip slippage as fraction (e.g. 0.001 = 0.1%%)",
+    )
+    autofin_bt.add_argument(
+        "--max-pages",
+        type=int,
+        default=20,
+        help="pagination cap on /closing-signals (default 20 → 1000 deals)",
+    )
+    autofin_bt.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("vietnam_algo/data/backtests"),
+        help="where to write backtest JSON+CSV (default data/backtests/)",
+    )
+    autofin_bt.add_argument(
+        "--notify",
+        action="store_true",
+        help="send the summary to Telegram",
+    )
+
     dnse_accounts = subparsers.add_parser("dnse-accounts", help="list DNSE trading accounts")
     add_dnse_auth_arguments(dnse_accounts)
 
@@ -994,6 +1034,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Saved order list to {orders_path}")
         for key, value in result.metrics.items():
             print(f"{key}: {value}")
+        return 0
+
+    if args.command == "backtest-autofin-signal":
+        from .backtest_autofin import (
+            format_backtest_report,
+            run_autofin_backtest,
+            write_backtest_outputs,
+        )
+        from .notifier import notify
+        result = run_autofin_backtest(
+            initial_nav=args.initial_nav,
+            fee_per_share=args.fee_per_share,
+            slippage_pct=args.slippage_pct,
+            max_pages=args.max_pages,
+        )
+        json_path, csv_path = write_backtest_outputs(result, args.out_dir)
+        report = format_backtest_report(result)
+        print(report)
+        print()
+        print(f"Saved backtest JSON to {json_path}")
+        print(f"Saved per-trade CSV to {csv_path}")
+        if args.notify:
+            notify(report)
         return 0
 
     if args.command == "dnse-accounts":
