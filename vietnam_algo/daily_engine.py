@@ -80,15 +80,21 @@ def latest_order_date(orders_csv: Path) -> str | None:
     return max(str(row["date"]) for row in rows if row.get("date"))
 
 
-def export_orders_for_date(orders_csv: Path, output_dir: Path, trade_date: str | None = None) -> tuple[Path, Path, str | None, int]:
+def export_orders_for_date(
+    orders_csv: Path,
+    output_dir: Path,
+    trade_date: str | None = None,
+    csv_filename: str = "latest_orders.csv",
+    json_filename: str = "latest_orders.json",
+) -> tuple[Path, Path, str | None, int]:
     with orders_csv.open("r", encoding="utf-8", newline="") as file:
         rows = list(csv.DictReader(file))
         fieldnames = list(rows[0].keys()) if rows else []
     selected_date = trade_date or latest_order_date(orders_csv)
     selected = [row for row in rows if selected_date and row.get("date") == selected_date]
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "latest_orders.csv"
-    json_path = output_dir / "latest_orders.json"
+    csv_path = output_dir / csv_filename
+    json_path = output_dir / json_filename
     with csv_path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
@@ -122,15 +128,37 @@ def update_dataset(config: EngineConfig) -> None:
         )
 
 
-def generate_live_orders(config: EngineConfig, strategy_config: StrategyConfig, trade_date: str | None = None) -> dict[str, object]:
+def generate_live_orders(
+    config: EngineConfig,
+    strategy_config: StrategyConfig,
+    trade_date: str | None = None,
+    strategy_name: str = "",
+) -> dict[str, object]:
+    """Run the strategy's full backtest and write per-strategy order files.
+
+    ``strategy_name`` controls the namespacing of:
+      - data/live/latest_orders.{name}.csv  (the live order CSV)
+      - data/live/latest_orders.{name}.json
+      - data/backtests/{name}_backtest.json
+
+    When empty, falls back to the legacy non-namespaced paths
+    (latest_orders.csv) for backward compatibility.
+    """
+    from .strategy_registry import get_strategy
     save_liquid_universe(build_liquid_universe(config.dataDir), config.dataDir)
+    adapter = get_strategy(config.strategy) if strategy_name else None
     result = strategy_runner(config.strategy)(config.dataDir, "liquid_stocks", strategy_config)
     result_path = save_backtest_result(result, config.dataDir)
     orders_path = save_order_list(result, config.dataDir)
+
+    csv_name = (adapter.orders_csv_filename if adapter else "latest_orders.csv")
+    json_name = (adapter.orders_json_filename if adapter else "latest_orders.json")
     csv_path, json_path, selected_date, count = export_orders_for_date(
         orders_path,
         config.dataDir / config.liveDirName,
         trade_date=trade_date,
+        csv_filename=csv_name,
+        json_filename=json_name,
     )
     result_payload = {
         "result": str(result_path),
@@ -140,6 +168,7 @@ def generate_live_orders(config: EngineConfig, strategy_config: StrategyConfig, 
         "tradeDate": selected_date,
         "count": count,
         "metrics": result.metrics,
+        "strategy": config.strategy,
     }
     notify(daily_generation_message(result_payload))
     return result_payload

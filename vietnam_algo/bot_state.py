@@ -18,12 +18,19 @@ class AutoBotState:
     tradingToken: str = ""
 
 
-def state_path(data_dir: Path = DEFAULT_DATA_DIR) -> Path:
-    return data_dir / "live" / "auto_bot_state.json"
+def state_path(data_dir: Path = DEFAULT_DATA_DIR, strategy_name: str = "") -> Path:
+    """Path to the auto-bot state file.
+
+    When ``strategy_name`` is non-empty, the file is namespaced
+    (e.g. ``auto_bot_state.momentum.json``) so multiple strategies can
+    run side-by-side without clobbering each other.
+    """
+    name = f"auto_bot_state.{strategy_name}.json" if strategy_name else "auto_bot_state.json"
+    return data_dir / "live" / name
 
 
-def load_state(data_dir: Path = DEFAULT_DATA_DIR) -> AutoBotState:
-    path = state_path(data_dir)
+def load_state(data_dir: Path = DEFAULT_DATA_DIR, strategy_name: str = "") -> AutoBotState:
+    path = state_path(data_dir, strategy_name)
     if not path.exists():
         return AutoBotState()
     payload = read_json(path)
@@ -39,7 +46,7 @@ def load_state(data_dir: Path = DEFAULT_DATA_DIR) -> AutoBotState:
     )
 
 
-def save_state(state: AutoBotState, data_dir: Path = DEFAULT_DATA_DIR) -> Path:
-    path = state_path(data_dir)
+def save_state(state: AutoBotState, data_dir: Path = DEFAULT_DATA_DIR, strategy_name: str = "") -> Path:
+    path = state_path(data_dir, strategy_name)
     write_json(path, asdict(state))
     return path

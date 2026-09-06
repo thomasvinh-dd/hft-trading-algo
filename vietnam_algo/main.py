@@ -370,6 +370,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override heartbeat time HH:MM (default 10:30 ICT)",
     )
+    # --strategy is already added by add_daily_engine_arguments; we accept the
+    # registered-strategy names too. Don't redeclare it here.
+
+    # New: list available strategies
+    subparsers.add_parser(
+        "list-strategies",
+        help="list all registered trading strategies",
+    )
+
     return parser
 
 
@@ -548,6 +557,13 @@ def engine_config_from_args(args: argparse.Namespace) -> EngineConfig:
         priceSleepSeconds=args.price_sleep_seconds,
         maxSymbols=args.max_symbols,
     )
+
+
+def _with_strategy(args: argparse.Namespace, strategy_name: str) -> EngineConfig:
+    """Build EngineConfig with the CLI --strategy override applied."""
+    from dataclasses import replace
+    cfg = engine_config_from_args(args)
+    return replace(cfg, strategy=strategy_name)
 
 
 def add_backtest_arguments(backtest_parser: argparse.ArgumentParser) -> None:
@@ -1351,14 +1367,20 @@ def main(argv: list[str] | None = None) -> int:
             print("Running in dry-run mode. Add --live-submit only when ready for real DNSE orders.")
         schedule = TradingSchedule()
         if getattr(args, "heartbeat_time", None):
-            from datetime import datetime as _dt, time as _t
+            from datetime import datetime as _dt
             try:
                 parsed = _dt.strptime(args.heartbeat_time, "%H:%M").time()
                 schedule = TradingSchedule(heartbeatTime=parsed)
             except ValueError:
                 print(f"--heartbeat-time must be HH:MM, got {args.heartbeat_time!r}; using default")
+        # Resolve strategy: CLI > existing config.strategy
+        strategy_name = getattr(args, "strategy", None) or args.strategy
+        # If user explicitly overrode, persist into the config
+        if getattr(args, "strategy", None):
+            cfg = engine_config_from_args(args)
+            object.__setattr__(cfg, "strategy", strategy_name)
         run_auto_bot(
-            engine_config_from_args(args),
+            engine_config_from_args(args) if not getattr(args, "strategy", None) else _with_strategy(args, strategy_name),
             strategy_config_from_args(args),
             dnse_client_from_args(args),
             args.account_no,
@@ -1367,7 +1389,16 @@ def main(argv: list[str] | None = None) -> int:
             once=args.once,
             sleep_seconds=args.sleep_seconds,
             schedule=schedule,
+            strategy_name=strategy_name,
         )
+        return 0
+
+    if args.command == "list-strategies":
+        from .strategy_registry import list_strategies
+        for entry in list_strategies():
+            print(f"  {entry['name']:<25}  {entry['description']}")
+            if entry["env"]:
+                print(f"    env: vietnam_algo/env/{entry['env']}")
         return 0
 
     return 2

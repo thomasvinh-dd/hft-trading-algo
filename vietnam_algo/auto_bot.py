@@ -17,6 +17,7 @@ from .schedule import (
     TradingSchedule, local_date, should_run_eod, should_submit_orders,
     should_sync_corporate_actions, should_send_heartbeat, vietnam_now,
 )
+from .strategy_registry import get_strategy
 from .token_store import ensure_fresh_trading_token
 
 
@@ -30,19 +31,27 @@ def run_auto_bot(
     once: bool = False,
     sleep_seconds: int = 60,
     schedule: TradingSchedule = TradingSchedule(),
+    strategy_name: str = "",
 ) -> None:
+    """Main bot loop.
+
+    ``strategy_name`` namespaces per-strategy state files
+    (auto_bot_state.{name}.json) so multiple strategies can run
+    side-by-side on the same VPS without clobbering each other.
+    """
+    strategy_adapter = get_strategy(engine_config.strategy) if engine_config.strategy else None
     bot_start_time = vietnam_now()
     while True:
         now = vietnam_now()
         today = local_date(now)
-        state = load_state(engine_config.dataDir)
+        state = load_state(engine_config.dataDir, strategy_name=strategy_name)
         if should_sync_market_holidays(state.marketHolidaySyncDate, today):
             print(f"[{now.isoformat()}] Syncing Vietnam market holidays")
             result = sync_market_holidays(engine_config.dataDir)
             print(result)
             notify("\n".join(["Vietnam Algo: market holidays synced", f"count: {result.get('count')}", f"path: {result.get('path')}"]))
             state.marketHolidaySyncDate = today
-            save_state(state, engine_config.dataDir)
+            save_state(state, engine_config.dataDir, strategy_name=strategy_name)
         holidays = load_market_holidays(engine_config.dataDir)
 
         if should_submit_orders(now, state.orderSubmitDate, schedule, holidays):
@@ -64,7 +73,7 @@ def run_auto_bot(
                 )
                 if was_refreshed and live_submit:
                     notify(token_refresh_message(account_no, live_submit, True))
-                    save_state(state, engine_config.dataDir)
+                    save_state(state, engine_config.dataDir, strategy_name=strategy_name)
             except Exception as exc:
                 notify(
                     "\n".join(
@@ -117,7 +126,7 @@ def run_auto_bot(
                         ]
                     )
                 )
-            save_state(state, engine_config.dataDir)
+            save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
         if should_sync_corporate_actions(now, state.corporateActionDate, schedule, holidays):
             print(f"[{now.isoformat()}] Syncing Vietstock corporate actions")
@@ -143,7 +152,7 @@ def run_auto_bot(
                 )
                 print(f"[{now.isoformat()}] CA sync failed: {exc}")
                 state.corporateActionDate = today  # don't retry on same day
-                save_state(state, engine_config.dataDir)
+                save_state(state, engine_config.dataDir, strategy_name=strategy_name)
                 continue
             print(result)
             notify(
@@ -159,16 +168,22 @@ def run_auto_bot(
                 )
             )
             state.corporateActionDate = today
-            save_state(state, engine_config.dataDir)
+            save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
         if should_run_eod(now, state.eodDate, schedule, holidays):
             print(f"[{now.isoformat()}] Running EOD data update and order generation")
-            notify(f"Vietnam Algo: EOD update started\ntime: {now.isoformat()}")
+            notify(f"Vietnam Algo: EOD update started\ntime: {now.isoformat()}\nstrategy: {engine_config.strategy}")
             update_dataset(engine_config)
-            result = generate_live_orders(engine_config, strategy_config)
+            result = generate_live_orders(
+                engine_config, strategy_config, strategy_name=strategy_name,
+            )
             print(result)
             if isinstance(result, dict):
-                notify(eod_summary_message(result))
+                # Use strategy-specific formatter if available, else default.
+                if strategy_adapter is not None:
+                    notify(strategy_adapter.format_cycle_summary(result))
+                else:
+                    notify(eod_summary_message(result))
                 # Pull live portfolio snapshot alongside EOD summary (best-effort)
                 try:
                     from .portfolio import build_portfolio_snapshot
@@ -185,7 +200,7 @@ def run_auto_bot(
                         )
                     )
             state.eodDate = today
-            save_state(state, engine_config.dataDir)
+            save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
         if should_send_heartbeat(now, state.lastHeartbeatDate, schedule, holidays):
             print(f"[{now.isoformat()}] Sending daily heartbeat")
@@ -220,7 +235,7 @@ def run_auto_bot(
             )
             notify(msg)
             state.lastHeartbeatDate = today
-            save_state(state, engine_config.dataDir)
+            save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
         if once:
             return
