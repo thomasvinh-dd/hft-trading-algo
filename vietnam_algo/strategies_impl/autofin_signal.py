@@ -59,22 +59,32 @@ def _select_signals_within_nav_budget(
 ) -> list[AutofinSignal]:
     """Pick signals in priority order until cumulative rateForNav <= budget.
 
-    Priority: latest `lastIndex` first (newest recommendation), then highest
-    `rateForNav` (largest position size wins on ties).
+    Per user spec: prioritize by risk-adjusted return, NOT by recency:
+      "the method choose the signal that make total NAV near 100 % is not
+       correct, we need to priority the signal that potentially make higher
+       profit with lower risk"
 
-    Note: autofin's `rateForNav` is per-signal allocation. We sum these
-    and cap at 100 % (1.0) NAV. Signals over budget are excluded — that's
-    the user's explicit instruction: "the total nav of that list will be
-    over 100 % so we need to choose which stock suggestion we want and
-    which one we will not do".
+    Score per signal combines:
+      - Risk/reward ratio:  (target_mid - entry_mid) / (entry_mid - stop_max)
+        higher is better (bigger upside vs tighter stop)
+      - Rating:             autofin's internal rS_Rating_IDB (0..10)
+      - Win rate:           autofin's rateWinByPrice (historical performance)
+      - Tiny tie-breaker on   rateForNav (larger allocation first when scores tie)
     """
-    sorted_signals = sorted(
-        signals,
-        key=lambda s: (
-            -(s.raw.get("lastIndex") or 0),  # newer first
-            -s.rate_for_nav,                   # larger NAV first
-        ),
-    )
+    def _score(s: AutofinSignal) -> tuple[float, float, float]:
+        entry = (s.supply_from + s.supply_to) / 2 if (s.supply_from and s.supply_to) else 0
+        target = (s.tp_from + s.tp_to) / 2 if (s.tp_from and s.tp_to) else 0
+        stop = max(s.sl_from or 0, s.sl_to or 0)
+        rating = float(s.raw.get("rS_Rating_IDB") or 0)
+        win_rate = float(s.raw.get("rateWinByPrice") or 0)
+        if entry <= 0 or target <= 0 or stop <= 0 or entry <= stop:
+            rr = 0.0
+        else:
+            rr = (target - entry) / (entry - stop)
+        return (-rr, -rating, -win_rate)
+
+    sorted_signals = sorted(signals, key=_score)
+
     selected: list[AutofinSignal] = []
     cumulative = 0.0
     for s in sorted_signals:
@@ -105,17 +115,28 @@ def _compute_order_plan(
 ) -> list[dict[str, Any]]:
     """Build BUY/SELL orders that mirror autofin's NAV-budget selection.
 
+    Real portfolio management — per user spec:
+      "how we are managing our portfolio? it's only signal so will now
+       manage the portfolio for us"
+
     Decision tree per symbol:
-      1. autofin holds it AND we don't   → BUY to match autofin's NAV%
+      1. autofin holds it AND we don't   → BUY at supply zone
       2. autofin holds it AND we do hold  → leave as-is (or top up if delta)
-      3. autofin doesn't hold it AND we do → SELL (close the position)
+      3. autofin doesn't hold it AND we do → SELL to close the position
       4. autofin doesn't hold it AND we don't → ignore (out of NAV budget)
 
+    For each BUY/SELL, we also place a paired exit-order (TP/SL bracket)
+    so the position auto-exits if price moves favorably or unfavorably.
+    TP at tp_F zone low, SL at sl_F zone low.
+
     Sub-threshold: skip the symbol if target_value < min_order_value_vnd
-    (so the strategy doesn't try to liquidate everything on a $25 NAV).
+    (so the strategy doesn't try to liquidate everything on a tiny NAV).
     """
     rows: list[dict[str, Any]] = []
     closes = autofin_open_symbols - {s.symbol for s in selected_signals if s.symbol}
+
+    # Index selected signals by symbol for quick lookup of SL/TP
+    sig_by_sym: dict[str, AutofinSignal] = {s.symbol: s for s in selected_signals if s.symbol}
 
     for s in selected_signals:
         if not s.symbol:
@@ -143,11 +164,32 @@ def _compute_order_plan(
             "quantity": abs(delta),
             "reason": f"autofin_mirror:nav{int(s.rate_for_nav*100)}pct:{s.last_recomment[:60]}",
         })
+        # For new BUY positions, also queue paired TP/SL exit orders
+        if side == "NB" and delta > 0:
+            tp_price = int(round(s.tp_from)) if s.tp_from > 0 else 0
+            sl_price = int(round(s.sl_from)) if s.sl_from > 0 else 0
+            if tp_price > 0:
+                rows.append({
+                    "symbol": s.symbol,
+                    "side": "NS",
+                    "price": tp_price,
+                    "quantity": abs(delta),
+                    "reason": f"autofin_take_profit:{int(s.tp_from)}",
+                })
+            if sl_price > 0:
+                rows.append({
+                    "symbol": s.symbol,
+                    "side": "NS",
+                    "price": sl_price,
+                    "quantity": abs(delta),
+                    "reason": f"autofin_stop_loss:{int(s.sl_from)}",
+                })
 
     for sym in closes:
         current_qty = our_positions.get(sym, 0)
         if current_qty <= 0:
             continue
+        # market sell to close the position
         rows.append({
             "symbol": sym,
             "side": "NS",
