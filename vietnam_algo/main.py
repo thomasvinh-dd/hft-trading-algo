@@ -407,7 +407,8 @@ def add_order_engine_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_daily_engine_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--strategy", choices=["momentum", "hybrid"], default="momentum")
+    parser.add_argument("--strategy", default="momentum",
+                        help="strategy name (see `list-strategies`; default: momentum)")
     parser.add_argument("--trade-date", default=None, help="optional order execution date to export/submit")
     parser.add_argument("--update-symbols", action="store_true")
     parser.add_argument("--update-prices", action="store_true")
