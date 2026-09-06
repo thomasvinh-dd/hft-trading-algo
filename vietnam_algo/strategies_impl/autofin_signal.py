@@ -187,22 +187,21 @@ class AutofinSignalAdapter(StrategyAdapter):
     ) -> dict[str, Any]:
         client = self._client_lazy()
 
-        # 1. autofin current open positions
-        try:
-            autofin_deals = client.fetch_deals(page_size=50, only_open=True)
-        except Exception as exc:
-            notify(f"⚠️ autofin fetch_deals failed: {exc}")
-            autofin_deals = []
-        autofin_open_symbols = {d.get("symbol") for d in autofin_deals if d.get("symbol")}
-
-        # 2. latest recommended signals
+        # 1. latest recommended signals (each carries statusDeal with the open
+        #    lifecycle info: price_Open, time_Open, isClosed, SL/TP, etc.)
         try:
             signals = client.fetch_signals(page_size=20)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_signals failed: {exc}")
             signals = []
 
-        # 3. NAV-budget-aware selection
+        # 2. autofin's currently OPEN symbols — derived from statusDeal.isClosed
+        autofin_open_symbols = {
+            s.symbol for s in signals
+            if not (s.raw.get("statusDeal", {}) or {}).get("isClosed")
+        }
+
+        # 3. NAV-budget-aware selection (newest first, then largest NAV)
         selected = _select_signals_within_nav_budget(signals, nav_budget_pct=1.0)
         excluded = [s for s in signals if s not in selected]
 
