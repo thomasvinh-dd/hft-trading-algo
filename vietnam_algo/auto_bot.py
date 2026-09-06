@@ -14,11 +14,38 @@ from .dnse_client import DnseClient
 from .market_calendar import load_market_holidays, should_sync_market_holidays, sync_market_holidays
 from .notifier import notify, token_refresh_message, eod_summary_message, heartbeat_message
 from .schedule import (
-    TradingSchedule, local_date, should_run_eod, should_submit_orders,
-    should_sync_corporate_actions, should_send_heartbeat, vietnam_now,
+    TradingSchedule, local_date, should_poll_strategy, should_run_eod,
+    should_submit_orders, should_sync_corporate_actions,
+    should_send_heartbeat, vietnam_now,
 )
 from .strategy_registry import get_strategy
 from .token_store import ensure_fresh_trading_token
+
+
+def _read_strategy_last_poll(data_dir: Path, strategy_name: str) -> str | None:
+    """Read ``last_poll_at`` from a strategy's state file (if any).
+
+    Used to throttle mid-day strategy polls. Each strategy can store its
+    own last-poll timestamp in its state file (e.g. for autofin_signal
+    we keep ``last_poll_at`` in ``autofin_signal_state.json``).
+    """
+    if not strategy_name:
+        return None
+    state_files = {
+        "autofin_signal": "autofin_signal_state.json",
+    }
+    fname = state_files.get(strategy_name)
+    if not fname:
+        return None
+    path = data_dir / "live" / fname
+    if not path.exists():
+        return None
+    try:
+        import json as _json
+        payload = _json.loads(path.read_text())
+        return payload.get("last_poll_at")
+    except Exception:
+        return None
 
 
 def run_auto_bot(
@@ -169,6 +196,35 @@ def run_auto_bot(
             )
             state.corporateActionDate = today
             save_state(state, engine_config.dataDir, strategy_name=strategy_name)
+
+        if should_poll_strategy(
+            now,
+            _read_strategy_last_poll(engine_config.dataDir, strategy_name),
+            schedule=schedule,
+            holidays=holidays,
+        ):
+            print(f"[{now.isoformat()}] Mid-day strategy poll (autofin partial-close detection)")
+            try:
+                poll_result = generate_live_orders(
+                    engine_config, strategy_config, strategy_name=strategy_name,
+                )
+                # The strategy itself sends per-order Telegram notifications
+                # for any newly-detected action (partial close, new entry,
+                # full close) — see AutofinSignalAdapter._notify_new_orders.
+                # The EOD summary is suppressed mid-day (only the EOD cycle
+                # sends the bundled message).
+                print(f"[{now.isoformat()}] poll result: {poll_result.get('count', 0)} orders planned")
+            except Exception as exc:
+                notify(
+                    "\n".join(
+                        [
+                            "⚠️ Vietnam Algo: mid-day poll FAILED",
+                            f"strategy: {engine_config.strategy}",
+                            f"err: {str(exc)[:300]}",
+                        ]
+                    )
+                )
+                print(f"[{now.isoformat()}] mid-day poll failed: {exc}")
 
         if should_run_eod(now, state.eodDate, schedule, holidays):
             print(f"[{now.isoformat()}] Running EOD data update and order generation")

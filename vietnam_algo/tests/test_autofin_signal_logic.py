@@ -225,3 +225,104 @@ def test_format_cycle_summary_handles_empty_cycle():
     assert "[autofin_signal]" in msg
     assert "No orders planned" in msg
     assert "NAV=0" in msg
+
+
+# ── Per-order Telegram notifications (mid-day) ───────────────────────────
+
+
+def test_per_order_message_contains_bot_id_signal_and_dnse_order(monkeypatch):
+    """The short per-order Telegram message must still show:
+      1. which bot is sending (autofin_signal)
+      2. what signal triggered the order
+      3. the actual DNSE order
+    """
+    import vietnam_algo.strategies_impl.autofin_signal as mod
+    sent: list[str] = []
+    monkeypatch.setattr(mod, "notify", lambda text, config=None: sent.append(text) or {"ok": True})
+
+    adapter = AutofinSignalAdapter()
+    deals = [
+        {
+            "action": "partial_close",
+            "symbol": "HCM",
+            "deal_id": "1785888000:HCM",
+            "lastRecomment": "💰 Chốt lãi lần 1 mức giá 26,900",
+            "rateForNav": 0.30,
+            "numberOfProfit": 1,
+            "dnse_orders": [
+                {"symbol": "HCM", "side": "NS", "price": 26900, "quantity": 100, "reason": "autofin_partial:deal#1785888000:HCM:..."},
+            ],
+        },
+    ]
+    adapter._notify_new_orders(deals)
+    assert len(sent) == 1
+    msg = sent[0]
+    # 1. bot identity
+    assert "autofin_signal" in msg
+    assert "new partial close" in msg
+    # 2. signal context
+    assert "💰 Chốt lãi lần 1 mức giá 26,900" in msg
+    assert "deal#1785888000:HCM" in msg
+    # 3. DNSE order
+    assert "SELL 100 HCM @ 26,900 VND" in msg
+    # notified keys recorded
+    assert len(adapter._notified_order_keys) == 1
+
+
+def test_per_order_message_not_re_notified_when_unchanged(monkeypatch):
+    """The same order should not be re-notified on the next cycle."""
+    import vietnam_algo.strategies_impl.autofin_signal as mod
+    sent: list[str] = []
+    monkeypatch.setattr(mod, "notify", lambda text, config=None: sent.append(text) or {"ok": True})
+
+    adapter = AutofinSignalAdapter()
+    deals = [
+        {
+            "action": "partial_close",
+            "symbol": "HCM",
+            "deal_id": "1785888000:HCM",
+            "lastRecomment": "💰 Chốt lãi lần 1 mức giá 26,900",
+            "rateForNav": 0.0,
+            "numberOfProfit": 1,
+            "dnse_orders": [
+                {"symbol": "HCM", "side": "NS", "price": 26900, "quantity": 100, "reason": "autofin_partial:deal#1785888000:HCM:..."},
+            ],
+        },
+    ]
+    adapter._notify_new_orders(deals)
+    adapter._notify_new_orders(deals)  # second call
+    assert len(sent) == 1, f"expected 1 notification, got {len(sent)}"
+
+
+def test_per_order_message_groups_bracket_legs_into_one_telegram(monkeypatch):
+    """A new-entry BUY+TP+SL bracket should produce ONE Telegram message,
+    not three (the user wants one notification per deal action)."""
+    import vietnam_algo.strategies_impl.autofin_signal as mod
+    sent: list[str] = []
+    monkeypatch.setattr(mod, "notify", lambda text, config=None: sent.append(text) or {"ok": True})
+
+    adapter = AutofinSignalAdapter()
+    deals = [
+        {
+            "action": "new_entry",
+            "symbol": "TDP",
+            "deal_id": "1787270400:TDP",
+            "lastRecomment": "Khuyến nghị đầu tư",
+            "rateForNav": 0.15,
+            "numberOfProfit": 0,
+            "dnse_orders": [
+                {"symbol": "TDP", "side": "NB", "price": 32000, "quantity": 700, "reason": "autofin_buy:deal#1787270400:TDP:..."},
+                {"symbol": "TDP", "side": "NS", "price": 36000, "quantity": 700, "reason": "autofin_tp:deal#1787270400:TDP:..."},
+                {"symbol": "TDP", "side": "NS", "price": 28500, "quantity": 700, "reason": "autofin_sl:deal#1787270400:TDP:..."},
+            ],
+        },
+    ]
+    adapter._notify_new_orders(deals)
+    assert len(sent) == 1
+    msg = sent[0]
+    assert "new entry" in msg
+    assert "BUY 700 TDP @ 32,000 VND" in msg
+    assert "SELL 700 TDP @ 36,000 VND" in msg  # TP
+    assert "SELL 700 TDP @ 28,500 VND" in msg  # SL
+    # all 3 legs recorded as notified
+    assert len(adapter._notified_order_keys) == 3

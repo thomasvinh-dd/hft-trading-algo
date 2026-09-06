@@ -438,6 +438,106 @@ def _build_deals_actioned(
     return deals
 
 
+def _order_key(o: dict[str, Any]) -> str:
+    """Stable key for an order row, used to de-dupe Telegram notifications."""
+    return (
+        f"{o.get('reason', '')}|{o.get('side', '')}|"
+        f"{o.get('symbol', '')}|{o.get('price', 0)}|{o.get('quantity', 0)}"
+    )
+
+
+def _format_per_action_message(deal: dict[str, Any], ts: str) -> str:
+    """Short per-action Telegram message (one per new order)."""
+    action = deal["action"]
+    title = {
+        "new_entry": "🤖 autofin_signal: new entry",
+        "partial_close": "🤖 autofin_signal: new partial close",
+        "full_close": "🤖 autofin_signal: full close",
+    }.get(action, "🤖 autofin_signal: order")
+
+    sym = deal["symbol"]
+    did = deal["deal_id"]
+    rec = deal.get("lastRecomment") or "(no recomment)"
+
+    lines: list[str] = [title, f"📅 {ts}"]
+    if action == "new_entry":
+        rate = deal.get("rateForNav") or 0
+        lines.append(f"• {sym}  [deal#{did}, rateForNav={rate:.0%}]")
+    elif action == "partial_close":
+        nP = deal.get("numberOfProfit", 0)
+        lines.append(f"• {sym}  [deal#{did}, nP={nP}]")
+    else:
+        lines.append(f"• {sym}  [deal#{did}]")
+    lines.append(f"  signal: {rec}")
+    for o in deal["dnse_orders"]:
+        side_lbl = "BUY" if o.get("side") == "NB" else "SELL"
+        price = o.get("price", 0)
+        price_s = f"{int(price):,}" if price else "market"
+        lines.append(
+            f"  → DNSE: {side_lbl} {o.get('quantity')} "
+            f"{o.get('symbol')} @ {price_s} VND"
+        )
+    return "\n".join(lines)
+    deals: list[dict[str, Any]] = []
+
+    new_by_deal: dict[str, list[dict[str, Any]]] = {}
+    for o in new_orders:
+        did = _extract_deal_id(o.get("reason", ""))
+        if did:
+            new_by_deal.setdefault(did, []).append(o)
+    for did, orders in new_by_deal.items():
+        # Prefer holding data; fall back to parsing the BUY order reason.
+        h = autofin_holding_by_id.get(did, {})
+        rec = str(h.get("lastRecomment") or "")
+        rate = float(h.get("rateForNav") or 0)
+        nP = int(h.get("numberOfProfit") or 0)
+        if not rec:
+            # extract from first order's reason: "autofin_buy:deal#X:navNpct:<rec>"
+            m = re.search(r"autofin_buy:[^:]+:[^:]+:nav\d+pct:(.+)$", orders[0].get("reason", ""))
+            if m:
+                rec = m.group(1).strip()
+                # also pull rate from the reason
+                rm = re.search(r"nav(\d+)pct", orders[0].get("reason", ""))
+                if rm:
+                    rate = int(rm.group(1)) / 100.0
+        deals.append({
+            "action": "new_entry",
+            "symbol": h.get("symbol", orders[0].get("symbol", "?")),
+            "deal_id": did,
+            "lastRecomment": rec,
+            "rateForNav": rate,
+            "numberOfProfit": nP,
+            "dnse_orders": orders,
+        })
+
+    for o in partial_orders:
+        did = _extract_deal_id(o.get("reason", ""))
+        h = autofin_holding_by_id.get(did, {})
+        deals.append({
+            "action": "partial_close",
+            "symbol": o.get("symbol", "?"),
+            "deal_id": did,
+            "lastRecomment": str(h.get("lastRecomment") or ""),
+            "rateForNav": float(h.get("rateForNav") or 0),
+            "numberOfProfit": int(h.get("numberOfProfit") or 0),
+            "dnse_orders": [o],
+        })
+
+    for o in close_orders:
+        did = _extract_deal_id(o.get("reason", ""))
+        deals.append({
+            "action": "full_close",
+            "symbol": o.get("symbol", "?"),
+            "deal_id": did,
+            "lastRecomment": "(autofin exited — not in holding)",
+            "rateForNav": 0.0,
+            "numberOfProfit": 0,
+            "dnse_orders": [o],
+        })
+
+    return deals
+
+
 class AutofinSignalAdapter(StrategyAdapter):
     """Mirror autofin.vn signals to DNSE orders, tracked by autofin deal_id."""
 
@@ -449,6 +549,12 @@ class AutofinSignalAdapter(StrategyAdapter):
         self._client: AutofinClient | None = None
         # Persistent state (loaded by the bot each cycle)
         self._our_deals: dict[str, dict[str, Any]] = {}  # deal_id → original signal
+        # Order-key set already sent to Telegram — used to de-dupe per-order
+        # notifications so we don't spam the chat every poll.
+        self._notified_order_keys: set[str] = set()
+        # Last time the strategy ran (UTC ISO). Used by the bot to throttle
+        # mid-day polls to once per hour.
+        self._last_poll_at: str | None = None
 
     def _client_lazy(self) -> AutofinClient:
         if self._client is None:
@@ -467,16 +573,52 @@ class AutofinSignalAdapter(StrategyAdapter):
         try:
             payload = json.loads(path.read_text())
             self._our_deals = {str(k): dict(v) for k, v in payload.get("our_deals", {}).items()}
+            self._notified_order_keys = set(payload.get("notified_order_keys", []) or [])
+            self._last_poll_at = payload.get("last_poll_at")
         except Exception:
             self._our_deals = {}
+            self._notified_order_keys = set()
+            self._last_poll_at = None
 
     def _save_state(self, data_dir: Path) -> None:
         path = data_dir / "live" / "autofin_signal_state.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(
-            {"our_deals": self._our_deals, "updatedAt": datetime.now(timezone.utc).isoformat()},
+            {
+                "our_deals": self._our_deals,
+                "notified_order_keys": sorted(self._notified_order_keys),
+                "last_poll_at": datetime.now(timezone.utc).isoformat(),
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+            },
             indent=2,
         ))
+
+    def last_poll_at(self) -> str | None:
+        return self._last_poll_at
+
+    def _notify_new_orders(self, deals_actioned: list[dict[str, Any]]) -> None:
+        """Send a short Telegram message for any deal-actioned entry that
+        hasn't been notified yet. Updates ``self._notified_order_keys`` so
+        the next cycle won't re-notify the same orders.
+
+        Each ``deal`` in ``deals_actioned`` becomes one Telegram message
+        (showing all DNSE legs for that deal — BUY+TP+SL bracket for
+        entries, single SELL for closes).
+        """
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        for deal in deals_actioned:
+            # build a per-deal key so multiple legs collapse to one message
+            keys = {_order_key(o) for o in deal.get("dnse_orders", [])}
+            if not keys:
+                continue
+            if keys.issubset(self._notified_order_keys):
+                continue  # already notified
+            msg = _format_per_action_message(deal, ts)
+            try:
+                notify(msg)
+            except Exception as exc:
+                print(f"[autofin_signal] per-order notify failed: {exc}")
+            self._notified_order_keys |= keys
 
     def generate_orders(
         self,
@@ -558,12 +700,18 @@ class AutofinSignalAdapter(StrategyAdapter):
         # are existing positions to monitor (handled by partial / full close).
         selected = _select_signals_within_nav_budget(signals, nav_budget_pct=1.0)
         # also include any deal we already hold (for rebalance when our
-        # tracked qty drifts from autofin's target)
+        # tracked qty drifts from autofin's target). Use the original
+        # holding data as the source so the composite deal_id is preserved.
         for did, sig in self._our_deals.items():
             if did in autofin_open_ids:
                 already = any(_deal_id(s.raw) == did for s in selected)
                 if not already:
-                    selected.append(parse_signal(sig))
+                    h = autofin_holding_by_id.get(did)
+                    if h is not None:
+                        selected.append(parse_signal(h))
+                    # If the deal is in suggest but not holding, fall back to
+                    # the stored sig — we lose the composite _id but the
+                    # partial-close path doesn't need it (it keys off nP).
 
         # 7. new entries (BUY + TP + SL)
         new_orders = _plan_orders_for_new_positions(selected, nav, positions)
@@ -596,12 +744,12 @@ class AutofinSignalAdapter(StrategyAdapter):
             for o in new_orders:
                 if o["symbol"] == s.symbol and o["side"] == "NB" and "tp:" not in o["reason"] and "sl:" not in o["reason"]:
                     self._our_deals[did]["_our_qty"] = o["quantity"]
-        # for each closed deal, remove
+        # for each closed deal, remove by deal_id (not symbol — symbols can
+        # collide across deals on the same day)
         for o in close_orders:
-            for did, sig in list(self._our_deals.items()):
-                if sig.get("symbol") == o["symbol"]:
-                    self._our_deals.pop(did, None)
-                    break
+            closed_did = _extract_deal_id(o.get("reason", ""))
+            if closed_did:
+                self._our_deals.pop(closed_did, None)
 
         # 11. assemble final order list (close → partial → new)
         all_orders = close_orders + partial_orders + new_orders
@@ -663,12 +811,16 @@ class AutofinSignalAdapter(StrategyAdapter):
             } for i, r in enumerate(all_orders)],
         }, indent=2, ensure_ascii=False))
 
-        # 12. save state for next cycle
+        # 12. send per-order Telegram notifications for any newly-detected
+        # action since the last cycle. The EOD summary will still bundle
+        # everything in one message at 15:15 ICT.
+        self._notify_new_orders(deals_actioned)
+
+        # 13. save state for next cycle
         self._save_state(config.dataDir)
 
-        # Note: Telegram notification is sent via format_cycle_summary() by
-        # the auto_bot's EOD path. We do NOT notify here to avoid duplicate
-        # messages.
+        # Note: the EOD daily-summary Telegram message is sent separately
+        # via format_cycle_summary() by the auto_bot's EOD path.
 
         return {
             "status": "generated",

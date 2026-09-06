@@ -84,3 +84,24 @@ def should_send_heartbeat(moment: datetime, last_date: str | None, schedule: Tra
     """
     today = local_date(moment)
     return today != last_date and local_time(moment) >= schedule.heartbeatTime
+
+
+def should_poll_strategy(
+    moment: datetime,
+    last_poll_time: datetime | None,
+    min_interval_seconds: int = 3600,
+    schedule: TradingSchedule = TradingSchedule(),
+    holidays: set[str] | None = None,
+) -> bool:
+    """Return True if we should re-run the strategy now.
+
+    Fires during main trading phases only, with at least ``min_interval_seconds``
+    between polls (default 1 hour). Use this to detect mid-day signal changes
+    (e.g. autofin partial closes) without spamming Telegram on every loop.
+    """
+    if not is_main_trading_phase(moment, schedule, holidays):
+        return False
+    if last_poll_time is None:
+        return True
+    elapsed = (moment - last_poll_time).total_seconds()
+    return elapsed >= min_interval_seconds
