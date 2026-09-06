@@ -181,15 +181,23 @@ def _plan_orders_for_new_positions(
 def _plan_close_orders(
     our_held_deal_ids: dict[str, dict[str, Any]],
     autofin_holding: list[dict[str, Any]],
+    autofin_suggest_ids: set[str] | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
 ) -> list[dict[str, Any]]:
     """Emit SELL orders for deals we hold that autofin no longer holds.
+
+    A deal is considered "still active in autofin" if it's in either
+    the holding list (currently held by autofin) or the suggest list
+    (still a recommended open position). Only when the deal is in
+    neither do we mirror-autofin by closing it.
 
     `our_held_deal_ids` is a map: deal_id → original signal (so we know
     the symbol + qty + the deal we opened).
     """
     rows: list[dict[str, Any]] = []
     autofin_open_ids = {_deal_id(d) for d in autofin_holding if _deal_id(d)}
+    if autofin_suggest_ids:
+        autofin_open_ids |= autofin_suggest_ids
     for did, sig in our_held_deal_ids.items():
         if did in autofin_open_ids:
             continue
@@ -571,7 +579,8 @@ class AutofinSignalAdapter(StrategyAdapter):
             did: sig for did, sig in self._our_deals.items()
             if sig.get("_our_qty", 0) > 0
         }
-        close_orders = _plan_close_orders(our_real_deals, holding)
+        suggest_ids = {_deal_id(s.raw) for s in signals if s.raw.get("_id")}
+        close_orders = _plan_close_orders(our_real_deals, holding, suggest_ids)
         # merge — close orders first so any new BUY on same symbol replaces
 
         # 10. update our tracked deals
