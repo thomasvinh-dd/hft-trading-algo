@@ -7,9 +7,9 @@ We cache them on disk so subsequent bot cycles don't re-login.
 Signal API: GET /gateway/api/gw/v1/signals/signal-static-suggest
 Returns a list of signals with:
   symbol, companyName, lastRecomment (text)
-  supply_F / supply_T: recommended buy zone
-  tP_F / tP_T: take-profit target
-  sL_F / sL_T: stop-loss
+  supply_F / supply_T: recommended buy zone (RAW VND)
+  tP_F / tP_T: take-profit target (RAW VND)
+  sL_F / sL_T: stop-loss (RAW VND)
   rateForNav: target portfolio allocation (0..1)
   isWaittingBuy / isWaittingSell: entry trigger
   statusDeal: live trade state (price_Open, time_Open, price_StopLoss, ...)
@@ -39,12 +39,12 @@ class AutofinSignal:
     symbol: str
     company_name: str
     last_recomment: str  # human-readable (e.g. "Khuyến nghị đầu tư")
-    supply_from: float  # buy zone low
-    supply_to: float    # buy zone high
-    tp_from: float      # take-profit target low
-    tp_to: float        # take-profit target high
-    sl_from: float      # stop-loss low
-    sl_to: float        # stop-loss high
+    supply_from: float  # buy zone low (VND)
+    supply_to: float    # buy zone high (VND)
+    tp_from: float      # take-profit target low (VND)
+    tp_to: float        # take-profit target high (VND)
+    sl_from: float      # stop-loss low (VND)
+    sl_to: float        # stop-loss high (VND)
     rate_for_nav: float # target portfolio allocation
     is_waitting_buy: bool
     is_waitting_sell: bool
@@ -53,18 +53,22 @@ class AutofinSignal:
 
 
 def parse_signal(raw: dict[str, Any]) -> AutofinSignal:
-    """Convert a raw autofin signal dict into a typed AutofinSignal."""
+    """Convert a raw autofin signal dict into a typed AutofinSignal.
+
+    All price fields from the autofin API are RAW VND (e.g. supply_F=5910
+    means 5,910 VND), so we do NOT multiply by 1000 here.
+    """
     sd = raw.get("statusDeal", {}) or {}
     return AutofinSignal(
         symbol=str(raw.get("symbol") or "").strip().upper(),
         company_name=str(raw.get("companyName") or ""),
         last_recomment=str(raw.get("lastRecomment") or ""),
-        supply_from=float(raw.get("supply_F") or 0) * 1000,
-        supply_to=float(raw.get("supply_T") or 0) * 1000,
-        tp_from=float(raw.get("tP_F") or 0) * 1000,
-        tp_to=float(raw.get("tP_T") or 0) * 1000,
-        sl_from=float(raw.get("sL_F") or 0) * 1000,
-        sl_to=float(raw.get("sL_T") or 0) * 1000,
+        supply_from=float(raw.get("supply_F") or 0),
+        supply_to=float(raw.get("supply_T") or 0),
+        tp_from=float(raw.get("tP_F") or 0),
+        tp_to=float(raw.get("tP_T") or 0),
+        sl_from=float(raw.get("sL_F") or 0),
+        sl_to=float(raw.get("sL_T") or 0),
         rate_for_nav=float(raw.get("rateForNav") or 0),
         is_waitting_buy=bool(raw.get("isWaittingBuy")),
         is_waitting_sell=bool(raw.get("isWaittingSell")),

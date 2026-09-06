@@ -30,12 +30,12 @@ def _make_signal(
         "symbol": symbol,
         "lastIndex": last_index,
         "statusDeal": {"market_TypePrice": 1},
-        "supply_F": (supply_to - 100) / 1000,
-        "supply_T": supply_to / 1000,
-        "tP_F": tp_from / 1000,
-        "tP_T": (tp_from + 100) / 1000,
-        "sL_F": (sl_to - 100) / 1000,
-        "sL_T": sl_to / 1000,
+        "supply_F": supply_to - 100,
+        "supply_T": supply_to,
+        "tP_F": tp_from,
+        "tP_T": tp_from + 100,
+        "sL_F": sl_to - 100,
+        "sL_T": sl_to,
         "rateForNav": rate_for_nav,
         "lastRecomment": "test",
         "isWaittingBuy": is_waiting_buy,
@@ -122,8 +122,8 @@ def test_plan_new_positions_no_op_when_match():
 
 def test_plan_close_orders_only_closes_what_autofin_exited():
     our_deals = {
-        "111": {"symbol": "APH", "_our_qty": 200},
-        "222": {"symbol": "VHM", "_our_qty": 100},
+        "111:APH": {"symbol": "APH", "_our_qty": 200},
+        "222:VHM": {"symbol": "VHM", "_our_qty": 100},
     }
     autofin_holding = [
         {"_id": 111, "symbol": "APH", "statusDeal": {"isClosed": False}},
@@ -164,7 +164,7 @@ def test_format_cycle_summary_shows_bot_signal_and_dnse_order():
             {
                 "action": "new_entry",
                 "symbol": "TDP",
-                "deal_id": "1781740900",
+                "deal_id": "1787270400:TDP",
                 "lastRecomment": "Khuyến nghị đầu tư",
                 "rateForNav": 0.15,
                 "numberOfProfit": 0,
@@ -177,7 +177,7 @@ def test_format_cycle_summary_shows_bot_signal_and_dnse_order():
             {
                 "action": "partial_close",
                 "symbol": "HCM",
-                "deal_id": "1785888000",
+                "deal_id": "1785888000:HCM",
                 "lastRecomment": "💰 Chốt lãi lần 1 mức giá 26,900",
                 "rateForNav": 0.30,
                 "numberOfProfit": 1,
@@ -188,7 +188,7 @@ def test_format_cycle_summary_shows_bot_signal_and_dnse_order():
             {
                 "action": "full_close",
                 "symbol": "L40",
-                "deal_id": "1756166400",
+                "deal_id": "1756166400:L40",
                 "lastRecomment": "(autofin exited — not in holding)",
                 "rateForNav": 0.0,
                 "numberOfProfit": 0,

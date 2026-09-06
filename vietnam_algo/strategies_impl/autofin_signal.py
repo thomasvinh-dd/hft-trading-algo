@@ -101,8 +101,20 @@ def _select_signals_within_nav_budget(
 
 
 def _deal_id(raw: dict[str, Any]) -> str:
-    """Autofin deal identifier (stable across pages)."""
-    return str(raw.get("_id") or raw.get("code") or "")
+    """Autofin deal identifier (stable across pages).
+
+    Note: the raw ``_id`` field is a Unix timestamp of the deal's open
+    time, which is **not unique** — multiple deals opened on the same
+    day share the same ``_id`` (e.g. HCM and MZG both have
+    ``_id=1785888000`` because they were both opened on 2026-08-05).
+    We therefore combine ``_id`` with ``symbol`` to form a unique
+    composite key.
+    """
+    _id = raw.get("_id") or raw.get("code") or ""
+    sym = raw.get("symbol") or ""
+    if not sym:
+        return str(_id)
+    return f"{_id}:{sym}"
 
 
 def _plan_orders_for_new_positions(
@@ -132,6 +144,7 @@ def _plan_orders_for_new_positions(
         delta = target_qty - current_qty
         if abs(delta) < board_lot:
             continue
+        did = _deal_id(s.raw)
         side = "NB" if delta > 0 else "NS"
         rows.append({
             "symbol": s.symbol,
@@ -139,7 +152,7 @@ def _plan_orders_for_new_positions(
             "price": int(round(ref_price)),
             "quantity": abs(delta),
             "reason": (
-                f"autofin_buy:deal#{s.raw.get('_id', '?')}:"
+                f"autofin_buy:deal#{did}:"
                 f"nav{int(s.rate_for_nav*100)}pct:{s.last_recomment[:60]}"
             ),
         })
@@ -152,7 +165,7 @@ def _plan_orders_for_new_positions(
                     "side": "NS",
                     "price": tp_price,
                     "quantity": abs(delta),
-                    "reason": f"autofin_tp:deal#{s.raw.get('_id', '?')}:{int(s.tp_from)}",
+                    "reason": f"autofin_tp:deal#{did}:{int(s.tp_from)}",
                 })
             if sl_price > 0:
                 rows.append({
@@ -160,7 +173,7 @@ def _plan_orders_for_new_positions(
                     "side": "NS",
                     "price": sl_price,
                     "quantity": abs(delta),
-                    "reason": f"autofin_sl:deal#{s.raw.get('_id', '?')}:{int(s.sl_from)}",
+                    "reason": f"autofin_sl:deal#{did}:{int(s.sl_from)}",
                 })
     return rows
 
@@ -338,7 +351,9 @@ def _plan_partial_close_orders(
 
 
 def _extract_deal_id(reason: str) -> str:
-    m = re.search(r"deal#(\w+)", reason or "")
+    # deal_id format is {digits}:{UPPERCASE} (e.g. "1785888000:HCM").
+    # The rest of the reason is colon-separated fields like ":take_profit_lap:lap1".
+    m = re.search(r"deal#(\d+:[A-Z]+)", reason or "")
     return m.group(1) if m else ""
 
 
@@ -350,6 +365,10 @@ def _build_deals_actioned(
 ) -> list[dict[str, Any]]:
     """Group the planned orders by deal and pair each with the autofin
     signal that triggered it. Used to build a rich Telegram summary.
+
+    For new entries, we extract the signal context from the order
+    reason itself (autofin_buy:deal#X:navNpct:<recomment>) so we can
+    show it even when the deal isn't in the holding list yet.
     """
     deals: list[dict[str, Any]] = []
 
@@ -359,14 +378,27 @@ def _build_deals_actioned(
         if did:
             new_by_deal.setdefault(did, []).append(o)
     for did, orders in new_by_deal.items():
+        # Prefer holding data; fall back to parsing the BUY order reason.
         h = autofin_holding_by_id.get(did, {})
+        rec = str(h.get("lastRecomment") or "")
+        rate = float(h.get("rateForNav") or 0)
+        nP = int(h.get("numberOfProfit") or 0)
+        if not rec:
+            # extract from first order's reason: "autofin_buy:deal#X:navNpct:<rec>"
+            m = re.search(r"autofin_buy:[^:]+:[^:]+:nav\d+pct:(.+)$", orders[0].get("reason", ""))
+            if m:
+                rec = m.group(1).strip()
+                # also pull rate from the reason
+                rm = re.search(r"nav(\d+)pct", orders[0].get("reason", ""))
+                if rm:
+                    rate = int(rm.group(1)) / 100.0
         deals.append({
             "action": "new_entry",
             "symbol": h.get("symbol", orders[0].get("symbol", "?")),
             "deal_id": did,
-            "lastRecomment": str(h.get("lastRecomment") or ""),
-            "rateForNav": float(h.get("rateForNav") or 0),
-            "numberOfProfit": int(h.get("numberOfProfit") or 0),
+            "lastRecomment": rec,
+            "rateForNav": rate,
+            "numberOfProfit": nP,
             "dnse_orders": orders,
         })
 
@@ -464,12 +496,13 @@ class AutofinSignalAdapter(StrategyAdapter):
 
         # 2. /signal-static-suggest — latest recommended signals
         try:
-            suggest_raw = client.fetch_signals(page_size=20)
+            signals = client.fetch_signals(page_size=20)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_signals failed: {exc}")
-            suggest_raw = []
-        signals = [parse_signal(s) for s in suggest_raw if isinstance(s, dict)]
-        suggest_by_id: dict[str, AutofinSignal] = {s.raw.get("_id", ""): s for s in signals if s.raw.get("_id")}
+            signals = []
+        suggest_by_id: dict[str, AutofinSignal] = {
+            _deal_id(s.raw): s for s in signals if s.raw.get("_id")
+        }
 
         # 3. /closing-signals — recently closed
         try:
@@ -513,13 +546,16 @@ class AutofinSignalAdapter(StrategyAdapter):
                 pass
 
         # 6. select signals (top risk-adjusted, NAV-budgeted)
+        # suggest-endpoint signals are NEW entries; holding-endpoint deals
+        # are existing positions to monitor (handled by partial / full close).
         selected = _select_signals_within_nav_budget(signals, nav_budget_pct=1.0)
-        # filter to only selected deals that are actually open in autofin
-        selected = [s for s in selected if (s.raw.get("_id") in autofin_open_ids)]
-        # also include any deal we hold that autofin still holds (for rebalance)
+        # also include any deal we already hold (for rebalance when our
+        # tracked qty drifts from autofin's target)
         for did, sig in self._our_deals.items():
-            if did in autofin_open_ids and sig not in selected:
-                selected.append(parse_signal(sig))
+            if did in autofin_open_ids:
+                already = any(_deal_id(s.raw) == did for s in selected)
+                if not already:
+                    selected.append(parse_signal(sig))
 
         # 7. new entries (BUY + TP + SL)
         new_orders = _plan_orders_for_new_positions(selected, nav, positions)
@@ -541,7 +577,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         # 10. update our tracked deals
         # for each new selected deal that we now hold, add to our_deals
         for s in selected:
-            did = s.raw.get("_id")
+            did = _deal_id(s.raw)
             if not did:
                 continue
             if did not in self._our_deals:

@@ -29,12 +29,12 @@ def _make_signal(
         "symbol": symbol,
         "companyName": symbol,
         "statusDeal": {"market_TypePrice": 1},
-        "supply_F": (supply_to - 100) / 1000,
-        "supply_T": supply_to / 1000,
-        "tP_F": tp_from / 1000,
-        "tP_T": (tp_from + 100) / 1000,
-        "sL_F": (sl_to - 100) / 1000,
-        "sL_T": sl_to / 1000,
+        "supply_F": supply_to - 100,
+        "supply_T": supply_to,
+        "tP_F": tp_from,
+        "tP_T": tp_from + 100,
+        "sL_F": sl_to - 100,
+        "sL_T": sl_to,
         "rateForNav": rate_for_nav,
         "lastRecomment": "test",
         "isWaittingBuy": False,
@@ -81,9 +81,9 @@ def test_plan_new_positions_no_op_when_match():
 def test_plan_close_orders_only_closes_what_we_hold():
     """SELL only deals we hold that autofin no longer holds."""
     our_deals = {
-        "111": {"symbol": "APH", "_our_qty": 200},
-        "222": {"symbol": "VHM", "_our_qty": 100},
-        "333": {"symbol": "BAF", "_our_qty": 50},
+        "111:APH": {"symbol": "APH", "_our_qty": 200},
+        "222:VHM": {"symbol": "VHM", "_our_qty": 100},
+        "333:BAF": {"symbol": "BAF", "_our_qty": 50},
     }
     autofin_holding = [
         # APH still held
@@ -95,16 +95,25 @@ def test_plan_close_orders_only_closes_what_we_hold():
     rows = _plan_close_orders(our_deals, autofin_holding)
     assert len(rows) == 1
     assert rows[0]["symbol"] == "VHM"
-    assert rows[0]["reason"] == "autofin_closed:deal#222"
+    assert rows[0]["reason"] == "autofin_closed:deal#222:VHM"
 
 
 def test_deal_id_extraction_handles_underscore_or_code():
     raw1 = {"_id": 12345, "code": 99999, "symbol": "A"}
     raw2 = {"_id": None, "code": 88888, "symbol": "B"}
-    raw3 = {"symbol": "C"}  # no id
-    assert _deal_id(raw1) == "12345"
-    assert _deal_id(raw2) == "88888"
-    assert _deal_id(raw3) == ""
+    raw3 = {"_id": None, "symbol": "C"}  # no id
+    # _id alone is a timestamp, not unique across deals — must include symbol
+    assert _deal_id(raw1) == "12345:A"
+    assert _deal_id(raw2) == "88888:B"
+    # no _id/code → empty key (caller will skip)
+    assert _deal_id(raw3) == ":C"
+
+
+def test_deal_id_is_unique_across_same_day_deals():
+    """Two deals opened on the same day share _id but have different symbols."""
+    a = {"_id": 1785888000, "symbol": "HCM"}
+    b = {"_id": 1785888000, "symbol": "MZG"}
+    assert _deal_id(a) != _deal_id(b)
 
 
 # ── Partial-close (lastRecomment) ──────────────────────────────────────────
@@ -149,27 +158,27 @@ def test_parse_partial_close_unknown():
 
 def test_partial_close_bootstrap_records_only_no_orders():
     """First time seeing the deal → record nP, do NOT issue partial close."""
-    our_deals = {"111": {"symbol": "HCM", "_our_qty": 300}}
+    our_deals = {"111:HCM": {"symbol": "HCM", "_our_qty": 300}}
     autofin_holding = [{
         "_id": 111, "symbol": "HCM", "numberOfProfit": 1,
         "lastRecomment": "💰 Chốt lãi lần 1 mức giá 26,900",
-        "tP_F": 26.9, "sL_F": 22.7,
+        "tP_F": 26900, "sL_F": 22700,
     }]
     rows = _plan_partial_close_orders(our_deals, autofin_holding)
     assert rows == []
-    assert our_deals["111"]["_last_numberOfProfit"] == 1
-    assert our_deals["111"]["_last_recomment"].startswith("💰")
+    assert our_deals["111:HCM"]["_last_numberOfProfit"] == 1
+    assert our_deals["111:HCM"]["_last_recomment"].startswith("💰")
 
 
 def test_partial_close_emits_sell_on_numberOfProfit_bump():
     """nP went 0→1 → emit SELL 1/3 at recomment price."""
     our_deals = {
-        "111": {"symbol": "HCM", "_our_qty": 300, "_last_numberOfProfit": 0},
+        "111:HCM": {"symbol": "HCM", "_our_qty": 300, "_last_numberOfProfit": 0},
     }
     autofin_holding = [{
         "_id": 111, "symbol": "HCM", "numberOfProfit": 1,
         "lastRecomment": "💰 Chốt lãi lần 1 mức giá 26,900",
-        "tP_F": 26.9, "sL_F": 22.7,
+        "tP_F": 26900, "sL_F": 22700,
     }]
     rows = _plan_partial_close_orders(our_deals, autofin_holding)
     assert len(rows) == 1
@@ -179,9 +188,9 @@ def test_partial_close_emits_sell_on_numberOfProfit_bump():
     assert r["price"] == 26900  # from recomment
     assert r["quantity"] == 100  # 300 // 3
     assert "take_profit_lap" in r["reason"]
-    assert "deal#111" in r["reason"]
-    assert our_deals["111"]["_last_numberOfProfit"] == 1
-    assert our_deals["111"]["_our_qty"] == 200  # 300 - 100
+    assert "deal#111:HCM" in r["reason"]
+    assert our_deals["111:HCM"]["_last_numberOfProfit"] == 1
+    assert our_deals["111:HCM"]["_our_qty"] == 200  # 300 - 100
 
 
 def test_partial_close_uses_tpF_when_no_price_in_recomment():
@@ -191,7 +200,7 @@ def test_partial_close_uses_tpF_when_no_price_in_recomment():
     Both should produce the same VND price.
     """
     our_deals = {
-        "222": {"symbol": "POW", "_our_qty": 300, "_last_numberOfProfit": 0},
+        "222:POW": {"symbol": "POW", "_our_qty": 300, "_last_numberOfProfit": 0},
     }
     autofin_holding = [{
         "_id": 222, "symbol": "POW", "numberOfProfit": 1,
@@ -207,7 +216,7 @@ def test_partial_close_uses_tpF_when_no_price_in_recomment():
 def test_partial_close_uses_tpF_in_thousands_when_small():
     """Same result if data is in thousands (suggest-endpoint format)."""
     our_deals = {
-        "222": {"symbol": "POW", "_our_qty": 300, "_last_numberOfProfit": 0},
+        "222:POW": {"symbol": "POW", "_our_qty": 300, "_last_numberOfProfit": 0},
     }
     autofin_holding = [{
         "_id": 222, "symbol": "POW", "numberOfProfit": 1,
@@ -222,7 +231,7 @@ def test_partial_close_uses_tpF_in_thousands_when_small():
 def test_partial_close_capital_protect_uses_pct():
     """'bảo toàn vốn 28.57%' → sell 28.57% of current."""
     our_deals = {
-        "333": {"symbol": "HSL", "_our_qty": 700, "_last_numberOfProfit": 3},
+        "333:HSL": {"symbol": "HSL", "_our_qty": 700, "_last_numberOfProfit": 3},
     }
     autofin_holding = [{
         "_id": 333, "symbol": "HSL", "numberOfProfit": 4,
@@ -240,12 +249,12 @@ def test_partial_close_capital_protect_uses_pct():
 
 def test_partial_close_skips_when_numberOfProfit_unchanged():
     our_deals = {
-        "444": {"symbol": "VPI", "_our_qty": 300, "_last_numberOfProfit": 1},
+        "444:VPI": {"symbol": "VPI", "_our_qty": 300, "_last_numberOfProfit": 1},
     }
     autofin_holding = [{
         "_id": 444, "symbol": "VPI", "numberOfProfit": 1,  # unchanged
         "lastRecomment": "💰 Chốt lãi lần 1 mức giá 64,900",
-        "tP_F": 64.9,
+        "tP_F": 64900,
     }]
     rows = _plan_partial_close_orders(our_deals, autofin_holding)
     assert rows == []
@@ -253,7 +262,7 @@ def test_partial_close_skips_when_numberOfProfit_unchanged():
 
 def test_partial_close_skips_deal_autofin_no_longer_holds():
     our_deals = {
-        "555": {"symbol": "L40", "_our_qty": 100, "_last_numberOfProfit": 0},
+        "555:L40": {"symbol": "L40", "_our_qty": 100, "_last_numberOfProfit": 0},
     }
     # autofin has fully closed — L40 not in holding list
     autofin_holding = []
@@ -264,12 +273,12 @@ def test_partial_close_skips_deal_autofin_no_longer_holds():
 def test_partial_close_sub_lot_qty_skipped():
     """If delta < 1 board lot, skip the partial close."""
     our_deals = {
-        "666": {"symbol": "X", "_our_qty": 200, "_last_numberOfProfit": 0},
+        "666:X": {"symbol": "X", "_our_qty": 200, "_last_numberOfProfit": 0},
     }
     autofin_holding = [{
         "_id": 666, "symbol": "X", "numberOfProfit": 1,
         "lastRecomment": "💰 Chốt lãi lần 1 mức giá 10,000",
-        "tP_F": 10.0,
+        "tP_F": 10000,
     }]
     # 200 // 3 = 66, rounded to 100 lots = 0 → skipped
     rows = _plan_partial_close_orders(our_deals, autofin_holding)
