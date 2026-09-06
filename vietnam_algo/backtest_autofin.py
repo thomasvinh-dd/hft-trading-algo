@@ -107,6 +107,8 @@ def run_autofin_backtest(
     fee_per_share: float = DEFAULT_FEE_PER_SHARE,
     slippage_pct: float = DEFAULT_SLIPPAGE_PCT,
     max_pages: int = MAX_PAGES,
+    min_profit_steps: int = 0,
+    stop_loss_pct: float = 0.0,
     client: AutofinClient | None = None,
 ) -> dict[str, Any]:
     """Replay all closed autofin deals as if we had mirrored them.
@@ -118,6 +120,14 @@ def run_autofin_backtest(
     fee_per_share : flat fee per share (VND); 0 by default
     slippage_pct : slippage on each fill (e.g. 0.001 = 0.1%); 0 by default
     max_pages : pagination cap on /closing-signals
+    min_profit_steps : skip deals whose ``numberOfProfit`` is below this
+        threshold (use 1+ to filter out trendless losers that never
+        triggered a partial take-profit). 0 = no filter.
+    stop_loss_pct : if > 0, cut the position when unrealized loss reaches
+        this fraction (e.g. 0.10 = 10%). The close price becomes
+        ``price_Open * (1 - stop_loss_pct)`` instead of ``price_Closed``.
+        Pnl is the simulated stop-out, not the actual autofin close.
+        0 = no stop-loss (default).
     client : optional pre-built AutofinClient (else built from env)
 
     Returns
@@ -159,6 +169,14 @@ def run_autofin_backtest(
         t_open = str(sd.get("time_Open") or "")
         t_close = str(sd.get("time_Closed") or "")
 
+        # filter: require minimum TP steps
+        if min_profit_steps > 0 and n_profit < min_profit_steps:
+            skipped.append({
+                "deal_id": did, "symbol": sym,
+                "reason": f"n_profit={n_profit} < min_profit_steps={min_profit_steps}",
+            })
+            continue
+
         if p_open <= 0 or p_close <= 0 or rate <= 0 or nav <= 0:
             skipped.append({
                 "deal_id": did, "symbol": sym, "reason":
@@ -168,7 +186,18 @@ def run_autofin_backtest(
 
         # simulate slippage: BUY slightly higher, SELL slightly lower
         eff_open = p_open * (1 + slippage_pct / 2)
+        # if a stop-loss is set, the simulated exit is at the SL level
+        # (we don't know if it actually hit SL or held to the autofin close,
+        # so the SL scenario is a worst-case modelling — both for losses
+        # and for winners that dipped and recovered)
         eff_close = p_close * (1 - slippage_pct / 2)
+        sl_triggered = False
+        if stop_loss_pct > 0 and p_open > 0:
+            sl_level = p_open * (1 - stop_loss_pct)
+            if p_close <= sl_level:
+                # the actual close would have hit our stop-loss first
+                eff_close = sl_level * (1 - slippage_pct / 2)
+                sl_triggered = True
 
         # size the position
         target_value = nav * rate
@@ -265,6 +294,8 @@ def run_autofin_backtest(
         "sharpe": sharpe,
         "fee_per_share": fee_per_share,
         "slippage_pct": slippage_pct,
+        "min_profit_steps": min_profit_steps,
+        "stop_loss_pct": stop_loss_pct,
         "trades": trades,
         "skipped": skipped,
     }
@@ -309,6 +340,14 @@ def format_backtest_report(result: dict[str, Any]) -> str:
         f"  • board lot: {DEFAULT_BOARD_LOT}, fee: {result['fee_per_share']} VND/sh, "
         f"slippage: {result['slippage_pct']:.2%}"
     )
+    if result.get("min_profit_steps", 0) > 0:
+        lines.append(
+            f"  • min profit steps: {result['min_profit_steps']} (skip trendless losers)"
+        )
+    if result.get("stop_loss_pct", 0) > 0:
+        lines.append(
+            f"  • stop-loss: {result['stop_loss_pct']:.1%} below entry"
+        )
     lines.append(
         f"  • source: autofin.vn /closing-signals, all closed deals"
     )

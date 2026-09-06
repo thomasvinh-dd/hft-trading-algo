@@ -184,3 +184,52 @@ def test_backtest_report_contains_key_metrics():
     assert "win rate:" in report
     assert "max drawdown:" in report
     assert "Top 5 winners" in report
+
+
+def test_backtest_min_profit_steps_filters_trendless_losers():
+    """Deals with numberOfProfit < min are skipped."""
+    deals = [
+        _make_closed_deal(symbol="LOSER", deal_id="1", p_open=10000, p_close=8000, n_profit=0, rate=0.15),
+        _make_closed_deal(symbol="WINNER", deal_id="2", p_open=10000, p_close=13000, n_profit=3, rate=0.15),
+    ]
+    client = FakeClient(deals)
+    result = run_autofin_backtest(initial_nav=1_000_000_000, min_profit_steps=1, client=client)
+    assert result["trade_count"] == 1
+    assert result["trades"][0].symbol == "WINNER"
+    assert result["skipped_count"] == 1
+    # the LOSER was skipped because n_profit=0 < 1
+
+
+def test_backtest_min_profit_steps_zero_keeps_all():
+    deals = [
+        _make_closed_deal(symbol="X", deal_id="1", p_open=10000, p_close=8000, n_profit=0),
+        _make_closed_deal(symbol="Y", deal_id="2", p_open=10000, p_close=13000, n_profit=2),
+    ]
+    client = FakeClient(deals)
+    result = run_autofin_backtest(initial_nav=1_000_000_000, min_profit_steps=0, client=client)
+    assert result["trade_count"] == 2
+
+
+def test_backtest_stop_loss_caps_loser_at_sl_level():
+    """A deal that closed below the SL is exited at the SL price, not the close."""
+    deals = [
+        # closes at 8000, entry 10000 → without SL, loss = -20%
+        # with SL 10%, exit at 9000 → loss = -10%
+        _make_closed_deal(symbol="X", deal_id="1", p_open=10000, p_close=8000, rate=0.5),
+    ]
+    client = FakeClient(deals)
+    no_sl = run_autofin_backtest(initial_nav=1_000_000_000, stop_loss_pct=0, client=FakeClient(deals))
+    with_sl = run_autofin_backtest(initial_nav=1_000_000_000, stop_loss_pct=0.10, client=FakeClient(deals))
+    assert with_sl["final_nav"] > no_sl["final_nav"]
+
+
+def test_backtest_stop_loss_does_not_affect_winners():
+    """A deal that closed ABOVE the SL level is not affected by the SL."""
+    deals = [
+        # closes at 13000, entry 10000 → winner either way
+        _make_closed_deal(symbol="X", deal_id="1", p_open=10000, p_close=13000, rate=0.5),
+    ]
+    client = FakeClient(deals)
+    no_sl = run_autofin_backtest(initial_nav=1_000_000_000, stop_loss_pct=0, client=FakeClient(deals))
+    with_sl = run_autofin_backtest(initial_nav=1_000_000_000, stop_loss_pct=0.10, client=FakeClient(deals))
+    assert abs(with_sl["final_nav"] - no_sl["final_nav"]) < 1

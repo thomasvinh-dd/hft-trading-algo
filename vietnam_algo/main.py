@@ -220,6 +220,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="pagination cap on /closing-signals (default 20 → 1000 deals)",
     )
     autofin_bt.add_argument(
+        "--min-profit-steps",
+        type=int,
+        default=0,
+        help="skip deals whose numberOfProfit is below this (e.g. 2 = only "
+             "take deals that triggered ≥2 partial TPs)",
+    )
+    autofin_bt.add_argument(
+        "--stop-loss-pct",
+        type=float,
+        default=0.0,
+        help="simulate a stop-loss at this fraction below entry "
+             "(e.g. 0.10 = 10%%). When the final close would have hit "
+             "the SL, model the exit at the SL level.",
+    )
+    autofin_bt.add_argument(
         "--out-dir",
         type=Path,
         default=Path("vietnam_algo/data/backtests"),
@@ -1048,6 +1063,8 @@ def main(argv: list[str] | None = None) -> int:
             fee_per_share=args.fee_per_share,
             slippage_pct=args.slippage_pct,
             max_pages=args.max_pages,
+            min_profit_steps=args.min_profit_steps,
+            stop_loss_pct=args.stop_loss_pct,
         )
         json_path, csv_path = write_backtest_outputs(result, args.out_dir)
         report = format_backtest_report(result)
