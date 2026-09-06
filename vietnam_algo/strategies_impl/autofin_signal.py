@@ -312,7 +312,12 @@ def _plan_partial_close_orders(
 
         price = action.price if action.price > 0 else 0
         if price <= 0:
-            tp_f = float(h.get("tP_F") or 0) * 1000
+            # /signal-static-holding returns raw VND (e.g. 15100), while
+            # /signal-static-suggest returns thousands (e.g. 15.1). Detect
+            # the scale by magnitude so we get the same number either way.
+            tp_f = float(h.get("tP_F") or 0)
+            if 0 < tp_f < 1000:
+                tp_f *= 1000
             price = int(round(tp_f)) if tp_f > 0 else 0
 
         rows.append({
@@ -330,6 +335,67 @@ def _plan_partial_close_orders(
         sig["_our_qty"] = max(0, our_qty - delta)
 
     return rows
+
+
+def _extract_deal_id(reason: str) -> str:
+    m = re.search(r"deal#(\w+)", reason or "")
+    return m.group(1) if m else ""
+
+
+def _build_deals_actioned(
+    new_orders: list[dict[str, Any]],
+    partial_orders: list[dict[str, Any]],
+    close_orders: list[dict[str, Any]],
+    autofin_holding_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group the planned orders by deal and pair each with the autofin
+    signal that triggered it. Used to build a rich Telegram summary.
+    """
+    deals: list[dict[str, Any]] = []
+
+    new_by_deal: dict[str, list[dict[str, Any]]] = {}
+    for o in new_orders:
+        did = _extract_deal_id(o.get("reason", ""))
+        if did:
+            new_by_deal.setdefault(did, []).append(o)
+    for did, orders in new_by_deal.items():
+        h = autofin_holding_by_id.get(did, {})
+        deals.append({
+            "action": "new_entry",
+            "symbol": h.get("symbol", orders[0].get("symbol", "?")),
+            "deal_id": did,
+            "lastRecomment": str(h.get("lastRecomment") or ""),
+            "rateForNav": float(h.get("rateForNav") or 0),
+            "numberOfProfit": int(h.get("numberOfProfit") or 0),
+            "dnse_orders": orders,
+        })
+
+    for o in partial_orders:
+        did = _extract_deal_id(o.get("reason", ""))
+        h = autofin_holding_by_id.get(did, {})
+        deals.append({
+            "action": "partial_close",
+            "symbol": o.get("symbol", "?"),
+            "deal_id": did,
+            "lastRecomment": str(h.get("lastRecomment") or ""),
+            "rateForNav": float(h.get("rateForNav") or 0),
+            "numberOfProfit": int(h.get("numberOfProfit") or 0),
+            "dnse_orders": [o],
+        })
+
+    for o in close_orders:
+        did = _extract_deal_id(o.get("reason", ""))
+        deals.append({
+            "action": "full_close",
+            "symbol": o.get("symbol", "?"),
+            "deal_id": did,
+            "lastRecomment": "(autofin exited — not in holding)",
+            "rateForNav": 0.0,
+            "numberOfProfit": 0,
+            "dnse_orders": [o],
+        })
+
+    return deals
 
 
 class AutofinSignalAdapter(StrategyAdapter):
@@ -436,6 +502,16 @@ class AutofinSignalAdapter(StrategyAdapter):
             nav = 0.0
             account = "?"
 
+        # 5b. MOCK_NAV override — for dry-run testing with funded account
+        # but zero balance. Lets us see the order plan without real money.
+        mock_nav = os.environ.get("MOCK_NAV", "").strip()
+        if mock_nav:
+            try:
+                nav = float(mock_nav)
+                positions = dict(positions)  # copy
+            except ValueError:
+                pass
+
         # 6. select signals (top risk-adjusted, NAV-budgeted)
         selected = _select_signals_within_nav_budget(signals, nav_budget_pct=1.0)
         # filter to only selected deals that are actually open in autofin
@@ -485,6 +561,12 @@ class AutofinSignalAdapter(StrategyAdapter):
         # 11. assemble final order list (close → partial → new)
         all_orders = close_orders + partial_orders + new_orders
 
+        # 11b. group orders by deal so the EOD summary can show signal ↔
+        # DNSE-order mapping per deal.
+        deals_actioned = _build_deals_actioned(
+            new_orders, partial_orders, close_orders, autofin_holding_by_id
+        )
+
         # 11. write outputs
         today = trade_date or datetime.now(timezone.utc).date().isoformat()
         out_dir = config.dataDir / config.liveDirName
@@ -524,6 +606,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             "newOrders": len(new_orders),
             "closeOrders": len(close_orders),
             "partialOrders": len(partial_orders),
+            "dealsActioned": deals_actioned,
             "items": [{
                 "orderId": i + 1,
                 "date": today,
@@ -538,20 +621,9 @@ class AutofinSignalAdapter(StrategyAdapter):
         # 12. save state for next cycle
         self._save_state(config.dataDir)
 
-        # 13. notify
-        risk_alerts = [d.get("symbol") for d in risk if isinstance(d, dict)]
-        notify_lines = [
-            "📡 Vietnam Algo: AUTOFIN signal cycle",
-            f"account: {account}",
-            f"NAV: {nav:,.0f} VND",
-            f"autofin holding: {len(holding)}  risk: {len(risk)}  closing: {len(closing)}",
-            f"signals fetched: {len(signals)}  deals tracked: {len(self._our_deals)}",
-            f"new: {len(new_orders)}  partial: {len(partial_orders)}  closes: {len(close_orders)}",
-            f"ordersFile: {csv_path}",
-        ]
-        if risk_alerts:
-            notify_lines.append(f"⚠️ RISK FLAGGED: {', '.join(risk_alerts[:10])}")
-        notify("\n".join(notify_lines))
+        # Note: Telegram notification is sent via format_cycle_summary() by
+        # the auto_bot's EOD path. We do NOT notify here to avoid duplicate
+        # messages.
 
         return {
             "status": "generated",
@@ -577,22 +649,100 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "new_symbols": [r["symbol"] for r in new_orders],
                 "close_symbols": [r["symbol"] for r in close_orders],
                 "partial_symbols": [r["symbol"] for r in partial_orders],
+                "account": account,
+                "nav": nav,
             },
+            "deals_actioned": deals_actioned,
         }
 
     def format_cycle_summary(self, result: dict[str, Any]) -> str:
+        """Rich per-deal Telegram summary.
+
+        Shows:
+          - which bot is sending (autofin_signal)
+          - what autofin signal triggered each order (lastRecomment, nP)
+          - the actual DNSE order we'll send (side, symbol, qty, price)
+        """
         sig = result.get("signals", {}) or {}
-        return "\n".join(
-            [
-                "📡 Vietnam Algo: AUTOFIN signal cycle",
-                f"tradeDate: {result.get('tradeDate')}",
-                f"autofin holding: {sig.get('autofin_holding', 0)}  risk: {sig.get('autofin_risk', 0)}  closing: {sig.get('autofin_closing', 0)}",
-                f"signals fetched: {sig.get('fetched', 0)}",
-                f"deals tracked: {sig.get('deals_tracked', 0)}",
-                f"orderCount: {result.get('count')}",
-                f"new entries:    {sig.get('new_count', 0)} → {', '.join(sig.get('new_symbols', []) or []) or '(none)'}",
-                f"partial closes: {sig.get('partial_count', 0)} → {', '.join(sig.get('partial_symbols', []) or []) or '(none)'}",
-                f"full closes:    {sig.get('close_count', 0)} → {', '.join(sig.get('close_symbols', []) or []) or '(none)'}",
-                f"ordersFile: {result.get('latestOrdersCsv')}",
-            ]
+        deals = result.get("deals_actioned", []) or []
+        nav = float(sig.get("nav") or result.get("metrics", {}).get("finalEquity") or 0)
+        account = sig.get("account") or "?"
+
+        lines: list[str] = []
+        lines.append("🤖 Vietnam Algo bot — [autofin_signal]")
+        lines.append(f"📅 Cycle: {result.get('tradeDate', '?')}")
+        lines.append(f"💼 Account: {account}")
+        lines.append(f"💰 NAV: {nav:,.0f} VND")
+        lines.append("")
+        lines.append("📊 Autofin state")
+        lines.append(
+            f"  • holding={sig.get('autofin_holding', 0)}  "
+            f"risk={sig.get('autofin_risk', 0)}  "
+            f"closing={sig.get('autofin_closing', 0)}"
         )
+        lines.append(
+            f"  • signals fetched={sig.get('fetched', 0)}  "
+            f"our tracked deals={sig.get('deals_tracked', 0)}"
+        )
+        lines.append("")
+
+        def _fmt_price(p: int | float) -> str:
+            return f"{int(p):,}" if p else "market"
+
+        def _fmt_order_line(o: dict[str, Any]) -> str:
+            side_lbl = "BUY" if o.get("side") == "NB" else "SELL"
+            return (
+                f"    → DNSE: {side_lbl} {o.get('quantity')} "
+                f"{o.get('symbol')} @ {_fmt_price(o.get('price', 0))} VND"
+            )
+
+        new_entries = [d for d in deals if d["action"] == "new_entry"]
+        partials = [d for d in deals if d["action"] == "partial_close"]
+        fulls = [d for d in deals if d["action"] == "full_close"]
+
+        if new_entries:
+            lines.append(f"📥 New entries ({len(new_entries)})")
+            for d in new_entries:
+                rate = d.get("rateForNav") or 0
+                lines.append(
+                    f"  • {d['symbol']}  [deal#{d['deal_id']}, rateForNav={rate:.0%}]"
+                )
+                lines.append(f"    signal: {d['lastRecomment'] or '(no recomment)'}")
+                for o in d["dnse_orders"]:
+                    lines.append(_fmt_order_line(o))
+            lines.append("")
+
+        if partials:
+            lines.append(f"📤 Partial closes ({len(partials)})")
+            for d in partials:
+                nP = d.get("numberOfProfit", 0)
+                lines.append(f"  • {d['symbol']}  [deal#{d['deal_id']}, nP={nP}]")
+                lines.append(f"    signal: {d['lastRecomment'] or '(no recomment)'}")
+                for o in d["dnse_orders"]:
+                    lines.append(_fmt_order_line(o))
+            lines.append("")
+
+        if fulls:
+            lines.append(f"🚪 Full closes ({len(fulls)})")
+            for d in fulls:
+                lines.append(f"  • {d['symbol']}  [deal#{d['deal_id']}]")
+                lines.append(f"    signal: {d['lastRecomment']}")
+                for o in d["dnse_orders"]:
+                    lines.append(_fmt_order_line(o))
+            lines.append("")
+
+        if not deals:
+            lines.append("ℹ️  No orders planned this cycle")
+            if nav == 0:
+                lines.append("   (account NAV=0 — orders will plan once funded)")
+            lines.append("")
+
+        if sig.get("autofin_risk"):
+            lines.append(
+                f"⚠️  {sig['autofin_risk']} positions risk-flagged (see risk endpoint)"
+            )
+            lines.append("")
+
+        lines.append(f"📁 Orders file: {result.get('latestOrdersCsv', '?')}")
+        lines.append(f"📊 JSON output:  {result.get('latestOrdersJson', '?')}")
+        return "\n".join(lines)

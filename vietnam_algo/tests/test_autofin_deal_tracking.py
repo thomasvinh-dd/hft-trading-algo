@@ -185,19 +185,38 @@ def test_partial_close_emits_sell_on_numberOfProfit_bump():
 
 
 def test_partial_close_uses_tpF_when_no_price_in_recomment():
-    """'Hạ tỷ trọng' has no price → fall back to tP_F from autofin."""
+    """'Hạ tỷ trọng' has no price → fall back to tP_F from autofin.
+
+    Holding endpoint returns raw VND; suggest endpoint returns thousands.
+    Both should produce the same VND price.
+    """
     our_deals = {
         "222": {"symbol": "POW", "_our_qty": 300, "_last_numberOfProfit": 0},
     }
     autofin_holding = [{
         "_id": 222, "symbol": "POW", "numberOfProfit": 1,
         "lastRecomment": "⚠️ Hạ tỷ trọng lần 2",
-        "tP_F": 15.1, "sL_F": 12.7,  # in thousands
+        "tP_F": 15100, "sL_F": 12700,  # raw VND (holding endpoint)
     }]
     rows = _plan_partial_close_orders(our_deals, autofin_holding)
     assert len(rows) == 1
     r = rows[0]
-    assert r["price"] == 15100  # tP_F * 1000
+    assert r["price"] == 15100  # raw VND, no double-multiplication
+
+
+def test_partial_close_uses_tpF_in_thousands_when_small():
+    """Same result if data is in thousands (suggest-endpoint format)."""
+    our_deals = {
+        "222": {"symbol": "POW", "_our_qty": 300, "_last_numberOfProfit": 0},
+    }
+    autofin_holding = [{
+        "_id": 222, "symbol": "POW", "numberOfProfit": 1,
+        "lastRecomment": "⚠️ Hạ tỷ trọng lần 2",
+        "tP_F": 15.1, "sL_F": 12.7,  # thousands (suggest endpoint)
+    }]
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert len(rows) == 1
+    assert rows[0]["price"] == 15100
 
 
 def test_partial_close_capital_protect_uses_pct():

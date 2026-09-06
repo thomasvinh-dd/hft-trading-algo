@@ -6,6 +6,7 @@ sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
 import vietnam_algo.strategies_impl.autofin_signal as mod
 from vietnam_algo.strategies_impl.autofin_signal import (
+    AutofinSignalAdapter,
     _plan_orders_for_new_positions,
     _plan_close_orders,
     parse_signal,
@@ -131,3 +132,96 @@ def test_plan_close_orders_only_closes_what_autofin_exited():
     rows = _plan_close_orders(our_deals, autofin_holding)
     assert len(rows) == 1
     assert rows[0]["symbol"] == "VHM"
+
+
+# ── Rich cycle-summary formatter (Telegram message) ───────────────────────
+
+
+def test_format_cycle_summary_shows_bot_signal_and_dnse_order():
+    """The EOD Telegram message must show:
+      1. which bot is sending (autofin_signal)
+      2. what autofin signal triggered each order
+      3. the actual DNSE order we'll send
+    """
+    adapter = AutofinSignalAdapter()
+    result = {
+        "tradeDate": "2026-09-07",
+        "latestOrdersCsv": "/path/to/latest_orders.autofin_signal.csv",
+        "latestOrdersJson": "/path/to/latest_orders.autofin_signal.json",
+        "signals": {
+            "autofin_holding": 20,
+            "autofin_risk": 1,
+            "autofin_closing": 2,
+            "fetched": 20,
+            "deals_tracked": 3,
+            "new_count": 1,
+            "close_count": 1,
+            "partial_count": 1,
+            "account": "0003937868",
+            "nav": 1_500_000_000,
+        },
+        "deals_actioned": [
+            {
+                "action": "new_entry",
+                "symbol": "TDP",
+                "deal_id": "1781740900",
+                "lastRecomment": "Khuyến nghị đầu tư",
+                "rateForNav": 0.15,
+                "numberOfProfit": 0,
+                "dnse_orders": [
+                    {"symbol": "TDP", "side": "NB", "price": 32000, "quantity": 700},
+                    {"symbol": "TDP", "side": "NS", "price": 36000, "quantity": 700},
+                    {"symbol": "TDP", "side": "NS", "price": 28500, "quantity": 700},
+                ],
+            },
+            {
+                "action": "partial_close",
+                "symbol": "HCM",
+                "deal_id": "1785888000",
+                "lastRecomment": "💰 Chốt lãi lần 1 mức giá 26,900",
+                "rateForNav": 0.30,
+                "numberOfProfit": 1,
+                "dnse_orders": [
+                    {"symbol": "HCM", "side": "NS", "price": 26900, "quantity": 100},
+                ],
+            },
+            {
+                "action": "full_close",
+                "symbol": "L40",
+                "deal_id": "1756166400",
+                "lastRecomment": "(autofin exited — not in holding)",
+                "rateForNav": 0.0,
+                "numberOfProfit": 0,
+                "dnse_orders": [
+                    {"symbol": "L40", "side": "NS", "price": 0, "quantity": 200},
+                ],
+            },
+        ],
+    }
+    msg = adapter.format_cycle_summary(result)
+    # 1. Bot identity
+    assert "[autofin_signal]" in msg
+    # 2. Signal context (autofin recomment) shown for each deal
+    assert "Khuyến nghị đầu tư" in msg
+    assert "Chốt lãi lần 1 mức giá 26,900" in msg
+    # 3. Actual DNSE orders shown
+    assert "BUY 700 TDP @ 32,000 VND" in msg
+    assert "SELL 100 HCM @ 26,900 VND" in msg
+    assert "SELL 200 L40 @ market VND" in msg
+    # grouping
+    assert "New entries (1)" in msg
+    assert "Partial closes (1)" in msg
+    assert "Full closes (1)" in msg
+
+
+def test_format_cycle_summary_handles_empty_cycle():
+    adapter = AutofinSignalAdapter()
+    result = {
+        "tradeDate": "2026-09-07",
+        "signals": {"account": "0003937868", "nav": 0},
+        "deals_actioned": [],
+    }
+    msg = adapter.format_cycle_summary(result)
+    assert "[autofin_signal]" in msg
+    assert "No orders planned" in msg
+    assert "NAV=0" in msg
