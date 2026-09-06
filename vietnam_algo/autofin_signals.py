@@ -208,3 +208,64 @@ class AutofinClient:
         if not isinstance(items, list):
             return []
         return [parse_signal(it) for it in items if isinstance(it, dict)]
+
+    def fetch_deals(
+        self,
+        symbol: str | None = None,
+        page_size: int = 50,
+        page_index: int = 1,
+        only_open: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Fetch autofin's position history (deals).
+
+        If ``symbol`` is None, returns all recent deals. With ``only_open=True``
+        (default), filters to ``statusDeal.isClosed == False``.
+        """
+        token = self.get_token()
+        params = {"pageSize": page_size, "pageIndex": page_index}
+        if symbol:
+            params["symbol"] = symbol.upper()
+        url = "https://api.autofin.vn/gateway/api/gw/v1/signals/signal-deals?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "accept": "*/*",
+                "origin": "https://www.autofin.vn",
+                "referer": "https://www.autofin.vn/",
+                "user-agent": "Mozilla/5.0",
+            },
+        )
+        req.add_header("Cookie", f"token={token}")
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    self._token = None
+                    token = self._ensure_token(force_refresh=True)
+                    req = urllib.request.Request(
+                        url,
+                        method="GET",
+                        headers={
+                            "accept": "*/*",
+                            "origin": "https://www.autofin.vn",
+                            "referer": "https://www.autofin.vn/",
+                            "user-agent": "Mozilla/5.0",
+                        },
+                    )
+                    req.add_header("Cookie", f"token={token}")
+                    continue
+                raise
+        items = payload.get("data") or []
+        if not isinstance(items, list):
+            return []
+        if only_open:
+            items = [
+                it for it in items
+                if isinstance(it, dict)
+                and not ((it.get("statusDeal") or {}).get("isClosed"))
+            ]
+        return items
