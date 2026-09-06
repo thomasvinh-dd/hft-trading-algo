@@ -221,11 +221,48 @@ class AutofinClient:
         If ``symbol`` is None, returns all recent deals. With ``only_open=True``
         (default), filters to ``statusDeal.isClosed == False``.
         """
+        items = self._fetch_paginated("signal-deals", page_size, page_index, symbol=symbol)
+        if only_open:
+            items = [
+                it for it in items
+                if isinstance(it, dict)
+                and not ((it.get("statusDeal") or {}).get("isClosed"))
+            ]
+        return items
+
+    def fetch_holding(
+        self, page_size: int = 50, page_index: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Fetch autofin's currently-HELD positions (deal_id keyed)."""
+        return self._fetch_paginated("signal-static-holding", page_size, page_index)
+
+    def fetch_closing(
+        self, page_size: int = 50, page_index: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Fetch autofin's RECENTLY CLOSED positions (exit history)."""
+        return self._fetch_paginated("closing-signals", page_size, page_index)
+
+    def fetch_risk(
+        self, page_size: int = 50, page_index: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Fetch autofin's RISK-flagged positions."""
+        return self._fetch_paginated("signal-static-risk", page_size, page_index)
+
+    def _fetch_paginated(
+        self,
+        endpoint: str,
+        page_size: int,
+        page_index: int,
+        symbol: str | None = None,
+    ) -> list[dict[str, Any]]:
         token = self.get_token()
-        params = {"pageSize": page_size, "pageIndex": page_index}
+        params: dict[str, object] = {"pageSize": page_size, "pageIndex": page_index}
         if symbol:
             params["symbol"] = symbol.upper()
-        url = "https://api.autofin.vn/gateway/api/gw/v1/signals/signal-deals?" + urllib.parse.urlencode(params)
+        url = (
+            f"https://api.autofin.vn/gateway/api/gw/v1/signals/{endpoint}?"
+            + urllib.parse.urlencode(params)
+        )
         req = urllib.request.Request(
             url,
             method="GET",
@@ -260,12 +297,4 @@ class AutofinClient:
                     continue
                 raise
         items = payload.get("data") or []
-        if not isinstance(items, list):
-            return []
-        if only_open:
-            items = [
-                it for it in items
-                if isinstance(it, dict)
-                and not ((it.get("statusDeal") or {}).get("isClosed"))
-            ]
-        return items
+        return items if isinstance(items, list) else []
