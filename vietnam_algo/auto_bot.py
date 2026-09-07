@@ -82,78 +82,96 @@ def run_auto_bot(
         holidays = load_market_holidays(engine_config.dataDir)
 
         if should_submit_orders(now, state.orderSubmitDate, schedule, holidays):
-            print(f"[{now.isoformat()}] Generating and submitting latest orders")
-            notify(f"Vietnam Algo: submit cycle started\ntime: {now.isoformat()}\nliveSubmit: {live_submit}")
-            # Lazy refresh: only fetch a token if (a) live mode AND
-            # (b) we don't have a fresh one. Dry-run just sets a placeholder.
-            def _refresh_and_notify(msg: str) -> None:
-                # Called from inside ensure_fresh_trading_token — keep
-                # the notify path uniform with the rest of the bot.
-                notify(msg)
+            # The legacy 09:16 submit cycle is only for strategies that
+            # go through run_daily_once → run_momentum_rotation /
+            # run_hybrid_*. Strategies like autofin_signal generate orders
+            # continuously via mid-day polls + EOD; their CSV is the
+            # source of truth and they have no DNSE submit path here.
+            # Skip the submit cycle entirely to avoid spamming
+            # "Unsupported live strategy: autofin_signal" errors.
+            from .daily_engine import strategy_runner
             try:
-                token, was_refreshed = ensure_fresh_trading_token(
-                    client=client,
-                    state=state,
-                    account_no=account_no,
-                    live_submit=live_submit,
-                    notify_fn=_refresh_and_notify,
+                strategy_runner(engine_config.strategy)
+            except ValueError:
+                print(
+                    f"[{now.isoformat()}] Skipping 09:16 submit cycle for "
+                    f"strategy={engine_config.strategy} (mid-day/EOD strategy)"
                 )
-                if was_refreshed and live_submit:
-                    notify(token_refresh_message(account_no, live_submit, True))
-                    save_state(state, engine_config.dataDir, strategy_name=strategy_name)
-            except Exception as exc:
-                notify(
-                    "\n".join(
-                        [
-                            "🚨 Vietnam Algo: TOKEN REFRESH FAILED",
-                            f"account: {account_no}",
-                            f"err: {str(exc)[:300]}",
-                        ]
-                    )
-                )
-                if once:
-                    raise
-                continue
-            try:
-                result = run_daily_once(
-                    engine_config,
-                    strategy_config,
-                    submit=live_submit,
-                    account_no=account_no,
-                    loan_package_id=loan_package_id,
-                    trading_token=token,
-                    client=client,
-                )
-            except Exception as exc:
-                notify(
-                    "\n".join(
-                        [
-                            "🚨 Vietnam Algo: SUBMIT CYCLE FAILED",
-                            f"account: {account_no}",
-                            f"tradeDate: {today}",
-                            f"err: {str(exc)[:400]}",
-                        ]
-                    )
-                )
-                print(result if False else f"[{now.isoformat()}] submit cycle failed: {exc}")
-                if once:
-                    raise
-                continue
-            print(result)
-            if result.get("submitComplete") or not live_submit:
                 state.orderSubmitDate = today
+                save_state(state, engine_config.dataDir, strategy_name=strategy_name)
             else:
-                notify(
-                    "\n".join(
-                        [
-                            "⚠️ Vietnam Algo: submit not marked complete",
-                            f"date: {today}",
-                            f"status: {result.get('status')}",
-                            "reason: order ledger has unknown/open/pending orders",
-                        ]
+                print(f"[{now.isoformat()}] Generating and submitting latest orders")
+                notify(f"Vietnam Algo: submit cycle started\ntime: {now.isoformat()}\nliveSubmit: {live_submit}")
+                # Lazy refresh: only fetch a token if (a) live mode AND
+                # (b) we don't have a fresh one. Dry-run just sets a placeholder.
+                def _refresh_and_notify(msg: str) -> None:
+                    # Called from inside ensure_fresh_trading_token — keep
+                    # the notify path uniform with the rest of the bot.
+                    notify(msg)
+                try:
+                    token, was_refreshed = ensure_fresh_trading_token(
+                        client=client,
+                        state=state,
+                        account_no=account_no,
+                        live_submit=live_submit,
+                        notify_fn=_refresh_and_notify,
                     )
-                )
-            save_state(state, engine_config.dataDir, strategy_name=strategy_name)
+                    if was_refreshed and live_submit:
+                        notify(token_refresh_message(account_no, live_submit, True))
+                        save_state(state, engine_config.dataDir, strategy_name=strategy_name)
+                except Exception as exc:
+                    notify(
+                        "\n".join(
+                            [
+                                "🚨 Vietnam Algo: TOKEN REFRESH FAILED",
+                                f"account: {account_no}",
+                                f"err: {str(exc)[:300]}",
+                            ]
+                        )
+                    )
+                    if once:
+                        raise
+                    continue
+                try:
+                    result = run_daily_once(
+                        engine_config,
+                        strategy_config,
+                        submit=live_submit,
+                        account_no=account_no,
+                        loan_package_id=loan_package_id,
+                        trading_token=token,
+                        client=client,
+                    )
+                except Exception as exc:
+                    notify(
+                        "\n".join(
+                            [
+                                "🚨 Vietnam Algo: SUBMIT CYCLE FAILED",
+                                f"account: {account_no}",
+                                f"tradeDate: {today}",
+                                f"err: {str(exc)[:400]}",
+                            ]
+                        )
+                    )
+                    print(f"[{now.isoformat()}] submit cycle failed: {exc}")
+                    if once:
+                        raise
+                    continue
+                print(result)
+                if result.get("submitComplete") or not live_submit:
+                    state.orderSubmitDate = today
+                else:
+                    notify(
+                        "\n".join(
+                            [
+                                "⚠️ Vietnam Algo: submit not marked complete",
+                                f"date: {today}",
+                                f"status: {result.get('status')}",
+                                "reason: order ledger has unknown/open/pending orders",
+                            ]
+                        )
+                    )
+                save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
         if should_sync_corporate_actions(now, state.corporateActionDate, schedule, holidays):
             print(f"[{now.isoformat()}] Syncing Vietstock corporate actions")
