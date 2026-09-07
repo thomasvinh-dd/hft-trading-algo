@@ -852,14 +852,20 @@ class AutofinSignalAdapter(StrategyAdapter):
             "deals_actioned": deals_actioned,
         }
 
-    def format_cycle_summary(self, result: dict[str, Any]) -> str:
+    def format_cycle_summary(
+        self,
+        result: dict[str, Any],
+        portfolio: dict[str, Any] | None = None,
+    ) -> str:
         """Rich per-deal Telegram summary.
 
         Shows:
           - which bot is sending (autofin_signal)
           - what autofin signal triggered each order (lastRecomment, nP)
           - the actual DNSE order we'll send (side, symbol, qty, price)
+          - current portfolio: cash, NAV, positions, unrealized P&L
         """
+        from ..notifier import portfolio_section_lines
         sig = result.get("signals", {}) or {}
         deals = result.get("deals_actioned", []) or []
         nav = float(sig.get("nav") or result.get("metrics", {}).get("finalEquity") or 0)
@@ -869,7 +875,10 @@ class AutofinSignalAdapter(StrategyAdapter):
         lines.append("🤖 Vietnam Algo bot — [autofin_signal]")
         lines.append(f"📅 Cycle: {result.get('tradeDate', '?')}")
         lines.append(f"💼 Account: {account}")
-        lines.append(f"💰 NAV: {nav:,.0f} VND")
+        lines.append(f"💰 MOCK NAV (autofin target): {nav:,.0f} VND")
+        lines.append("")
+        # current portfolio: cash, NAV, positions, unrealized P&L
+        lines.extend(portfolio_section_lines(portfolio))
         lines.append("")
         lines.append("📊 Autofin state")
         lines.append(

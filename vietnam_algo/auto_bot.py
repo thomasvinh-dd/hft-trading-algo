@@ -256,27 +256,29 @@ def run_auto_bot(
                 notify_telegram=False,
             )
             print(result)
+            # Fetch live portfolio snapshot once so the EOD summary can
+            # show cash, NAV, and per-position P&L inline.
+            portfolio_snap: dict | None = None
+            try:
+                from .portfolio import build_portfolio_snapshot
+                portfolio_snap = build_portfolio_snapshot(client, account_no)
+            except Exception as exc:
+                notify(
+                    "\n".join(
+                        [
+                            "⚠️ Vietnam Algo: portfolio snapshot FAILED at EOD",
+                            f"err: {str(exc)[:200]}",
+                        ]
+                    )
+                )
+                print(f"[{now.isoformat()}] portfolio snapshot failed: {exc}")
             if isinstance(result, dict):
                 # Use strategy-specific formatter if available, else default.
+                # Both now accept the live portfolio snapshot.
                 if strategy_adapter is not None:
-                    notify(strategy_adapter.format_cycle_summary(result))
+                    notify(strategy_adapter.format_cycle_summary(result, portfolio=portfolio_snap))
                 else:
-                    notify(eod_summary_message(result))
-                # Pull live portfolio snapshot alongside EOD summary (best-effort)
-                try:
-                    from .portfolio import build_portfolio_snapshot
-                    from .notifier import portfolio_snapshot_message
-                    snap = build_portfolio_snapshot(client, account_no)
-                    notify(portfolio_snapshot_message(snap))
-                except Exception as exc:
-                    notify(
-                        "\n".join(
-                            [
-                                "⚠️ Vietnam Algo: portfolio snapshot FAILED at EOD",
-                                f"err: {str(exc)[:200]}",
-                            ]
-                        )
-                    )
+                    notify(eod_summary_message(result, portfolio=portfolio_snap))
             state.eodDate = today
             save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 

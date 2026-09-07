@@ -227,6 +227,62 @@ def test_format_cycle_summary_handles_empty_cycle():
     assert "NAV=0" in msg
 
 
+def test_format_cycle_summary_includes_portfolio_data():
+    """The EOD summary should include the live portfolio snapshot:
+    cash, NAV, and per-position unrealized P&L."""
+    adapter = AutofinSignalAdapter()
+    result = {
+        "tradeDate": "2026-09-07",
+        "signals": {"account": "0003937868", "nav": 0},
+        "deals_actioned": [],
+    }
+    portfolio = {
+        "balance": {
+            "totalCash": 50_000_000,
+            "availableCash": 30_000_000,
+            "withdrawableCash": 30_000_000,
+        },
+        "positions": [
+            {
+                "symbol": "HCM",
+                "quantity": 1000,
+                "avgPrice": 26126,
+                "marketPrice": 27500,
+                "marketValue": 27_500_000,
+                "costBasis": 26_126_000,
+                "unrealizedPnl": 1_374_000,
+                "unrealizedPnlPct": 5.26,
+            },
+        ],
+        "totals": {
+            "stockValue": 27_500_000,
+            "portfolioValue": 57_500_000,
+            "totalUnrealizedPnl": 1_374_000,
+            "totalUnrealizedPnlPct": 2.45,
+            "positionCount": 1,
+        },
+    }
+    msg = adapter.format_cycle_summary(result, portfolio=portfolio)
+    assert "CURRENT PORTFOLIO" in msg
+    assert "30,000,000" in msg or "30.000.000" in msg  # availableCash
+    assert "NAV:" in msg
+    assert "HCM" in msg  # the position
+    assert "uPnL" in msg
+
+
+def test_format_cycle_summary_handles_none_portfolio():
+    """Passing portfolio=None must not crash."""
+    adapter = AutofinSignalAdapter()
+    result = {
+        "tradeDate": "2026-09-07",
+        "signals": {"account": "0003937868", "nav": 0},
+        "deals_actioned": [],
+    }
+    msg = adapter.format_cycle_summary(result, portfolio=None)
+    assert "[autofin_signal]" in msg
+    assert "portfolio" in msg.lower()  # shows "unavailable" note
+
+
 # ── Per-order Telegram notifications (mid-day) ───────────────────────────
 
 

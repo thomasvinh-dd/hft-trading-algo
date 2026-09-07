@@ -379,12 +379,64 @@ def heartbeat_message(
     return "\n".join(lines)
 
 
-def eod_summary_message(result: dict[str, Any]) -> str:
+def portfolio_section_lines(
+    portfolio: dict[str, Any] | None,
+    top_n: int = 8,
+    label: str = "CURRENT PORTFOLIO",
+) -> list[str]:
+    """Render a Telegram section showing cash, NAV, P&L, and per-position P&L.
+
+    Returns a list of message lines (no trailing newline). If ``portfolio`` is
+    None or missing data, returns a single-line note that the snapshot
+    couldn't be fetched.
+    """
+    if not isinstance(portfolio, dict):
+        return ["💼 portfolio snapshot: unavailable"]
+    bal = portfolio.get("balance", {}) or {}
+    totals = portfolio.get("totals", {}) or {}
+    positions = portfolio.get("positions", []) or []
+
+    lines: list[str] = [f"💼 {label}"]
+    lines.append(f"  cash (available): {format_money(bal.get('availableCash'))} VND")
+    lines.append(f"  cash (total):     {format_money(bal.get('totalCash'))} VND")
+    lines.append(f"  stock value:      {format_money(totals.get('stockValue'))} VND")
+    lines.append(f"  NAV:              {format_money(totals.get('portfolioValue'))} VND")
+    upnl = totals.get("totalUnrealizedPnl", 0) or 0
+    upnl_pct = totals.get("totalUnrealizedPnlPct", 0.0) or 0.0
+    lines.append(
+        f"  unrealized P&L:   {format_money(upnl)} VND  ({upnl_pct:+.2f}%)"
+    )
+    if positions:
+        lines.append("")
+        lines.append(f"  📊 Positions ({len(positions)}):")
+        for p in positions[:top_n]:
+            sym = p.get("symbol", "?")
+            qty = p.get("quantity", 0)
+            avg = p.get("avgPrice") or 0
+            mkt = p.get("marketPrice") or 0
+            mv = p.get("marketValue") or 0
+            pnl = p.get("unrealizedPnl") or 0
+            pnl_pct = p.get("unrealizedPnlPct") or 0.0
+            lines.append(
+                f"    • {sym}: qty={qty:,}  avg={format_money(avg)}  "
+                f"mkt={format_money(mkt)}  MV={format_money(mv)} VND  "
+                f"uPnL={format_money(pnl)} VND ({pnl_pct:+.2f}%)"
+            )
+        if len(positions) > top_n:
+            lines.append(f"    ... and {len(positions) - top_n} more")
+    return lines
+
+
+def eod_summary_message(
+    result: dict[str, Any],
+    portfolio: dict[str, Any] | None = None,
+) -> str:
     """Default EOD cycle summary (used by momentum / hybrid etc.).
 
     Reads the per-trade rows from the latest_orders JSON file so the
     Telegram message shows the actual BUY/SELL orders being submitted,
-    not just a count.
+    not just a count. When ``portfolio`` is provided, includes cash, NAV,
+    and per-position unrealized P&L.
     """
     metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
     orders_info = result.get("latestOrdersCsv")
@@ -397,7 +449,10 @@ def eod_summary_message(result: dict[str, Any]) -> str:
         f"maxDrawdown: {format_percent(metrics.get('maxDrawdownPercent'))}",
         f"finalEquity: {format_money(metrics.get('finalEquity'))}",
     ]
-    # include actual order rows (BUY/SELL, symbol, price, qty)
+    # current portfolio (cash, NAV, P&L, positions)
+    lines.append("")
+    lines.extend(portfolio_section_lines(portfolio, label="CURRENT PORTFOLIO"))
+    # orders to submit (read from latest_orders JSON)
     items: list[dict[str, Any]] = []
     json_path = result.get("latestOrdersJson")
     if json_path:
