@@ -284,6 +284,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="send the summary to Telegram",
     )
+    autofin_daily_bt.add_argument(
+        "--from-cache",
+        type=Path,
+        default=None,
+        help="load closed deals from a JSON cache file instead of "
+             "fetching from the autofin API (useful when autofin.vn "
+             "is unreachable)",
+    )
 
     dnse_accounts = subparsers.add_parser("dnse-accounts", help="list DNSE trading accounts")
     add_dnse_auth_arguments(dnse_accounts)
@@ -1139,11 +1147,17 @@ def main(argv: list[str] | None = None) -> int:
             write_daily_replay_outputs,
         )
         from .notifier import notify
+        closed_deals = None
+        if args.from_cache:
+            from .backtest_autofin import load_closed_deals_from_json
+            closed_deals = load_closed_deals_from_json(args.from_cache)
+            print(f"Loaded {len(closed_deals)} closed deals from {args.from_cache}")
         result = run_daily_replay_backtest(
             initial_nav=args.initial_nav,
             fee_pct_per_side=args.fee_pct_per_side,
             slippage_pct_per_fill=args.slippage_pct_per_fill,
             max_pages=args.max_pages,
+            closed_deals=closed_deals,
         )
         json_path, nav_csv, fills_csv = write_daily_replay_outputs(
             result, args.out_dir, prefix=args.prefix,

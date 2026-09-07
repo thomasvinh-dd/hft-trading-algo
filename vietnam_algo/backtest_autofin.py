@@ -133,6 +133,16 @@ def fetch_all_closed(
     return all_items
 
 
+def load_closed_deals_from_json(path: Path) -> list[dict[str, Any]]:
+    """Load cached autofin closing-signals records from a JSON file.
+
+    The JSON must be a list of autofin raw deal dicts. Useful for
+    offline testing / backtest replay without hitting the autofin API.
+    """
+    import json
+    return json.loads(Path(path).read_text())
+
+
 def _simulate_trade(
     *,
     qty: int,

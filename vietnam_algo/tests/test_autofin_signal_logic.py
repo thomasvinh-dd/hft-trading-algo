@@ -114,11 +114,126 @@ def test_plan_new_positions_skips_when_target_too_small():
 
 
 def test_plan_new_positions_no_op_when_match():
+    """Fixed sizing: if we already hold this symbol, skip entirely."""
     sig = _make_signal("APH", 0.10, supply_to=6100)
     rows = _plan_orders_for_new_positions(
         selected=[sig], nav_vnd=610_000, our_positions={"APH": 100}
     )
     assert rows == []
+
+
+def test_plan_new_positions_skips_when_already_held():
+    """Fixed sizing: never re-enter an existing position, even if NAV grew."""
+    sig = _make_signal("APH", 0.15, supply_to=6100, tp_from=6500, sl_to=5320)
+    # We hold 100 shares — under fixed sizing we should NOT issue a top-up BUY
+    # even though NAV grew enough to justify a larger position.
+    rows = _plan_orders_for_new_positions(
+        selected=[sig], nav_vnd=10_000_000_000, our_positions={"APH": 100}
+    )
+    assert rows == []
+
+
+def test_plan_new_positions_skips_topup_after_partial_close():
+    """Fixed sizing: after a partial-TP reduces our qty, don't top up."""
+    sig = _make_signal("APH", 0.15, supply_to=6100, tp_from=6500, sl_to=5320)
+    # We hold 50 shares (was 100, partial-TP took 50)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig], nav_vnd=1_000_000_000, our_positions={"APH": 50}
+    )
+    # Should NOT issue a BUY for the missing 50 shares — that was the
+    # death-spiral behavior. Position stays at 50 until full-close or
+    # further partial-TPs.
+    assert rows == []
+
+
+def test_plan_new_positions_emits_buy_when_position_zero():
+    """Fresh entry: target_qty = NAV * rate / ref_price, BUY + TP + SL."""
+    sig = _make_signal("APH", 0.15, supply_to=6100, tp_from=6500, sl_to=5320)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig], nav_vnd=1_000_000_000, our_positions={"APH": 0}
+    )
+    sides = [r["side"] for r in rows]
+    # BUY + TP-SELL + SL-SELL
+    assert sides.count("NB") == 1
+    assert sides.count("NS") == 2
+    buy = next(r for r in rows if r["side"] == "NB")
+    # target_value = 1B * 0.15 = 150M; / 6100 = 24590 shares → 245 lots
+    # = 24500
+    assert buy["quantity"] == 24500
+    assert buy["price"] == 6100
+
+
+def test_plan_new_positions_only_buy_never_sell():
+    """Fixed sizing: this function NEVER emits a SELL for sizing. SELLs
+    come from partial-close / full-close logic only."""
+    sig = _make_signal("APH", 0.10, supply_to=6100)
+    # Edge: we hold MORE than target (e.g. after NAV dropped)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig], nav_vnd=100_000, our_positions={"APH": 10000}
+    )
+    # Should skip entirely (we hold > 0) — no SELL
+    assert rows == []
+
+
+def test_decide_orders_does_not_rebalance_existing_positions():
+    """decide_orders() must not add held deals back to selected for re-entry.
+    This was the source of the death-spiral bug.
+    """
+    # We hold APH. autofin still has APH in holding (no exit). A new
+    # signal APH appears in suggest (autofin re-suggests it). Strategy
+    # must NOT issue a new BUY.
+    sig = _make_signal("APH", 0.15, supply_to=6100, tp_from=6500, sl_to=5320)
+    raw_aph = sig.raw
+    raw_aph["_id"] = 1700000000
+    holding = [{
+        "_id": 1700000000, "symbol": "APH", "companyName": "APH Co",
+        "statusDeal": {"price_Open": 6100, "price_Closed": 6500},
+        "numberOfProfit": 0, "rateForNav": 0.15,
+        "lastRecomment": "open", "supply_F": 6100, "supply_T": 6100,
+        "tP_F": 6500, "tP_T": 6600, "sL_F": 5300, "sL_T": 5400,
+    }]
+    our_deals = {
+        "1700000000:APH": {**raw_aph, "_our_qty": 1000, "_last_numberOfProfit": 0},
+    }
+    orders, new_our_deals, _ = mod.decide_orders(
+        holding=holding, signals=[sig], our_deals=our_deals,
+        our_positions={"APH": 1000}, nav=1_000_000_000,
+    )
+    # No new BUY for APH — we already hold it
+    buys = [o for o in orders if o["symbol"] == "APH" and o["side"] == "NB"]
+    assert buys == []
+
+
+def test_decide_orders_handles_new_entry_only_once():
+    """Same deal can be re-suggested by autofin across multiple days; we
+    only enter on the FIRST appearance (when our_positions has 0 for the
+    symbol). Subsequent suggestions are ignored for entry (no top-up)."""
+    sig = _make_signal("NEW", 0.10, supply_to=10000, tp_from=11000, sl_to=9000)
+    sig.raw["_id"] = 1750000000
+    holding = [{
+        "_id": 1750000000, "symbol": "NEW", "companyName": "New Co",
+        "statusDeal": {"price_Open": 10000, "price_Closed": 11000},
+        "numberOfProfit": 0, "rateForNav": 0.10,
+        "lastRecomment": "open", "supply_F": 10000, "supply_T": 10000,
+        "tP_F": 11000, "tP_T": 11100, "sL_F": 8900, "sL_T": 9000,
+    }]
+    our_deals_empty: dict = {}
+    # First call: position is empty → issue BUY
+    orders1, our_deals1, _ = mod.decide_orders(
+        holding=holding, signals=[sig], our_deals=our_deals_empty,
+        our_positions={}, nav=1_000_000_000,
+    )
+    assert any(o["symbol"] == "NEW" and o["side"] == "NB" for o in orders1)
+    # Set our positions to reflect the BUY
+    # (in real life the BUY would have filled by next cycle)
+    our_deals_after_entry = our_deals1
+    # Second call: we already hold the position → no new BUY
+    orders2, _, _ = mod.decide_orders(
+        holding=holding, signals=[sig], our_deals=our_deals_after_entry,
+        our_positions={"NEW": 10000}, nav=1_000_000_000,
+    )
+    new_buys = [o for o in orders2 if o["symbol"] == "NEW" and o["side"] == "NB"]
+    assert new_buys == []
 
 
 def test_plan_close_orders_only_closes_what_autofin_exited():

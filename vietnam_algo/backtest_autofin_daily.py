@@ -245,6 +245,7 @@ def run_daily_replay_backtest(
     board_lot: int = DEFAULT_BOARD_LOT,
     max_pages: int = MAX_PAGES,
     client: AutofinClient | None = None,
+    closed_deals: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Day-by-day replay that runs the actual strategy code.
 
@@ -255,13 +256,22 @@ def run_daily_replay_backtest(
     No hindsight filters are applied. The result is the most
     defensible estimate of what the strategy would actually do
     if run historically.
+
+    Parameters
+    ----------
+    closed_deals : optional pre-fetched list of autofin closing-signals
+        records. If provided, skips the autofin API call. Use this for
+        offline testing / when the autofin API is unreachable.
     """
-    if client is None:
-        client = AutofinClient(
-            email=os.environ["AUTOFIN_EMAIL"],
-            password=os.environ["AUTOFIN_PASSWORD"],
-        )
-    closed = fetch_all_closed(client, max_pages=max_pages)
+    if closed_deals is None:
+        if client is None:
+            client = AutofinClient(
+                email=os.environ["AUTOFIN_EMAIL"],
+                password=os.environ["AUTOFIN_PASSWORD"],
+            )
+        closed = fetch_all_closed(client, max_pages=max_pages)
+    else:
+        closed = closed_deals
     if not closed:
         return {
             "mode": "daily_replay",
@@ -327,7 +337,9 @@ def run_daily_replay_backtest(
         total_fees += fees_added
         total_slippage += slippage_added
 
-        # 2. Mark-to-market open positions at today's interpolated price
+        # 2. Mark-to-market open positions at today's interpolated price.
+        # NAV here = cash + positions at their today's price. After fills
+        # (BUYs/SELLs applied in step 1), this reflects the actual wealth.
         mtm_value = state.cash
         for sym, qty in state.positions.items():
             if qty <= 0:
@@ -402,12 +414,26 @@ def run_daily_replay_backtest(
                 "reason": reason,
             })
 
-        # 5. Apply any fills that were just queued for today.
+        # 5. Apply any fills that were just queued for today. Then
+        # RECOMPUTE NAV because cash and positions both changed.
         fees_added, slippage_added = apply_pending_fills(
             state, current, fee_pct_per_side, slippage_pct_per_fill, filled_orders,
         )
         total_fees += fees_added
         total_slippage += slippage_added
+        # After today's fills, recompute NAV. If we still hold positions,
+        # mark them at today's price; if we sold everything, NAV = cash.
+        post_fill_value = state.cash
+        for sym, qty in state.positions.items():
+            if qty <= 0:
+                continue
+            sym_deals = filled_deals_in_holding_for_day(closed, current, sym)
+            for d in sym_deals:
+                p = _interpolated_price(d, current) or 0.0
+                if p > 0:
+                    post_fill_value += qty * p
+                    break
+        state.nav = post_fill_value
 
         # Record daily NAV
         daily_nav.append({

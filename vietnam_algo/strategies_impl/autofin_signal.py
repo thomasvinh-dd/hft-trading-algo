@@ -124,12 +124,33 @@ def _plan_orders_for_new_positions(
     board_lot: int = DEFAULT_BOARD_LOT,
     min_order_value_vnd: float = 1_000_000,
 ) -> list[dict[str, Any]]:
-    """Emit BUY + TP + SL bracket orders for selected new positions."""
+    """Emit BUY + TP + SL bracket orders for **new** positions only.
+
+    Fixed-sizing model (introduced 2026-09-07): a position is
+    sized ONCE at entry based on the current NAV × rateForNav.
+    We never top up after that — partial-TP signals reduce the
+    position, full-close exits. This avoids the NAV-based death
+    spiral where daily rebalancing amplifies losses (when NAV
+    drops, target shrinks, strategy SELLs, realizes losses,
+    NAV drops further, more SELLs).
+
+    Concretely:
+      - If we already hold a positive qty for this symbol,
+        skip entirely. The partial-close / full-close logic
+        handles exits.
+      - Otherwise, size the new BUY at
+        target_qty = NAV * rateForNav / ref_price.
+      - Emit the BUY plus TP and SL bracket at the signal's
+        declared trigger levels.
+    """
     rows: list[dict[str, Any]] = []
     for s in selected:
         if not s.symbol:
             continue
         current_qty = our_positions.get(s.symbol, 0)
+        if current_qty > 0:
+            # Already hold this position — never rebalance.
+            continue
         if s.rate_for_nav <= 0 or nav_vnd <= 0:
             continue
         target_value = nav_vnd * s.rate_for_nav
@@ -141,40 +162,38 @@ def _plan_orders_for_new_positions(
         target_qty = _round_to_lots(int(target_value / ref_price), board_lot)
         if target_qty <= 0:
             continue
-        delta = target_qty - current_qty
-        if abs(delta) < board_lot:
-            continue
         did = _deal_id(s.raw)
-        side = "NB" if delta > 0 else "NS"
         rows.append({
             "symbol": s.symbol,
-            "side": side,
+            "side": "NB",
             "price": int(round(ref_price)),
-            "quantity": abs(delta),
+            "quantity": target_qty,
             "reason": (
                 f"autofin_buy:deal#{did}:"
                 f"nav{int(s.rate_for_nav*100)}pct:{s.last_recomment[:60]}"
             ),
         })
-        if side == "NB" and delta > 0:
-            tp_price = int(round(s.tp_from)) if s.tp_from > 0 else 0
-            sl_price = int(round(s.sl_from)) if s.sl_from > 0 else 0
-            if tp_price > 0:
-                rows.append({
-                    "symbol": s.symbol,
-                    "side": "NS",
-                    "price": tp_price,
-                    "quantity": abs(delta),
-                    "reason": f"autofin_tp:deal#{did}:{int(s.tp_from)}",
-                })
-            if sl_price > 0:
-                rows.append({
-                    "symbol": s.symbol,
-                    "side": "NS",
-                    "price": sl_price,
-                    "quantity": abs(delta),
-                    "reason": f"autofin_sl:deal#{did}:{int(s.sl_from)}",
-                })
+        # TP/SL bracket at signal's declared trigger levels. These
+        # become conditional orders in the live bot (and in the daily
+        # backtest) — they only fill if the price reaches the trigger.
+        tp_price = int(round(s.tp_from)) if s.tp_from > 0 else 0
+        sl_price = int(round(s.sl_from)) if s.sl_from > 0 else 0
+        if tp_price > 0:
+            rows.append({
+                "symbol": s.symbol,
+                "side": "NS",
+                "price": tp_price,
+                "quantity": target_qty,
+                "reason": f"autofin_tp:deal#{did}:{int(s.tp_from)}",
+            })
+        if sl_price > 0:
+            rows.append({
+                "symbol": s.symbol,
+                "side": "NS",
+                "price": sl_price,
+                "quantity": target_qty,
+                "reason": f"autofin_sl:deal#{did}:{int(s.sl_from)}",
+            })
     return rows
 
 
@@ -575,20 +594,18 @@ def decide_orders(
         if did:
             autofin_holding_by_id[did] = dict(d)
 
-    # 2. Select new-entry signals (top risk-adjusted, NAV-budgeted)
+    # 2. Select new-entry signals (top risk-adjusted, NAV-budgeted).
+    # NOTE (2026-09-07, fixed-sizing model): we use the SUGGEST
+    # endpoint only. The previous logic added HELD deals back to
+    # `selected` so the strategy could "rebalance" them — but that
+    # caused a death spiral when NAV dropped (target shrinks →
+    # SELL → realized loss → NAV drops further → more SELLs).
+    # Under fixed sizing, existing positions are NEVER re-evaluated
+    # for entry sizing; partial-close / full-close logic handles exits.
     selected = _select_signals_within_nav_budget(signals, nav_budget_pct=1.0)
 
-    # 3. Also include any deal we already hold (for rebalance). Use
-    # the original holding data so the composite deal_id is preserved.
-    autofin_open_ids = set(autofin_holding_by_id.keys())
-    suggest_ids = {_deal_id(s.raw) for s in signals if s.raw.get("_id")}
-    for did, sig in our_deals.items():
-        if did in autofin_open_ids:
-            already = any(_deal_id(s.raw) == did for s in selected)
-            if not already:
-                h = autofin_holding_by_id.get(did)
-                if h is not None:
-                    selected.append(parse_signal(h))
+    # 3. NO rebalance loop. Existing positions stay in `our_deals`
+    # for partial-close / full-close detection only.
 
     # 4. Compute orders
     new_orders = _plan_orders_for_new_positions(selected, nav, our_positions, board_lot=board_lot)
@@ -597,6 +614,7 @@ def decide_orders(
         did: sig for did, sig in our_deals.items()
         if sig.get("_our_qty", 0) > 0
     }
+    suggest_ids = {_deal_id(s.raw) for s in signals if s.raw.get("_id")}
     close_orders = _plan_close_orders(our_real_deals, holding, suggest_ids, board_lot=board_lot)
 
     # 4b. CRITICAL FIX (2026-09-07): don't re-enter deals that are being
