@@ -15,10 +15,10 @@ from .market_calendar import load_market_holidays, should_sync_market_holidays, 
 from .notifier import notify, token_refresh_message, eod_summary_message, heartbeat_message
 from .schedule import (
     TradingSchedule, local_date, should_poll_strategy, should_run_eod,
-    should_submit_orders, should_sync_corporate_actions,
-    should_send_heartbeat, vietnam_now,
+    should_run_start_of_day, should_submit_orders,
+    should_sync_corporate_actions, should_send_heartbeat, vietnam_now,
 )
-from .strategy_registry import get_strategy
+from .strategy_registry import STRATEGY_REGISTRY, get_strategy
 from .token_store import ensure_fresh_trading_token
 
 
@@ -195,6 +195,45 @@ def run_auto_bot(
                 )
             )
             state.corporateActionDate = today
+            save_state(state, engine_config.dataDir, strategy_name=strategy_name)
+
+        if should_run_start_of_day(
+            now,
+            state.startOfDayDate,
+            schedule=schedule,
+            holidays=holidays,
+        ):
+            print(f"[{now.isoformat()}] Sending start-of-day briefing")
+            try:
+                from .portfolio import build_portfolio_snapshot
+                from .notifier import start_of_day_message
+                portfolio_snap = build_portfolio_snapshot(client, account_no)
+                # read latest_orders JSON for the per-strategy file
+                from .strategy_base import StrategyAdapter
+                adapter = STRATEGY_REGISTRY.get(engine_config.strategy) if engine_config.strategy else None
+                json_name = adapter.orders_json_filename if adapter else "latest_orders.json"
+                json_path = (
+                    engine_config.dataDir / engine_config.liveDirName / json_name
+                )
+                msg = start_of_day_message(
+                    portfolio=portfolio_snap,
+                    today=today,
+                    orders_json_path=str(json_path),
+                    strategy_name=engine_config.strategy or "?",
+                    account=account_no,
+                )
+                notify(msg)
+            except Exception as exc:
+                notify(
+                    "\n".join(
+                        [
+                            "⚠️ Vietnam Algo: start-of-day briefing FAILED",
+                            f"err: {str(exc)[:300]}",
+                        ]
+                    )
+                )
+                print(f"[{now.isoformat()}] start-of-day failed: {exc}")
+            state.startOfDayDate = today
             save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
         if should_poll_strategy(

@@ -11,6 +11,7 @@ VIETNAM_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 @dataclass(frozen=True)
 class TradingSchedule:
     tokenTime: time = time(8, 30)
+    startOfDayTime: time = time(9, 0)
     orderSubmitTime: time = time(9, 16)
     eodUpdateTime: time = time(15, 15)
     corporateActionSyncTime: time = time(15, 10)
@@ -84,6 +85,21 @@ def should_send_heartbeat(moment: datetime, last_date: str | None, schedule: Tra
     """
     today = local_date(moment)
     return today != last_date and local_time(moment) >= schedule.heartbeatTime
+
+
+def should_run_start_of_day(
+    moment: datetime,
+    last_date: str | None,
+    schedule: TradingSchedule = TradingSchedule(),
+    holidays: set[str] | None = None,
+) -> bool:
+    """Send the morning briefing when we cross startOfDayTime and haven't
+    sent one today. Skips weekends + Vietnam market holidays.
+    """
+    if not is_trading_day(moment, holidays):
+        return False
+    today = local_date(moment)
+    return today != last_date and local_time(moment) >= schedule.startOfDayTime
 
 
 def should_poll_strategy(

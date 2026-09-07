@@ -1,6 +1,7 @@
 """Tests for autofin signal-selection logic + order-plan computation."""
 from __future__ import annotations
 
+import json
 import sys
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
@@ -281,6 +282,85 @@ def test_format_cycle_summary_handles_none_portfolio():
     msg = adapter.format_cycle_summary(result, portfolio=None)
     assert "[autofin_signal]" in msg
     assert "portfolio" in msg.lower()  # shows "unavailable" note
+
+
+# ── Start-of-day message (morning briefing) ───────────────────────────────
+
+
+def test_start_of_day_message_shows_portfolio_and_orders(tmp_path, monkeypatch):
+    from vietnam_algo.notifier import start_of_day_message
+    portfolio = {
+        "balance": {"totalCash": 50_000_000, "availableCash": 30_000_000},
+        "positions": [
+            {"symbol": "HCM", "quantity": 1000, "avgPrice": 26126, "marketPrice": 27500,
+             "marketValue": 27_500_000, "costBasis": 26_126_000, "unrealizedPnl": 1_374_000,
+             "unrealizedPnlPct": 5.26},
+        ],
+        "totals": {"stockValue": 27_500_000, "portfolioValue": 57_500_000,
+                   "totalUnrealizedPnl": 1_374_000, "totalUnrealizedPnlPct": 2.45, "positionCount": 1},
+    }
+    orders_json = tmp_path / "latest_orders.json"
+    orders_json.write_text(json.dumps({
+        "count": 1, "items": [
+            {"symbol": "HCM", "side": "BUY", "price": 26126, "quantity": 3000,
+             "reason": "top_rank", "date": "2026-09-07"},
+        ],
+    }))
+    msg = start_of_day_message(
+        portfolio=portfolio,
+        today="2026-09-07",
+        orders_json_path=str(orders_json),
+        strategy_name="momentum",
+        account="0003937868",
+    )
+    # Bot identity + heading
+    assert "START OF DAY" in msg
+    assert "momentum" in msg
+    assert "0003937868" in msg
+    # Portfolio section
+    assert "CURRENT PORTFOLIO" in msg
+    assert "30,000,000" in msg
+    assert "NAV:" in msg
+    # Today's planned orders section
+    assert "Today's planned orders" in msg
+    assert "BUY 3000 HCM" in msg
+    # Next-step hint
+    assert "09:16 ICT" in msg
+
+
+def test_start_of_day_message_handles_empty_orders(tmp_path):
+    from vietnam_algo.notifier import start_of_day_message
+    msg = start_of_day_message(
+        portfolio=None,
+        today="2026-09-07",
+        orders_json_path=str(tmp_path / "missing.json"),  # doesn't exist
+        strategy_name="momentum",
+        account="0003937868",
+    )
+    assert "START OF DAY" in msg
+    assert "No orders planned" in msg
+    assert "portfolio snapshot: unavailable" in msg
+
+
+def test_should_run_start_of_day_respects_trading_calendar():
+    from vietnam_algo.schedule import (
+        VIETNAM_TZ, should_run_start_of_day, TradingSchedule,
+    )
+    from datetime import datetime
+    # Mon Sep 7 2026 — weekday
+    mon = datetime(2026, 9, 7, 9, 30, tzinfo=VIETNAM_TZ)
+    assert should_run_start_of_day(mon, last_date=None) is True
+    # Already sent today
+    assert should_run_start_of_day(mon, last_date="2026-09-07") is False
+    # Before 09:00
+    early = datetime(2026, 9, 7, 8, 59, tzinfo=VIETNAM_TZ)
+    assert should_run_start_of_day(early, last_date=None) is False
+    # Sat Sep 5 — weekend
+    sat = datetime(2026, 9, 5, 10, 0, tzinfo=VIETNAM_TZ)
+    assert should_run_start_of_day(sat, last_date=None) is False
+    # Vietnam holiday Sep 2
+    holiday = datetime(2026, 9, 2, 10, 0, tzinfo=VIETNAM_TZ)
+    assert should_run_start_of_day(holiday, last_date=None, holidays={"2026-09-02"}) is False
 
 
 # ── Per-order Telegram notifications (mid-day) ───────────────────────────

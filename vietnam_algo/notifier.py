@@ -482,6 +482,62 @@ def eod_summary_message(
     return "\n".join(lines)
 
 
+def start_of_day_message(
+    portfolio: dict[str, Any] | None = None,
+    today: str | None = None,
+    orders_json_path: str | None = None,
+    strategy_name: str = "momentum",
+    account: str = "?",
+) -> str:
+    """Morning Telegram briefing sent before the 09:16 submit cycle.
+
+    Shows:
+      - current portfolio: cash, NAV, positions, unrealized P&L
+      - today's planned orders (read from latest_orders JSON — these
+        were generated at yesterday's EOD and will be submitted at
+        09:16 ICT)
+    """
+    today = today or datetime.now().strftime("%Y-%m-%d")
+    lines: list[str] = [
+        "🌅 Vietnam Algo: START OF DAY",
+        f"📅 {today}",
+        f"💼 Account: {account}  |  strategy: {strategy_name}",
+    ]
+    lines.append("")
+    lines.extend(portfolio_section_lines(portfolio, label="CURRENT PORTFOLIO"))
+    # today's planned orders (read from latest_orders JSON)
+    items: list[dict[str, Any]] = []
+    if orders_json_path:
+        try:
+            payload = json.loads(Path(orders_json_path).read_text())
+            items = list(payload.get("items") or [])
+        except Exception:
+            items = []
+    if items:
+        lines.append("")
+        lines.append(f"📋 Today's planned orders ({len(items)}) — submitted at 09:16 ICT:")
+        for o in items[:20]:
+            sym = o.get("symbol", "?")
+            side = o.get("side", "?")
+            price = o.get("price", 0)
+            try:
+                price_s = f"{int(float(price)):,}"
+            except (TypeError, ValueError):
+                price_s = str(price)
+            qty = o.get("quantity", 0)
+            reason = str(o.get("reason") or "")[:30]
+            lines.append(f"  • {side} {qty} {sym} @ {price_s} VND  ({reason})")
+        if len(items) > 20:
+            lines.append(f"  ... and {len(items) - 20} more")
+    else:
+        lines.append("")
+        lines.append("ℹ️  No orders planned for today "
+                     "(latest_orders.json empty or unreadable)")
+    lines.append("")
+    lines.append("🕒 Next: 09:16 ICT submit cycle → 15:15 ICT EOD update")
+    return "\n".join(lines)
+
+
 def portfolio_snapshot_message(snap: dict[str, Any], top_n: int = 8) -> str:
     """Format a Telegram message for a live DNSE portfolio snapshot.
 
