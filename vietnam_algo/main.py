@@ -193,7 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     autofin_bt = subparsers.add_parser(
         "backtest-autofin-signal",
-        help="backtest autofin.vn signal mirroring using /closing-signals",
+        help="backtest autofin.vn signal mirroring using /closing-signals (strict, no look-ahead)",
     )
     autofin_bt.add_argument(
         "--initial-nav",
@@ -202,16 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="starting NAV in VND (default 1B)",
     )
     autofin_bt.add_argument(
-        "--fee-per-share",
+        "--fee-pct-per-side",
         type=float,
-        default=0.0,
-        help="flat fee per share, applied on BUY+SELL (default 0)",
+        default=0.0012,
+        help="DNSE-equivalent fee per side as fraction of value (default 0.0012 = 0.12%%)",
     )
     autofin_bt.add_argument(
-        "--slippage-pct",
+        "--slippage-pct-per-fill",
         type=float,
-        default=0.0,
-        help="round-trip slippage as fraction (e.g. 0.001 = 0.1%%)",
+        default=0.001,
+        help="slippage per fill as fraction (default 0.001 = 0.1%%; round-trip 0.2%%)",
     )
     autofin_bt.add_argument(
         "--max-pages",
@@ -220,19 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="pagination cap on /closing-signals (default 20 → 1000 deals)",
     )
     autofin_bt.add_argument(
-        "--min-profit-steps",
-        type=int,
-        default=0,
-        help="skip deals whose numberOfProfit is below this (e.g. 2 = only "
-             "take deals that triggered ≥2 partial TPs)",
-    )
-    autofin_bt.add_argument(
-        "--stop-loss-pct",
-        type=float,
-        default=0.0,
-        help="simulate a stop-loss at this fraction below entry "
-             "(e.g. 0.10 = 10%%). When the final close would have hit "
-             "the SL, model the exit at the SL level.",
+        "--with-hindsight",
+        action="store_true",
+        help="additionally run hindsight-only filters (min_profit_steps, "
+             "stop_loss_pct) and print those numbers in a clearly-labelled "
+             "section. Do not use them as live-trading expectations.",
     )
     autofin_bt.add_argument(
         "--out-dir",
@@ -1055,20 +1047,37 @@ def main(argv: list[str] | None = None) -> int:
         from .backtest_autofin import (
             format_backtest_report,
             run_autofin_backtest,
+            run_hindsight_variants,
             write_backtest_outputs,
         )
         from .notifier import notify
         result = run_autofin_backtest(
             initial_nav=args.initial_nav,
-            fee_per_share=args.fee_per_share,
-            slippage_pct=args.slippage_pct,
+            fee_pct_per_side=args.fee_pct_per_side,
+            slippage_pct_per_fill=args.slippage_pct_per_fill,
             max_pages=args.max_pages,
-            min_profit_steps=args.min_profit_steps,
-            stop_loss_pct=args.stop_loss_pct,
         )
         json_path, csv_path = write_backtest_outputs(result, args.out_dir)
         report = format_backtest_report(result)
         print(report)
+        if args.with_hindsight:
+            hv = run_hindsight_variants(
+                initial_nav=args.initial_nav,
+                fee_pct_per_side=args.fee_pct_per_side,
+                slippage_pct_per_fill=args.slippage_pct_per_fill,
+                max_pages=args.max_pages,
+            )
+            print()
+            print("⚠️  HINDSIGHT VARIANTS (DO NOT USE AS LIVE EXPECTATIONS)")
+            print(hv["warning"])
+            for name, m in hv["variants"].items():
+                print(
+                    f"  • {name:24s}  trades={m['trades']:>4}  "
+                    f"final={m['final_nav']:>16,.0f}  "
+                    f"total={m['total_pnl_pct']:+7.1%}  "
+                    f"maxDD={m['max_drawdown_pct']:6.1%}  "
+                    f"Sharpe={m['sharpe']:>5.2f}"
+                )
         print()
         print(f"Saved backtest JSON to {json_path}")
         print(f"Saved per-trade CSV to {csv_path}")
