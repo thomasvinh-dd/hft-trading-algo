@@ -5,6 +5,7 @@ import os
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -379,19 +380,51 @@ def heartbeat_message(
 
 
 def eod_summary_message(result: dict[str, Any]) -> str:
+    """Default EOD cycle summary (used by momentum / hybrid etc.).
+
+    Reads the per-trade rows from the latest_orders JSON file so the
+    Telegram message shows the actual BUY/SELL orders being submitted,
+    not just a count.
+    """
     metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
     orders_info = result.get("latestOrdersCsv")
-    return "\n".join(
-        [
-            "📊 Vietnam Algo: EOD SUMMARY",
-            f"tradeDate: {result.get('tradeDate')}",
-            f"orderCount: {result.get('count')}",
-            f"totalReturn: {format_percent(metrics.get('totalReturnPercent'))}",
-            f"maxDrawdown: {format_percent(metrics.get('maxDrawdownPercent'))}",
-            f"finalEquity: {format_money(metrics.get('finalEquity'))}",
-            f"ordersFile: {orders_info}",
-        ]
-    )
+    lines: list[str] = [
+        "📊 Vietnam Algo: EOD SUMMARY",
+        f"tradeDate: {result.get('tradeDate')}",
+        f"strategy: {result.get('strategy')}",
+        f"orderCount: {result.get('count')}",
+        f"totalReturn: {format_percent(metrics.get('totalReturnPercent'))}",
+        f"maxDrawdown: {format_percent(metrics.get('maxDrawdownPercent'))}",
+        f"finalEquity: {format_money(metrics.get('finalEquity'))}",
+    ]
+    # include actual order rows (BUY/SELL, symbol, price, qty)
+    items: list[dict[str, Any]] = []
+    json_path = result.get("latestOrdersJson")
+    if json_path:
+        try:
+            payload = json.loads(Path(json_path).read_text())
+            items = list(payload.get("items") or [])
+        except Exception:
+            items = []
+    if items:
+        lines.append("")
+        lines.append(f"📋 Orders ({len(items)}):")
+        for o in items[:20]:
+            sym = o.get("symbol", "?")
+            side = o.get("side", "?")
+            price = o.get("price", 0)
+            try:
+                price_s = f"{int(float(price)):,}"
+            except (TypeError, ValueError):
+                price_s = str(price)
+            qty = o.get("quantity", 0)
+            reason = str(o.get("reason") or "")[:30]
+            lines.append(f"  • {side} {qty} {sym} @ {price_s} VND  ({reason})")
+        if len(items) > 20:
+            lines.append(f"  ... and {len(items) - 20} more")
+    lines.append("")
+    lines.append(f"ordersFile: {orders_info}")
+    return "\n".join(lines)
 
 
 def portfolio_snapshot_message(snap: dict[str, Any], top_n: int = 8) -> str:

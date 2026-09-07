@@ -88,7 +88,7 @@ def should_send_heartbeat(moment: datetime, last_date: str | None, schedule: Tra
 
 def should_poll_strategy(
     moment: datetime,
-    last_poll_time: datetime | None,
+    last_poll_time: datetime | str | None,
     min_interval_seconds: int = 3600,
     schedule: TradingSchedule = TradingSchedule(),
     holidays: set[str] | None = None,
@@ -98,10 +98,20 @@ def should_poll_strategy(
     Fires during main trading phases only, with at least ``min_interval_seconds``
     between polls (default 1 hour). Use this to detect mid-day signal changes
     (e.g. autofin partial closes) without spamming Telegram on every loop.
+
+    ``last_poll_time`` may be a ``datetime`` or an ISO-8601 string (the
+    latter is what we persist in the strategy state file).
     """
     if not is_main_trading_phase(moment, schedule, holidays):
         return False
     if last_poll_time is None:
         return True
+    if isinstance(last_poll_time, str):
+        try:
+            last_poll_time = datetime.fromisoformat(last_poll_time.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+    if last_poll_time.tzinfo is None:
+        last_poll_time = last_poll_time.replace(tzinfo=VIETNAM_TZ)
     elapsed = (moment - last_poll_time).total_seconds()
     return elapsed >= min_interval_seconds

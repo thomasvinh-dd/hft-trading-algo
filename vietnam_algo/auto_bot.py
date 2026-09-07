@@ -203,28 +203,49 @@ def run_auto_bot(
             schedule=schedule,
             holidays=holidays,
         ):
-            print(f"[{now.isoformat()}] Mid-day strategy poll (autofin partial-close detection)")
-            try:
-                poll_result = generate_live_orders(
-                    engine_config, strategy_config, strategy_name=strategy_name,
+            # Mid-day polls only run for strategies that need real-time
+            # detection of mid-day signal changes (e.g. autofin partial
+            # closes). Other strategies (momentum, hybrid, etc.) are
+            # designed to run at EOD only — running them mid-day just
+            # regenerates the same orders and spams Telegram.
+            if engine_config.strategy != "autofin_signal":
+                print(
+                    f"[{now.isoformat()}] Skipping mid-day poll for "
+                    f"strategy={engine_config.strategy} (EOD-only strategy)"
                 )
-                # The strategy itself sends per-order Telegram notifications
-                # for any newly-detected action (partial close, new entry,
-                # full close) — see AutofinSignalAdapter._notify_new_orders.
-                # The EOD summary is suppressed mid-day (only the EOD cycle
-                # sends the bundled message).
-                print(f"[{now.isoformat()}] poll result: {poll_result.get('count', 0)} orders planned")
-            except Exception as exc:
-                notify(
-                    "\n".join(
-                        [
-                            "⚠️ Vietnam Algo: mid-day poll FAILED",
-                            f"strategy: {engine_config.strategy}",
-                            f"err: {str(exc)[:300]}",
-                        ]
+            else:
+                print(f"[{now.isoformat()}] Mid-day autofin poll (partial-close detection)")
+                try:
+                    # Call the autofin adapter directly so it detects new
+                    # partial closes and sends per-order Telegram
+                    # notifications. Do NOT call generate_live_orders
+                    # (that runs the momentum backtest).
+                    if strategy_adapter is not None:
+                        poll_result = strategy_adapter.generate_orders(
+                            engine_config, strategy_config,
+                            trade_date=today,
+                        )
+                    else:
+                        poll_result = generate_live_orders(
+                            engine_config, strategy_config,
+                            strategy_name=strategy_name,
+                        )
+                    # The strategy itself sends per-order Telegram
+                    # notifications for any newly-detected action (partial
+                    # close, new entry, full close) — see
+                    # AutofinSignalAdapter._notify_new_orders.
+                    print(f"[{now.isoformat()}] poll result: {poll_result.get('count', 0)} orders planned")
+                except Exception as exc:
+                    notify(
+                        "\n".join(
+                            [
+                                "⚠️ Vietnam Algo: mid-day poll FAILED",
+                                f"strategy: {engine_config.strategy}",
+                                f"err: {str(exc)[:300]}",
+                            ]
+                        )
                     )
-                )
-                print(f"[{now.isoformat()}] mid-day poll failed: {exc}")
+                    print(f"[{now.isoformat()}] mid-day poll failed: {exc}")
 
         if should_run_eod(now, state.eodDate, schedule, holidays):
             print(f"[{now.isoformat()}] Running EOD data update and order generation")
@@ -232,6 +253,7 @@ def run_auto_bot(
             update_dataset(engine_config)
             result = generate_live_orders(
                 engine_config, strategy_config, strategy_name=strategy_name,
+                notify_telegram=False,
             )
             print(result)
             if isinstance(result, dict):

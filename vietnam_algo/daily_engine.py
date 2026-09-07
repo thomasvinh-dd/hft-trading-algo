@@ -133,6 +133,7 @@ def generate_live_orders(
     strategy_config: StrategyConfig,
     trade_date: str | None = None,
     strategy_name: str = "",
+    notify_telegram: bool = False,
 ) -> dict[str, object]:
     """Run the strategy's full backtest and write per-strategy order files.
 
@@ -143,6 +144,11 @@ def generate_live_orders(
 
     When empty, falls back to the legacy non-namespaced paths
     (latest_orders.csv) for backward compatibility.
+
+    ``notify_telegram`` defaults to False — callers should use
+    ``daily_generation_message()`` or ``format_cycle_summary()`` to
+    decide what (if anything) to send to Telegram, rather than always
+    sending a generic "orders generated" message on every call.
     """
     from .strategy_registry import get_strategy
     save_liquid_universe(build_liquid_universe(config.dataDir), config.dataDir)
@@ -169,8 +175,10 @@ def generate_live_orders(
         "count": count,
         "metrics": result.metrics,
         "strategy": config.strategy,
+        "orders_file": str(csv_path),
     }
-    notify(daily_generation_message(result_payload))
+    if notify_telegram:
+        notify(daily_generation_message(result_payload))
     return result_payload
 
 
