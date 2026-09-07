@@ -111,7 +111,8 @@ def test_fixed_sizing_no_death_spiral_on_losing_deal():
 
 def test_fixed_sizing_no_rebalance_on_winning_deal():
     """A winning deal should be entered once and held to close, with no
-    re-entries or top-ups as NAV grows."""
+    re-entries or top-ups as NAV grows. Synthetic partial-TPs DO fire
+    (since autofin's lastRecomment changes aren't in our snapshot)."""
     deals = [_make_deal(
         symbol="WINNER",
         deal_id="1700000002",
@@ -134,21 +135,20 @@ def test_fixed_sizing_no_rebalance_on_winning_deal():
     sells = [f for f in fills if f["side"] == "SELL"]
     # 1 BUY (entry) — never a top-up
     assert len(buys) == 1, f"expected 1 BUY, got {len(buys)}"
-    # 1 SELL (final close on close day) — but numberOfProfit=2 means
-    # the deal had 2 partial TPs. With our reconstruction, partial-TP
-    # fires when numberOfProfit increases day-over-day. Since we only
-    # see the deal from its first appearance in holding (with the final
-    # numberOfProfit value), the partial-TP path initializes
-    # _last_numberOfProfit=current and does NOT fire any partials.
-    # So we should only see the final close SELL.
-    assert len(sells) == 1, f"expected 1 SELL, got {len(sells)}: {sells}"
+    # 2 partial-TP SELLs + 1 final close SELL = 3 SELLs total.
+    # Synthetic TPs evenly distributed over 30-day holding period.
+    synthetic_sells = [s for s in sells if "synthetic" in s.get("reason", "")]
+    final_closes = [s for s in sells if "autofin_closed" in s.get("reason", "")]
+    assert len(synthetic_sells) == 2, f"expected 2 synthetic TPs, got {len(synthetic_sells)}"
+    assert len(final_closes) == 1, f"expected 1 final close, got {len(final_closes)}"
     # Final NAV should be > initial (positive return)
     assert result["final_nav"] > result["initial_nav"]
 
 
 def test_fixed_sizing_multiple_deals_no_overlap_rebalance():
     """Multiple overlapping deals should each be entered ONCE and held
-    independently. No cross-deal rebalancing."""
+    independently. No cross-deal rebalancing. Synthetic partial-TPs fire
+    for each deal based on its own numberOfProfit count."""
     deals = [
         _make_deal(
             symbol="AAA", deal_id="1700000001", p_open=10000, p_close=11000,
@@ -176,15 +176,13 @@ def test_fixed_sizing_multiple_deals_no_overlap_rebalance():
     )
     fills = result["filled_orders"]
     buys = [f for f in fills if f["side"] == "BUY"]
-    sells = [f for f in fills if f["side"] == "SELL"]
     # Each deal entered exactly once
     assert len(buys) == 3, f"expected 3 BUYs, got {len(buys)}: {[b['symbol'] for b in buys]}"
-    # Each deal closed exactly once (final close on close day)
-    assert len(sells) == 3, f"expected 3 SELLs, got {len(sells)}: {[s['symbol'] for s in sells]}"
+    # Sell count: AAA has 1 TP + 1 close = 2; BBB has 0 TP + 1 close = 1;
+    # CCC has 2 TPs + 1 close = 3. Total = 6.
+    assert len([f for f in fills if f["side"] == "SELL"]) == 6
     symbols_bought = sorted([b["symbol"] for b in buys])
-    symbols_sold = sorted([s["symbol"] for s in sells])
     assert symbols_bought == ["AAA", "BBB", "CCC"]
-    assert symbols_sold == ["AAA", "BBB", "CCC"]
 
 
 def test_fixed_sizing_does_not_re_enter_after_full_close():

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
@@ -223,3 +223,62 @@ def test_interpolated_price_for_order_uses_close_on_close_day():
 def test_interpolated_price_for_order_returns_zero_for_none():
     """If no deal is provided, return 0 (caller must handle)."""
     assert _interpolated_price_for_order(None, date(2024, 1, 10)) == 0.0
+
+
+def test_synthetic_tps_distributed_evenly_over_holding_period():
+    """For a deal with N=2 partial-TPs over a 30-day hold, the TPs
+    fire on days 10 and 20 (k/(N+1) * holding_days from open)."""
+    deal = _make_deal(
+        symbol="AAA", p_open=10000.0, p_close=13000.0,
+        t_open="01/01/2024 07:00:00", t_close="01/31/2024 07:00:00",
+        n_profit=2,
+    )
+    # Holding days = (01/31 - 01/01).days = 30
+    # TPs at offset 1/3*30=10 days, 2/3*30=20 days from open
+    # So TP1 fires on 01/11, TP2 on 01/21.
+    snap = reconstruct_snapshot(date(2024, 1, 11), [deal])
+    assert len(snap["synthetic_partial_tps"]) == 1
+    assert snap["synthetic_partial_tps"][0]["symbol"] == "AAA"
+    assert snap["synthetic_partial_tps"][0]["fraction"] == 1 / 3
+
+    snap = reconstruct_snapshot(date(2024, 1, 21), [deal])
+    assert len(snap["synthetic_partial_tps"]) == 1
+    # Each TP sells 1/(N+1) of ORIGINAL position (uniform split,
+    # not 1/3 of current). N=2 → fraction = 1/3.
+    assert snap["synthetic_partial_tps"][0]["fraction"] == 1 / 3
+
+    # Day 12 — past TP1, before TP2, no TP
+    snap = reconstruct_snapshot(date(2024, 1, 12), [deal])
+    assert snap["synthetic_partial_tps"] == []
+
+
+def test_synthetic_tps_no_fire_after_close_day():
+    """Synthetic TPs must NOT fire on or after the actual close day."""
+    deal = _make_deal(
+        symbol="AAA", p_open=10000.0, p_close=13000.0,
+        t_open="01/01/2024 07:00:00", t_close="01/15/2024 07:00:00",
+        n_profit=2,
+    )
+    # Close day is 01/15. N=2 TPs over 14-day holding: days 1/3*14=4, 2/3*14=9.
+    # Day 15 is close day → no synthetic TPs (real close happens instead).
+    snap = reconstruct_snapshot(date(2024, 1, 15), [deal])
+    # The deal leaves holding on close day, so it's not in `holding`
+    # and no synthetic TPs are emitted.
+    assert snap["synthetic_partial_tps"] == []
+    assert "AAA" not in [d.get("symbol") for d in snap["holding"]]
+
+
+def test_synthetic_tps_zero_when_no_profit_steps():
+    """Deals with numberOfProfit=0 emit no synthetic TPs."""
+    deal = _make_deal(
+        symbol="AAA", p_open=10000.0, p_close=13000.0,
+        t_open="01/01/2024 07:00:00", t_close="01/31/2024 07:00:00",
+        n_profit=0,
+    )
+    # Any day during the holding period
+    for day_offset in [5, 10, 15, 20, 25]:
+        day = date(2024, 1, 1) + timedelta(days=day_offset)
+        snap = reconstruct_snapshot(day, [deal])
+        assert snap["synthetic_partial_tps"] == [], (
+            f"unexpected TPs on day {day}: {snap['synthetic_partial_tps']}"
+        )

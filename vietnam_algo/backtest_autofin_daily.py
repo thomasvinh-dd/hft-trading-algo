@@ -182,6 +182,13 @@ def reconstruct_snapshot(
       - ``suggest``: list of AutofinSignal objects for deals opened
         ON day (approximation of new signals published that day)
       - ``closing``: list of raw deal dicts closed on day
+      - ``synthetic_partial_tps``: list of partial-TP sell events
+        that autofin would have triggered by EOD ``day`` for active
+        deals. Each event has symbol, qty, price (interpolated),
+        and reason. The strategy didn't actually publish these in
+        real-time (it published `lastRecomment` text changes which
+        we don't have), so we synthesize them evenly distributed
+        across the holding period.
 
     Each holding/suggest entry carries the full autofin dict
     so ``decide_orders`` can read ``lastRecomment``,
@@ -190,6 +197,7 @@ def reconstruct_snapshot(
     holding: list[dict[str, Any]] = []
     closing: list[dict[str, Any]] = []
     suggest_raw: list[dict[str, Any]] = []
+    synthetic_partial_tps: list[dict[str, Any]] = []
     for d in all_deals:
         sd = d.get("statusDeal", {}) or {}
         t_open = _parse_dt(str(sd.get("time_Open") or ""))
@@ -202,9 +210,17 @@ def reconstruct_snapshot(
             # open deal (no close yet) — in holding on day if d_open <= day
             if d_open <= day:
                 holding.append(dict(d))
+                _append_synthetic_tps(
+                    d, day, synthetic_partial_tps,
+                    include_only_if_before_close=False,
+                )
             continue
         if d_open <= day < d_close:
             holding.append(dict(d))
+            _append_synthetic_tps(
+                d, day, synthetic_partial_tps,
+                include_only_if_before_close=True,
+            )
         if d_close == day:
             closing.append(dict(d))
         if d_open == day:
@@ -213,7 +229,70 @@ def reconstruct_snapshot(
         "holding": holding,
         "suggest": [parse_signal(r) for r in suggest_raw],
         "closing": closing,
+        "synthetic_partial_tps": synthetic_partial_tps,
     }
+
+
+def _append_synthetic_tps(
+    deal: dict[str, Any],
+    day: date,
+    out: list[dict[str, Any]],
+    include_only_if_before_close: bool,
+) -> None:
+    """Add synthetic partial-TP events to ``out`` if ``day`` is a TP day.
+
+    autofin's real-time strategy fires a partial-TP SELL each time
+    its `numberOfProfit` increases. We don't have the historical
+    intermediate `numberOfProfit` values, only the final count.
+    Reconstruct TP days by distributing N partial-TPs evenly over
+    the holding period: TP_k fires on day open + k/(N+1) * holding_days.
+
+    Each synthetic TP sells 1/(N+1) of the original target_qty at
+    the interpolated price on that day. autofin's actual pattern is
+    1/3 per TP of CURRENT position, but uniform split is the most
+    defensible default without more data.
+    """
+    n_profit = int(deal.get("numberOfProfit") or 0)
+    if n_profit <= 0:
+        return
+    sd = deal.get("statusDeal", {}) or {}
+    t_open = _parse_dt(str(sd.get("time_Open") or ""))
+    t_close = _parse_dt(str(sd.get("time_Closed") or ""))
+    if t_open is None:
+        return
+    d_open = t_open.date()
+    if t_close is None:
+        d_close = None
+        holding_days = None
+    else:
+        d_close = t_close.date()
+        holding_days = (d_close - d_open).days or 1
+
+    if include_only_if_before_close and d_close is not None and day >= d_close:
+        return  # never fire synthetic TPs on or after the actual close day
+
+    for k in range(1, n_profit + 1):
+        if holding_days is None:
+            # open deal — distribute TPs over a 30-day window from open
+            tp_day = d_open + timedelta(days=int(k * 30 / (n_profit + 1)))
+        else:
+            frac = k / (n_profit + 1)
+            tp_day = d_open + timedelta(days=int(frac * holding_days))
+        if tp_day == day:
+            p = _interpolated_price(deal, day) or 0.0
+            if p <= 0:
+                continue
+            out.append({
+                "symbol": deal.get("symbol", "?"),
+                "side": "NS",
+                "qty": None,  # filled by caller from position size
+                "fraction": 1.0 / (n_profit + 1),
+                "price": p,
+                "reason": (
+                    f"synthetic_tp:deal#{deal.get('_id')}:"
+                    f"{deal.get('symbol')}:k{k}/{n_profit}"
+                ),
+            })
 
 
 def _interpolated_price_for_order(deal: dict[str, Any], day: date) -> float:
@@ -419,6 +498,43 @@ def run_daily_replay_backtest(
                 "qty": qty,
                 "price": day_price,
                 "reason": reason,
+            })
+
+        # 4b. SYNTHETIC PARTIAL-TPs: autofin publishes `numberOfProfit`
+        # changes in real-time (we don't have those historical snapshots),
+        # so we synthesize partial-TP events evenly distributed across
+        # the holding period. Each event sells a fraction of our current
+        # position at the day's interpolated price.
+        for tp in snap["synthetic_partial_tps"]:
+            sym = tp["symbol"]
+            held = state.positions.get(sym, 0)
+            if held <= 0:
+                continue
+            # Sell `fraction` of current position, rounded down to lots.
+            sell_qty = int(held * tp["fraction"])
+            sell_qty = sell_qty - (sell_qty % board_lot)
+            if sell_qty < board_lot:
+                continue
+            half = slippage_pct_per_fill * 0.5
+            fill = tp["price"] * (1 - half)
+            value = sell_qty * fill
+            fee = value * fee_pct_per_side
+            slip = (tp["price"] - fill) * sell_qty
+            state.cash += value - fee
+            state.positions[sym] = held - sell_qty
+            if state.positions[sym] <= 0:
+                state.positions.pop(sym, None)
+            total_fees += fee
+            total_slippage += slip
+            filled_orders.append({
+                "date": current.isoformat(),
+                "side": "SELL",
+                "symbol": sym,
+                "qty": sell_qty,
+                "price": fill,
+                "fees": fee,
+                "slippage": slip,
+                "reason": tp["reason"] + " [synthetic]",
             })
 
         # 5. Apply any fills that were just queued for today. Then
