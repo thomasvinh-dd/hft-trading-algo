@@ -244,6 +244,7 @@ def run_daily_replay_backtest(
     slippage_pct_per_fill: float = DEFAULT_SLIPPAGE_PCT_PER_FILL,
     board_lot: int = DEFAULT_BOARD_LOT,
     max_pages: int = MAX_PAGES,
+    user_sl_pct: float = 0.0,
     client: AutofinClient | None = None,
     closed_deals: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -259,6 +260,9 @@ def run_daily_replay_backtest(
 
     Parameters
     ----------
+    user_sl_pct : fraction (e.g. 0.05 = 5%) — user-defined stop-loss
+        override. The SL bracket is the TIGHTER of this and autofin's
+        declared sL_F. Default 0 = use autofin's SL only.
     closed_deals : optional pre-fetched list of autofin closing-signals
         records. If provided, skips the autofin API call. Use this for
         offline testing / when the autofin API is unreachable.
@@ -359,13 +363,15 @@ def run_daily_replay_backtest(
             our_deals=state.our_deals,
             our_positions=dict(state.positions),
             nav=state.nav,
+            user_sl_pct=user_sl_pct,
         )
         state.our_deals = new_our_deals
 
-        # 4. Queue orders. TP/SL bracket orders become CONDITIONAL
-        # (they fire only when the price reaches the trigger level).
-        # All other orders (BUY, partial-close SELL, full-close SELL)
-        # are immediate fills at today's interpolated price.
+        # 4. Queue orders. The strategy marks each order with a ``kind``:
+        #   - "tp" or "sl": conditional brackets (fire only when price
+        #     reaches the trigger level)
+        #   - anything else (entry / partial_close / full_close): immediate
+        #     fill at today's interpolated price
         for o in orders:
             sym = o.get("symbol", "?")
             side = o.get("side", "")
@@ -374,8 +380,9 @@ def run_daily_replay_backtest(
             if qty <= 0:
                 continue
             reason = o.get("reason", "")
+            kind = o.get("kind", "")
             # TP/SL bracket → conditional
-            if "autofin_tp:" in reason:
+            if kind == "tp":
                 state.conditional_orders.append({
                     "trigger": ">=",
                     "price": price_hint,
@@ -385,7 +392,7 @@ def run_daily_replay_backtest(
                     "reason": reason,
                 })
                 continue
-            if "autofin_sl:" in reason:
+            if kind == "sl":
                 state.conditional_orders.append({
                     "trigger": "<=",
                     "price": price_hint,
@@ -485,6 +492,7 @@ def run_daily_replay_backtest(
         "slippage_total": total_slippage,
         "fee_pct_per_side": fee_pct_per_side,
         "slippage_pct_per_fill": slippage_pct_per_fill,
+        "user_sl_pct": user_sl_pct,
         "daily_nav": daily_nav,
         "filled_orders": filled_orders,
         "skipped_deals": skipped_deals,
@@ -767,6 +775,11 @@ def format_daily_replay_report(result: dict[str, Any]) -> str:
         f"  • fee per side: {result['fee_pct_per_side']:.4%}, "
         f"slippage per fill: {result['slippage_pct_per_fill']:.4%}"
     )
+    if result.get("user_sl_pct", 0) > 0:
+        lines.append(
+            f"  • user stop-loss: {result['user_sl_pct']:.1%} below entry "
+            f"(tighter of this vs autofin sL_F wins)"
+        )
     lines.append(
         f"  • strategy: actual decide_orders() function, run against "
         f"reconstructed daily snapshots"

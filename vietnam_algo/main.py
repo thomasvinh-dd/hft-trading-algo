@@ -268,6 +268,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="pagination cap on /closing-signals (default 20)",
     )
     autofin_daily_bt.add_argument(
+        "--user-sl-pct",
+        type=float,
+        default=0.0,
+        help="user-defined stop-loss override (e.g. 0.05 = 5%% below entry). "
+             "The SL bracket is the tighter of this and autofin's sL_F. "
+             "Default 0 = use autofin's SL only.",
+    )
+    autofin_daily_bt.add_argument(
         "--out-dir",
         type=Path,
         default=Path("vietnam_algo/data/backtests"),
@@ -1157,6 +1165,7 @@ def main(argv: list[str] | None = None) -> int:
             fee_pct_per_side=args.fee_pct_per_side,
             slippage_pct_per_fill=args.slippage_pct_per_fill,
             max_pages=args.max_pages,
+            user_sl_pct=args.user_sl_pct,
             closed_deals=closed_deals,
         )
         json_path, nav_csv, fills_csv = write_daily_replay_outputs(

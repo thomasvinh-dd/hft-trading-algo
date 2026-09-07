@@ -236,6 +236,76 @@ def test_decide_orders_handles_new_entry_only_once():
     assert new_buys == []
 
 
+def test_plan_new_positions_emits_user_sl_when_tighter_than_autofin():
+    """If user_sl_pct=0.05 and autofin's sL_F is at 10% (looser),
+    we use the 5% user SL — tighter, fires sooner on the way down."""
+    sig = _make_signal("AAA", 0.15, supply_to=10000, tp_from=12000, sl_to=9100)
+    # sL_F = sl_to - 100 = 9000 (10% below entry)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig], nav_vnd=1_000_000_000, our_positions={},
+        user_sl_pct=0.05,
+    )
+    sl_rows = [r for r in rows if "sl" in r["reason"]]
+    assert len(sl_rows) == 1
+    # Entry @ 10000, user SL @ 9500 (5% below). autofin SL was @ 9000 (10%).
+    # Tighter wins → SL @ 9500.
+    assert sl_rows[0]["price"] == 9500
+    # Reason should identify it as user SL
+    assert "user_sl" in sl_rows[0]["reason"]
+
+
+def test_plan_new_positions_uses_autofin_sl_when_tighter_than_user():
+    """If autofin's sL_F is at 2% (tighter than user 5%), use autofin's."""
+    sig = _make_signal("BBB", 0.15, supply_to=10000, tp_from=12000, sl_to=9900)
+    # sL_F = sl_to - 100 = 9800 (2% below entry, tighter than user 5%)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig], nav_vnd=1_000_000_000, our_positions={},
+        user_sl_pct=0.05,
+    )
+    sl_rows = [r for r in rows if "sl" in r["reason"]]
+    assert len(sl_rows) == 1
+    # autofin's 9800 is tighter than user 9500 → use autofin's
+    assert sl_rows[0]["price"] == 9800
+    assert "autofin_sl:" in sl_rows[0]["reason"]
+
+
+def test_plan_new_positions_no_user_sl_when_disabled():
+    """user_sl_pct=0 disables the override → autofin's SL only."""
+    sig = _make_signal("CCC", 0.15, supply_to=10000, tp_from=12000, sl_to=9100)
+    # sL_F = sl_to - 100 = 9000
+    rows = _plan_orders_for_new_positions(
+        selected=[sig], nav_vnd=1_000_000_000, our_positions={},
+        user_sl_pct=0.0,
+    )
+    sl_rows = [r for r in rows if "sl" in r["reason"]]
+    assert len(sl_rows) == 1
+    # No user SL → autofin's 9000
+    assert sl_rows[0]["price"] == 9000
+    assert "user_sl" not in sl_rows[0]["reason"]
+
+
+def test_decide_orders_threads_user_sl_pct():
+    """decide_orders passes user_sl_pct through to _plan_orders_for_new_positions."""
+    sig = _make_signal("DDD", 0.15, supply_to=10000, tp_from=12000, sl_to=9100)
+    sig.raw["_id"] = 1750000003
+    holding = [{
+        "_id": 1750000003, "symbol": "DDD", "companyName": "DDD Co",
+        "statusDeal": {"price_Open": 10000, "price_Closed": 12000},
+        "numberOfProfit": 0, "rateForNav": 0.15,
+        "lastRecomment": "open",
+        "supply_F": 10000, "supply_T": 10000,
+        "tP_F": 12000, "tP_T": 12000, "sL_F": 9000, "sL_T": 9000,
+    }]
+    orders, _, _ = mod.decide_orders(
+        holding=holding, signals=[sig], our_deals={}, our_positions={},
+        nav=1_000_000_000, user_sl_pct=0.05,
+    )
+    sl_rows = [o for o in orders if "sl" in o["reason"]]
+    assert len(sl_rows) == 1
+    # entry 10000, user SL 9500 wins over autofin's 9000
+    assert sl_rows[0]["price"] == 9500
+
+
 def test_plan_close_orders_only_closes_what_autofin_exited():
     our_deals = {
         "111:APH": {"symbol": "APH", "_our_qty": 200},

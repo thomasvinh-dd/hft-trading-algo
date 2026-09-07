@@ -123,6 +123,7 @@ def _plan_orders_for_new_positions(
     our_positions: dict[str, int],
     board_lot: int = DEFAULT_BOARD_LOT,
     min_order_value_vnd: float = 1_000_000,
+    user_sl_pct: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Emit BUY + TP + SL bracket orders for **new** positions only.
 
@@ -134,14 +135,21 @@ def _plan_orders_for_new_positions(
     drops, target shrinks, strategy SELLs, realizes losses,
     NAV drops further, more SELLs).
 
+    Each emitted order dict carries a ``kind`` field that the
+    backtest uses to route orders correctly:
+      - ``kind="entry"``: BUY at entry, fills immediately at today's price
+      - ``kind="tp"``: take-profit bracket, conditional (fires only on trigger)
+      - ``kind="sl"``: stop-loss bracket, conditional (fires only on trigger)
+
     Concretely:
       - If we already hold a positive qty for this symbol,
         skip entirely. The partial-close / full-close logic
         handles exits.
       - Otherwise, size the new BUY at
         target_qty = NAV * rateForNav / ref_price.
-      - Emit the BUY plus TP and SL bracket at the signal's
-        declared trigger levels.
+      - Emit the BUY plus TP and SL bracket. SL is the TIGHTER
+        of autofin's declared sL_F and the user's `user_sl_pct`
+        below entry (default 0 = use autofin's SL only).
     """
     rows: list[dict[str, Any]] = []
     for s in selected:
@@ -162,37 +170,48 @@ def _plan_orders_for_new_positions(
         target_qty = _round_to_lots(int(target_value / ref_price), board_lot)
         if target_qty <= 0:
             continue
+        entry_price = int(round(ref_price))
         did = _deal_id(s.raw)
         rows.append({
             "symbol": s.symbol,
             "side": "NB",
-            "price": int(round(ref_price)),
+            "price": entry_price,
             "quantity": target_qty,
+            "kind": "entry",
             "reason": (
                 f"autofin_buy:deal#{did}:"
                 f"nav{int(s.rate_for_nav*100)}pct:{s.last_recomment[:60]}"
             ),
         })
-        # TP/SL bracket at signal's declared trigger levels. These
-        # become conditional orders in the live bot (and in the daily
-        # backtest) — they only fill if the price reaches the trigger.
-        tp_price = int(round(s.tp_from)) if s.tp_from > 0 else 0
-        sl_price = int(round(s.sl_from)) if s.sl_from > 0 else 0
-        if tp_price > 0:
+        # TP bracket at signal's declared trigger level. Conditional
+        # — fires only when today's price reaches the trigger.
+        if s.tp_from > 0:
             rows.append({
                 "symbol": s.symbol,
                 "side": "NS",
-                "price": tp_price,
+                "price": int(round(s.tp_from)),
                 "quantity": target_qty,
+                "kind": "tp",
                 "reason": f"autofin_tp:deal#{did}:{int(s.tp_from)}",
             })
-        if sl_price > 0:
+        # SL bracket: tighter of autofin's sL_F and our user_sl_pct.
+        # Higher trigger price = tighter (fires sooner on the way down).
+        autofin_sl = int(round(s.sl_from)) if s.sl_from > 0 else 0
+        user_sl = int(round(entry_price * (1 - user_sl_pct))) if user_sl_pct > 0 else 0
+        effective_sl = max(autofin_sl, user_sl)
+        if effective_sl > 0 and effective_sl < entry_price:
+            # Identify which source the SL came from for the Telegram message
+            if user_sl > autofin_sl:
+                sl_reason = f"autofin_user_sl:deal#{did}:{user_sl_pct:.0%}:{effective_sl}"
+            else:
+                sl_reason = f"autofin_sl:deal#{did}:{int(s.sl_from)}"
             rows.append({
                 "symbol": s.symbol,
                 "side": "NS",
-                "price": sl_price,
+                "price": effective_sl,
                 "quantity": target_qty,
-                "reason": f"autofin_sl:deal#{did}:{int(s.sl_from)}",
+                "kind": "sl",
+                "reason": sl_reason,
             })
     return rows
 
@@ -229,6 +248,7 @@ def _plan_close_orders(
             "side": "NS",
             "price": 0,  # market order to close
             "quantity": _round_to_lots(qty, board_lot),
+            "kind": "full_close",
             "reason": f"autofin_closed:deal#{did}",
         })
     return rows
@@ -365,6 +385,7 @@ def _plan_partial_close_orders(
             "side": "NS",
             "price": price,
             "quantity": delta,
+            "kind": "partial_close",
             "reason": (
                 f"autofin_partial:deal#{did}:{action.action}:"
                 f"lap{action.lap}:pct{int(round(action.percent * 100))}:{rec[:60]}"
@@ -566,6 +587,7 @@ def decide_orders(
     nav: float,
     config: StrategyConfig | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
+    user_sl_pct: float = 0.0,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -574,6 +596,13 @@ def decide_orders(
     time-of-day, no DNSE calls — so this function can be replayed
     against any historical snapshot, which is what the daily
     backtest does.
+
+    Parameters
+    ----------
+    user_sl_pct : fraction (e.g. 0.05 = 5%) — sets a user-defined
+        stop-loss at this fraction below the entry price. The actual
+        SL bracket is the TIGHTER of this and autofin's declared
+        sL_F. Default 0 = use autofin's SL only.
 
     Returns
     -------
@@ -608,7 +637,9 @@ def decide_orders(
     # for partial-close / full-close detection only.
 
     # 4. Compute orders
-    new_orders = _plan_orders_for_new_positions(selected, nav, our_positions, board_lot=board_lot)
+    new_orders = _plan_orders_for_new_positions(
+        selected, nav, our_positions, board_lot=board_lot, user_sl_pct=user_sl_pct,
+    )
     partial_orders = _plan_partial_close_orders(our_deals, holding, board_lot=board_lot)
     our_real_deals = {
         did: sig for did, sig in our_deals.items()
@@ -813,6 +844,14 @@ class AutofinSignalAdapter(StrategyAdapter):
             except ValueError:
                 pass
 
+        # 5c. User-defined stop-loss (overrides autofin's loose SL with
+        # a tighter one). Read from env so it can be tuned per-environment.
+        # 0 = disabled (use autofin's sL_F only).
+        try:
+            user_sl_pct = float(os.environ.get("AUTOFIN_USER_SL_PCT", "0.05") or "0.05")
+        except ValueError:
+            user_sl_pct = 0.05
+
         # 6-9. Delegate to the pure decision function. This is the same
         # function the daily-replay backtest calls.
         all_orders, new_our_deals, deals_actioned = decide_orders(
@@ -822,6 +861,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             our_positions=positions,
             nav=nav,
             config=strategy_config,
+            user_sl_pct=user_sl_pct,
         )
 
         # 10. Update our persistent state. Note: decide_orders() returns
