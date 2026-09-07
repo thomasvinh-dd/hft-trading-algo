@@ -238,6 +238,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="send the summary to Telegram",
     )
 
+    autofin_daily_bt = subparsers.add_parser(
+        "backtest-autofin-daily",
+        help="day-by-day replay of the autofin mirror strategy (reconstructs "
+             "historical snapshots and runs the actual decide_orders function)",
+    )
+    autofin_daily_bt.add_argument(
+        "--initial-nav",
+        type=float,
+        default=1_000_000_000,
+        help="starting NAV in VND (default 1B)",
+    )
+    autofin_daily_bt.add_argument(
+        "--fee-pct-per-side",
+        type=float,
+        default=0.0012,
+        help="DNSE-equivalent fee per side (default 0.12%%)",
+    )
+    autofin_daily_bt.add_argument(
+        "--slippage-pct-per-fill",
+        type=float,
+        default=0.001,
+        help="slippage per fill (default 0.1%%)",
+    )
+    autofin_daily_bt.add_argument(
+        "--max-pages",
+        type=int,
+        default=20,
+        help="pagination cap on /closing-signals (default 20)",
+    )
+    autofin_daily_bt.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("vietnam_algo/data/backtests"),
+        help="where to write replay JSON+CSVs (default data/backtests/)",
+    )
+    autofin_daily_bt.add_argument(
+        "--prefix",
+        type=str,
+        default="autofin_daily_replay",
+        help="output file prefix (default autofin_daily_replay)",
+    )
+    autofin_daily_bt.add_argument(
+        "--notify",
+        action="store_true",
+        help="send the summary to Telegram",
+    )
+
     dnse_accounts = subparsers.add_parser("dnse-accounts", help="list DNSE trading accounts")
     add_dnse_auth_arguments(dnse_accounts)
 
@@ -1081,6 +1128,32 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(f"Saved backtest JSON to {json_path}")
         print(f"Saved per-trade CSV to {csv_path}")
+        if args.notify:
+            notify(report)
+        return 0
+
+    if args.command == "backtest-autofin-daily":
+        from .backtest_autofin_daily import (
+            format_daily_replay_report,
+            run_daily_replay_backtest,
+            write_daily_replay_outputs,
+        )
+        from .notifier import notify
+        result = run_daily_replay_backtest(
+            initial_nav=args.initial_nav,
+            fee_pct_per_side=args.fee_pct_per_side,
+            slippage_pct_per_fill=args.slippage_pct_per_fill,
+            max_pages=args.max_pages,
+        )
+        json_path, nav_csv, fills_csv = write_daily_replay_outputs(
+            result, args.out_dir, prefix=args.prefix,
+        )
+        report = format_daily_replay_report(result)
+        print(report)
+        print()
+        print(f"Saved replay JSON to {json_path}")
+        print(f"Saved daily-NAV CSV to {nav_csv}")
+        print(f"Saved per-fill CSV to {fills_csv}")
         if args.notify:
             notify(report)
         return 0

@@ -538,6 +538,121 @@ def _format_per_action_message(deal: dict[str, Any], ts: str) -> str:
     return deals
 
 
+def decide_orders(
+    *,
+    holding: list[dict[str, Any]],
+    signals: list[AutofinSignal],
+    our_deals: dict[str, dict[str, Any]],
+    our_positions: dict[str, int],
+    nav: float,
+    config: StrategyConfig | None = None,
+    board_lot: int = DEFAULT_BOARD_LOT,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Pure-functional decision function for the autofin mirror strategy.
+
+    Given a snapshot of autofin state + our tracked state, return
+    the orders to place and the new state to persist. No I/O, no
+    time-of-day, no DNSE calls — so this function can be replayed
+    against any historical snapshot, which is what the daily
+    backtest does.
+
+    Returns
+    -------
+    (orders, new_our_deals, deals_actioned)
+        ``orders``: list of DNSE order rows (close → partial → new).
+        ``new_our_deals``: the updated ``our_deals`` state (deal_id →
+            signal dict, with ``_our_qty`` and ``_last_numberOfProfit``
+            updated to reflect the orders issued).
+        ``deals_actioned``: per-deal grouping of orders, suitable for
+            Telegram formatting.
+    """
+    config = config or StrategyConfig()
+
+    # 1. Build lookup maps from holding snapshot
+    autofin_holding_by_id: dict[str, dict[str, Any]] = {}
+    for d in holding:
+        did = _deal_id(d)
+        if did:
+            autofin_holding_by_id[did] = dict(d)
+
+    # 2. Select new-entry signals (top risk-adjusted, NAV-budgeted)
+    selected = _select_signals_within_nav_budget(signals, nav_budget_pct=1.0)
+
+    # 3. Also include any deal we already hold (for rebalance). Use
+    # the original holding data so the composite deal_id is preserved.
+    autofin_open_ids = set(autofin_holding_by_id.keys())
+    suggest_ids = {_deal_id(s.raw) for s in signals if s.raw.get("_id")}
+    for did, sig in our_deals.items():
+        if did in autofin_open_ids:
+            already = any(_deal_id(s.raw) == did for s in selected)
+            if not already:
+                h = autofin_holding_by_id.get(did)
+                if h is not None:
+                    selected.append(parse_signal(h))
+
+    # 4. Compute orders
+    new_orders = _plan_orders_for_new_positions(selected, nav, our_positions, board_lot=board_lot)
+    partial_orders = _plan_partial_close_orders(our_deals, holding, board_lot=board_lot)
+    our_real_deals = {
+        did: sig for did, sig in our_deals.items()
+        if sig.get("_our_qty", 0) > 0
+    }
+    close_orders = _plan_close_orders(our_real_deals, holding, suggest_ids, board_lot=board_lot)
+
+    # 4b. CRITICAL FIX (2026-09-07): don't re-enter deals that are being
+    # closed in this same iteration. The previous logic added held
+    # deals to `selected` for "rebalance", which caused a death spiral
+    # when NAV had just dropped: we issue a close SELL (selling the
+    # whole position), then immediately re-buy because the deal is
+    # still in `selected` and `our_positions` is now zero. We need
+    # to filter out symbols being closed from new entries.
+    closing_symbols: set[str] = {
+        o.get("symbol", "") for o in close_orders if o.get("symbol")
+    }
+    if closing_symbols:
+        new_orders = [
+            o for o in new_orders
+            if o.get("symbol") not in closing_symbols
+        ]
+        selected = [
+            s for s in selected if s.symbol not in closing_symbols
+        ]
+
+    # 5. Update our_deals state to reflect the orders we're issuing.
+    # Build a deep-copy so callers can mutate our_deals without
+    # affecting the in-memory state of the bot.
+    new_our_deals: dict[str, dict[str, Any]] = {
+        did: dict(sig) for did, sig in our_deals.items()
+    }
+    # for each new BUY we issue, add the deal + track qty
+    for s in selected:
+        did = _deal_id(s.raw)
+        if not did:
+            continue
+        if did not in new_our_deals:
+            new_our_deals[did] = dict(s.raw)
+        new_our_deals[did].setdefault("_our_qty", 0)
+        for o in new_orders:
+            if (
+                o["symbol"] == s.symbol
+                and o["side"] == "NB"
+                and "tp:" not in o["reason"]
+                and "sl:" not in o["reason"]
+            ):
+                new_our_deals[did]["_our_qty"] = o["quantity"]
+    # for each close, drop the deal
+    for o in close_orders:
+        closed_did = _extract_deal_id(o.get("reason", ""))
+        if closed_did:
+            new_our_deals.pop(closed_did, None)
+
+    all_orders = close_orders + partial_orders + new_orders
+    deals_actioned = _build_deals_actioned(
+        new_orders, partial_orders, close_orders, autofin_holding_by_id
+    )
+    return all_orders, new_our_deals, deals_actioned
+
+
 class AutofinSignalAdapter(StrategyAdapter):
     """Mirror autofin.vn signals to DNSE orders, tracked by autofin deal_id."""
 
@@ -635,39 +750,24 @@ class AutofinSignalAdapter(StrategyAdapter):
         except Exception as exc:
             notify(f"⚠️ autofin fetch_holding failed: {exc}")
             holding = []
-        autofin_open_ids = {_deal_id(d) for d in holding if _deal_id(d)}
-        # Build a map: deal_id → signal details (for the TP/SL etc.)
-        autofin_holding_by_id: dict[str, dict[str, Any]] = {}
-        for d in holding:
-            did = _deal_id(d)
-            if did:
-                d["_our_qty"] = 0  # placeholder; set when we hold it
-                autofin_holding_by_id[did] = d
-
         # 2. /signal-static-suggest — latest recommended signals
         try:
             signals = client.fetch_signals(page_size=20)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_signals failed: {exc}")
             signals = []
-        suggest_by_id: dict[str, AutofinSignal] = {
-            _deal_id(s.raw): s for s in signals if s.raw.get("_id")
-        }
-
         # 3. /closing-signals — recently closed
         try:
             closing = client.fetch_closing(page_size=50)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_closing failed: {exc}")
             closing = []
-
         # 4. /signal-static-risk — risk positions (for alerts)
         try:
             risk = client.fetch_risk(page_size=50)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_risk failed: {exc}")
             risk = []
-
         # 5. fetch our current DNSE positions for sizing
         try:
             from ..dnse_client import DnseClient
@@ -691,74 +791,28 @@ class AutofinSignalAdapter(StrategyAdapter):
         if mock_nav:
             try:
                 nav = float(mock_nav)
-                positions = dict(positions)  # copy
+                positions = dict(positions)
             except ValueError:
                 pass
 
-        # 6. select signals (top risk-adjusted, NAV-budgeted)
-        # suggest-endpoint signals are NEW entries; holding-endpoint deals
-        # are existing positions to monitor (handled by partial / full close).
-        selected = _select_signals_within_nav_budget(signals, nav_budget_pct=1.0)
-        # also include any deal we already hold (for rebalance when our
-        # tracked qty drifts from autofin's target). Use the original
-        # holding data as the source so the composite deal_id is preserved.
-        for did, sig in self._our_deals.items():
-            if did in autofin_open_ids:
-                already = any(_deal_id(s.raw) == did for s in selected)
-                if not already:
-                    h = autofin_holding_by_id.get(did)
-                    if h is not None:
-                        selected.append(parse_signal(h))
-                    # If the deal is in suggest but not holding, fall back to
-                    # the stored sig — we lose the composite _id but the
-                    # partial-close path doesn't need it (it keys off nP).
-
-        # 7. new entries (BUY + TP + SL)
-        new_orders = _plan_orders_for_new_positions(selected, nav, positions)
-
-        # 8. partial close (mirror autofin's trim / take-profit step)
-        # Only for deals we actually hold; reads + mutates self._our_deals
-        # to update _last_numberOfProfit and decrement _our_qty.
-        partial_orders = _plan_partial_close_orders(self._our_deals, holding)
-
-        # 9. close positions autofin no longer holds
-        # Filter out deals we never actually opened (NAV=0 caused zero orders)
-        our_real_deals = {
-            did: sig for did, sig in self._our_deals.items()
-            if sig.get("_our_qty", 0) > 0
-        }
-        suggest_ids = {_deal_id(s.raw) for s in signals if s.raw.get("_id")}
-        close_orders = _plan_close_orders(our_real_deals, holding, suggest_ids)
-        # merge — close orders first so any new BUY on same symbol replaces
-
-        # 10. update our tracked deals
-        # for each new selected deal that we now hold, add to our_deals
-        for s in selected:
-            did = _deal_id(s.raw)
-            if not did:
-                continue
-            if did not in self._our_deals:
-                self._our_deals[did] = dict(s.raw)
-            self._our_deals[did]["_our_qty"] = self._our_deals[did].get("_our_qty", 0)
-            # also derive _our_qty from new order if BUY
-            for o in new_orders:
-                if o["symbol"] == s.symbol and o["side"] == "NB" and "tp:" not in o["reason"] and "sl:" not in o["reason"]:
-                    self._our_deals[did]["_our_qty"] = o["quantity"]
-        # for each closed deal, remove by deal_id (not symbol — symbols can
-        # collide across deals on the same day)
-        for o in close_orders:
-            closed_did = _extract_deal_id(o.get("reason", ""))
-            if closed_did:
-                self._our_deals.pop(closed_did, None)
-
-        # 11. assemble final order list (close → partial → new)
-        all_orders = close_orders + partial_orders + new_orders
-
-        # 11b. group orders by deal so the EOD summary can show signal ↔
-        # DNSE-order mapping per deal.
-        deals_actioned = _build_deals_actioned(
-            new_orders, partial_orders, close_orders, autofin_holding_by_id
+        # 6-9. Delegate to the pure decision function. This is the same
+        # function the daily-replay backtest calls.
+        all_orders, new_our_deals, deals_actioned = decide_orders(
+            holding=holding,
+            signals=signals,
+            our_deals=self._our_deals,
+            our_positions=positions,
+            nav=nav,
+            config=strategy_config,
         )
+
+        # 10. Update our persistent state. Note: decide_orders() returns
+        # a deep-copied new_our_deals; we copy it back into our adapter's
+        # state so subsequent calls see the new positions.
+        self._our_deals = new_our_deals
+        new_orders = [o for o in all_orders if o.get("side") == "NB" and "tp:" not in o.get("reason", "") and "sl:" not in o.get("reason", "")]
+        partial_orders = [o for o in all_orders if "autofin_partial:" in o.get("reason", "")]
+        close_orders = [o for o in all_orders if "autofin_closed:" in o.get("reason", "")]
 
         # 11. write outputs
         today = trade_date or datetime.now(timezone.utc).date().isoformat()
