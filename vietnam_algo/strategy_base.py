@@ -30,10 +30,20 @@ class StrategyAdapter(ABC):
         """Run the strategy and return the same payload as generate_live_orders."""
         ...
 
-    def format_cycle_summary(self, result: dict[str, Any]) -> str:
-        """Format a Telegram message for this strategy's EOD summary."""
+    def format_cycle_summary(
+        self,
+        result: dict[str, Any],
+        portfolio: dict[str, Any] | None = None,
+    ) -> str:
+        """Format a Telegram message for this strategy's EOD summary.
+
+        ``portfolio`` is the live portfolio snapshot (cash, NAV,
+        positions) the auto_bot fetched. The base implementation
+        forwards it to ``eod_summary_message`` if provided;
+        subclasses may override to format per-strategy context.
+        """
         from .notifier import eod_summary_message
-        return eod_summary_message(result)
+        return eod_summary_message(result, portfolio=portfolio)
 
     @property
     def backtest_csv_name(self) -> str:

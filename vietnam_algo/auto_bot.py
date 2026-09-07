@@ -308,10 +308,20 @@ def run_auto_bot(
             print(f"[{now.isoformat()}] Running EOD data update and order generation")
             notify(f"Vietnam Algo: EOD update started\ntime: {now.isoformat()}\nstrategy: {engine_config.strategy}")
             update_dataset(engine_config)
-            result = generate_live_orders(
-                engine_config, strategy_config, strategy_name=strategy_name,
-                notify_telegram=False,
-            )
+            # Use the strategy adapter's generate_orders() when available.
+            # This is the right path for strategies like autofin_signal
+            # which don't go through run_daily_once → run_momentum_rotation.
+            # Fall back to the legacy generate_live_orders() for momentum /
+            # hybrid strategies.
+            if strategy_adapter is not None:
+                result = strategy_adapter.generate_orders(
+                    engine_config, strategy_config, trade_date=today,
+                )
+            else:
+                result = generate_live_orders(
+                    engine_config, strategy_config, strategy_name=strategy_name,
+                    notify_telegram=False,
+                )
             print(result)
             # Fetch live portfolio snapshot once so the EOD summary can
             # show cash, NAV, and per-position P&L inline.
