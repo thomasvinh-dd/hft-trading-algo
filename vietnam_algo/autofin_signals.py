@@ -289,7 +289,9 @@ class AutofinClient:
         page_size: int = 50,
         closed_only: bool = True,
         progress: bool = False,
-        default_rate_for_nav: float = 0.15,
+        default_rate_for_nav: float = 0.10,
+        default_tp_pct_above_entry: float = 0.10,
+        default_sl_pct_below_entry: float = 0.10,
     ) -> list[dict[str, Any]]:
         """Fetch full closed-deal history across all symbols.
 
@@ -300,12 +302,24 @@ class AutofinClient:
         The ``/signal-deals`` endpoint does NOT include some fields
         that ``/closing-signals`` does (rateForNav, supply_F/T, tP_F/T,
         sL_F/T). For backtesting, we synthesize defaults so the
-        strategy has data to work with:
-          - rateForNav: defaults to ``default_rate_for_nav`` (0.15)
+        strategy has data to work with — but we use FORECAST-BASED
+        defaults that DO NOT depend on future information
+        (price_Close). Concretely:
+          - rateForNav: defaults to ``default_rate_for_nav`` (0.10)
           - supply_F, supply_T: defaults to statusDeal.price_Open
-          - tP_F, tP_T: defaults to statusDeal.price_Closed
-          - sL_F, sL_T: defaults to statusDeal.price_Open * 0.90
-            (i.e. autofin's typical 10% SL)
+          - tP_F, tP_T: defaults to price_Open × (1 + tp_pct_above_entry)
+            i.e. autofin's typical forecast-based TP target ABOVE
+            entry. NEVER below entry (would fire on day 1, look-ahead).
+          - sL_F, sL_T: defaults to price_Open × (1 - sl_pct_below_entry)
+            i.e. autofin's typical forecast-based SL target.
+
+        Honesty note: this avoids look-ahead bias from using
+        price_Close for TP/SL targets. For LOSERS, this means
+        the TP never fires (price drops below entry), so we hold
+        to the final close — capturing the full loss. The previous
+        "TP = price_Close" approach was biased upward: for losers,
+        it set TP below entry and fired day 1, capping losses
+        artificially.
 
         With ``closed_only=True`` (default), filters to
         ``statusDeal.isClosed == True`` deals.
@@ -337,25 +351,28 @@ class AutofinClient:
                 continue
             if closed_only:
                 deals = [d for d in deals if (d.get("statusDeal") or {}).get("isClosed")]
-            # Synthesize missing fields for backtest compatibility
+            # Synthesize missing fields for backtest compatibility.
+            # IMPORTANT: use FORECAST-BASED defaults (price_Open only),
+            # NOT future data (price_Close), to avoid look-ahead bias.
             for d in deals:
                 sd = d.get("statusDeal") or {}
                 if not d.get("rateForNav"):
                     d["rateForNav"] = default_rate_for_nav
                 p_open = float(sd.get("price_Open") or 0)
-                p_close = float(sd.get("price_Closed") or 0)
                 if not d.get("supply_F"):
                     d["supply_F"] = p_open
                 if not d.get("supply_T"):
                     d["supply_T"] = p_open
+                # TP forecast: above entry (autofin targets profit).
+                # Never below entry — that would be look-ahead bias.
                 if not d.get("tP_F"):
-                    d["tP_F"] = p_close
+                    d["tP_F"] = p_open * (1 + default_tp_pct_above_entry)
                 if not d.get("tP_T"):
-                    d["tP_T"] = p_close
+                    d["tP_T"] = p_open * (1 + default_tp_pct_above_entry)
                 if not d.get("sL_F"):
-                    d["sL_F"] = p_open * 0.90
+                    d["sL_F"] = p_open * (1 - default_sl_pct_below_entry)
                 if not d.get("sL_T"):
-                    d["sL_T"] = p_open * 0.90
+                    d["sL_T"] = p_open * (1 - default_sl_pct_below_entry)
             all_items.extend(deals)
         if progress:
             import sys
