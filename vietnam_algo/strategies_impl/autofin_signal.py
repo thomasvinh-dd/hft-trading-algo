@@ -117,6 +117,75 @@ def _deal_id(raw: dict[str, Any]) -> str:
     return f"{_id}:{sym}"
 
 
+def _expand_signals_with_held_unentered(
+    signals: list[AutofinSignal],
+    holding: list[dict[str, Any]],
+    our_deals: dict[str, dict[str, Any]],
+    current_prices: dict[str, float],
+    above_zone_tolerance_pct: float = 0.05,
+) -> list[AutofinSignal]:
+    """Augment ``signals`` with held-but-not-entered deals that are
+    currently in the buy zone.
+
+    Per user feedback (2026-09-08): autofin's recommendation gives a
+    *price range* (e.g. "Vùng mua: 20,650 - 21,300"). The deal can be
+    entered at any time while the current market price is within that
+    range — NOT only on ``time_Open`` day. The previous logic only
+    considered signals from /signal-static-suggest (latest 20 deals),
+    so any older deal that autofin kept open but dropped off the
+    suggest page was invisible to the entry logic.
+
+    This function scans ``holding`` (autofin's source of truth for
+    currently-open deals) and converts any deal we have NOT yet
+    entered (``our_deals[deal_id]._our_qty == 0`` or missing) into
+    a synthetic AutofinSignal, but ONLY if its current market price
+    is within (or up to ``above_zone_tolerance_pct`` above) the
+    declared supply zone. De-duplicated against existing ``signals``
+    by deal_id so fresh signals win.
+    """
+    seen_ids: set[str] = {_deal_id(s.raw) for s in signals if s.symbol}
+    out: list[AutofinSignal] = list(signals)
+    for h in holding:
+        did = _deal_id(h)
+        if not did or did in seen_ids:
+            continue
+        # Already entered this deal — partial/full-close logic handles it.
+        if (our_deals.get(did) or {}).get("_our_qty", 0) > 0:
+            continue
+        # Filter out holds that autofin has already closed — keep only
+        # genuinely OPEN deals (statusDeal.isClosed != True).
+        sd = h.get("statusDeal") or {}
+        if sd.get("isClosed"):
+            continue
+        # Build signal-shaped record from the holding row.
+        try:
+            sig = parse_signal(h)
+        except Exception:
+            continue
+        if not sig.symbol:
+            continue
+        cur = current_prices.get(sig.symbol, 0)
+        if cur <= 0:
+            # No price yet — can't gate on zone. Skip to avoid stale orders.
+            continue
+        s_lo = float(sig.supply_from or 0)
+        s_hi = float(sig.supply_to or 0)
+        if s_hi <= 0:
+            # No declared buy zone — can't decide. Skip.
+            continue
+        if cur > s_hi * (1.0 + above_zone_tolerance_pct):
+            # Way above the buy zone — wait for pullback.
+            continue
+        # Also enforce a reasonable lower bound: if current price is
+        # more than 30% below the buy zone, the deal is likely
+        # already invalid (autofin's zone has moved past). Skip.
+        if s_lo > 0 and cur < s_lo * 0.7:
+            continue
+        out.append(sig)
+        seen_ids.add(did)
+    return out
+
+
 def _plan_orders_for_new_positions(
     selected: list[AutofinSignal],
     nav_vnd: float,
@@ -124,6 +193,8 @@ def _plan_orders_for_new_positions(
     board_lot: int = DEFAULT_BOARD_LOT,
     min_order_value_vnd: float = 1_000_000,
     user_sl_pct: float = 0.0,
+    current_prices: dict[str, float] | None = None,
+    above_zone_tolerance_pct: float = 0.05,
 ) -> list[dict[str, Any]]:
     """Emit BUY + TP + SL bracket orders for **new** positions only.
 
@@ -150,6 +221,19 @@ def _plan_orders_for_new_positions(
       - Emit the BUY plus TP and SL bracket. SL is the TIGHTER
         of autofin's declared sL_F and the user's `user_sl_pct`
         below entry (default 0 = use autofin's SL only).
+
+    Entry price selection (user feedback 2026-09-08):
+      - If ``current_prices[symbol]`` is provided AND the price is
+        within (or up to ``above_zone_tolerance_pct`` above) the
+        buy zone ``[supply_from, supply_to]``, enter.
+      - Entry price = ``min(current_price, supply_to)`` — buys at
+        the better of the two, so we never overpay vs the buy zone
+        ceiling.
+      - If current price is way above the buy zone (above tolerance),
+        SKIP — wait for a pullback to the zone.
+      - If no current price is available for this symbol (price data
+        not yet synced), fall back to the legacy behaviour of entering
+        at ``supply_to`` (high end of buy zone).
     """
     rows: list[dict[str, Any]] = []
     for s in selected:
@@ -167,10 +251,24 @@ def _plan_orders_for_new_positions(
         ref_price = _signal_ref_price(s)
         if ref_price <= 0:
             continue
-        target_qty = _round_to_lots(int(target_value / ref_price), board_lot)
+        # ----- Entry-price gate based on current market price -----
+        cur = (current_prices or {}).get(s.symbol, 0)
+        s_lo = float(s.supply_from or 0)
+        s_hi = float(s.supply_to or 0)
+        if cur > 0:
+            # Way above the buy zone → skip and wait for pullback.
+            if s_hi > 0 and cur > s_hi * (1.0 + above_zone_tolerance_pct):
+                continue
+            # Below or at the top of zone → enter at the better price.
+            entry_price = int(round(min(cur, s_hi))) if s_hi > 0 else int(round(cur))
+        else:
+            # No live price → legacy fallback.
+            entry_price = int(round(ref_price))
+        if entry_price <= 0:
+            continue
+        target_qty = _round_to_lots(int(target_value / entry_price), board_lot)
         if target_qty <= 0:
             continue
-        entry_price = int(round(ref_price))
         did = _deal_id(s.raw)
         rows.append({
             "symbol": s.symbol,
@@ -588,6 +686,7 @@ def decide_orders(
     config: StrategyConfig | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
     user_sl_pct: float = 0.0,
+    current_prices: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -603,6 +702,13 @@ def decide_orders(
         stop-loss at this fraction below the entry price. The actual
         SL bracket is the TIGHTER of this and autofin's declared
         sL_F. Default 0 = use autofin's SL only.
+    current_prices : optional ``symbol → last_close`` map. When
+        provided, the function augments ``signals`` with any HELD
+        autofin deals we haven't entered yet, as long as their
+        current price is within the buy zone (per
+        ``_expand_signals_with_held_unentered``). BUY orders are
+        also gated on price within zone + sized at the better of
+        current_price vs supply_to.
 
     Returns
     -------
@@ -612,7 +718,7 @@ def decide_orders(
             signal dict, with ``_our_qty`` and ``_last_numberOfProfit``
             updated to reflect the orders issued).
         ``deals_actioned``: per-deal grouping of orders, suitable for
-            Telegram formatting.
+        Telegram formatting.
     """
     config = config or StrategyConfig()
 
@@ -623,7 +729,20 @@ def decide_orders(
         if did:
             autofin_holding_by_id[did] = dict(d)
 
-    # 2. Select new-entry signals (top risk-adjusted, NAV-budgeted).
+    # 2. Augment signals with HELD-but-not-entered deals that are
+    # currently in the buy zone. Per user feedback (2026-09-08): an
+    # autofin recommendation gives a price range, not a one-day
+    # entry window — we can enter any day while current price is
+    # within the zone. This also picks up older deals that dropped
+    # off /signal-static-suggest but are still active in autofin's
+    # /signal-static-holding.
+    augmented_signals = signals
+    if current_prices:
+        augmented_signals = _expand_signals_with_held_unentered(
+            signals, holding, our_deals, current_prices,
+        )
+
+    # 3. Select new-entry signals (top risk-adjusted, NAV-budgeted).
     # NOTE (2026-09-07, fixed-sizing model): we use the SUGGEST
     # endpoint only. The previous logic added HELD deals back to
     # `selected` so the strategy could "rebalance" them — but that
@@ -631,14 +750,18 @@ def decide_orders(
     # SELL → realized loss → NAV drops further → more SELLs).
     # Under fixed sizing, existing positions are NEVER re-evaluated
     # for entry sizing; partial-close / full-close logic handles exits.
-    selected = _select_signals_within_nav_budget(signals, nav_budget_pct=1.0)
+    selected = _select_signals_within_nav_budget(
+        augmented_signals, nav_budget_pct=1.0,
+    )
 
-    # 3. NO rebalance loop. Existing positions stay in `our_deals`
+    # 4. NO rebalance loop. Existing positions stay in `our_deals`
     # for partial-close / full-close detection only.
 
-    # 4. Compute orders
+    # 5. Compute orders
     new_orders = _plan_orders_for_new_positions(
-        selected, nav, our_positions, board_lot=board_lot, user_sl_pct=user_sl_pct,
+        selected, nav, our_positions,
+        board_lot=board_lot, user_sl_pct=user_sl_pct,
+        current_prices=current_prices,
     )
     partial_orders = _plan_partial_close_orders(our_deals, holding, board_lot=board_lot)
     our_real_deals = {
@@ -852,6 +975,36 @@ class AutofinSignalAdapter(StrategyAdapter):
         except ValueError:
             user_sl_pct = 0.05
 
+        # 5d. Build a symbol → last_close price map from local price data.
+        # Used to (a) gate entry on price-within-buy-zone and (b) include
+        # HELD-but-not-entered deals in the candidate list. Per user
+        # feedback 2026-09-08, autofin deals have a price range, so the
+        # bot should be able to enter at any time the current price is
+        # within that range — not only on the day time_Open was set.
+        try:
+            from ..universe import load_price_bars
+        except ImportError:
+            load_price_bars = None  # type: ignore[assignment]
+        current_prices: dict[str, float] = {}
+        seen_symbols: set[str] = set()
+        for s in signals:
+            if s.symbol and s.symbol not in seen_symbols:
+                seen_symbols.add(s.symbol)
+        for h in holding:
+            sym = str(h.get("symbol") or "").strip().upper()
+            if sym and sym not in seen_symbols:
+                seen_symbols.add(sym)
+        if load_price_bars is not None:
+            for sym in seen_symbols:
+                try:
+                    bars = load_price_bars(sym, config.dataDir)
+                except Exception:
+                    continue
+                if bars:
+                    last_close = float(bars[-1].close or 0)
+                    if last_close > 0:
+                        current_prices[sym] = last_close
+
         # 6-9. Delegate to the pure decision function. This is the same
         # function the daily-replay backtest calls.
         all_orders, new_our_deals, deals_actioned = decide_orders(
@@ -862,6 +1015,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             nav=nav,
             config=strategy_config,
             user_sl_pct=user_sl_pct,
+            current_prices=current_prices,
         )
 
         # 10. Update our persistent state. Note: decide_orders() returns
