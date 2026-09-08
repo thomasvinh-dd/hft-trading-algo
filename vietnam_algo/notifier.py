@@ -395,17 +395,32 @@ def portfolio_section_lines(
     bal = portfolio.get("balance", {}) or {}
     totals = portfolio.get("totals", {}) or {}
     positions = portfolio.get("positions", []) or []
+    errors = portfolio.get("errors", []) or []
 
     lines: list[str] = [f"💼 {label}"]
+    cash_total = bal.get("totalCash") or 0
+    stock_value = totals.get("stockValue") or 0
+    nav = totals.get("portfolioValue") or 0
     lines.append(f"  cash (available): {format_money(bal.get('availableCash'))} VND")
-    lines.append(f"  cash (total):     {format_money(bal.get('totalCash'))} VND")
-    lines.append(f"  stock value:      {format_money(totals.get('stockValue'))} VND")
-    lines.append(f"  NAV:              {format_money(totals.get('portfolioValue'))} VND")
+    lines.append(f"  cash (total):     {format_money(cash_total)} VND")
+    lines.append(f"  stock value:      {format_money(stock_value)} VND")
+    lines.append(f"  NAV:              {format_money(nav)} VND")
     upnl = totals.get("totalUnrealizedPnl", 0) or 0
     upnl_pct = totals.get("totalUnrealizedPnlPct", 0.0) or 0.0
     lines.append(
         f"  unrealized P&L:   {format_money(upnl)} VND  ({upnl_pct:+.2f}%)"
     )
+    # When the live account is empty, surface that explicitly so users
+    # don't confuse the backtest metrics above with live state.
+    if cash_total == 0 and stock_value == 0 and not positions:
+        lines.append("")
+        lines.append(
+            "  ⚠️  Live account is EMPTY — no cash, no positions."
+            " No live orders can be submitted."
+        )
+    if errors:
+        lines.append("")
+        lines.append(f"  ⚠️  Snapshot errors: {', '.join(errors)}")
     if positions:
         lines.append("")
         lines.append(f"  📊 Positions ({len(positions)}):")
@@ -437,6 +452,11 @@ def eod_summary_message(
     Telegram message shows the actual BUY/SELL orders being submitted,
     not just a count. When ``portfolio`` is provided, includes cash, NAV,
     and per-position unrealized P&L.
+
+    NOTE: the ``metrics`` block in ``result`` is the **backtest**
+    simulation result (initial 1B VND NAV run daily through the
+    strategy), NOT the live DNSE account. We label it as such so it
+    doesn't get confused with the live portfolio.
     """
     metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
     orders_info = result.get("latestOrdersCsv")
@@ -445,13 +465,22 @@ def eod_summary_message(
         f"tradeDate: {result.get('tradeDate')}",
         f"strategy: {result.get('strategy')}",
         f"orderCount: {result.get('count')}",
-        f"totalReturn: {format_percent(metrics.get('totalReturnPercent'))}",
-        f"maxDrawdown: {format_percent(metrics.get('maxDrawdownPercent'))}",
-        f"finalEquity: {format_money(metrics.get('finalEquity'))}",
     ]
-    # current portfolio (cash, NAV, P&L, positions)
+    # Backtest simulation metrics (NOT live P&L). Only show when the
+    # strategy actually ran a backtest (it sets initialCash/finalEquity).
+    has_backtest = (
+        metrics.get("initialCash") not in (None, 0)
+        or metrics.get("finalEquity") not in (None, 0)
+    )
+    if has_backtest:
+        lines.append("")
+        lines.append("  📈 Backtest simulation (1B VND start, NOT live P&L):")
+        lines.append(f"    totalReturn: {format_percent(metrics.get('totalReturnPercent'))}")
+        lines.append(f"    maxDrawdown: {format_percent(metrics.get('maxDrawdownPercent'))}")
+        lines.append(f"    finalEquity: {format_money(metrics.get('finalEquity'))} VND")
+    # current portfolio (cash, NAV, positions)
     lines.append("")
-    lines.extend(portfolio_section_lines(portfolio, label="CURRENT PORTFOLIO"))
+    lines.extend(portfolio_section_lines(portfolio, label="LIVE PORTFOLIO (DNSE)"))
     # orders to submit (read from latest_orders JSON)
     items: list[dict[str, Any]] = []
     json_path = result.get("latestOrdersJson")
