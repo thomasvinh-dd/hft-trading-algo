@@ -122,8 +122,29 @@ def _parse_dt(s: str) -> datetime | None:
 def fetch_all_closed(
     client: AutofinClient,
     max_pages: int = MAX_PAGES,
+    use_full_history: bool = True,
+    progress: bool = False,
 ) -> list[dict[str, Any]]:
-    """Fetch all closed deals, paginating through /closing-signals."""
+    """Fetch all closed deals for the backtest.
+
+    ``use_full_history=True`` (default): fetches the FULL per-symbol
+    deal history by combining ``/closing-signals`` (to enumerate
+    symbols) with ``/signal-deals?symbol=X`` (to fetch all deals per
+    symbol). This typically returns 10-20x more deals than just
+    ``/closing-signals`` alone (which only returns the most recent
+    closed deal per symbol).
+
+    ``use_full_history=False``: legacy behaviour — paginate
+    ``/closing-signals`` only. Each item is one deal (one row per
+    unique symbol).
+
+    For 250+ symbols, ``use_full_history=True`` can take 5-10 minutes.
+    """
+    if use_full_history:
+        return client.fetch_all_deals_pages(
+            symbols=None, page_size=50, closed_only=True, progress=progress,
+        )
+    # Legacy: /closing-signals only
     all_items: list[dict[str, Any]] = []
     for page in range(1, max_pages + 1):
         items = client.fetch_closing(page_size=50, page_index=page)
@@ -251,6 +272,7 @@ def run_autofin_backtest(
     fee_pct_per_side: float = DEFAULT_FEE_PCT_PER_SIDE,
     slippage_pct_per_fill: float = DEFAULT_SLIPPAGE_PCT_PER_FILL,
     max_pages: int = MAX_PAGES,
+    use_full_history: bool = True,
     client: AutofinClient | None = None,
 ) -> dict[str, Any]:
     """Strict, no-look-ahead replay of autofin's closed deals.
@@ -275,7 +297,7 @@ def run_autofin_backtest(
             email=os.environ["AUTOFIN_EMAIL"],
             password=os.environ["AUTOFIN_PASSWORD"],
         )
-    closed = fetch_all_closed(client, max_pages=max_pages)
+    closed = fetch_all_closed(client, max_pages=max_pages, use_full_history=use_full_history)
     # sort by open time (parsed) so NAV evolves chronologically
     def _sort_key(d: dict[str, Any]) -> datetime:
         sd = d.get("statusDeal", {}) or {}
@@ -446,6 +468,7 @@ def run_hindsight_variants(
     max_pages: int = MAX_PAGES,
     min_profit_steps_values: tuple[int, ...] = (1, 2, 3),
     stop_loss_pct_values: tuple[float, ...] = (0.05, 0.10, 0.15),
+    use_full_history: bool = True,
     client: AutofinClient | None = None,
 ) -> dict[str, Any]:
     """Run the same dataset under multiple hindsight-only filters.
@@ -469,7 +492,9 @@ def run_hindsight_variants(
             email=os.environ["AUTOFIN_EMAIL"],
             password=os.environ["AUTOFIN_PASSWORD"],
         )
-    closed = fetch_all_closed(client, max_pages=max_pages)
+    closed = fetch_all_closed(
+        client, max_pages=max_pages, use_full_history=use_full_history,
+    )
 
     def _sort_key(d: dict[str, Any]) -> datetime:
         sd = d.get("statusDeal", {}) or {}

@@ -227,6 +227,13 @@ def build_parser() -> argparse.ArgumentParser:
              "section. Do not use them as live-trading expectations.",
     )
     autofin_bt.add_argument(
+        "--no-full-history",
+        action="store_true",
+        help="disable use_full_history (fetch /closing-signals only, "
+             "1 deal per symbol). Default fetches full per-symbol history "
+             "via /signal-deals?symbol=X (10-20x more deals, takes 5-10 min).",
+    )
+    autofin_bt.add_argument(
         "--out-dir",
         type=Path,
         default=Path("vietnam_algo/data/backtests"),
@@ -280,6 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("vietnam_algo/data/backtests"),
         help="where to write replay JSON+CSVs (default data/backtests/)",
+    )
+    autofin_daily_bt.add_argument(
+        "--no-full-history",
+        action="store_true",
+        help="disable use_full_history (use /closing-signals only, "
+             "1 deal per symbol). Default uses full per-symbol history.",
     )
     autofin_daily_bt.add_argument(
         "--prefix",
@@ -1119,6 +1132,7 @@ def main(argv: list[str] | None = None) -> int:
             fee_pct_per_side=args.fee_pct_per_side,
             slippage_pct_per_fill=args.slippage_pct_per_fill,
             max_pages=args.max_pages,
+            use_full_history=not args.no_full_history,
         )
         json_path, csv_path = write_backtest_outputs(result, args.out_dir)
         report = format_backtest_report(result)
@@ -1166,6 +1180,7 @@ def main(argv: list[str] | None = None) -> int:
             slippage_pct_per_fill=args.slippage_pct_per_fill,
             max_pages=args.max_pages,
             user_sl_pct=args.user_sl_pct,
+            use_full_history=not args.no_full_history,
             closed_deals=closed_deals,
         )
         json_path, nav_csv, fills_csv = write_daily_replay_outputs(

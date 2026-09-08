@@ -60,6 +60,13 @@ class FakeClient:
     def fetch_closing(self, page_size: int = 50, page_index: int = 1):
         start = (page_index - 1) * page_size
         return self._deals[start:start + page_size]
+    def fetch_all_deals_pages(
+        self, symbols=None, page_size: int = 50,
+        closed_only: bool = True, progress: bool = False,
+    ):
+        if closed_only:
+            return [d for d in self._deals if d.get("statusDeal", {}).get("isClosed", True)]
+        return self._deals
 
 
 def test_round_to_lots_basic():

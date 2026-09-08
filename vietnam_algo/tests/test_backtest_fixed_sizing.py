@@ -66,6 +66,14 @@ class FakeClient:
     def fetch_closing(self, page_size: int = 50, page_index: int = 1):
         # ignore pagination, return all
         return self._deals
+    def fetch_all_deals_pages(
+        self, symbols=None, page_size: int = 50,
+        closed_only: bool = True, progress: bool = False,
+    ):
+        # For tests: just return whatever deals we were given (assume all closed).
+        if closed_only:
+            return [d for d in self._deals if d.get("statusDeal", {}).get("isClosed", True)]
+        return self._deals
 
 
 def test_fixed_sizing_no_death_spiral_on_losing_deal():

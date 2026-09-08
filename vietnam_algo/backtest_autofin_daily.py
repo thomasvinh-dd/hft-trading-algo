@@ -159,8 +159,23 @@ def _interpolated_price(deal: dict[str, Any], day: date) -> float | None:
 def fetch_all_closed(
     client: AutofinClient,
     max_pages: int = MAX_PAGES,
+    use_full_history: bool = True,
+    progress: bool = False,
 ) -> list[dict[str, Any]]:
-    """Fetch all closed deals, paginating through /closing-signals."""
+    """Fetch all closed deals for the daily-replay backtest.
+
+    ``use_full_history=True`` (default): fetches the FULL per-symbol
+    deal history by combining ``/closing-signals`` (to enumerate
+    symbols) with ``/signal-deals?symbol=X`` (all deals per symbol).
+    This returns 10-20x more deals than just ``/closing-signals``.
+
+    ``use_full_history=False``: legacy — paginate ``/closing-signals``
+    only (one deal per symbol).
+    """
+    if use_full_history:
+        return client.fetch_all_deals_pages(
+            symbols=None, page_size=50, closed_only=True, progress=progress,
+        )
     all_items: list[dict[str, Any]] = []
     for page in range(1, max_pages + 1):
         items = client.fetch_closing(page_size=50, page_index=page)
@@ -324,6 +339,7 @@ def run_daily_replay_backtest(
     board_lot: int = DEFAULT_BOARD_LOT,
     max_pages: int = MAX_PAGES,
     user_sl_pct: float = 0.0,
+    use_full_history: bool = True,
     client: AutofinClient | None = None,
     closed_deals: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -352,7 +368,9 @@ def run_daily_replay_backtest(
                 email=os.environ["AUTOFIN_EMAIL"],
                 password=os.environ["AUTOFIN_PASSWORD"],
             )
-        closed = fetch_all_closed(client, max_pages=max_pages)
+        closed = fetch_all_closed(
+            client, max_pages=max_pages, use_full_history=use_full_history,
+        )
     else:
         closed = closed_deals
     if not closed:
@@ -386,6 +404,105 @@ def run_daily_replay_backtest(
     end_dates = [dt for dt in end_dates if dt is not None]
     end = max(end_dates).date() if end_dates else start
 
+    # Pre-build a sorted index of (open_date, deal) and (close_date, deal)
+    # so the per-day snapshot lookup is O(active deals) instead of
+    # O(total deals). With 3,321 deals, this turns a 200s backtest into <10s.
+    # Also pre-parse signals so decide_orders gets AutofinSignal objects.
+    open_index: dict[date, list[dict[str, Any]]] = {}
+    open_signals_index: dict[date, list[AutofinSignal]] = {}
+    for d in closed:
+        t_o = _parse_dt(str((d.get("statusDeal") or {}).get("time_Open") or ""))
+        if t_o is None:
+            continue
+        open_index.setdefault(t_o.date(), []).append(d)
+        try:
+            open_signals_index.setdefault(t_o.date(), []).append(parse_signal(d))
+        except Exception:
+            pass
+
+    # Build per-day snapshot cache. For each day in [start, end],
+    # we pre-compute holding, suggest, closing, synthetic_partial_tps
+    # using the open/close indices.
+    snapshot_cache: dict[date, dict[str, list[Any]]] = {}
+    # Track active deals: deal_id -> {open_date, close_date_or_None}
+    active_by_open: dict[date, list[dict[str, Any]]] = open_index
+    # Maintain a sorted list of (open_date, deal) entries for incremental
+    # traversal. Key = tuple of (date_iso, _id, symbol).
+    import heapq
+    open_heap: list[tuple[date, int, str, dict[str, Any]]] = []
+    for d in open_index.items():
+        for deal in d[1]:
+            heapq.heappush(open_heap, (d[0], id(deal), str(deal.get("symbol", "")), deal))
+    # close_heap: (close_date, sort_key, deal)
+    close_heap: list[tuple[date, int, str, dict[str, Any]]] = []
+    for d in closed:
+        t_c = _parse_dt(str((d.get("statusDeal") or {}).get("time_Closed") or ""))
+        if t_c is None:
+            continue
+        heapq.heappush(close_heap, (t_c.date(), id(d), str(d.get("symbol", "")), d))
+    # Currently-active deals (by id(deal) for stable tracking)
+    currently_active: dict[int, dict[str, Any]] = {}
+
+    def _build_snapshot_fast(day: date) -> dict[str, list[Any]]:
+        # Open any deals that opened today
+        while open_heap and open_heap[0][0] == day:
+            _, _, _, deal = heapq.heappop(open_heap)
+            currently_active[id(deal)] = deal
+        # Close any deals that closed today
+        closes_today: list[dict[str, Any]] = []
+        while close_heap and close_heap[0][0] == day:
+            _, _, _, deal = heapq.heappop(close_heap)
+            d_id = id(deal)
+            if d_id in currently_active:
+                del currently_active[d_id]
+            closes_today.append(deal)
+        holding = list(currently_active.values())
+        suggest = open_signals_index.get(day, [])
+        # Synthetic partial-TPs: for each active deal with N>0 TPs,
+        # check if today is a TP day and emit one synthetic event.
+        synthetic_partial_tps: list[dict[str, Any]] = []
+        for deal in holding:
+            n_profit = int(deal.get("numberOfProfit") or 0)
+            if n_profit <= 0:
+                continue
+            sd = deal.get("statusDeal", {}) or {}
+            t_open = _parse_dt(str(sd.get("time_Open") or ""))
+            t_close = _parse_dt(str(sd.get("time_Closed") or ""))
+            if t_open is None:
+                continue
+            d_open = t_open.date()
+            d_close = t_close.date() if t_close else None
+            if d_close is not None and day >= d_close:
+                continue
+            if d_close is not None:
+                holding_days = (d_close - d_open).days or 1
+            else:
+                holding_days = 30
+            for k in range(1, n_profit + 1):
+                frac = k / (n_profit + 1)
+                tp_day = d_open + timedelta(days=int(frac * holding_days))
+                if tp_day == day:
+                    p = _interpolated_price(deal, day) or 0.0
+                    if p <= 0:
+                        continue
+                    synthetic_partial_tps.append({
+                        "symbol": deal.get("symbol", "?"),
+                        "side": "NS",
+                        "qty": None,
+                        "fraction": 1.0 / (n_profit + 1),
+                        "price": p,
+                        "reason": (
+                            f"synthetic_tp:deal#{deal.get('_id')}:"
+                            f"{deal.get('symbol')}:k{k}/{n_profit}"
+                        ),
+                    })
+        return {
+            "holding": holding,
+            "suggest": suggest,
+            "closing": closes_today,
+            "synthetic_partial_tps": synthetic_partial_tps,
+        }
+
     # Walk every day in the range
     state = DayState(nav=initial_nav, cash=initial_nav)
     daily_nav: list[dict[str, Any]] = []
@@ -396,7 +513,7 @@ def run_daily_replay_backtest(
 
     current = start
     while current <= end:
-        snap = reconstruct_snapshot(current, closed)
+        snap = _build_snapshot_fast(current)
         holding = snap["holding"]
         signals = snap["suggest"]
 

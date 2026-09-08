@@ -220,10 +220,14 @@ class AutofinClient:
         page_index: int = 1,
         only_open: bool = True,
     ) -> list[dict[str, Any]]:
-        """Fetch autofin's position history (deals).
+        """Fetch autofin's position history (deals) for one symbol.
 
-        If ``symbol`` is None, returns all recent deals. With ``only_open=True``
-        (default), filters to ``statusDeal.isClosed == False``.
+        If ``symbol`` is None, the ``signal-deals`` endpoint returns a
+        server error (500) — autofin requires the ``symbol`` parameter.
+        Use ``fetch_all_deals_pages()`` or ``fetch_all_deals()`` to
+        iterate across all symbols.
+
+        With ``only_open=True`` (default), filters to ``statusDeal.isClosed == False``.
         """
         items = self._fetch_paginated("signal-deals", page_size, page_index, symbol=symbol)
         if only_open:
@@ -234,6 +238,131 @@ class AutofinClient:
             ]
         return items
 
+    def fetch_deals_for_symbol_all_pages(
+        self,
+        symbol: str,
+        page_size: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Fetch ALL deals for one symbol, paginating through every page.
+
+        Returns both open and closed deals. Use ``statusDeal.isClosed``
+        to filter.
+        """
+        all_items: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            items = self.fetch_deals(
+                symbol=symbol, page_size=page_size, page_index=page,
+                only_open=False,
+            )
+            if not items:
+                break
+            all_items.extend(items)
+            if len(items) < page_size:
+                break
+            page += 1
+        return all_items
+
+    def fetch_all_symbols(self, max_pages: int = 50) -> list[str]:
+        """Get all unique symbols that appear in ``/closing-signals``.
+
+        Each symbol appears once in closing-signals (one row per
+        symbol — typically the most recent closed deal). For the full
+        deal history of each symbol, use ``fetch_deals_for_symbol_all_pages``.
+
+        Returns sorted list of unique symbols.
+        """
+        symbols: set[str] = set()
+        for page in range(1, max_pages + 1):
+            items = self.fetch_closing(page_size=50, page_index=page)
+            if not items:
+                break
+            for it in items:
+                sym = it.get("symbol")
+                if sym:
+                    symbols.add(str(sym).upper())
+        return sorted(symbols)
+
+    def fetch_all_deals_pages(
+        self,
+        symbols: list[str] | None = None,
+        page_size: int = 50,
+        closed_only: bool = True,
+        progress: bool = False,
+        default_rate_for_nav: float = 0.15,
+    ) -> list[dict[str, Any]]:
+        """Fetch full closed-deal history across all symbols.
+
+        Combines two endpoints:
+          1. ``/closing-signals`` (paginated) to enumerate symbols.
+          2. ``/signal-deals?symbol=X`` (paginated) per symbol.
+
+        The ``/signal-deals`` endpoint does NOT include some fields
+        that ``/closing-signals`` does (rateForNav, supply_F/T, tP_F/T,
+        sL_F/T). For backtesting, we synthesize defaults so the
+        strategy has data to work with:
+          - rateForNav: defaults to ``default_rate_for_nav`` (0.15)
+          - supply_F, supply_T: defaults to statusDeal.price_Open
+          - tP_F, tP_T: defaults to statusDeal.price_Closed
+          - sL_F, sL_T: defaults to statusDeal.price_Open * 0.90
+            (i.e. autofin's typical 10% SL)
+
+        With ``closed_only=True`` (default), filters to
+        ``statusDeal.isClosed == True`` deals.
+
+        Returns a list of raw autofin deal dicts (compatible with the
+        ``run_autofin_backtest`` and ``run_daily_replay_backtest``
+        callers).
+
+        For 250+ symbols this can take 5-10 minutes. ``progress=True``
+        prints progress to stderr.
+        """
+        if symbols is None:
+            symbols = self.fetch_all_symbols()
+        if progress:
+            import sys
+            print(f"[fetch_all_deals_pages] scanning {len(symbols)} symbols...",
+                  file=sys.stderr, flush=True)
+        all_items: list[dict[str, Any]] = []
+        for i, sym in enumerate(symbols):
+            if progress and (i + 1) % 10 == 0:
+                import sys
+                print(f"  {i+1}/{len(symbols)} scanned, {len(all_items)} deals so far",
+                      file=sys.stderr, flush=True)
+            try:
+                deals = self.fetch_deals_for_symbol_all_pages(sym, page_size=page_size)
+            except Exception as e:
+                if progress:
+                    print(f"  {sym}: ERROR {e}", file=sys.stderr, flush=True)
+                continue
+            if closed_only:
+                deals = [d for d in deals if (d.get("statusDeal") or {}).get("isClosed")]
+            # Synthesize missing fields for backtest compatibility
+            for d in deals:
+                sd = d.get("statusDeal") or {}
+                if not d.get("rateForNav"):
+                    d["rateForNav"] = default_rate_for_nav
+                p_open = float(sd.get("price_Open") or 0)
+                p_close = float(sd.get("price_Closed") or 0)
+                if not d.get("supply_F"):
+                    d["supply_F"] = p_open
+                if not d.get("supply_T"):
+                    d["supply_T"] = p_open
+                if not d.get("tP_F"):
+                    d["tP_F"] = p_close
+                if not d.get("tP_T"):
+                    d["tP_T"] = p_close
+                if not d.get("sL_F"):
+                    d["sL_F"] = p_open * 0.90
+                if not d.get("sL_T"):
+                    d["sL_T"] = p_open * 0.90
+            all_items.extend(deals)
+        if progress:
+            import sys
+            print(f"[fetch_all_deals_pages] done: {len(all_items)} deals from "
+                  f"{len(symbols)} symbols", file=sys.stderr, flush=True)
+        return all_items
+
     def fetch_holding(
         self, page_size: int = 50, page_index: int = 1,
     ) -> list[dict[str, Any]]:
@@ -243,7 +372,13 @@ class AutofinClient:
     def fetch_closing(
         self, page_size: int = 50, page_index: int = 1,
     ) -> list[dict[str, Any]]:
-        """Fetch autofin's RECENTLY CLOSED positions (exit history)."""
+        """Fetch autofin's RECENTLY CLOSED positions (one record per symbol).
+
+        NOTE: this endpoint returns ONE deal per unique symbol (the most
+        recent closed one). For full per-symbol deal history, use
+        ``fetch_deals(symbol=X, only_open=False)`` or the higher-level
+        ``fetch_all_deals()`` helper.
+        """
         return self._fetch_paginated("closing-signals", page_size, page_index)
 
     def fetch_risk(
