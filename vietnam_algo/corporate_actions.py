@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import subprocess
+import time
 import http.cookiejar
 import urllib.error
 import urllib.parse
@@ -10,7 +12,7 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .data import DEFAULT_DATA_DIR, write_json
 
@@ -361,32 +363,57 @@ def sync_corporate_actions_incremental(
     to_date: str | None = None,
     page_size: int = 100,
     timeout: float = 30.0,
+    max_attempts: int = 5,
+    initial_backoff_seconds: float = 5.0,
 ) -> dict[str, Any]:
     path = corporate_action_path(data_dir)
     existing = load_corporate_actions(path)
     from_date = latest_corporate_action_date(existing) or "2012-07-13"
     end_date = to_date or datetime.now().date().isoformat()
-    session = fetch_vietstock_session(timeout) if not request_verification_token else None
-    fetched: list[CorporateAction] = []
-    page = 1
-    total: int | None = None
-    while True:
-        rows, total = fetch_vietstock_events_page_with_total(
-            from_date,
-            end_date,
-            page,
-            page_size,
-            request_verification_token=request_verification_token,
-            cookie=cookie,
-            timeout=timeout,
-            session=session,
-        )
-        fetched.extend(rows)
-        if not rows:
+    # Retry the full fetch loop on transient errors (anti-bot rate-limits
+    # occasionally return empty bodies mid-day). Each attempt refreshes the
+    # session so we re-bootstrap cookies and request token. Backoff doubles
+    # each attempt up to 60s, so the full retry window is ~3 minutes —
+    # long enough to ride out typical rate-limit windows on Vietstock.
+    last_error: Exception | None = None
+    backoff = initial_backoff_seconds
+    for attempt in range(1, max_attempts + 1):
+        session = fetch_vietstock_session(timeout) if not request_verification_token else None
+        fetched: list[CorporateAction] = []
+        page = 1
+        total: int | None = None
+        try:
+            while True:
+                rows, total = fetch_vietstock_events_page_with_total(
+                    from_date,
+                    end_date,
+                    page,
+                    page_size,
+                    request_verification_token=request_verification_token,
+                    cookie=cookie,
+                    timeout=timeout,
+                    session=session,
+                )
+                fetched.extend(rows)
+                if not rows:
+                    break
+                if total is not None and page * page_size >= total:
+                    break
+                page += 1
+            # If we got no rows AT ALL on an early attempt, treat as transient.
+            if not fetched and page == 1:
+                raise RuntimeError("Vietstock returned empty payload (transient)")
             break
-        if total is not None and page * page_size >= total:
-            break
-        page += 1
+        except (json.JSONDecodeError, RuntimeError, urllib.error.URLError) as exc:
+            last_error = exc
+            print(f"[CA sync] attempt {attempt}/{max_attempts} failed: {exc}")
+            if attempt < max_attempts:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+                continue
+            raise
+    if last_error is not None and not fetched:
+        raise last_error
     merged, added = merge_corporate_actions(existing, fetched)
     save_corporate_actions(merged, data_dir)
     return {
@@ -469,26 +496,405 @@ def non_cash_events_in_window(
     return risky
 
 
+def build_corporate_action_lookup(
+    actions: Iterable[CorporateAction],
+    trading_dates: list[str],
+    non_cash_only: bool = True,
+) -> tuple[list[CorporateAction], dict[int, int]]:
+    """Precompute a fast event_id -> trading-date index map.
+
+    Returns (filtered_actions, ex_index_by_event_id). The map is built once
+    per backtest / per day and lets ``non_cash_events_in_trading_window``
+    avoid the O(M*N) scan inside that function.
+    """
+    if not trading_dates:
+        return [], {}
+    filtered: list[CorporateAction] = []
+    ex_index_by_event_id: dict[int, int] = {}
+    for action in actions:
+        if non_cash_only and not action.isNonCash:
+            continue
+        if not action.exDate or not action.eventId:
+            continue
+        ex_index = bisect.bisect_left(trading_dates, action.exDate)
+        if ex_index >= len(trading_dates):
+            continue
+        filtered.append(action)
+        ex_index_by_event_id[action.eventId] = ex_index
+    return filtered, ex_index_by_event_id
+
+
 def non_cash_events_in_trading_window(
-    actions: list[CorporateAction],
+    actions: Iterable[CorporateAction],
     trade_date: str,
     trading_dates: list[str],
     window_days: int = 3,
     include_ex_date: bool = True,
+    precomputed_ex_index: dict[int, int] | None = None,
 ) -> dict[str, list[CorporateAction]]:
-    if trade_date not in trading_dates:
-        return non_cash_events_in_window(actions, trade_date, window_days=window_days, include_ex_date=include_ex_date)
-    trade_index = trading_dates.index(trade_date)
+    """Find non-cash events whose first trading date on/after ex-date falls
+    within ``window_days`` sessions of ``trade_date``.
+
+    ``precomputed_ex_index`` is an optional event_id -> trading_date_index
+    map produced by ``build_corporate_action_lookup`` to skip the per-action
+    O(log N) bisect in hot loops.
+    """
+    if not trading_dates:
+        return {}
+    try:
+        trade_index = trading_dates.index(trade_date)
+    except ValueError:
+        return non_cash_events_in_window(list(actions), trade_date, window_days=window_days, include_ex_date=include_ex_date)
+    lower = 0 if include_ex_date else 1
     risky: dict[str, list[CorporateAction]] = {}
+    if precomputed_ex_index is not None:
+        for action in actions:
+            if not action.isNonCash or not action.eventId:
+                continue
+            ex_index = precomputed_ex_index.get(action.eventId)
+            if ex_index is None:
+                continue
+            sessions_until = ex_index - trade_index
+            if lower <= sessions_until <= window_days:
+                risky.setdefault(action.symbol, []).append(action)
+        return risky
     for action in actions:
         if not action.isNonCash or not action.exDate:
             continue
-        ex_trading_dates = [date for date in trading_dates if date >= action.exDate]
-        if not ex_trading_dates:
+        ex_index = bisect.bisect_left(trading_dates, action.exDate)
+        if ex_index >= len(trading_dates):
             continue
-        ex_index = trading_dates.index(ex_trading_dates[0])
         sessions_until = ex_index - trade_index
-        lower = 0 if include_ex_date else 1
         if lower <= sessions_until <= window_days:
             risky.setdefault(action.symbol, []).append(action)
+    return risky
+
+
+def closes_until_date(
+    symbol: str,
+    as_of_date: str,
+    trading_dates: list[str],
+    closes_by_symbol: dict[str, dict[str, float]],
+    lookback: int,
+) -> list[float]:
+    """Return the closes for ``symbol`` from ``as_of_date`` looking back ``lookback`` days.
+
+    Used by the pre-exit signal logic: we want to know whether the price has
+    dropped from a recent peak (topping pattern) or fallen below a moving
+    average (momentum roll-over). Looks at the most recent ``lookback``
+    closes, ending at ``as_of_date`` inclusive.
+    """
+    if not trading_dates or not closes_by_symbol:
+        return []
+    sym_closes = closes_by_symbol.get(symbol, {})
+    end_idx = next((i for i, d in enumerate(trading_dates) if d >= as_of_date), None)
+    if end_idx is None:
+        return []
+    start_idx = max(0, end_idx - lookback + 1)
+    closes: list[float] = []
+    for i in range(start_idx, end_idx + 1):
+        c = sym_closes.get(trading_dates[i])
+        if c is not None:
+            closes.append(float(c))
+    return closes
+
+
+def pre_exit_signal_drop_from_high(
+    closes_window: list[float],
+    threshold_pct: float,
+) -> bool:
+    """Fire when the current close has dropped by ``threshold_pct`` from the
+    recent peak.
+
+    Captures the "topping pattern" — price rallied (perhaps toward an ex-date
+    expectation) and now starts drifting down. The threshold is relative to
+    the local maximum, so it adapts to any post-ex drop magnitude.
+    """
+    if not closes_window:
+        return False
+    peak = max(closes_window)
+    current = closes_window[-1]
+    if peak <= 0:
+        return False
+    return current <= peak * (1.0 - threshold_pct)
+
+
+def pre_exit_signal_below_ma(
+    closes_window: list[float],
+    ma_period: int,
+) -> bool:
+    """Fire when current close has fallen below the ``ma_period``-close moving average."""
+    if len(closes_window) < ma_period:
+        return False
+    ma = sum(closes_window[-ma_period:]) / ma_period
+    return closes_window[-1] < ma
+
+
+def pre_exit_signal_momentum_reversal(
+    closes_window: list[float],
+    short_period: int,
+    long_period: int,
+) -> bool:
+    """Fire when short MA crosses below long MA (bearish momentum reversal).
+
+    Catches trend changes earlier than the drop-from-high signal because the
+    MA-cross detects the turn even when the absolute level is still close to
+    the peak.
+    """
+    if len(closes_window) < long_period + 1:
+        return False
+    short_now = sum(closes_window[-short_period:]) / short_period
+    long_now = sum(closes_window[-long_period:]) / long_period
+    short_prev = sum(closes_window[-(short_period+1):-1]) / short_period
+    long_prev = sum(closes_window[-(long_period+1):-1]) / long_period
+    return short_prev >= long_prev and short_now < long_now
+
+
+def evaluate_pre_exit_signal(
+    closes_window: list[float],
+    config: Any,
+) -> tuple[bool, str]:
+    """Return (triggered, reason) for the configured pre-exit signal.
+
+    Modes (read from ``config.corporateActionPreExitSignalMode``):
+
+        "fixed_window"  — never returns True here; pre-exit handled by
+                          ``corporateActionPreExitDays`` (legacy behaviour).
+        "drop_from_high" — fire when close has dropped
+                           ``PreExitSignalDropPct`` from the recent peak.
+        "below_ma"       — fire when close has fallen below the
+                           ``PreExitSignalMaPeriod``-close MA.
+        "momentum_reversal" — fire on short/long MA bearish cross.
+        "combined"       — fire when BOTH drop_from_high AND below_ma
+                           trigger together.
+    """
+    mode = getattr(config, "corporateActionPreExitSignalMode", "fixed_window")
+    if mode == "fixed_window":
+        return False, "fixed_window_mode"
+    drop_pct = max(0.0, getattr(config, "corporateActionPreExitSignalDropPct", 0.02))
+    ma_period = max(2, getattr(config, "corporateActionPreExitSignalMaPeriod", 5))
+    short_period = max(2, getattr(config, "corporateActionPreExitSignalShortPeriod", 3))
+    long_period = max(short_period + 1, getattr(config, "corporateActionPreExitSignalLongPeriod", 8))
+    lookback = max(ma_period, long_period + 1, getattr(config, "corporateActionPreExitSignalLookback", 14))
+    if len(closes_window) < 3:
+        return False, "not_enough_history"
+
+    dropped = pre_exit_signal_drop_from_high(closes_window, drop_pct)
+    below = pre_exit_signal_below_ma(closes_window, ma_period)
+    reversed = pre_exit_signal_momentum_reversal(closes_window, short_period, long_period)
+
+    if mode == "drop_from_high":
+        return (dropped, "drop_from_high")
+    if mode == "below_ma":
+        return (below, "below_ma")
+    if mode == "momentum_reversal":
+        return (reversed, "momentum_reversal")
+    if mode == "combined":
+        return (dropped and below, "combined")
+    return False, "unknown_mode"
+
+
+# ---------------------------------------------------------------------------
+# Risk classifier + post-CA rebuy signal logic
+# ---------------------------------------------------------------------------
+#
+# These helpers were originally in ``backtest.py``. They are pure functions
+# of (closes, corporate actions, config) and have no dependency on the
+# backtest runner, so they live here so both the backtest AND the live engine
+# can call the exact same code paths. Keeping a single source of truth is
+# important: any divergence between engines is a real divergence in trading
+# behaviour, not a refactor artefact.
+
+
+def corporate_action_risk_type(action: CorporateAction) -> str:
+    """Classify a CA event as ``standard`` or ``high``.
+
+    ``high`` events (additional share issuance, rights offerings, share swaps,
+    private placements, convertible bonds) mechanically change the share
+    structure of the issuer. ``standard`` events (stock dividends, stock bonus,
+    cash dividends) adjust the price without changing shareholder rights.
+
+    The classifier only inspects the short ``name`` and ``note`` fields and
+    uses multi-word keyword terms. It deliberately ignores ``title`` (a
+    generic regulatory summary that frequently mentions unrelated events on
+    the same ex-date) and avoids bare ``"phát hành"`` / ``"chuyển đổi"``
+    substrings that match too broadly.
+    """
+    text = " ".join(part for part in (action.name or "", action.note or "") if part).lower()
+    if not text:
+        return "standard"
+    high_risk_terms = (
+        "phát hành thêm",
+        "quyền mua",
+        "trái phiếu chuyển đổi",
+        "hoán đổi",
+        "riêng lẻ",
+    )
+    return "high" if any(term in text for term in high_risk_terms) else "standard"
+
+
+def closes_since_ex_window(
+    symbol: str,
+    ex_date: str,
+    trading_dates: list[str],
+    closes_by_symbol: dict[str, dict[str, float]],
+) -> list[float]:
+    """Return the sequence of closes for ``symbol`` from ``ex_date`` onward.
+
+    ``trading_dates`` is the sorted list of session dates. ``closes_by_symbol``
+    is a {symbol: {date_str: close}} lookup; the live path can build this
+    from ``data/prices/SYM.json`` and the backtest passes its in-memory
+    price_table directly.
+
+    Returns an empty list if the symbol has no closes on/after ``ex_date``.
+    """
+    if not trading_dates or not closes_by_symbol:
+        return []
+    sym_closes = closes_by_symbol.get(symbol, {})
+    ex_index = next((i for i, d in enumerate(trading_dates) if d >= ex_date), None)
+    if ex_index is None:
+        return []
+    closes: list[float] = []
+    for d in trading_dates[ex_index:]:
+        c = sym_closes.get(d)
+        if c is not None:
+            closes.append(float(c))
+    return closes
+
+
+def rebuy_signal_recovery(closes_window: list[float], recovery_pct: float) -> bool:
+    """Fire when current close has bounced by ``recovery_pct`` from the post-ex low.
+
+    Adapts to the actual drop magnitude — the threshold is relative to the
+    local minimum, so a 5% post-ex drop and a 30% drop can both fire when
+    the price first shows real recovery.
+    """
+    if not closes_window:
+        return False
+    min_close = min(closes_window)
+    if min_close <= 0:
+        return False
+    return closes_window[-1] >= min_close * (1.0 + recovery_pct)
+
+
+def rebuy_signal_stabilization(
+    closes_window: list[float],
+    range_pct: float,
+    lookback: int,
+) -> bool:
+    """Fire when the range over the last ``lookback`` closes is below ``range_pct``."""
+    if len(closes_window) < lookback:
+        return False
+    recent = closes_window[-lookback:]
+    low = min(recent)
+    high = max(recent)
+    if low <= 0:
+        return False
+    return (high - low) / low < range_pct
+
+
+def rebuy_signal_new_high(closes_window: list[float]) -> bool:
+    """Fire when current close is the highest close since the ex-date."""
+    if len(closes_window) < 2:
+        return False
+    return closes_window[-1] >= max(closes_window[:-1])
+
+
+def rebuy_signal_no_new_low(closes_window: list[float], lookback: int) -> bool:
+    """Fire when no new low has been made over the last ``lookback`` closes."""
+    if len(closes_window) < lookback + 1:
+        return False
+    window = closes_window[-(lookback + 1):]
+    recent_min = min(window[:-1])
+    return window[-1] >= recent_min
+
+
+def rebuy_signal_ma_cross(closes_window: list[float], ma_period: int) -> bool:
+    """Fire when the current close is above the ``ma_period``-close MA of the
+    post-ex window.
+
+    This is a simple "price is above the MA" proxy — a true golden/death
+    cross requires the pre-ex tail of closes which the live path doesn't have
+    access to. The proxy still captures the "post-ex recovery has begun"
+    pattern: the price prints above its short-term average, which is what a
+    classic MA-cross would converge to anyway.
+    """
+    if len(closes_window) < ma_period:
+        return False
+    ma = sum(closes_window[-ma_period:]) / ma_period
+    return closes_window[-1] > ma
+
+
+def evaluate_post_ca_rebuy_signal(
+    closes_window: list[float],
+    config: Any,
+) -> tuple[bool, str]:
+    """Return (triggered, reason) for the configured post-CA rebuy signal.
+
+    Modes (read from ``config.corporateActionRebuySignalMode``):
+        "fixed_delay"     — never returns True here; delay handled separately.
+        "recovery"        — fire when post-ex recovery threshold is met.
+        "stabilization"   — fire when post-ex range is tight.
+        "new_high"        — fire when current close >= max closes since ex.
+        "ma_cross"        — proxy: "price > MA" with a simple MA-cross-style
+                              check (live back-compat is intentionally
+                              conservative since proper MA-cross needs the
+                              pre-ex tail of closes).
+        "no_new_low"      — fire when no new low over the last ``lookback``.
+         "combined"        — BOTH recovery AND stabilization must fire.
+         "stabilization_or_no_new_low" — either stabilization or no new low.
+
+    Confirm-days: require the signal to have been true at the close of each
+    of the last ``confirm_days`` post-ex trading days. Filters single-day
+    spikes / dead-cat bounces.
+    """
+    mode = getattr(config, "corporateActionRebuySignalMode", "fixed_delay")
+    if mode == "fixed_delay":
+        return False, "fixed_delay_mode"
+    confirm = max(1, getattr(config, "corporateActionRebuySignalConfirmDays", 1))
+    lookback = max(1, getattr(config, "corporateActionRebuySignalLookback", 3))
+    if len(closes_window) < max(confirm, lookback):
+        return False, "not_enough_history"
+    recovery_pct = getattr(config, "corporateActionRebuySignalRecoveryPct", 0.005)
+    range_pct = getattr(config, "corporateActionRebuySignalRangePct", 0.025)
+
+    ma_period = max(2, getattr(config, "corporateActionRebuySignalMaPeriod", 5))
+    triggers: dict[str, bool] = {
+        "recovery": True,
+        "stabilization": True,
+        "new_high": True,
+        "no_new_low": True,
+        "ma_cross": True,
+    }
+    for k in range(confirm):
+        sub = closes_window[: len(closes_window) - k]
+        if not rebuy_signal_recovery(sub, recovery_pct):
+            triggers["recovery"] = False
+        if not rebuy_signal_stabilization(sub, range_pct, lookback):
+            triggers["stabilization"] = False
+        if not rebuy_signal_new_high(sub):
+            triggers["new_high"] = False
+        if not rebuy_signal_no_new_low(sub, lookback):
+            triggers["no_new_low"] = False
+        if not rebuy_signal_ma_cross(sub, ma_period):
+            triggers["ma_cross"] = False
+
+    if mode == "recovery":
+        return (triggers["recovery"], "recovery")
+    if mode == "stabilization":
+        return (triggers["stabilization"], "stabilization")
+    if mode == "new_high":
+        return (triggers["new_high"], "new_high")
+    if mode == "no_new_low":
+        return (triggers["no_new_low"], "no_new_low")
+    if mode == "ma_cross":
+        return (triggers["ma_cross"], "ma_cross")
+    if mode == "combined":
+        return (triggers["recovery"] and triggers["stabilization"], "combined")
+    if mode == "stabilization_or_no_new_low":
+        return (
+            triggers["stabilization"] or triggers["no_new_low"],
+            "stabilization_or_no_new_low",
+        )
+    return False, "unknown_mode"
     return risky
