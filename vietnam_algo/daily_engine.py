@@ -114,18 +114,38 @@ def export_orders_for_date(
 
 def update_dataset(config: EngineConfig) -> None:
     if config.updateSymbols:
+        print(f"[update_dataset] refreshing symbol universe at {config.dataDir}")
         sync_symbols(config.dataDir)
-    if config.updatePrices:
-        symbols = load_saved_symbols(config.dataDir)
-        if config.maxSymbols > 0:
-            symbols = symbols[: config.maxSymbols]
-        sync_prices(
-            symbols,
-            config.dataDir,
-            price_limit=config.priceLimit,
-            sleep_seconds=config.priceSleepSeconds,
-            skip_existing=False,
+    if not config.updatePrices:
+        # Be loud about this — forgetting --update-prices on the launch
+        # command silently leaves price files stale (see git log for the
+        # 2026-09-08 incident where prices stayed at 2026-08-28 for days).
+        print(
+            "[update_dataset] updatePrices=False → skipping price sync."
+            " Pass --update-prices to refresh."
         )
+        return
+    symbols = load_saved_symbols(config.dataDir)
+    if config.maxSymbols > 0:
+        symbols = symbols[: config.maxSymbols]
+    if not symbols:
+        print(f"[update_dataset] no symbols found in {config.dataDir}/symbols.json")
+        return
+    print(
+        f"[update_dataset] incremental price sync for {len(symbols)} symbols"
+        f" (sleep={config.priceSleepSeconds}s)"
+    )
+    # Use incremental sync: fetch only the most-recent bars and merge
+    # with existing on-disk files. This is dramatically cheaper than
+    # re-fetching the full ``priceLimit``-bar history every cycle and
+    # keeps the data fresh for EOD mark-to-market and order generation.
+    from .data import sync_prices_incremental
+    sync_prices_incremental(
+        symbols,
+        config.dataDir,
+        sleep_seconds=config.priceSleepSeconds,
+        incremental_limit=10,
+    )
 
 
 def generate_live_orders(

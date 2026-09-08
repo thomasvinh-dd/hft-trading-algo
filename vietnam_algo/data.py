@@ -261,6 +261,100 @@ def sync_prices(
     return paths
 
 
+def load_saved_price_bars(path: Path) -> list[dict[str, Any]]:
+    """Read existing price JSON file and return its raw bar dicts."""
+    if not path.exists():
+        return []
+    try:
+        payload = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return []
+    items = payload.get("items") if isinstance(payload, dict) else None
+    return [it for it in (items or []) if isinstance(it, dict)]
+
+
+def sync_prices_incremental(
+    symbols: list[str],
+    data_dir: Path = DEFAULT_DATA_DIR,
+    timeout: float = 30.0,
+    sleep_seconds: float = 0.2,
+    incremental_limit: int = 10,
+) -> list[Path]:
+    """Incrementally append new bars to existing price files.
+
+    For each symbol:
+      - If no existing file, fetch full ``incremental_limit`` bars (cheap
+        fallback — full history will be built up over the next refreshes).
+      - If existing file is present, fetch only ``incremental_limit``
+        most-recent bars from the upstream API, merge with existing bars
+        by deduping on ``time``, and persist the merged result.
+
+    Returns the list of paths that were written (newest bar timestamp
+    moved forward).
+    """
+    data_dir = ensure_data_dir(data_dir)
+    paths: list[Path] = []
+    total = len(symbols)
+    new_bars_added = 0
+    for index, symbol in enumerate(symbols, start=1):
+        ticker = symbol.strip().upper()
+        path = data_dir / "prices" / f"{ticker}.json"
+        existing_rows = load_saved_price_bars(path)
+        try:
+            fresh_bars = fetch_price_bars(symbol, limit=incremental_limit, timeout=timeout)
+        except Exception as exc:
+            print(f"[{index}/{total}] fetch {ticker} FAILED: {exc}")
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+            continue
+        # Convert PriceBar -> dict so we can dedupe by 'time' with existing rows.
+        fresh_rows = [asdict(b) for b in fresh_bars]
+        # existing rows already have the same shape (time/open/high/low/close/volume)
+        seen = {str(r.get("time")) for r in existing_rows}
+        before = len(existing_rows)
+        merged = list(existing_rows)
+        for row in fresh_rows:
+            t = str(row.get("time"))
+            if t and t not in seen:
+                seen.add(t)
+                merged.append(row)
+                new_bars_added += 1
+        # Sort by time ascending (defensive)
+        merged.sort(key=lambda r: str(r.get("time") or ""))
+        if not merged:
+            continue
+        # Always write if we added new bars OR if the file wasn't there.
+        if new_bars_added > 0 or not existing_rows:
+            save_price_bars(
+                symbol,
+                [
+                    PriceBar(
+                        time=str(r.get("time") or ""),
+                        open=float(r.get("open") or 0),
+                        high=float(r.get("high") or 0),
+                        low=float(r.get("low") or 0),
+                        close=float(r.get("close") or 0),
+                        volume=float(r.get("volume") or 0),
+                    )
+                    for r in merged
+                ],
+                data_dir,
+            )
+            paths.append(path)
+        if index % 50 == 0 or index == total:
+            print(
+                f"[{index}/{total}] updated {len(paths)}/{index}"
+                f" (+{new_bars_added} new bars so far)"
+            )
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+    print(
+        f"sync_prices_incremental done: {len(paths)} files updated,"
+        f" {new_bars_added} new bars appended across {total} symbols."
+    )
+    return paths
+
+
 def saved_price_file_has_items(path: Path) -> bool:
     if not path.exists():
         return False
