@@ -57,24 +57,167 @@ def parse_signal(raw: dict[str, Any]) -> AutofinSignal:
 
     All price fields from the autofin API are RAW VND (e.g. supply_F=5910
     means 5,910 VND), so we do NOT multiply by 1000 here.
+
+    autofin nests the strategy fields under ``detail.*`` in some
+    endpoints (/signal-deals) and at the top level in others
+    (/closing-signals, /signal-static-holding, /signal-static-suggest).
+    We read from ``detail.*`` first, then fall back to top level.
     """
     sd = raw.get("statusDeal", {}) or {}
+    detail = raw.get("detail", {}) or {}
+    # Use detail.* when present (signal-deals endpoint), else top-level
+    def _g(field: str) -> float:
+        v = detail.get(field)
+        if v is None or v == 0 or v == "":
+            v = raw.get(field)
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
     return AutofinSignal(
-        symbol=str(raw.get("symbol") or "").strip().upper(),
-        company_name=str(raw.get("companyName") or ""),
-        last_recomment=str(raw.get("lastRecomment") or ""),
-        supply_from=float(raw.get("supply_F") or 0),
-        supply_to=float(raw.get("supply_T") or 0),
-        tp_from=float(raw.get("tP_F") or 0),
-        tp_to=float(raw.get("tP_T") or 0),
-        sl_from=float(raw.get("sL_F") or 0),
-        sl_to=float(raw.get("sL_T") or 0),
-        rate_for_nav=float(raw.get("rateForNav") or 0),
-        is_waitting_buy=bool(raw.get("isWaittingBuy")),
-        is_waitting_sell=bool(raw.get("isWaittingSell")),
-        market_type=int(sd.get("market_TypePrice") or raw.get("market_TypePrice") or 0),
+        symbol=str(raw.get("symbol") or detail.get("symbol") or "").strip().upper(),
+        company_name=str(raw.get("companyName") or detail.get("companyName") or ""),
+        last_recomment=str(raw.get("lastRecomment") or detail.get("lastRecomment") or ""),
+        supply_from=_g("supply_F"),
+        supply_to=_g("supply_T"),
+        tp_from=_g("tP_F"),
+        tp_to=_g("tP_T"),
+        sl_from=_g("sL_F"),
+        sl_to=_g("sL_T"),
+        rate_for_nav=_g("rateForNav"),
+        is_waitting_buy=bool(detail.get("isWaittingBuy", raw.get("isWaittingBuy", False))),
+        is_waitting_sell=bool(detail.get("isWaittingSell", raw.get("isWaittingSell", False))),
+        market_type=int(sd.get("market_TypePrice") or detail.get("market_TypePrice") or raw.get("market_TypePrice") or 0),
         raw=raw,
     )
+
+
+def _strip_html(s: str) -> str:
+    """Remove HTML tags from a recommendation string for parsing."""
+    import re as _re
+    s = _re.sub(r"<[^>]+>", " ", s or "")
+    s = _re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _parse_vnd_int(s: str) -> int:
+    """Parse '12,900' → 12900 (Vietnamese thousands separator)."""
+    return int((s or "").replace(".", "").replace(",", "").strip() or "0")
+
+
+def parse_recommendation_history(raw_deal: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse the ``hisRecomment`` array into a list of typed events.
+
+    Each event dict has:
+      - ``day_offset``: int, days from deal's time_Open (0 = same day)
+      - ``action``: one of "tp", "reduce", "capital_protect", "close"
+      - ``price``: int VND (recommended execution price)
+      - ``fraction``: float, fraction of CURRENT position to sell (0..1)
+      - ``raw``: the original recommendation text
+
+    Patterns recognised:
+      - "💰 Chốt lãi lần N mức giá P, Tỷ trọng X %" → TP lap, X% of position
+      - "⚠️ Hạ X % tỉ trọng lần N, Giá: P" → reduce, X% of position
+      - "🛡️ Chốt lãi X % bảo toàn vốn tại P" → capital protect, X% of position
+      - "Đóng DEAL ..." → full close at P (uses last known price)
+      - Entry: "Ngày khuyến nghị: ..." → returned with action="entry"
+    """
+    import re as _re
+    sd = raw_deal.get("statusDeal", {}) or {}
+    p_open = float(sd.get("price_Open") or 0)
+    p_close = float(sd.get("price_Closed") or 0)
+    his = raw_deal.get("hisRecomment") or []
+    if not isinstance(his, list):
+        return []
+
+    events: list[dict[str, Any]] = []
+    for entry in his:
+        if not isinstance(entry, str):
+            continue
+        text = _strip_html(entry)
+        if not text:
+            continue
+
+        # Parse day offset: "Nắm giữ: X ngày" (X = days from open)
+        days_match = _re.search(r"Nắm giữ:\s*(\d+)\s*ngày", text)
+        day_offset = int(days_match.group(1)) if days_match else 0
+
+        # 1. TP lap: "💰 Chốt lãi lần N mức giá P ... Tỷ trọng X %"
+        m = _re.search(r"Chốt lãi lần\s*\d+\s*mức giá\s*([\d,\.]+)", text)
+        if m:
+            price = _parse_vnd_int(m.group(1))
+            pct = _re.search(r"Tỷ trọng\s*(\d+)\s*%", text)
+            fraction = (int(pct.group(1)) / 100.0) if pct else 1 / 3
+            events.append({
+                "day_offset": day_offset,
+                "action": "tp",
+                "price": price,
+                "fraction": fraction,
+                "raw": text,
+            })
+            continue
+
+        # 2. Capital protect: "🛡️ Chốt lãi X % bảo toàn vốn tại P"
+        m = _re.search(r"Chốt lãi\s*([\d\.]+)\s*%\s*bảo toàn vốn\s*tại\s*([\d,\.]+)", text)
+        if m:
+            fraction = float(m.group(1)) / 100.0
+            price = _parse_vnd_int(m.group(2))
+            events.append({
+                "day_offset": day_offset,
+                "action": "capital_protect",
+                "price": price,
+                "fraction": fraction,
+                "raw": text,
+            })
+            continue
+
+        # 3. Reduce: "⚠️ Hạ X % tỉ trọng lần N Giá: P"
+        m = _re.search(r"Hạ\s*(\d+)\s*%\s*tỉ trọng\s*lần\s*\d+", text)
+        if m:
+            fraction = int(m.group(1)) / 100.0
+            price_m = _re.search(r"Giá:\s*([\d,\.]+)", text)
+            price = _parse_vnd_int(price_m.group(1)) if price_m else (p_close or p_open)
+            events.append({
+                "day_offset": day_offset,
+                "action": "reduce",
+                "price": price,
+                "fraction": fraction,
+                "raw": text,
+            })
+            continue
+
+        # 4. Full close: "Đóng DEAL ..."
+        if _re.search(r"Đóng\s*DEAL", text):
+            close_price_m = _re.search(r"Lãi:\s*[\d\.]+\s*%\)?", text)
+            # Close uses final price_Close or last known price
+            events.append({
+                "day_offset": day_offset,
+                "action": "close",
+                "price": p_close or p_open,
+                "fraction": 1.0,  # remaining position
+                "raw": text,
+            })
+            continue
+
+        # 5. Entry: "Ngày khuyến nghị: ..."
+        if _re.search(r"khuyến nghị", text):
+            # Extract buy-zone midpoint as the implicit BUY price
+            m = _re.search(r"Vùng mua:\s*([\d,\.]+)\s*-\s*([\d,\.]+)", text)
+            price = 0
+            if m:
+                lo = _parse_vnd_int(m.group(1))
+                hi = _parse_vnd_int(m.group(2))
+                price = (lo + hi) // 2
+            events.append({
+                "day_offset": 0,
+                "action": "entry",
+                "price": price or p_open,
+                "fraction": 1.0,
+                "raw": text,
+            })
+            continue
+
+    return events
 
 
 def _read_token_cache(path: Path) -> dict[str, Any] | None:
@@ -351,27 +494,28 @@ class AutofinClient:
                 continue
             if closed_only:
                 deals = [d for d in deals if (d.get("statusDeal") or {}).get("isClosed")]
-            # Synthesize missing fields for backtest compatibility.
-            # IMPORTANT: use FORECAST-BASED defaults (price_Open only),
-            # NOT future data (price_Close), to avoid look-ahead bias.
+            # Backfill any remaining gaps from autofin's detail record.
+            # Real /signal-deals data has these fields nested under detail.*
+            # (which parse_signal already reads), so we just check for presence.
             for d in deals:
+                detail = d.get("detail") or {}
                 sd = d.get("statusDeal") or {}
-                if not d.get("rateForNav"):
+                # If still missing (very old deal), apply the forecast-based
+                # defaults — NEVER use price_Close (look-ahead bias).
+                if not (d.get("rateForNav") or detail.get("rateForNav")):
                     d["rateForNav"] = default_rate_for_nav
                 p_open = float(sd.get("price_Open") or 0)
-                if not d.get("supply_F"):
+                if not (d.get("supply_F") or detail.get("supply_F")):
                     d["supply_F"] = p_open
-                if not d.get("supply_T"):
+                if not (d.get("supply_T") or detail.get("supply_T")):
                     d["supply_T"] = p_open
-                # TP forecast: above entry (autofin targets profit).
-                # Never below entry — that would be look-ahead bias.
-                if not d.get("tP_F"):
+                if not (d.get("tP_F") or detail.get("tP_F")):
                     d["tP_F"] = p_open * (1 + default_tp_pct_above_entry)
-                if not d.get("tP_T"):
+                if not (d.get("tP_T") or detail.get("tP_T")):
                     d["tP_T"] = p_open * (1 + default_tp_pct_above_entry)
-                if not d.get("sL_F"):
+                if not (d.get("sL_F") or detail.get("sL_F")):
                     d["sL_F"] = p_open * (1 - default_sl_pct_below_entry)
-                if not d.get("sL_T"):
+                if not (d.get("sL_T") or detail.get("sL_T")):
                     d["sL_T"] = p_open * (1 - default_sl_pct_below_entry)
             all_items.extend(deals)
         if progress:

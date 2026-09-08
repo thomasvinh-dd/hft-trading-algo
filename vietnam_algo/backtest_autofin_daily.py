@@ -88,7 +88,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .autofin_signals import AutofinClient, AutofinSignal, parse_signal
+from .autofin_signals import AutofinClient, AutofinSignal, parse_signal, parse_recommendation_history
 from .backtest_autofin import (
     DEFAULT_BOARD_LOT,
     DEFAULT_FEE_PCT_PER_SIDE,
@@ -458,13 +458,12 @@ def run_daily_replay_backtest(
             closes_today.append(deal)
         holding = list(currently_active.values())
         suggest = open_signals_index.get(day, [])
-        # Synthetic partial-TPs: for each active deal with N>0 TPs,
-        # check if today is a TP day and emit one synthetic event.
+        # Partial-TPs: use the REAL recommendation history from autofin's
+        # ``hisRecomment`` field, parsed by ``parse_recommendation_history``.
+        # Each event has day_offset (days from open), action, price, and
+        # the fraction of CURRENT position to sell.
         synthetic_partial_tps: list[dict[str, Any]] = []
         for deal in holding:
-            n_profit = int(deal.get("numberOfProfit") or 0)
-            if n_profit <= 0:
-                continue
             sd = deal.get("statusDeal", {}) or {}
             t_open = _parse_dt(str(sd.get("time_Open") or ""))
             t_close = _parse_dt(str(sd.get("time_Closed") or ""))
@@ -472,28 +471,31 @@ def run_daily_replay_backtest(
                 continue
             d_open = t_open.date()
             d_close = t_close.date() if t_close else None
-            if d_close is not None and day >= d_close:
-                continue
-            if d_close is not None:
-                holding_days = (d_close - d_open).days or 1
-            else:
-                holding_days = 30
-            for k in range(1, n_profit + 1):
-                frac = k / (n_profit + 1)
-                tp_day = d_open + timedelta(days=int(frac * holding_days))
-                if tp_day == day:
-                    p = _interpolated_price(deal, day) or 0.0
+            event_day = d_open
+            for ev in parse_recommendation_history(deal):
+                if ev["action"] in ("entry",):
+                    continue  # entry events are handled via BUY
+                if ev["action"] in ("tp", "reduce", "capital_protect"):
+                    event_day = d_open + timedelta(days=ev["day_offset"])
+                    if event_day != day:
+                        continue
+                    if d_close is not None and event_day >= d_close:
+                        continue
+                    p = float(ev["price"]) if ev["price"] > 0 else (
+                        _interpolated_price(deal, day) or 0.0
+                    )
                     if p <= 0:
                         continue
                     synthetic_partial_tps.append({
                         "symbol": deal.get("symbol", "?"),
                         "side": "NS",
                         "qty": None,
-                        "fraction": 1.0 / (n_profit + 1),
+                        "fraction": float(ev["fraction"]),
                         "price": p,
+                        "action": ev["action"],
                         "reason": (
-                            f"synthetic_tp:deal#{deal.get('_id')}:"
-                            f"{deal.get('symbol')}:k{k}/{n_profit}"
+                            f"{ev['action']}:deal#{deal.get('_id')}:"
+                            f"{deal.get('symbol')}:d{ev['day_offset']}"
                         ),
                     })
         return {

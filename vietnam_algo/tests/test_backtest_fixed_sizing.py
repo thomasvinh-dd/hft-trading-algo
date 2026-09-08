@@ -36,7 +36,29 @@ def _make_deal(
     t_close: str,
     rate: float = 0.15,
     rec: str = "Đóng DEAL chạm điểm chặn lãi",
+    days: int = 30,
 ) -> dict:
+    """Synthesize a deal. If n_profit > 0, also generates a synthetic
+    ``hisRecomment`` array with N partial-TP events distributed
+    evenly over the holding period (for tests that need them)."""
+    from datetime import datetime, timedelta
+    parts = []
+    t_open_dt = datetime.strptime(t_open, "%m/%d/%Y %H:%M:%S")
+    parts.append(
+        f'<div><p>Ngày khuyến nghị: {t_open_dt:%d/%m/%Y}</p>'
+        f'<p>🟢 Vùng mua: {int(p_open)} - {int(p_open)}</p></div>'
+    )
+    if n_profit > 0:
+        for k in range(1, n_profit + 1):
+            day_off = int(k * days / (n_profit + 1))
+            tp_price = int(p_open + (p_close - p_open) * (k / (n_profit + 1)))
+            parts.append(
+                f'<div><p>[{symbol}] 💰 Chốt lãi lần {k} mức giá {tp_price:,}</p>'
+                f'<p>Tỷ trọng 10 % danh mục nắm giữ</p>'
+                f'<p>Nắm giữ: {day_off} ngày</p></div>'
+            )
+    parts.append(f'<div><p>{rec}</p></div>')
+
     return {
         "_id": int(deal_id),
         "symbol": symbol,
@@ -46,7 +68,8 @@ def _make_deal(
             "time_Open": t_open,
             "price_Closed": p_close,
             "time_Closed": t_close,
-            "timeHolding": 30,
+            "timeHolding": days,
+            "isClosed": True,
         },
         "numberOfProfit": n_profit,
         "rateForNav": rate,
@@ -57,6 +80,7 @@ def _make_deal(
         "tP_T": p_close,
         "sL_F": p_open * 0.9,
         "sL_T": p_open * 0.9,
+        "hisRecomment": parts,
     }
 
 
