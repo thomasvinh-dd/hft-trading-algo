@@ -22,6 +22,108 @@ from .strategy_registry import STRATEGY_REGISTRY, get_strategy
 from .token_store import ensure_fresh_trading_token
 
 
+def _apply_dry_run_fills(
+    result: dict,
+    engine_config: "EngineConfig",
+    account_no: str,
+) -> None:
+    """Apply today's ``latest_orders.json`` orders to the dry-run state.
+
+    In dry-run mode the bot doesn't actually submit orders, but it still
+    generates a daily plan. We replay the plan as simulated fills against
+    the local ``DryRunState`` so subsequent cycles see realistic cash,
+    positions, and realized P&L — without ever calling DNSE.
+
+    Dedup is handled by tagging ``state.closed_trades`` with the trade
+    date, so re-running the EOD cycle (e.g. after a restart) does NOT
+    apply the same orders twice.
+    """
+    from .dry_run_state import (
+        apply_orders_to_state,
+        init_dry_run_state,
+        save_dry_run_state,
+    )
+    state = init_dry_run_state(engine_config.dataDir)
+    json_path = result.get("latestOrdersJson")
+    if not json_path:
+        return
+    try:
+        from pathlib import Path
+        import json as _json
+        payload = _json.loads(Path(json_path).read_text(encoding="utf-8"))
+    except Exception:
+        return
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        return
+    trade_date = (
+        payload.get("tradeDate")
+        or result.get("tradeDate")
+        or ""
+    )
+    marker_key = f"_applied:{trade_date}"
+    # Dedup: skip if we've already applied orders for this tradeDate.
+    if any(
+        isinstance(t, dict) and t.get("note") == marker_key
+        for t in state.closed_trades[-100:]
+    ):
+        return
+    fills = apply_orders_to_state(state, items)
+    if fills:
+        state.closed_trades.append({
+            "note": marker_key,
+            "fill_count": len(fills),
+        })
+    save_dry_run_state(state, engine_config.dataDir)
+
+
+def _build_portfolio_snapshot(
+    client: "DnseClient | None",
+    account_no: str,
+    engine_config: "EngineConfig",
+    live_submit: bool,
+) -> dict:
+    """Build a portfolio snapshot.
+
+    In live mode (``live_submit=True``) this queries DNSE for the real
+    account state. In dry-run mode (``live_submit=False``) we DO NOT
+    touch DNSE — instead we read the locally-simulated ``DryRunState``
+    that the bot has been updating each cycle. The dry-run state has
+    the same shape as ``build_portfolio_snapshot``'s output so the
+    EOD/start-of-day formatters work transparently for both modes.
+
+    The dry-run state is initialized from ``DRY_RUN_INITIAL_NAV`` (or
+    the legacy ``MOCK_NAV``) env var, defaulting to 100,000,000 VND.
+    """
+    if not live_submit:
+        from .dry_run_state import (
+            build_dry_run_snapshot,
+            init_dry_run_state,
+            mark_to_market,
+        )
+        state = init_dry_run_state(engine_config.dataDir)
+        # Mark-to-market any open positions against the most recent close
+        # we have locally — this gives a meaningful "live" P&L in the
+        # summary even though we're not actually connected to a feed.
+        try:
+            from .universe import load_price_bars
+            prices: dict[str, float] = {}
+            for sym in list(state.positions.keys()):
+                bars = load_price_bars(sym, engine_config.dataDir)
+                if bars:
+                    last_close = bars[-1].close if hasattr(bars[-1], "close") else 0
+                    if last_close > 0:
+                        prices[sym] = float(last_close)
+            mark_to_market(state, prices)
+        except Exception:
+            pass
+        return build_dry_run_snapshot(state, account_no=account_no)
+
+    # Live mode — query DNSE.
+    from .portfolio import build_portfolio_snapshot
+    return build_portfolio_snapshot(client, account_no)
+
+
 def _read_strategy_last_poll(data_dir: Path, strategy_name: str) -> str | None:
     """Read ``last_poll_at`` from a strategy's state file (if any).
 
@@ -223,9 +325,10 @@ def run_auto_bot(
         ):
             print(f"[{now.isoformat()}] Sending start-of-day briefing")
             try:
-                from .portfolio import build_portfolio_snapshot
                 from .notifier import start_of_day_message
-                portfolio_snap = build_portfolio_snapshot(client, account_no)
+                portfolio_snap = _build_portfolio_snapshot(
+                    client, account_no, engine_config, live_submit,
+                )
                 # read latest_orders JSON for the per-strategy file
                 from .strategy_base import StrategyAdapter
                 adapter = STRATEGY_REGISTRY.get(engine_config.strategy) if engine_config.strategy else None
@@ -323,12 +426,23 @@ def run_auto_bot(
                     notify_telegram=False,
                 )
             print(result)
+            # In dry-run mode, REPLAY today's planned orders against the
+            # simulated state BEFORE building the snapshot, so the EOD
+            # summary shows cash + positions post-fill (matching what the
+            # bot would have entered if it were live).
+            if not live_submit and isinstance(result, dict):
+                try:
+                    _apply_dry_run_fills(result, engine_config, account_no)
+                except Exception as exc:
+                    print(f"[{now.isoformat()}] dry-run fill replay failed: {exc}")
             # Fetch live portfolio snapshot once so the EOD summary can
             # show cash, NAV, and per-position P&L inline.
+            # In dry-run mode, use the local simulated state instead of DNSE.
             portfolio_snap: dict | None = None
             try:
-                from .portfolio import build_portfolio_snapshot
-                portfolio_snap = build_portfolio_snapshot(client, account_no)
+                portfolio_snap = _build_portfolio_snapshot(
+                    client, account_no, engine_config, live_submit,
+                )
             except Exception as exc:
                 notify(
                     "\n".join(

@@ -396,11 +396,22 @@ def portfolio_section_lines(
     totals = portfolio.get("totals", {}) or {}
     positions = portfolio.get("positions", []) or []
     errors = portfolio.get("errors", []) or []
+    mode = portfolio.get("mode") or ""
 
-    lines: list[str] = [f"💼 {label}"]
+    # Section header — show DRY-RUN vs LIVE up front so it's obvious.
+    header_label = label
+    if mode == "dry_run":
+        header_label = f"{label}  🔸 DRY-RUN SIMULATED"
+    lines: list[str] = [f"💼 {header_label}"]
     cash_total = bal.get("totalCash") or 0
     stock_value = totals.get("stockValue") or 0
     nav = totals.get("portfolioValue") or 0
+    # Dry-run extras: show initial NAV, realized P&L, total return.
+    if mode == "dry_run":
+        initial = totals.get("initialNav") or 0
+        realized = totals.get("realizedPnl") or 0
+        ret = totals.get("totalReturnPct") or 0
+        lines.append(f"  initial NAV:      {format_money(initial)} VND")
     lines.append(f"  cash (available): {format_money(bal.get('availableCash'))} VND")
     lines.append(f"  cash (total):     {format_money(cash_total)} VND")
     lines.append(f"  stock value:      {format_money(stock_value)} VND")
@@ -410,14 +421,29 @@ def portfolio_section_lines(
     lines.append(
         f"  unrealized P&L:   {format_money(upnl)} VND  ({upnl_pct:+.2f}%)"
     )
+    if mode == "dry_run":
+        total_pnl = totals.get("totalPnl") or 0
+        ret_pct = totals.get("totalReturnPct") or 0
+        lines.append(
+            f"  realized P&L:     {format_money(realized)} VND"
+        )
+        lines.append(
+            f"  total P&L:        {format_money(total_pnl)} VND  ({ret_pct:+.2%} vs initial)"
+        )
     # When the live account is empty, surface that explicitly so users
     # don't confuse the backtest metrics above with live state.
     if cash_total == 0 and stock_value == 0 and not positions:
         lines.append("")
-        lines.append(
-            "  ⚠️  Live account is EMPTY — no cash, no positions."
-            " No live orders can be submitted."
-        )
+        if mode == "dry_run":
+            lines.append(
+                "  ⚠️  Dry-run account is EMPTY — no simulated positions yet."
+                " Submit orders (or wait for the bot to fill some) to populate."
+            )
+        else:
+            lines.append(
+                "  ⚠️  Live account is EMPTY — no cash, no positions."
+                " No live orders can be submitted."
+            )
     if errors:
         lines.append("")
         lines.append(f"  ⚠️  Snapshot errors: {', '.join(errors)}")
@@ -460,27 +486,32 @@ def eod_summary_message(
     """
     metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
     orders_info = result.get("latestOrdersCsv")
+    is_dry_run = isinstance(portfolio, dict) and portfolio.get("mode") == "dry_run"
     lines: list[str] = [
         "📊 Vietnam Algo: EOD SUMMARY",
         f"tradeDate: {result.get('tradeDate')}",
         f"strategy: {result.get('strategy')}",
         f"orderCount: {result.get('count')}",
     ]
-    # Backtest simulation metrics (NOT live P&L). Only show when the
-    # strategy actually ran a backtest (it sets initialCash/finalEquity).
-    has_backtest = (
-        metrics.get("initialCash") not in (None, 0)
-        or metrics.get("finalEquity") not in (None, 0)
-    )
-    if has_backtest:
-        lines.append("")
-        lines.append("  📈 Backtest simulation (1B VND start, NOT live P&L):")
-        lines.append(f"    totalReturn: {format_percent(metrics.get('totalReturnPercent'))}")
-        lines.append(f"    maxDrawdown: {format_percent(metrics.get('maxDrawdownPercent'))}")
-        lines.append(f"    finalEquity: {format_money(metrics.get('finalEquity'))} VND")
+    # In dry-run mode, the portfolio section already shows the simulated
+    # P&L — don't show the misleading backtest block (which is from a
+    # 1B-VND historical backtest, unrelated to dry-run state).
+    if not is_dry_run:
+        # Backtest simulation metrics (NOT live P&L). Only show when the
+        # strategy actually ran a backtest (it sets initialCash/finalEquity).
+        has_backtest = (
+            metrics.get("initialCash") not in (None, 0)
+            or metrics.get("finalEquity") not in (None, 0)
+        )
+        if has_backtest:
+            lines.append("")
+            lines.append("  📈 Backtest simulation (1B VND start, NOT live P&L):")
+            lines.append(f"    totalReturn: {format_percent(metrics.get('totalReturnPercent'))}")
+            lines.append(f"    maxDrawdown: {format_percent(metrics.get('maxDrawdownPercent'))}")
+            lines.append(f"    finalEquity: {format_money(metrics.get('finalEquity'))} VND")
     # current portfolio (cash, NAV, positions)
     lines.append("")
-    lines.extend(portfolio_section_lines(portfolio, label="LIVE PORTFOLIO (DNSE)"))
+    lines.extend(portfolio_section_lines(portfolio, label="PORTFOLIO"))
     # orders to submit (read from latest_orders JSON)
     items: list[dict[str, Any]] = []
     json_path = result.get("latestOrdersJson")
