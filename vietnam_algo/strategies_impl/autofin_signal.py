@@ -30,7 +30,7 @@ import csv
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -65,6 +65,7 @@ def _signal_ref_price(s: AutofinSignal) -> float:
 def _select_signals_within_nav_budget(
     signals: list[AutofinSignal],
     nav_budget_pct: float = 1.0,
+    min_leftover_fraction: float = 0.05,
 ) -> list[AutofinSignal]:
     """Pick signals in priority order until cumulative rateForNav <= budget.
 
@@ -74,6 +75,21 @@ def _select_signals_within_nav_budget(
        profit with lower risk"
 
     Score: (-risk_reward_ratio, -autofin_rating, -win_rate)
+
+    Partial-budget allocation (user feedback 2026-09-08):
+      When the budget has leftover after fitting as many full deals as
+      possible, we DO NOT just skip the next deal — we allocate the
+      leftover fraction to it (down to ``min_leftover_fraction`` of NAV,
+      default 5%) so the portfolio can be fully invested. The
+      signal is returned as a shallow copy with ``rate_for_nav``
+      adjusted to the leftover amount, so ``_plan_orders_for_new_positions``
+      sizes the position correctly without further changes.
+
+      Example:
+        NAV=100M, rateForNav=0.30 each, budget=1.0
+        Deals A,B,C at 30% → 0.90 cumulative
+        Deal D wants 0.30, leftover 0.10 → enter D at 0.10 NAV
+        Deal E wants 0.30, leftover 0 → skip (no room)
     """
     def _score(s: AutofinSignal) -> tuple[float, float, float]:
         entry = (s.supply_from + s.supply_to) / 2 if (s.supply_from and s.supply_to) else 0
@@ -93,10 +109,26 @@ def _select_signals_within_nav_budget(
     for s in sorted_signals:
         if s.rate_for_nav <= 0:
             continue
-        if cumulative + s.rate_for_nav > nav_budget_pct + 1e-9:
+        # Full fit: cumulative + s.rate_for_nav <= budget
+        if cumulative + s.rate_for_nav <= nav_budget_pct + 1e-9:
+            selected.append(s)
+            cumulative += s.rate_for_nav
             continue
-        selected.append(s)
-        cumulative += s.rate_for_nav
+        # Overflow — try partial-budget entry on the leftover.
+        leftover = nav_budget_pct - cumulative
+        if (
+            min_leftover_fraction > 0
+            and leftover >= min_leftover_fraction
+            and s.rate_for_nav > leftover
+        ):
+            # Allocate the leftover fraction to this deal. Return a
+            # shallow copy with the adjusted rate so we don't mutate
+            # the caller's signal.
+            selected.append(replace(s, rate_for_nav=leftover))
+            cumulative += leftover
+            continue
+        # No room — skip.
+        continue
     return selected
 
 

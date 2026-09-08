@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import pytest
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
 import vietnam_algo.strategies_impl.autofin_signal as mod
@@ -55,6 +56,12 @@ def _make_signal(
 
 
 def test_select_within_nav_budget_sums_to_one():
+    """5 deals at 30% → first 3 full (90%), 4th partial at 10%, 5th skip.
+
+    Per user feedback 2026-09-08: the bot should not leave cash idle
+    if there's a deal that can take the leftover NAV. The 4th deal
+    gets 10% (the leftover) and the 5th is skipped because no room.
+    """
     sigs = [
         _make_signal("A", 0.30, last_index=5),
         _make_signal("B", 0.30, last_index=4),
@@ -63,9 +70,61 @@ def test_select_within_nav_budget_sums_to_one():
         _make_signal("E", 0.30, last_index=1),
     ]
     selected = mod._select_signals_within_nav_budget(sigs, nav_budget_pct=1.0)
+    assert len(selected) == 4
+    symbols = [s.symbol for s in selected]
+    assert symbols == ["A", "B", "C", "D"]
+    # D was downsized from 0.30 to 0.10 (the leftover)
+    assert abs(sum(s.rate_for_nav for s in selected) - 1.0) < 1e-6
+    assert selected[-1].rate_for_nav == pytest.approx(0.10, abs=1e-6)
+
+
+def test_select_within_nav_budget_does_not_overallocate():
+    """The partial-budget allocation must NOT push cumulative past budget."""
+    sigs = [
+        _make_signal("A", 0.50, last_index=3),
+        _make_signal("B", 0.50, last_index=2),
+        _make_signal("C", 0.50, last_index=1),
+    ]
+    selected = mod._select_signals_within_nav_budget(sigs, nav_budget_pct=1.0)
+    assert len(selected) == 2
+    # A full at 0.50, B partial at 0.50 (the leftover)
+    assert abs(sum(s.rate_for_nav for s in selected) - 1.0) < 1e-6
+
+
+def test_select_within_nav_budget_skips_tiny_leftover():
+    """Leftover < min_leftover_fraction → skip (avoid fee-inefficient entry)."""
+    # 3 deals at 0.32 each = 0.96; leftover 0.04 < min_leftover=0.05.
+    sigs = [
+        _make_signal("A", 0.32, last_index=3),
+        _make_signal("B", 0.32, last_index=2),
+        _make_signal("C", 0.32, last_index=1),
+    ]
+    selected = mod._select_signals_within_nav_budget(sigs, nav_budget_pct=1.0)
     assert len(selected) == 3
-    assert {s.symbol for s in selected} == {"A", "B", "C"}
-    assert abs(sum(s.rate_for_nav for s in selected) - 0.90) < 1e-6
+    # All 3 fit full (3 * 0.32 = 0.96 ≤ 1.0)
+    assert abs(sum(s.rate_for_nav for s in selected) - 0.96) < 1e-6
+    # But now add a 4th deal: 0.96 + 0.32 = 1.28 > 1.0, leftover 0.04 < 0.05
+    # → would be skipped because 0.04 < min_leftover.
+    sigs.append(_make_signal("D", 0.32, last_index=0))
+    selected = mod._select_signals_within_nav_budget(sigs, nav_budget_pct=1.0)
+    assert len(selected) == 3  # D skipped
+    assert abs(sum(s.rate_for_nav for s in selected) - 0.96) < 1e-6
+
+
+def test_select_within_nav_budget_can_disable_partial():
+    """min_leftover_fraction=0 → never allocate partial, fall back to skip."""
+    sigs = [
+        _make_signal("A", 0.30, last_index=3),
+        _make_signal("B", 0.30, last_index=2),
+        _make_signal("C", 0.30, last_index=1),
+    ]
+    selected = mod._select_signals_within_nav_budget(
+        sigs, nav_budget_pct=0.50, min_leftover_fraction=0.0,
+    )
+    # With 50% budget, A fits (0.30 ≤ 0.50), B doesn't fit (0.30 leftover 0.20
+    # but min_leftover=0 means we don't allocate partial → skip).
+    assert len(selected) == 1
+    assert selected[0].symbol == "A"
 
 
 def test_select_within_nav_budget_excludes_zero_nav():
