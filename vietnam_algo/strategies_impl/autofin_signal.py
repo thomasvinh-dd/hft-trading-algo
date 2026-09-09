@@ -227,6 +227,7 @@ def _plan_orders_for_new_positions(
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
     above_zone_tolerance_pct: float = 0.05,
+    already_planned_symbols: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Emit BUY + TP + SL bracket orders for **new** positions only.
 
@@ -237,6 +238,17 @@ def _plan_orders_for_new_positions(
     spiral where daily rebalancing amplifies losses (when NAV
     drops, target shrinks, strategy SELLs, realizes losses,
     NAV drops further, more SELLs).
+
+    Per user feedback (2026-09-09): also accept ``already_planned_symbols`` —
+    a set of symbols that are already in the bot's persistent
+    ``_our_deals`` with positive ``_our_qty``. The bot was previously
+    relying solely on DNSE's positions (via ``our_positions``) to skip
+    duplicate entries, which works fine in live mode but causes double
+    entries in dry-run (where DNSE returns empty positions even
+    though we have "planned" entries from prior cycles). Now the
+    bot also skips symbols that are already tracked in its own state
+    — so a held deal with no DNSE position still won't be re-bought
+    on the next EOD cycle.
 
     Each emitted order dict carries a ``kind`` field that the
     backtest uses to route orders correctly:
@@ -274,6 +286,12 @@ def _plan_orders_for_new_positions(
         current_qty = our_positions.get(s.symbol, 0)
         if current_qty > 0:
             # Already hold this position — never rebalance.
+            continue
+        # ALSO skip if this symbol is already in our tracked deals
+        # with positive _our_qty. This catches the dry-run case where
+        # DNSE returns empty positions but the bot already planned
+        # an entry on a previous cycle.
+        if already_planned_symbols and s.symbol in already_planned_symbols:
             continue
         if s.rate_for_nav <= 0 or nav_vnd <= 0:
             continue
@@ -609,11 +627,48 @@ def _build_deals_actioned(
 
 
 def _order_key(o: dict[str, Any]) -> str:
-    """Stable key for an order row, used to de-dupe Telegram notifications."""
-    return (
-        f"{o.get('reason', '')}|{o.get('side', '')}|"
-        f"{o.get('symbol', '')}|{o.get('price', 0)}|{o.get('quantity', 0)}"
-    )
+    """Stable key for an order row, used to de-dupe Telegram notifications.
+
+    Per user feedback (2026-09-09): the key MUST be stable across cycles
+    — same deal_id + action should always hash to the same key even if
+    the entry price or partial-budget qty changes between days. Otherwise
+    we'd re-notify "new entry" messages every day the price moves a tick,
+    which is confusing for users.
+    """
+    reason = str(o.get("reason") or "")
+    did = _extract_deal_id(reason) or ""
+    side = str(o.get("side") or "")
+    symbol = str(o.get("symbol") or "")
+    kind = str(o.get("kind") or "")
+    # Group by deal + action. Price/qty deliberately excluded so the
+    # same deal's bracket arms dedupe cleanly across re-plans.
+    return f"{did}|{side}|{symbol}|{kind}|{_arm(reason)}"
+
+
+def _arm(reason: str) -> str:
+    """Extract the order-arm from a reason string.
+
+    Examples (input → output):
+      autofin_buy:deal#1234:HII:nav15pct:...   → "entry"
+      autofin_tp:deal#1234:HI:10000            → "tp:10000"
+      autofin_user_sl:deal#1234:HII:5%:8550   → "usersl"
+      autofin_partial:deal#1234:HII           → "partial"
+      autofin_closed:deal#1234:HII            → "closed"
+    """
+    r = reason.strip()
+    if r.startswith("autofin_buy:"):
+        return "entry"
+    if r.startswith("autofin_tp:"):
+        return "tp:" + r.split(":", 3)[-1]  # include the trigger level
+    if r.startswith("autofin_user_sl:"):
+        return "usersl"
+    if r.startswith("autofin_sl:"):
+        return "sl"
+    if r.startswith("autofin_partial:"):
+        return "partial"
+    if r.startswith("autofin_closed:"):
+        return "closed"
+    return r[:32]
 
 
 def _format_per_action_message(deal: dict[str, Any], ts: str) -> str:
@@ -719,6 +774,7 @@ def decide_orders(
     board_lot: int = DEFAULT_BOARD_LOT,
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
+    already_planned_symbols: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -794,6 +850,7 @@ def decide_orders(
         selected, nav, our_positions,
         board_lot=board_lot, user_sl_pct=user_sl_pct,
         current_prices=current_prices,
+        already_planned_symbols=already_planned_symbols,
     )
     partial_orders = _plan_partial_close_orders(our_deals, holding, board_lot=board_lot)
     our_real_deals = {
@@ -1037,6 +1094,20 @@ class AutofinSignalAdapter(StrategyAdapter):
                     if last_close > 0:
                         current_prices[sym] = last_close
 
+        # 5e. Compute the set of symbols we already have planned entries
+        # for (used to skip duplicate BUY emissions on consecutive EOD
+        # cycles, especially in dry-run mode where DNSE returns empty
+        # positions even though we've "planned" entries from prior cycles).
+        # Per user feedback (2026-09-09): previously the bot double-bought
+        # the same deal on consecutive days because it only consulted DNSE
+        # for "do I already have this position" — and DNSE is empty in
+        # dry-run mode.
+        already_planned_symbols: set[str] = {
+            str(sig.get("symbol") or "").strip().upper()
+            for sig in self._our_deals.values()
+            if int(sig.get("_our_qty", 0) or 0) > 0
+        }
+
         # 6-9. Delegate to the pure decision function. This is the same
         # function the daily-replay backtest calls.
         all_orders, new_our_deals, deals_actioned = decide_orders(
@@ -1048,6 +1119,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             config=strategy_config,
             user_sl_pct=user_sl_pct,
             current_prices=current_prices,
+            already_planned_symbols=already_planned_symbols,
         )
 
         # 10. Update our persistent state. Note: decide_orders() returns
