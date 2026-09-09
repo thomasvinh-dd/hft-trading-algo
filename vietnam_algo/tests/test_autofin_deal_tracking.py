@@ -46,17 +46,21 @@ def _make_signal(
     return raw
 
 
-def test_plan_new_positions_emits_buy_tp_sl_bracket():
-    """New entry must come with TP and SL exit orders."""
+def test_plan_new_positions_emits_buy_sl_bracket():
+    """New entry emits BUY + SL only — TP bracket is NOT emitted
+    (per-event partial-close logic is the canonical mechanism).
+    Per user feedback 2026-09-09."""
     sig = mod.parse_signal(_make_signal("APH", 0.15, deal_id="111", supply_to=6100, tp_from=6500, sl_to=5320))
     rows = _plan_orders_for_new_positions(
         selected=[sig], nav_vnd=1_000_000_000, our_positions={}
     )
     sides = [r["side"] for r in rows]
     assert sides.count("NB") == 1
-    assert sides.count("NS") == 2  # TP + SL
+    assert sides.count("NS") == 1  # SL only — no TP bracket
     buy = next(r for r in rows if r["side"] == "NB")
+    sell = next(r for r in rows if r["side"] == "NS")
     assert "deal#111" in buy["reason"]
+    assert sell["kind"] == "sl"
     assert buy["price"] == 6100
 
 

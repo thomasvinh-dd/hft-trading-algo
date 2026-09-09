@@ -253,8 +253,10 @@ def _plan_orders_for_new_positions(
     Each emitted order dict carries a ``kind`` field that the
     backtest uses to route orders correctly:
       - ``kind="entry"``: BUY at entry, fills immediately at today's price
-      - ``kind="tp"``: take-profit bracket, conditional (fires only on trigger)
       - ``kind="sl"``: stop-loss bracket, conditional (fires only on trigger)
+        (TP brackets are NOT emitted here — autofin's TP events are
+        partial closes driven by the per-event ``numberOfProfit``
+        logic in ``_plan_partial_close_orders``.)
 
     Concretely:
       - If we already hold a positive qty for this symbol,
@@ -331,19 +333,21 @@ def _plan_orders_for_new_positions(
                 f"nav{int(s.rate_for_nav*100)}pct:{s.last_recomment[:60]}"
             ),
         })
-        # TP bracket at signal's declared trigger level. Conditional
-        # — fires only when today's price reaches the trigger.
-        if s.tp_from > 0:
-            rows.append({
-                "symbol": s.symbol,
-                "side": "NS",
-                "price": int(round(s.tp_from)),
-                "quantity": target_qty,
-                "kind": "tp",
-                "reason": f"autofin_tp:deal#{did}:{int(s.tp_from)}",
-            })
-        # SL bracket: tighter of autofin's sL_F and our user_sl_pct.
-        # Higher trigger price = tighter (fires sooner on the way down).
+        # NO TP bracket on entry — TPs come from autofin's per-event signal
+        # (``numberOfProfit`` increment / ``lastRecomment`` partial close).
+        # Autofin publishes TPs as PARTIAL closes at varying percentages
+        # (e.g. 10%, 30% of REMAINING position), not full closes. The bracket
+        # mechanism was emitting a SELL of the full qty at s.tp_from, which
+        # both (a) duplicated the per-event logic (causing 2× the intended
+        # sell when both fire) and (b) closed the position when autofin
+        # only wanted a partial trim. The correct primary mechanism is
+        # ``_plan_partial_close_orders``, which reads autofin's actual %
+        # from ``lastRecomment`` and ``numberOfProfit`` deltas.
+        # SL bracket only — autofin's stop-loss exits are always full-close
+        # ("Đóng DEAL chạm điểm cắt lỗ"). Keeping this as a safety net
+        # means that if autofin's API hiccups during a fast drop, our
+        # _our_qty > 0 + 5%-below-entry bracket catches the loss BEFORE
+        # the per-event logic fires on the next cycle.
         autofin_sl = int(round(s.sl_from)) if s.sl_from > 0 else 0
         user_sl = int(round(entry_price * (1 - user_sl_pct))) if user_sl_pct > 0 else 0
         effective_sl = max(autofin_sl, user_sl)

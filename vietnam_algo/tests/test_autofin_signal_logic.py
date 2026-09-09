@@ -152,16 +152,43 @@ def test_select_within_nav_budget_uses_rating_and_winrate():
     assert [s.symbol for s in selected] == ["B", "A"]
 
 
-def test_plan_new_positions_emits_buy_tp_sl_bracket():
+def test_plan_new_positions_emits_buy_sl_bracket():
+    """BUY + SL bracket only — TP is per-event (autofin publishes
+    partial closes via ``numberOfProfit`` / ``lastRecomment``), not
+    hardcoded. Per user feedback 2026-09-09: autofin's TP events are
+    partial closes (10%-30% of REMAINING position), not full closes,
+    so the bracket must not emit a SELL of target_qty at TP1 level
+    — that duplicates the per-event partial-close logic and risks
+    overselling."""
     sig = _make_signal("APH", 0.15, supply_to=6100, tp_from=6500, sl_to=5320)
     rows = _plan_orders_for_new_positions(
         selected=[sig], nav_vnd=1_000_000_000, our_positions={}
     )
     sides = [r["side"] for r in rows]
     assert sides.count("NB") == 1
-    assert sides.count("NS") == 2
+    assert sides.count("NS") == 1
     buy = next(r for r in rows if r["side"] == "NB")
+    sell = next(r for r in rows if r["side"] == "NS")
     assert buy["price"] == 6100
+    assert buy["kind"] == "entry"
+    assert sell["kind"] == "sl"  # SL only, no TP bracket
+    # user_sl (5% of 6100 = 5220) is tighter than autofin's 5320, so user wins.
+    assert sell["price"] == 5220
+
+
+def test_plan_new_positions_skips_tp_bracket():
+    """Even with a tp_from > 0 we DO NOT emit a TP bracket anymore —
+    per-event partial-close logic handles it. Confirm the only SELL
+    emitted is the SL bracket."""
+    sig = _make_signal("APH", 0.15, supply_to=6100, tp_from=6500, sl_to=5320)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig], nav_vnd=1_000_000_000, our_positions={}
+    )
+    tp_legs = [r for r in rows if r["kind"] == "tp"]
+    assert tp_legs == [], (
+        "TP bracket should NOT be emitted — autofin's TPs are partial "
+        "closes driven by _plan_partial_close_orders, not brackets"
+    )
 
 
 def test_plan_new_positions_skips_when_target_too_small():
@@ -212,9 +239,9 @@ def test_plan_new_positions_emits_buy_when_position_zero():
         selected=[sig], nav_vnd=1_000_000_000, our_positions={"APH": 0}
     )
     sides = [r["side"] for r in rows]
-    # BUY + TP-SELL + SL-SELL
+    # BUY + SL-SELL (no TP bracket — per-event TP is the canonical path)
     assert sides.count("NB") == 1
-    assert sides.count("NS") == 2
+    assert sides.count("NS") == 1
     buy = next(r for r in rows if r["side"] == "NB")
     # target_value = 1B * 0.15 = 150M; / 6100 = 24590 shares → 245 lots
     # = 24500
