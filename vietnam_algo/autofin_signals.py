@@ -22,13 +22,16 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_LOGIN_URL = "https://api.autofin.vn/gateway/api/auth/sign-in"
 DEFAULT_SIGNALS_URL = "https://api.autofin.vn/gateway/api/gw/v1/signals/signal-static-suggest"
+DEFAULT_NOTIFICATIONS_URL = (
+    "https://api.autofin.vn/gateway/api/gw/v1/notification/get-notify-by-topics"
+)
 DEFAULT_TOKEN_CACHE_PATH = Path("vietnam_algo/data/live/autofin_token.json")
 
 
@@ -92,10 +95,60 @@ def parse_signal(raw: dict[str, Any]) -> AutofinSignal:
     )
 
 
+@dataclass(frozen=True)
+class AutofinNotification:
+    """A single autofin.vn notification event.
+
+    Notifications are emitted by autofin whenever something happens:
+    a new deal opens, a TP fires, an SL hits, a daily report is ready,
+    etc. Each carries the EXACT timestamp of the event, the type tags,
+    and a human-readable title+body with structured data (zones, prices,
+    percentages) that we already parse from ``lastRecomment`` today.
+
+    This is a different shape from ``AutofinSignal`` (which is a state
+    snapshot of one deal): notifications are an EVENT STREAM. We can
+    use them as a faster/replacement source for TP/SL detection that
+    currently polls ``numberOfProfit`` deltas.
+    """
+
+    id: int                          # unique notification id (Unix-ns timestamp)
+    time_request: str                # ISO timestamp from autofin
+    tags: tuple[str, ...]            # e.g. ("SIGNAL", "TRADINGTIME", "TAKEPROFIT")
+    title: str                       # Vietnamese title (e.g. "💰 CHỐT LÃI DRI")
+    body: str                        # Event body (HTML stripped to plain text)
+    image_url: str = ""              # company logo or autofin logo
+    action_url: str = ""             # Deep link to dashboard
+    has_read: bool = False
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    # Convenience properties for tag-matching.
+    @property
+    def is_buy_opened(self) -> bool:
+        return "OPENDEAL" in self.tags and "EOD" in self.tags
+
+    @property
+    def is_take_profit(self) -> bool:
+        return "TAKEPROFIT" in self.tags
+
+    @property
+    def is_stop_order(self) -> bool:
+        return "STOPORDER" in self.tags
+
+    @property
+    def is_close_deal(self) -> bool:
+        return "CLOSEDEAL" in self.tags
+
+    @property
+    def is_daily_report(self) -> bool:
+        return "REPORT" in self.tags and "EOD" in self.tags
+
+
 def _strip_html(s: str) -> str:
-    """Remove HTML tags from a recommendation string for parsing."""
+    """Remove HTML tags AND decode HTML entities (&#xNN; and &name;)."""
     import re as _re
+    import html as _html
     s = _re.sub(r"<[^>]+>", " ", s or "")
+    s = _html.unescape(s)
     s = _re.sub(r"\s+", " ", s)
     return s.strip()
 
@@ -103,6 +156,31 @@ def _strip_html(s: str) -> str:
 def _parse_vnd_int(s: str) -> int:
     """Parse '12,900' → 12900 (Vietnamese thousands separator)."""
     return int((s or "").replace(".", "").replace(",", "").strip() or "0")
+
+
+def parse_notification(raw: dict[str, Any]) -> AutofinNotification:
+    """Parse one autofin notification API response into ``AutofinNotification``.
+
+    The endpoint ``/notification/get-notify-by-topics?topics=SIGNAL``
+    returns ``{"data": [{_id, timeRequest, tag, type, notifyDetail, ...}]}``.
+    Each notification is an EVENT, not a state — handle the various
+    tag combinations (OPENDEAL, TAKEPROFIT, STOPORDER, CLOSEDEAL,
+    REPORT, REMIND) via the ``AutofinNotification`` helper properties.
+    """
+    detail = raw.get("notifyDetail") or {}
+    raw_tag = raw.get("tag") or ""
+    tags = tuple(t.strip() for t in raw_tag.split(",") if t.strip())
+    return AutofinNotification(
+        id=int(raw.get("_id") or 0),
+        time_request=str(raw.get("timeRequest") or ""),
+        tags=tags,
+        title=str(detail.get("title") or ""),
+        body=_strip_html(str(detail.get("body") or "")),
+        image_url=str(detail.get("imageURL") or ""),
+        action_url=str(detail.get("action") or ""),
+        has_read=bool(raw.get("hasRead", False)),
+        raw=raw,
+    )
 
 
 def parse_recommendation_history(raw_deal: dict[str, Any]) -> list[dict[str, Any]]:
@@ -249,6 +327,7 @@ class AutofinClient:
         password: str,
         login_url: str = DEFAULT_LOGIN_URL,
         signals_url: str = DEFAULT_SIGNALS_URL,
+        notifications_url: str = DEFAULT_NOTIFICATIONS_URL,
         token_cache_path: Path = DEFAULT_TOKEN_CACHE_PATH,
         request_timeout: float = 15.0,
     ) -> None:
@@ -256,9 +335,11 @@ class AutofinClient:
         self.password = password
         self.login_url = login_url
         self.signals_url = signals_url
+        self.notifications_url = notifications_url
         self.token_cache_path = token_cache_path
         self.request_timeout = request_timeout
         self._token: str | None = None
+        self._user_id: int | None = None
 
     def _load_cached_token(self) -> str | None:
         cached = _read_token_cache(self.token_cache_path)
@@ -299,12 +380,29 @@ class AutofinClient:
         if not payload.get("accessToken"):
             raise RuntimeError(f"Autofin login failed: {payload!r}")
         self._save_tokens(payload)
+        # Capture user id (used by notifications endpoint) if present.
+        uid = payload.get("userId") or (payload.get("data") or {}).get("id")
+        if isinstance(uid, int):
+            self._user_id = uid
+        elif isinstance(uid, str) and uid.isdigit():
+            self._user_id = int(uid)
         return payload["accessToken"]
 
     def get_token(self) -> str:
         if self._token is None:
             self._ensure_token()
         return self._token  # type: ignore[return-value]
+
+    def get_user_id(self) -> int:
+        """Return the cached autofin user id, or 581 (default from sample URL).
+
+        The notification endpoint requires ``uid`` as a query param.
+        Default to 581 (the sample UID from autofin's web app) so the
+        method works even if we haven't captured the real userId yet.
+        """
+        if self._user_id is not None:
+            return self._user_id
+        return 581
 
     def fetch_signals(
         self,
@@ -355,6 +453,82 @@ class AutofinClient:
         if not isinstance(items, list):
             return []
         return [parse_signal(it) for it in items if isinstance(it, dict)]
+
+    def fetch_notifications(
+        self,
+        topics: str = "SIGNAL",
+        number: int = 20,
+        skip: int = 0,
+    ) -> list[AutofinNotification]:
+        """Fetch the user's notification feed from autofin's API.
+
+        Endpoint: ``GET /gateway/api/gw/v1/notification/get-notify-by-topics``
+        Params: ``uid``, ``topics`` (comma-separated), ``number`` (page size),
+        ``skip`` (offset).
+
+        Returns a paginated EVENT STREAM — each item has tags like
+        ``SIGNAL,TRADINGTIME,TAKEPROFIT`` (a TP fired) or
+        ``SIGNAL,EOD,OPENDEAL`` (a new buy recommendation) or
+        ``SIGNAL,EOD,CLOSEDEAL`` (deal closed). The exact tags let us
+        route each event to the right handler (see
+        ``AutofinNotification.is_*`` helpers).
+
+        Each event's body is HTML-stripped to plain text. We keep the
+        raw payload so callers can inspect ``image_url`` (company logo)
+        and ``action_url`` (deep link to autofin dashboard).
+
+        Note: this endpoint is the SAME one autofin's web app uses to
+        populate the bell-icon notification panel. Per user feedback
+        2026-09-09: the events have the same fields as
+        ``/signal-static-suggest`` (zone, TP, SL, %) plus exact event
+        timestamps — useful as a faster TP/SL detector than polling
+        ``numberOfProfit`` deltas.
+        """
+        # Trigger login if we don't have a token yet (also captures userId).
+        token = self.get_token()
+        uid = self.get_user_id()
+        url = (
+            f"{self.notifications_url}?uid={uid}&topics={topics}"
+            f"&number={number}&skip={skip}"
+        )
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "accept": "*/*",
+                "origin": "https://www.autofin.vn",
+                "referer": "https://www.autofin.vn/",
+                "user-agent": "Mozilla/5.0",
+            },
+        )
+        req.add_header("Cookie", f"token={token}")
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    self._token = None
+                    token = self._ensure_token(force_refresh=True)
+                    req = urllib.request.Request(
+                        url,
+                        method="GET",
+                        headers={
+                            "accept": "*/*",
+                            "origin": "https://www.autofin.vn",
+                            "referer": "https://www.autofin.vn/",
+                            "user-agent": "Mozilla/5.0",
+                        },
+                    )
+                    req.add_header("Cookie", f"token={token}")
+                    continue
+                raise
+        # API returns {"data": [...], "errorMessage": ..., "statusCode": ...}.
+        items = payload.get("data") or []
+        if not isinstance(items, list):
+            return []
+        return [parse_notification(it) for it in items if isinstance(it, dict)]
 
     def fetch_deals(
         self,
