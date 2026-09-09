@@ -454,10 +454,17 @@ def _parse_partial_close(recomment: str) -> PartialCloseAction:
             price = _parse_vnd(m.group(2)) if m.group(2) else 0.0
             return PartialCloseAction(action=action, lap=lap, price=price)
         if action == "reduce_lap":
-            return PartialCloseAction(action=action, lap=int(m.group(1)))
+            # Reduce events often include a price on the next line as
+            # "Giá: X - Nắm giữ: Y ngày". Try to extract it.
+            price_m = re.search(r"Giá\s*:\s*([\d,\.]+)", rec)
+            price = _parse_vnd(price_m.group(1)) if price_m else 0.0
+            return PartialCloseAction(action=action, lap=int(m.group(1)), price=price)
         if action == "capital_protect":
             pct = _parse_percent(m.group(1))
-            return PartialCloseAction(action=action, percent=pct)
+            # capital_protect also includes a price: "tại P"
+            price_m = re.search(r"tại\s*([\d,\.]+)", rec)
+            price = _parse_vnd(price_m.group(1)) if price_m else 0.0
+            return PartialCloseAction(action=action, percent=pct, price=price)
         if action == "full_close":
             return PartialCloseAction(action=action)
     return PartialCloseAction(action="unknown")
@@ -555,6 +562,97 @@ def _extract_deal_id(reason: str) -> str:
     # The rest of the reason is colon-separated fields like ":take_profit_lap:lap1".
     m = re.search(r"deal#(\d+:[A-Z]+)", reason or "")
     return m.group(1) if m else ""
+
+
+def _event_to_partial_orders(
+    event_title: str,
+    event_body: str,
+    our_deals: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert a single autofin notification event into one or more SELL orders.
+
+    The event title + body has the same structured text that we already parse
+    via ``_parse_partial_close`` (e.g. "💰 Chốt lãi lần 1 mức giá 15,000",
+    "⚠️ Hạ 50 % tỉ trọng lần 2", "🛡️ Chốt lãi 12.50 % bảo toàn vốn tại 10,150").
+    We reuse that parser and translate it into SELL orders that the
+    bot can submit.
+
+    The notification body doesn't include the deal_id explicitly (it's
+    not in the standard autofin notification schema), so we match the
+    SYMBOL in the body (e.g. "[HII] 💰 Chốt lãi lần 1 ...") against
+    the symbol of each deal in ``our_deals``. If we have HII in our
+    deals and the event says "[HII] 💰 Chốt lãi ...", we attribute
+    the partial-close to HII.
+
+    Returns a list of SELL order dicts (same shape as
+    ``_plan_partial_close_orders``). Empty list if the event doesn't
+    parse or we don't have a matching tracked position.
+    """
+    import re
+    # Extract the symbol from the body — usually wrapped in [SYMBOL].
+    sym_match = re.search(r"\[([A-Z0-9]{2,5})\]", event_body or "")
+    if not sym_match:
+        return []
+    symbol = sym_match.group(1).upper()
+
+    # Find the matching tracked deal for this symbol.
+    our_match: dict[str, Any] | None = None
+    for did, sig in our_deals.items():
+        if str(sig.get("symbol") or "").upper() == symbol and int(sig.get("_our_qty", 0)) > 0:
+            our_match = sig
+            our_match_id = did
+            break
+    if our_match is None:
+        return []
+
+    # Reuse the existing partial-close parser.
+    action = _parse_partial_close(event_body)
+    if action.action in ("unknown", "full_close"):
+        return []
+
+    our_qty = int(our_match.get("_our_qty", 0))
+    if our_qty <= 0:
+        return []
+
+    if action.action in ("take_profit_lap", "reduce_lap"):
+        delta = our_qty // 3
+    elif action.action == "capital_protect":
+        delta = int(our_qty * action.percent / 100)
+    else:
+        return []
+
+    delta = _round_to_lots(delta)
+    if delta < DEFAULT_BOARD_LOT:
+        return []
+
+    price = action.price if action.price > 0 else 0
+    if price <= 0:
+        return []
+
+    return [{
+        "symbol": symbol,
+        "side": "NS",
+        "price": price,
+        "quantity": delta,
+        "kind": "partial_close",
+        "reason": (
+            f"autofin_partial_event:{our_match_id}:{action.action}:"
+            f"lap{action.lap}:pct{int(round(action.percent * 100))}:"
+            f"{(event_title or '')[:60]}"
+        ),
+    }]
+
+
+def _is_trading_event(tags: tuple[str, ...]) -> bool:
+    """True if a notification has tags indicating a TP/SL/stop-event.
+
+    We use this as a pre-filter so we don't waste cycles parsing
+    daily-report / reminder notifications. The actual action type
+    (TP / reduce / capital_protect / stop / close) is then
+    determined by parsing the BODY text via ``_parse_partial_close``.
+    """
+    trade_tags = {"TAKEPROFIT", "STOPORDER", "TRAILINGSTOP"}
+    return any(t in tags for t in trade_tags)
 
 
 def _build_deals_actioned(
@@ -935,6 +1033,15 @@ class AutofinSignalAdapter(StrategyAdapter):
         # Last time the strategy ran (UTC ISO). Used by the bot to throttle
         # mid-day polls to once per hour.
         self._last_poll_at: str | None = None
+        # Last notification id we've seen (from /notification/get-notify-by-topics).
+        # Used to fetch only NEW events on each poll (id > this). Empty string
+        # means we haven't seen any yet (next poll fetches everything).
+        self._last_notification_id: str = ""
+        # Last time we fetched notifications. Throttles the mid-day poll.
+        self._last_notification_poll_at: str | None = None
+        # Notification-ids already converted into SELL orders — used to
+        # de-dupe so the same event doesn't fire a SELL twice across cycles.
+        self._notified_event_ids: set[str] = set()
 
     def _client_lazy(self) -> AutofinClient:
         if self._client is None:
@@ -955,10 +1062,18 @@ class AutofinSignalAdapter(StrategyAdapter):
             self._our_deals = {str(k): dict(v) for k, v in payload.get("our_deals", {}).items()}
             self._notified_order_keys = set(payload.get("notified_order_keys", []) or [])
             self._last_poll_at = payload.get("last_poll_at")
+            self._last_notification_id = str(payload.get("last_notification_id") or "")
+            self._last_notification_poll_at = payload.get("last_notification_poll_at")
+            self._notified_event_ids = set(
+                str(x) for x in (payload.get("notified_event_ids") or [])
+            )
         except Exception:
             self._our_deals = {}
             self._notified_order_keys = set()
             self._last_poll_at = None
+            self._last_notification_id = ""
+            self._last_notification_poll_at = None
+            self._notified_event_ids = set()
 
     def _save_state(self, data_dir: Path) -> None:
         path = data_dir / "live" / "autofin_signal_state.json"
@@ -968,6 +1083,9 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "our_deals": self._our_deals,
                 "notified_order_keys": sorted(self._notified_order_keys),
                 "last_poll_at": datetime.now(timezone.utc).isoformat(),
+                "last_notification_id": self._last_notification_id,
+                "last_notification_poll_at": self._last_notification_poll_at,
+                "notified_event_ids": sorted(self._notified_event_ids),
                 "updatedAt": datetime.now(timezone.utc).isoformat(),
             },
             indent=2,
@@ -975,6 +1093,129 @@ class AutofinSignalAdapter(StrategyAdapter):
 
     def last_poll_at(self) -> str | None:
         return self._last_poll_at
+
+    def _poll_notifications_for_events(
+        self,
+        max_pages: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Fetch new autofin notification events and emit SELL orders for TP/SL.
+
+        Per user feedback (2026-09-09): the ``/notification/get-notify-by-topics``
+        endpoint gives us a fast event stream for TAKEPROFIT/STOPORDER/CLOSEDEAL
+        — instead of waiting until the next EOD cycle to detect
+        ``numberOfProfit`` deltas, we can read the event itself and
+        issue a SELL order within minutes.
+
+        Pagination: read up to ``max_pages * number`` events. We only
+        process events with ``id > self._last_notification_id`` (so we
+        don't re-fire orders for events we've already handled).
+
+        The returned orders are in the same shape as
+        ``_plan_partial_close_orders`` so the existing
+        ``_notify_new_orders`` / ``format_cycle_summary`` paths work
+        unchanged.
+
+        Returns the list of partial-close orders derived from the new
+        events. The caller should also call ``_notify_new_orders`` if it
+        wants Telegram alerts.
+        """
+        try:
+            client = self._client_lazy()
+        except Exception as exc:
+            print(f"[autofin_signal] notification poll: no client ({exc})")
+            return []
+
+        all_events = []
+        try:
+            for skip in range(0, max_pages * 20, 20):
+                page = client.fetch_notifications(topics="SIGNAL", number=20, skip=skip)
+                if not page:
+                    break
+                all_events.extend(page)
+                # If a page came back short, we've hit the end of available
+                # events — stop paginating.
+                if len(page) < 20:
+                    break
+        except Exception as exc:
+            print(f"[autofin_signal] notification poll failed: {exc}")
+            return []
+
+        # Sort events newest-first by id, then filter to NEW only.
+        # Events arrive newest-first from the API (id is Unix-ns timestamp).
+        new_events = []
+        max_id_seen = int(self._last_notification_id) if self._last_notification_id else 0
+        overall_max_id = max_id_seen
+        for ev in all_events:
+            if ev.id > overall_max_id:
+                overall_max_id = ev.id
+            if ev.id > max_id_seen and str(ev.id) not in self._notified_event_ids:
+                new_events.append(ev)
+
+        # Update last_notification_id so the next poll skips these.
+        if overall_max_id > max_id_seen:
+            self._last_notification_id = str(overall_max_id)
+        self._last_notification_poll_at = datetime.now(timezone.utc).isoformat()
+
+        # Convert TP/SL events into partial-close orders. The body parser
+        # is the source of truth for the action type — the tag is just a
+        # filter so we don't waste cycles parsing daily-report events.
+        new_orders: list[dict[str, Any]] = []
+        for ev in new_events:
+            if not _is_trading_event(ev.tags):
+                continue
+            partials = _event_to_partial_orders(ev.title, ev.body, self._our_deals)
+            for o in partials:
+                # Mark this notification id as notified so we don't reprocess.
+                self._notified_event_ids.add(str(ev.id))
+                new_orders.append(o)
+
+        # For CLOSEDEAL events on tracked positions, also queue a full-close SELL.
+        for ev in new_events:
+            if not ev.is_close_deal:
+                continue
+            if str(ev.id) in self._notified_event_ids:
+                continue
+            # Reuse _event_to_partial_orders with action="full_close" by
+            # re-parsing — but our parser returns "unknown" for full close.
+            # Instead, build a full-close order directly: find matching symbol,
+            # set qty to remaining, price from body if available.
+            import re
+            sym_match = re.search(r"\[([A-Z0-9]{2,5})\]", ev.body or "")
+            if not sym_match:
+                continue
+            symbol = sym_match.group(1).upper()
+            our_match_id = None
+            our_match = None
+            for did, sig in self._our_deals.items():
+                if (
+                    str(sig.get("symbol") or "").upper() == symbol
+                    and int(sig.get("_our_qty", 0)) > 0
+                ):
+                    our_match_id = did
+                    our_match = sig
+                    break
+            if our_match is None:
+                continue
+            # Extract close price from body (e.g. "📦 HSL chốt 9,950, T+: ...").
+            price_match = re.search(r"ch[oố]t\s*([\d,\.]+)", ev.body or "")
+            close_price = int(price_match.group(1).replace(".", "").replace(",", "")) if price_match else 0
+            qty = int(our_match.get("_our_qty", 0))
+            if qty <= 0:
+                continue
+            self._notified_event_ids.add(str(ev.id))
+            new_orders.append({
+                "symbol": symbol,
+                "side": "NS",
+                "price": close_price,
+                "quantity": qty,
+                "kind": "close_event",
+                "reason": (
+                    f"autofin_close_event:{our_match_id}:{symbol}:"
+                    f"price{close_price}:{(ev.title or '')[:60]}"
+                ),
+            })
+
+        return new_orders
 
     def _notify_new_orders(self, deals_actioned: list[dict[str, Any]]) -> None:
         """Send a short Telegram message for any deal-actioned entry that
@@ -1128,12 +1369,40 @@ class AutofinSignalAdapter(StrategyAdapter):
             already_planned_symbols=already_planned_symbols,
         )
 
+        # 9b. Notification-driven mid-day TP/SL detection. Per user feedback
+        # 2026-09-09: pull the latest TAKEPROFIT/STOPORDER/CLOSEDEAL events
+        # from autofin's notification feed and convert them into SELL orders
+        # so we capture intraday events without waiting for EOD reconciliation
+        # via numberOfProfit deltas. The new orders merge with the dedupe
+        # flow so the same event never fires twice across cycles.
+        # Build a holding-by-id map from the holding snapshot so the
+        # notification parser can attribute events to deals (by symbol).
+        autofin_holding_by_id: dict[str, dict[str, Any]] = {}
+        for h in holding:
+            did = _deal_id(h)
+            if did:
+                autofin_holding_by_id[did] = dict(h)
+        notification_orders = self._poll_notifications_for_events()
+        if notification_orders:
+            all_orders.extend(notification_orders)
+            deals_actioned.extend(_build_deals_actioned(
+                new_orders=[],  # no new entries from events
+                partial_orders=[o for o in notification_orders if o.get("kind") == "partial_close"],
+                close_orders=[o for o in notification_orders if o.get("kind") == "close_event"],
+                autofin_holding_by_id=autofin_holding_by_id,
+            ))
+
         # 10. Update our persistent state. Note: decide_orders() returns
         # a deep-copied new_our_deals; we copy it back into our adapter's
         # state so subsequent calls see the new positions.
         self._our_deals = new_our_deals
         new_orders = [o for o in all_orders if o.get("side") == "NB" and "tp:" not in o.get("reason", "") and "sl:" not in o.get("reason", "")]
-        partial_orders = [o for o in all_orders if "autofin_partial:" in o.get("reason", "")]
+        partial_orders = [
+            o for o in all_orders
+            if "autofin_partial:" in o.get("reason", "")
+            or o.get("kind") == "partial_close"
+            or o.get("kind") == "close_event"
+        ]
         close_orders = [o for o in all_orders if "autofin_closed:" in o.get("reason", "")]
 
         # 11. write outputs
