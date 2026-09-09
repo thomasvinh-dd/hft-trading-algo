@@ -144,6 +144,106 @@ def fetch_vietstock_session(timeout: float = 30.0) -> VietstockSession:
     return VietstockSession(token=extract_request_verification_token(html), opener=opener)
 
 
+def _looks_like_json_response(body: str, content_type: str) -> bool:
+    """Heuristic: did the response actually contain JSON?
+
+    Vietstock's invalid-session failure mode returns HTML (the cached
+    page fragment from /lich-su-kien.htm) or an empty body. The valid
+    mode returns application/json. We use this to decide whether to
+    refresh the session before doing the real fetch.
+    """
+    if not body or not body.strip():
+        return False
+    ct = (content_type or "").lower()
+    if "json" in ct:
+        return True
+    # Some endpoints return JSON with text/plain content-type; trust the
+    # leading character of the body.
+    head = body.lstrip()[:1]
+    if head in ("[", "{"):
+        return True
+    return False
+
+
+def validate_vietstock_session(
+    session: "VietstockSession",
+    timeout: float = 15.0,
+    today: str | None = None,
+) -> bool:
+    """Cheap probe: does this session+token produce a valid JSON response
+    with actual event data?
+
+    Issues a tiny POST to ``/data/eventstypedata`` for the last 7 days
+    with pageSize=1. We use 7 days (not just today) because the empty
+    ``[]`` response is what Vietstock returns for an invalid session,
+    so a today-only probe would always succeed (because invalid sessions
+    also return ``[]`` for empty ranges). Using a 7-day range (which
+    almost always has events on a trading day) lets us tell the difference
+    between \"valid session returning empty today\" vs \"invalid session
+    faking a response\".
+
+    Returns True only if:
+      1. The response has JSON content-type (or starts with ``[``/``{``).
+      2. The response parses as a non-empty list.
+    """
+    from datetime import datetime, timedelta  # local import
+    today = today or datetime.now().date().isoformat()
+    seven_days_ago = (datetime.now().date() - timedelta(days=7)).isoformat()
+    body = urllib.parse.urlencode({
+        "eventTypeID": 1,
+        "channelID": 0,
+        "code": "",
+        "catID": -1,
+        "fDate": seven_days_ago,
+        "tDate": today,
+        "page": 1,
+        "pageSize": 1,
+        "orderBy": "Date1",
+        "orderDir": "DESC",
+        "__RequestVerificationToken": session.token,
+    }).encode("utf-8")
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": "https://finance.vietstock.vn",
+        "Referer": VIETSTOCK_REFERER,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+        ),
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    request = urllib.request.Request(
+        VIETSTOCK_EVENTS_URL, data=body, method="POST", headers=headers,
+    )
+    try:
+        with session.opener.open(request, timeout=timeout) as response:
+            content_type = response.headers.get("Content-Type", "")
+            text = response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        return False
+    if not _looks_like_json_response(text, content_type):
+        return False
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    # Vietstock returns either [[rows], total] or [rows]. Either way,
+    # the first element is the rows list. A valid session on a
+    # 7-day window should return at least 1 event during trading days.
+    rows_container = parsed[0] if isinstance(parsed, list) and parsed else None
+    if isinstance(rows_container, list) and len(rows_container) > 0:
+        return True
+    # If the body parsed as JSON but is empty/non-list, the session
+    # is producing suspicious empty responses — treat as invalid.
+    return False
+
+
 def fetch_vietstock_events(
     from_date: str,
     to_date: str,
@@ -260,7 +360,18 @@ def fetch_vietstock_events_page_with_total(
     request = urllib.request.Request(VIETSTOCK_EVENTS_URL, data=body, method="POST", headers=headers)
     opener = session.opener if session and session.opener else urllib.request
     with opener.open(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        text = response.read().decode("utf-8", errors="replace")
+        content_type = response.headers.get("Content-Type", "")
+    # Defensive: if the server returned non-JSON, surface a clear error so
+    # the caller can refresh the session. (The session-level probe in
+    # sync_corporate_actions_incremental usually catches this first, but
+    # defence-in-depth.)
+    if not _looks_like_json_response(text, content_type):
+        raise RuntimeError(
+            f"Vietstock events returned non-JSON "
+            f"(content-type={content_type!r}, body[:100]={text[:100]!r})"
+        )
+    payload = json.loads(text)
     if isinstance(payload, list) and payload and isinstance(payload[0], list):
         total = int(payload[1]) if len(payload) > 1 and isinstance(payload[1], int) else None
         actions = [action for row in payload[0] if isinstance(row, dict) and (action := normalize_vietstock_event(row))]
@@ -382,7 +493,36 @@ def sync_corporate_actions_incremental(
     last_error: Exception | None = None
     backoff = initial_backoff_seconds
     for attempt in range(1, max_attempts + 1):
-        session = fetch_vietstock_session(timeout) if not request_verification_token else None
+        # Bootstrap a fresh session and VALIDATE it before doing any real
+        # fetches. Per user feedback (2026-09-09): when Vietstock returns
+        # an invalid/empty body, blindly retrying doesn't help because the
+        # session+token combo we just received may already be invalidated.
+        # Probing first means we discard bad sessions immediately and get a
+        # fresh one for the actual fetch.
+        session = None
+        validation_ok = False
+        # If the caller passed an explicit token/cookie, skip session
+        # bootstrap and the probe (we have everything we need).
+        if request_verification_token and cookie:
+            session = None  # explicit credentials → use them as-is
+            validation_ok = True
+        else:
+            for _ in range(2):  # try once, optionally refresh once
+                session = fetch_vietstock_session(timeout)
+                if validate_vietstock_session(session, timeout=min(timeout, 15.0)):
+                    validation_ok = True
+                    break
+                print(f"[CA sync] session probe failed; refreshing")
+
+        if not validation_ok:
+            last_error = RuntimeError("Vietstock session probe failed twice; upstream unreachable")
+            print(f"[CA sync] attempt {attempt}/{max_attempts} failed: {last_error}")
+            if attempt < max_attempts:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+                continue
+            raise last_error
+
         fetched: list[CorporateAction] = []
         page = 1
         total: int | None = None
@@ -401,6 +541,15 @@ def sync_corporate_actions_incremental(
                 fetched.extend(rows)
                 if not rows:
                     break
+                # Vietstock's `/data/eventstypedata` returns ALL rows for the
+                # date range in page 1 (total is always None). Pages >= 2
+                # always return an empty body, which would otherwise crash
+                # with "non-JSON response". Per user feedback 2026-09-09:
+                # when total is None and we got a full page of data on
+                # page 1, stop here — there's nothing more to fetch.
+                if total is None and len(rows) >= 1:
+                    break
+                # Other defensive break conditions.
                 if total is not None and page * page_size >= total:
                     break
                 page += 1
