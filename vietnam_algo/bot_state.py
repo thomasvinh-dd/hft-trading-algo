@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .data import DEFAULT_DATA_DIR, read_json, write_json
@@ -17,6 +17,11 @@ class AutoBotState:
     lastHeartbeatDate: str | None = None
     startOfDayDate: str | None = None
     tradingToken: str = ""
+    # Date (YYYY-MM-DD) we last sent a CA-sync-failure Telegram alert.
+    # Empty string means no failure alert has been sent. Resets after a
+    # successful sync (we clear it in save_state when sync succeeds).
+    caAlertSentDate: str = ""
+    last_ca_sync_error: str = ""  # most recent error message, for status display
 
 
 def state_path(data_dir: Path = DEFAULT_DATA_DIR, strategy_name: str = "") -> Path:
@@ -45,6 +50,8 @@ def load_state(data_dir: Path = DEFAULT_DATA_DIR, strategy_name: str = "") -> Au
         lastHeartbeatDate=payload.get("lastHeartbeatDate"),
         startOfDayDate=payload.get("startOfDayDate"),
         tradingToken=str(payload.get("tradingToken", "")),
+        caAlertSentDate=str(payload.get("caAlertSentDate") or ""),
+        last_ca_sync_error=str(payload.get("last_ca_sync_error") or ""),
     )
 
 

@@ -277,7 +277,6 @@ def run_auto_bot(
 
         if should_sync_corporate_actions(now, state.corporateActionDate, schedule, holidays):
             print(f"[{now.isoformat()}] Syncing Vietstock corporate actions")
-            notify(f"Vietnam Algo: syncing corporate actions\ntime: {now.isoformat()}")
             token = os.environ.get("VIETSTOCK_REQUEST_TOKEN", "")
             cookie = os.environ.get("VIETSTOCK_COOKIE", "")
             try:
@@ -288,34 +287,49 @@ def run_auto_bot(
                 to_date=today,
                 )
             except Exception as exc:
-                notify(
-                    "\n".join(
-                        [
-                            "⚠️ Vietnam Algo: corporate-action sync FAILED",
-                            f"err: {str(exc)[:300]}",
-                            "continuing without updated CA data",
-                        ]
+                # CA sync failed — downgrade from "FAILED" alert to a
+                # low-noise log+optional warning. The bot uses CA data
+                # only for forced exits on CA events; in dry-run mode
+                # the impact is zero, and even in live mode the existing
+                # CA cache (last successful sync) is still usable. Per
+                # user feedback (2026-09-09): the per-attempt Telegram
+                # alert was noisy; consolidate to ONE warning per day.
+                err_short = str(exc)[:200]
+                print(f"[{now.isoformat()}] CA sync failed: {err_short}")
+                # First-time failure today → Telegram warning.
+                if getattr(state, "caAlertSentDate", None) != today:
+                    notify(
+                        "\n".join(
+                            [
+                                "⚠️ Vietnam Algo: corporate-action sync FAILED (will retry tomorrow)",
+                                f"err: {err_short[:200]}",
+                                "continuing without updated CA data; using cached file",
+                            ]
+                        )
                     )
-                )
-                print(f"[{now.isoformat()}] CA sync failed: {exc}")
+                    state.caAlertSentDate = today
                 state.corporateActionDate = today  # don't retry on same day
                 save_state(state, engine_config.dataDir, strategy_name=strategy_name)
                 continue
             print(result)
-            notify(
-                "\n".join(
-                    [
-                        "Vietnam Algo: corporate actions synced",
-                        f"fromDate: {result.get('fromDate')}",
-                        f"toDate: {result.get('toDate')}",
-                        f"fetched: {result.get('fetched')}",
-                        f"added: {result.get('added')}",
-                        f"total: {result.get('total')}",
-                    ]
-                )
-            )
             state.corporateActionDate = today
+            state.caAlertSentDate = ""
             save_state(state, engine_config.dataDir, strategy_name=strategy_name)
+            # Only emit the success message if we actually fetched new
+            # events — avoids noisy "synced 0 events" messages.
+            if result.get("fetched", 0) > 0:
+                notify(
+                    "\n".join(
+                        [
+                            "Vietnam Algo: corporate actions synced",
+                            f"fromDate: {result.get('fromDate')}",
+                            f"toDate: {result.get('toDate')}",
+                            f"fetched: {result.get('fetched')}",
+                            f"added: {result.get('added')}",
+                            f"total: {result.get('total')}",
+                        ]
+                    )
+                )
 
         if should_run_start_of_day(
             now,

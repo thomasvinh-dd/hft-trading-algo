@@ -363,18 +363,22 @@ def sync_corporate_actions_incremental(
     to_date: str | None = None,
     page_size: int = 100,
     timeout: float = 30.0,
-    max_attempts: int = 5,
-    initial_backoff_seconds: float = 5.0,
+    max_attempts: int = 3,
+    initial_backoff_seconds: float = 10.0,
 ) -> dict[str, Any]:
     path = corporate_action_path(data_dir)
     existing = load_corporate_actions(path)
     from_date = latest_corporate_action_date(existing) or "2012-07-13"
     end_date = to_date or datetime.now().date().isoformat()
-    # Retry the full fetch loop on transient errors (anti-bot rate-limits
-    # occasionally return empty bodies mid-day). Each attempt refreshes the
-    # session so we re-bootstrap cookies and request token. Backoff doubles
-    # each attempt up to 60s, so the full retry window is ~3 minutes —
-    # long enough to ride out typical rate-limit windows on Vietstock.
+# Retry the full fetch loop on transient errors (anti-bot rate-limits
+    # occasionally return empty bodies mid-day, or Vietstock returns
+    # HTML on a session-cookie glitch). Each attempt refreshes the
+    # session so we re-bootstrap cookies and request token. Backoff
+    # doubles each attempt up to 60s.
+    #
+    # Per user feedback 2026-09-09: 5 attempts was too noisy and the
+    # upstream often fails all 5 identically (not transient, just
+    # blocking). Default reduced to 3 with 10s initial backoff.
     last_error: Exception | None = None
     backoff = initial_backoff_seconds
     for attempt in range(1, max_attempts + 1):
@@ -401,7 +405,7 @@ def sync_corporate_actions_incremental(
                     break
                 page += 1
             # If we got no rows AT ALL on an early attempt, treat as transient.
-            if not fetched and page == 1:
+            if not fetched:
                 raise RuntimeError("Vietstock returned empty payload (transient)")
             break
         except (json.JSONDecodeError, RuntimeError, urllib.error.URLError) as exc:
