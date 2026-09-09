@@ -1062,11 +1062,13 @@ class AutofinSignalAdapter(StrategyAdapter):
 
         # 5c. User-defined stop-loss (overrides autofin's loose SL with
         # a tighter one). Read from env so it can be tuned per-environment.
-        # 0 = disabled (use autofin's sL_F only).
+        # 0 = disabled (use autofin's sL_F only). Default 10% matches
+        # typical Vietnamese stock intraday volatility (~7%); 5% was
+        # too tight and got stopped out by noise on entry-day gaps.
         try:
-            user_sl_pct = float(os.environ.get("AUTOFIN_USER_SL_PCT", "0.05") or "0.05")
+            user_sl_pct = float(os.environ.get("AUTOFIN_USER_SL_PCT", "0.10") or "0.10")
         except ValueError:
-            user_sl_pct = 0.05
+            user_sl_pct = 0.10
 
         # 5d. Build a symbol → last_close price map from local price data.
         # Used to (a) gate entry on price-within-buy-zone and (b) include
