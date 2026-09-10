@@ -532,27 +532,45 @@ def eod_summary_message(
         skipped_lookup: dict[tuple, str] = {}
         clipped_lookup: dict[tuple, str] = {}
         if is_dry_run:
-            from .dry_run_state import _state_path as _dry_path
-            try:
-                dry_path = _dry_path(orders_info.parent.parent if orders_info else None)
-            except Exception:
-                dry_path = None
             try:
                 # dry-run state lives at data/live/dry_run_state.json
-                state_path = orders_info.parent / "dry_run_state.json"
+                state_path = Path(orders_info).parent / "dry_run_state.json"
                 if state_path.exists():
                     raw = json.loads(state_path.read_text())
                     for entry in reversed(raw.get("closed_trades") or []):
                         if not isinstance(entry, dict):
                             continue
-                        if entry.get("note", "").startswith("_applied:"):
+                        note = entry.get("note", "")
+                        if note.startswith("_applied:"):
                             for sk in entry.get("skipped") or []:
-                                k = (sk.get("symbol"), sk.get("side"), sk.get("price"), sk.get("qty"))
+                                # The skipped order is keyed by the
+                                # requested qty (what latest_orders.json
+                                # has). For BUYs that fail with no cash
+                                # there is no requested_qty, so qty IS
+                                # the requested qty.
+                                k = (
+                                    sk.get("symbol"),
+                                    sk.get("side"),
+                                    sk.get("price"),
+                                    sk.get("requested_qty") or sk.get("qty"),
+                                )
                                 skipped_lookup.setdefault(k, str(sk.get("reason", "skipped")))
                             for cl in entry.get("clipped") or []:
-                                k = (cl.get("symbol"), cl.get("side"), cl.get("price"), cl.get("qty"))
+                                # Clipped fills carry requested_qty
+                                # separately because qty is the
+                                # post-clip lot-rounded qty. Match by
+                                # requested so we can decorate the row
+                                # in latest_orders.json.
+                                k = (
+                                    cl.get("symbol"),
+                                    cl.get("side"),
+                                    cl.get("price"),
+                                    cl.get("requested_qty") or cl.get("qty"),
+                                )
                                 clipped_lookup.setdefault(k, f"clipped to {cl.get('qty')}")
                             break
+            except Exception:
+                pass
             except Exception:
                 pass
         for o in items[:20]:

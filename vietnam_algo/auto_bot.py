@@ -95,13 +95,22 @@ def _apply_dry_run_fills(
     clipped = [f for f in fills if f.get("status") == "clipped"]
     skipped = [f for f in fills if f.get("status") == "skipped"]
     if applied or clipped or skipped:
+        # Stamp each clipped entry with the requested_qty it came from
+        # so the notifier can match it back to the original order row
+        # in latest_orders.json (which still has the full requested qty).
+        clipped_for_log = []
+        for f in clipped:
+            entry = dict(f)
+            if "requested_qty" not in entry and "qty" in entry:
+                entry["requested_qty"] = entry["qty"]
+            clipped_for_log.append(entry)
         state.closed_trades.append({
             "note": marker_key,
             "applied_count": len(applied),
             "clipped_count": len(clipped),
             "skipped_count": len(skipped),
             "skipped": skipped,
-            "clipped": clipped,
+            "clipped": clipped_for_log,
             "fill_count": len(fills),
         })
     save_dry_run_state(state, engine_config.dataDir)
