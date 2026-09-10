@@ -126,13 +126,32 @@ class DryRunState:
 
 # ----- file I/O -----
 
-def _state_path(data_dir: Path) -> Path:
-    return data_dir / "live" / "dry_run_state.json"
+
+def _state_path(data_dir: Path, strategy_name: str = "") -> Path:
+    """Per-strategy dry-run state file.
+
+    Two strategies running on the same VPS (autofin_signal + momentum)
+    must NOT share ``dry_run_state.json`` — otherwise each bot's
+    ``_apply_dry_run_fills`` call clobbers the other bot's cash and
+    positions. We default to a strategy-suffixed file
+    (``dry_run_state.<strategy>.json``) and fall back to the legacy
+    un-suffixed path when ``strategy_name`` is empty (used by unit
+    tests that don't care about isolation).
+    """
+    if not strategy_name:
+        return data_dir / "live" / "dry_run_state.json"
+    safe = "".join(
+        c if c.isalnum() or c in ("-", "_") else "_"
+        for c in str(strategy_name)
+    ).strip("_") or "default"
+    return data_dir / "live" / f"dry_run_state.{safe}.json"
 
 
-def load_dry_run_state(data_dir: Path) -> DryRunState | None:
+def load_dry_run_state(
+    data_dir: Path, strategy_name: str = ""
+) -> DryRunState | None:
     """Load the persisted dry-run state. Returns None if file missing/empty."""
-    path = _state_path(data_dir)
+    path = _state_path(data_dir, strategy_name)
     if not path.exists():
         return None
     try:
@@ -144,11 +163,13 @@ def load_dry_run_state(data_dir: Path) -> DryRunState | None:
     return DryRunState.from_dict(payload)
 
 
-def save_dry_run_state(state: DryRunState, data_dir: Path) -> Path:
+def save_dry_run_state(
+    state: DryRunState, data_dir: Path, strategy_name: str = ""
+) -> Path:
     state.updated_at = datetime.now(UTC).isoformat()
     if not state.created_at:
         state.created_at = state.updated_at
-    path = _state_path(data_dir)
+    path = _state_path(data_dir, strategy_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
     return path
@@ -157,27 +178,29 @@ def save_dry_run_state(state: DryRunState, data_dir: Path) -> Path:
 def init_dry_run_state(
     data_dir: Path,
     initial_nav: float | None = None,
+    strategy_name: str = "",
 ) -> DryRunState:
     """Initialize a fresh dry-run state. Honours ``DRY_RUN_INITIAL_NAV`` /
     ``MOCK_NAV`` env vars. If state already exists, returns it untouched
     (use ``reset_dry_run_state`` if you want to wipe and start over)."""
-    existing = load_dry_run_state(data_dir)
+    existing = load_dry_run_state(data_dir, strategy_name)
     if existing is not None:
         return existing
     nav = initial_nav if initial_nav is not None else _initial_nav_from_env()
     state = DryRunState(initial_nav=nav, cash=nav)
-    save_dry_run_state(state, data_dir)
+    save_dry_run_state(state, data_dir, strategy_name)
     return state
 
 
 def reset_dry_run_state(
     data_dir: Path,
     initial_nav: float | None = None,
+    strategy_name: str = "",
 ) -> DryRunState:
     """Wipe the dry-run state and start fresh with the given NAV (or env default)."""
     nav = initial_nav if initial_nav is not None else _initial_nav_from_env()
     state = DryRunState(initial_nav=nav, cash=nav)
-    save_dry_run_state(state, data_dir)
+    save_dry_run_state(state, data_dir, strategy_name)
     return state
 
 

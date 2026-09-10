@@ -27,6 +27,7 @@ def _apply_dry_run_fills(
     engine_config: "EngineConfig",
     account_no: str,
     strategy_config: "StrategyConfig | None" = None,
+    strategy_name: str = "",
 ) -> None:
     """Apply today's ``latest_orders.json`` orders to the dry-run state.
 
@@ -46,13 +47,17 @@ def _apply_dry_run_fills(
 
     Cash-constrained BUYs are clipped to a board lot (default 100 —
        Vietnamese market) instead of partial fractional shares.
+
+    The dry-run state is per-strategy (autofin_signal vs momentum) so
+    that running two bots on the same VPS doesn't have them clobber
+    each other's simulated cash and positions.
     """
     from .dry_run_state import (
         apply_orders_to_state,
         init_dry_run_state,
         save_dry_run_state,
     )
-    state = init_dry_run_state(engine_config.dataDir)
+    state = init_dry_run_state(engine_config.dataDir, strategy_name=strategy_name)
     json_path = result.get("latestOrdersJson")
     if not json_path:
         return
@@ -64,6 +69,18 @@ def _apply_dry_run_fills(
         return
     items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(items, list) or not items:
+        return
+    # SL/TP brackets are CONDITIONAL orders — they should NOT fill at
+    # submission time. Treating them as immediate fills caused the bot
+    # to instantly close every new entry at a loss (autofin emits
+    # BUY + SL SELL as a pair). Only the AUTO entry kind (BUY/NS) is
+    # applied at plan time; bracket arms are tracked separately by
+    # the live order ledger.
+    items = [
+        o for o in items
+        if (str(o.get("kind") or "")).lower() not in ("sl", "tp", "tp_bracket")
+    ]
+    if not items:
         return
     trade_date = (
         payload.get("tradeDate")
@@ -113,7 +130,7 @@ def _apply_dry_run_fills(
             "clipped": clipped_for_log,
             "fill_count": len(fills),
         })
-    save_dry_run_state(state, engine_config.dataDir)
+    save_dry_run_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
 
 def _build_portfolio_snapshot(
@@ -121,6 +138,7 @@ def _build_portfolio_snapshot(
     account_no: str,
     engine_config: "EngineConfig",
     live_submit: bool,
+    strategy_name: str = "",
 ) -> dict:
     """Build a portfolio snapshot.
 
@@ -131,6 +149,10 @@ def _build_portfolio_snapshot(
     the same shape as ``build_portfolio_snapshot``'s output so the
     EOD/start-of-day formatters work transparently for both modes.
 
+    The dry-run state is per-strategy (``dry_run_state.<strategy>.json``)
+    so autofin and momentum don't clobber each other's simulated
+    cash and positions when both bots are running on the same VPS.
+
     The dry-run state is initialized from ``DRY_RUN_INITIAL_NAV`` (or
     the legacy ``MOCK_NAV``) env var, defaulting to 100,000,000 VND.
     """
@@ -140,7 +162,7 @@ def _build_portfolio_snapshot(
             init_dry_run_state,
             mark_to_market,
         )
-        state = init_dry_run_state(engine_config.dataDir)
+        state = init_dry_run_state(engine_config.dataDir, strategy_name=strategy_name)
         # Mark-to-market any open positions against the most recent close
         # we have locally — this gives a meaningful "live" P&L in the
         # summary even though we're not actually connected to a feed.
@@ -486,7 +508,10 @@ def run_auto_bot(
             # bot would have entered if it were live).
             if not live_submit and isinstance(result, dict):
                 try:
-                    _apply_dry_run_fills(result, engine_config, account_no, strategy_config)
+                    _apply_dry_run_fills(
+                        result, engine_config, account_no, strategy_config,
+                        strategy_name=strategy_name,
+                    )
                 except Exception as exc:
                     print(f"[{now.isoformat()}] dry-run fill replay failed: {exc}")
             # Fetch live portfolio snapshot once so the EOD summary can
@@ -496,6 +521,7 @@ def run_auto_bot(
             try:
                 portfolio_snap = _build_portfolio_snapshot(
                     client, account_no, engine_config, live_submit,
+                    strategy_name=strategy_name,
                 )
             except Exception as exc:
                 notify(

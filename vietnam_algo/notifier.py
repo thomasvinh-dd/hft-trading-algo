@@ -533,8 +533,25 @@ def eod_summary_message(
         clipped_lookup: dict[tuple, str] = {}
         if is_dry_run:
             try:
-                # dry-run state lives at data/live/dry_run_state.json
-                state_path = Path(orders_info).parent / "dry_run_state.json"
+                # dry-run state is per-strategy; the orders csv/json
+                # live at data/live/latest_orders[.<strategy>].{csv,json}
+                # so we can recover the strategy name from the file
+                # stem (e.g. "latest_orders.autofin_signal.json" →
+                # "autofin_signal"). Falls back to the legacy
+                # un-suffixed dry_run_state.json if that doesn't
+                # exist or isn't readable.
+                orders_stem = Path(orders_info).stem
+                strategy_suffix = ""
+                if orders_stem.startswith("latest_orders.") and orders_stem != "latest_orders":
+                    strategy_suffix = orders_stem[len("latest_orders."):]
+                live_dir = Path(orders_info).parent
+                if strategy_suffix:
+                    state_path = live_dir / f"dry_run_state.{strategy_suffix}.json"
+                else:
+                    state_path = live_dir / "dry_run_state.json"
+                if not state_path.exists():
+                    # Fall back: try the legacy un-suffixed path.
+                    state_path = live_dir / "dry_run_state.json"
                 if state_path.exists():
                     raw = json.loads(state_path.read_text())
                     for entry in reversed(raw.get("closed_trades") or []):
