@@ -524,6 +524,37 @@ def eod_summary_message(
     if items:
         lines.append("")
         lines.append(f"📋 Orders ({len(items)}):")
+        # In dry-run mode, distinguish applied orders from clipped/skipped
+        # ones so the user can see why a BUY they expected to fill did
+        # not (e.g., insufficient cash after a previous fill in the
+        # same cycle). The dry-run state records skipped/clipped fills
+        # in its closed_trades marker entry — match them up here.
+        skipped_lookup: dict[tuple, str] = {}
+        clipped_lookup: dict[tuple, str] = {}
+        if is_dry_run:
+            from .dry_run_state import _state_path as _dry_path
+            try:
+                dry_path = _dry_path(orders_info.parent.parent if orders_info else None)
+            except Exception:
+                dry_path = None
+            try:
+                # dry-run state lives at data/live/dry_run_state.json
+                state_path = orders_info.parent / "dry_run_state.json"
+                if state_path.exists():
+                    raw = json.loads(state_path.read_text())
+                    for entry in reversed(raw.get("closed_trades") or []):
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get("note", "").startswith("_applied:"):
+                            for sk in entry.get("skipped") or []:
+                                k = (sk.get("symbol"), sk.get("side"), sk.get("price"), sk.get("qty"))
+                                skipped_lookup.setdefault(k, str(sk.get("reason", "skipped")))
+                            for cl in entry.get("clipped") or []:
+                                k = (cl.get("symbol"), cl.get("side"), cl.get("price"), cl.get("qty"))
+                                clipped_lookup.setdefault(k, f"clipped to {cl.get('qty')}")
+                            break
+            except Exception:
+                pass
         for o in items[:20]:
             sym = o.get("symbol", "?")
             side = o.get("side", "?")
@@ -534,7 +565,19 @@ def eod_summary_message(
                 price_s = str(price)
             qty = o.get("quantity", 0)
             reason = str(o.get("reason") or "")[:30]
-            lines.append(f"  • {side} {qty} {sym} @ {price_s} VND  ({reason})")
+            tag = ""
+            if is_dry_run:
+                try:
+                    key = (sym, side, float(price), float(qty))
+                except (TypeError, ValueError):
+                    key = None
+                if key in skipped_lookup:
+                    tag = f"  ⚠ SKIPPED ({skipped_lookup[key]})"
+                elif key in clipped_lookup:
+                    tag = f"  ✂️ {clipped_lookup[key]}"
+                elif side == "BUY":
+                    tag = "  ✓ filled"
+            lines.append(f"  • {side} {qty} {sym} @ {price_s} VND  ({reason}){tag}")
         if len(items) > 20:
             lines.append(f"  ... and {len(items) - 20} more")
     lines.append("")

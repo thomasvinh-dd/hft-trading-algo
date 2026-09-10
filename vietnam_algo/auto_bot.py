@@ -26,6 +26,7 @@ def _apply_dry_run_fills(
     result: dict,
     engine_config: "EngineConfig",
     account_no: str,
+    strategy_config: "StrategyConfig | None" = None,
 ) -> None:
     """Apply today's ``latest_orders.json`` orders to the dry-run state.
 
@@ -34,9 +35,17 @@ def _apply_dry_run_fills(
     the local ``DryRunState`` so subsequent cycles see realistic cash,
     positions, and realized P&L — without ever calling DNSE.
 
-    Dedup is handled by tagging ``state.closed_trades`` with the trade
-    date, so re-running the EOD cycle (e.g. after a restart) does NOT
-    apply the same orders twice.
+    Two layers of dedup protect against double-applies:
+
+    1. Per-trade-date marker (``_applied:{trade_date}``) so a bot restart
+       mid-cycle doesn't re-apply today's plan.
+    2. Per-order dedup (date+symbol+side+qty+price) inside
+       ``apply_orders_to_state`` so individual orders from the backtest's
+       repeated trade history don't accumulate position qty across
+       multiple EOD cycles.
+
+    Cash-constrained BUYs are clipped to a board lot (default 100 —
+       Vietnamese market) instead of partial fractional shares.
     """
     from .dry_run_state import (
         apply_orders_to_state,
@@ -68,10 +77,31 @@ def _apply_dry_run_fills(
         for t in state.closed_trades[-100:]
     ):
         return
-    fills = apply_orders_to_state(state, items)
-    if fills:
+    # Use the same board lot and fee the strategy uses for real orders
+    # so dry-run cash accounting matches what live mode would do.
+    if strategy_config is not None:
+        board_lot = int(getattr(strategy_config, "boardLotSize", 0) or 100) or 100
+        fee_rate = float(getattr(strategy_config, "feeRate", 0) or 0)
+    else:
+        from .config import StrategyConfig
+        default_cfg = StrategyConfig()
+        board_lot = int(getattr(default_cfg, "boardLotSize", 100) or 100)
+        fee_rate = float(getattr(default_cfg, "feeRate", 0.0) or 0)
+    fees_bps = fee_rate * 10_000
+    fills = apply_orders_to_state(
+        state, items, board_lot=board_lot, fees_bps=fees_bps,
+    )
+    applied = [f for f in fills if f.get("status") == "applied"]
+    clipped = [f for f in fills if f.get("status") == "clipped"]
+    skipped = [f for f in fills if f.get("status") == "skipped"]
+    if applied or clipped or skipped:
         state.closed_trades.append({
             "note": marker_key,
+            "applied_count": len(applied),
+            "clipped_count": len(clipped),
+            "skipped_count": len(skipped),
+            "skipped": skipped,
+            "clipped": clipped,
             "fill_count": len(fills),
         })
     save_dry_run_state(state, engine_config.dataDir)
@@ -238,6 +268,7 @@ def run_auto_bot(
                     result = run_daily_once(
                         engine_config,
                         strategy_config,
+                        trade_date=today,
                         submit=live_submit,
                         account_no=account_no,
                         loan_package_id=loan_package_id,
@@ -446,7 +477,7 @@ def run_auto_bot(
             # bot would have entered if it were live).
             if not live_submit and isinstance(result, dict):
                 try:
-                    _apply_dry_run_fills(result, engine_config, account_no)
+                    _apply_dry_run_fills(result, engine_config, account_no, strategy_config)
                 except Exception as exc:
                     print(f"[{now.isoformat()}] dry-run fill replay failed: {exc}")
             # Fetch live portfolio snapshot once so the EOD summary can

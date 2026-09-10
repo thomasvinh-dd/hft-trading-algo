@@ -196,10 +196,35 @@ def _initial_nav_from_env() -> float:
 # ----- order application -----
 
 
+def _dedup_key(order: dict[str, Any]) -> str:
+    """Stable per-order key used to detect already-applied orders.
+
+    Same shape as ``latest_orders.json`` rows: date + symbol + side +
+    qty + price. The price/qty are kept in the key because the EOD
+    summary shows the EXACT orders being submitted; if a row with the
+    same shape has been applied already, we don't want to apply it again.
+    """
+    return (
+        f"{order.get('date', '')}|{order.get('symbol', '')}|"
+        f"{order.get('side', '')}|{order.get('quantity', '')}|"
+        f"{order.get('price', '')}"
+    )
+
+
+def _get_applied_keys(state: DryRunState) -> set[str]:
+    keys: set[str] = set()
+    for t in state.closed_trades:
+        if isinstance(t, dict) and t.get("applied_keys"):
+            keys.update(str(k) for k in t["applied_keys"])
+    return keys
+
+
 def apply_orders_to_state(
     state: DryRunState,
     orders: Iterable[dict[str, Any]],
     prices: dict[str, float] | None = None,
+    board_lot: int = 100,
+    fees_bps: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Apply BUY/SELL orders from ``latest_orders.json`` to a DryRunState.
 
@@ -208,10 +233,24 @@ def apply_orders_to_state(
       * ``symbol``
       * ``price``
       * ``quantity``
+      * ``date`` (optional — used for dedup; orders with the same
+        date/symbol/side/qty/price are skipped if already applied)
 
-    Returns a list of fills that were applied (so the caller can log).
+    ``board_lot`` is the lot size to round to on cash-constrained
+    clipped buys (default 100 — Vietnamese board lot). ``fees_bps`` is
+    the round-trip fee in basis points added to the cash debit on each
+    BUY so the cash column tracks the strategy's actual fill cost.
+
+    Returns a list of fill dicts. Each fill has a ``status`` field:
+      * ``"applied"`` — full qty filled
+      * ``"clipped"``  — qty was reduced due to cash constraint, rounded
+        down to a board lot. The fill has ``requested_qty`` recorded.
+      * ``"skipped"``  — couldn't apply at all (no cash, no position,
+        already applied, invalid input, etc.). Reason in ``reason``.
     """
     fills: list[dict[str, Any]] = []
+    applied_keys = _get_applied_keys(state)
+    applied_now: list[str] = []
     for o in orders:
         sym = str(o.get("symbol") or "").strip().upper()
         if not sym:
@@ -235,16 +274,47 @@ def apply_orders_to_state(
         if price <= 0:
             continue
 
+        # Dedup: skip if we've already applied this exact order.
+        dedup = _dedup_key({**o, "symbol": sym, "side": side_raw})
+        if dedup in applied_keys:
+            fills.append({
+                "status": "skipped", "reason": "already_applied",
+                "symbol": sym, "side": side, "qty": qty, "price": price,
+            })
+            continue
+
         pos = state.positions.get(sym) or DryRunPosition(symbol=sym)
+        requested_qty = qty
         if side == "BUY":
-            cost = qty * price
+            cost = qty * price * (1 + fees_bps / 10_000)
+            clipped = False
             if state.cash < cost:
-                # cash-constrained: clip qty to what we can afford
-                max_qty = int(state.cash // price)
+                # cash-constrained: clip qty to what we can afford, then
+                # round down to the nearest board lot. Without the board
+                # lot step, the simulated portfolio ends up holding
+                # 146-share VIC positions etc., which is unrealistic.
+                max_qty = int(state.cash // (price * (1 + fees_bps / 10_000)))
                 if max_qty <= 0:
+                    fills.append({
+                        "status": "skipped", "reason": "insufficient_cash",
+                        "symbol": sym, "side": side, "qty": qty, "price": price,
+                        "requested_qty": requested_qty,
+                    })
                     continue
-                qty = max_qty
-                cost = qty * price
+                if board_lot > 1:
+                    lot_qty = (max_qty // board_lot) * board_lot
+                else:
+                    lot_qty = max_qty
+                if lot_qty <= 0:
+                    fills.append({
+                        "status": "skipped", "reason": "below_board_lot",
+                        "symbol": sym, "side": side, "qty": qty, "price": price,
+                        "requested_qty": requested_qty,
+                    })
+                    continue
+                qty = min(qty, lot_qty)
+                cost = qty * price * (1 + fees_bps / 10_000)
+                clipped = qty < requested_qty
             new_qty = pos.quantity + qty
             pos.avg_price = (
                 (pos.avg_price * pos.quantity + price * qty) / new_qty
@@ -253,20 +323,30 @@ def apply_orders_to_state(
             pos.quantity = new_qty
             pos.cost_basis = pos.quantity * pos.avg_price
             state.cash -= cost
-            fills.append({
+            fill = {
+                "status": "clipped" if clipped else "applied",
                 "side": "BUY", "symbol": sym, "qty": qty,
                 "price": price, "value": cost,
-            })
+            }
+            if clipped:
+                fill["requested_qty"] = requested_qty
+            fills.append(fill)
+            applied_keys.add(dedup)
+            applied_now.append(dedup)
         else:  # SELL
             sell_qty = min(qty, pos.quantity)
             if sell_qty <= 0:
+                fills.append({
+                    "status": "skipped", "reason": "no_position",
+                    "symbol": sym, "side": side, "qty": qty, "price": price,
+                    "requested_qty": requested_qty,
+                })
                 continue
             proceeds = sell_qty * price
             realized = (price - pos.avg_price) * sell_qty if pos.avg_price > 0 else 0.0
             pos.quantity -= sell_qty
             pos.cost_basis = pos.quantity * pos.avg_price
             if pos.quantity == 0:
-                # record closed trade
                 state.closed_trades.append({
                     "symbol": sym,
                     "avg_cost": pos.avg_price,
@@ -278,10 +358,13 @@ def apply_orders_to_state(
             state.cash += proceeds
             state.realized_pnl += realized
             fills.append({
+                "status": "applied",
                 "side": "SELL", "symbol": sym, "qty": sell_qty,
                 "price": price, "value": proceeds,
                 "realized_pnl": realized,
             })
+            applied_keys.add(dedup)
+            applied_now.append(dedup)
 
         # update last_price from prices dict or fill price
         pos.last_price = (
@@ -292,6 +375,14 @@ def apply_orders_to_state(
             state.positions.pop(sym, None)
         else:
             state.positions[sym] = pos
+
+    # Persist the dedup keys in a closed_trades marker entry so the
+    # next call to apply_orders_to_state sees them.
+    if applied_now:
+        state.closed_trades.append({
+            "note": "_applied_keys",
+            "applied_keys": applied_now,
+        })
     return fills
 
 

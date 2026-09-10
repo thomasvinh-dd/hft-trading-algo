@@ -90,14 +90,16 @@ class DryRunStateTests(unittest.TestCase):
     def test_buy_clipped_to_available_cash(self) -> None:
         state = DryRunState(initial_nav=10_000_000, cash=10_000_000)
         # Try to buy 1000 shares @ 75,000 = 75M (way more than 10M cash).
-        # apply_orders_to_state should clip qty to 10M / 75k = 133 shares.
-        fills = apply_orders_to_state(state, [
-            {"side": "NB", "symbol": "VHM", "price": 75_000, "quantity": 1000},
-        ])
-        # We may get a clipped fill or none — depends on the integer division.
-        # Either cash > 0 and we bought at most 133 shares, or no fill at all.
+        # With board_lot=100 (Vietnam default), the buy rounds down to
+        # 100 shares; with board_lot=1 it would be 133. Either way the
+        # clip is enforced — and cash must not go negative.
+        fills = apply_orders_to_state(
+            state,
+            [{"side": "NB", "symbol": "VHM", "price": 75_000, "quantity": 1000}],
+            board_lot=100,
+        )
         if fills:
-            self.assertLessEqual(fills[0]["qty"], 133)
+            self.assertLessEqual(fills[0]["qty"], 100)
             self.assertGreaterEqual(state.cash, 0)
 
     def test_sell_records_realized_pnl(self) -> None:
