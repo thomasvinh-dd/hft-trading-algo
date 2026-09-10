@@ -877,6 +877,7 @@ def decide_orders(
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
     already_planned_symbols: set[str] | None = None,
+    actioned_deals: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -919,6 +920,15 @@ def decide_orders(
         if did:
             autofin_holding_by_id[did] = dict(d)
 
+    # 1b. Deal-ids the bot has ever issued ANY order for (entry, partial
+    # close, or full close). These are tracked so we don't re-enter a
+    # deal we previously closed — autofin keeps re-suggesting open deals
+    # even after we fully exit them, and ``_our_deals`` doesn't always
+    # retain them once _our_qty hits 0. The caller (AutofinSignalAdapter)
+    # provides this set from its persistent ``_actioned_deals``.
+    if config:
+        pass  # placeholder so future per-config plumbing lives here
+
     # 2. Augment signals with HELD-but-not-entered deals that are
     # currently in the buy zone. Per user feedback (2026-09-08): an
     # autofin recommendation gives a price range, not a one-day
@@ -931,6 +941,23 @@ def decide_orders(
         augmented_signals = _expand_signals_with_held_unentered(
             signals, holding, our_deals, current_prices,
         )
+
+    # 2b. Filter out signals for deals we've ALREADY actioned (entry,
+    # partial-close, or full-close) at any point in the past. autofin
+    # keeps re-suggesting deals we previously closed because it tracks
+    # them as still-open in /signal-static-suggest; without this guard
+    # the bot would re-enter the same deal on the next cycle.
+    if actioned_deals:
+        before = len(augmented_signals)
+        augmented_signals = [
+            s for s in augmented_signals
+            if _deal_id(s.raw) not in actioned_deals
+        ]
+        if before != len(augmented_signals):
+            print(
+                f"[decide_orders] filtered {before - len(augmented_signals)} "
+                f"signal(s) for already-actioned deals"
+            )
 
     # 3. Select new-entry signals (top risk-adjusted, NAV-budgeted).
     # NOTE (2026-09-07, fixed-sizing model): we use the SUGGEST
@@ -1003,13 +1030,34 @@ def decide_orders(
                 and "sl:" not in o["reason"]
             ):
                 new_our_deals[did]["_our_qty"] = o["quantity"]
-    # for each close, drop the deal
+    # for each close, mark the deal closed (qty=0) but KEEP it in the
+    # dict so we can detect re-entry attempts later. Previously we
+    # popped it, but autofin's suggest endpoint keeps returning the
+    # same deal as an open BUY even after we exit it — that path
+    # caused a re-entry bug on 2026-09-10 (TRC re-entered after
+    # full_close). Keeping the row with qty=0 is the safety net;
+    # ``_actioned_deals`` (separate set, persisted) is the primary
+    # guard.
+    closed_dids: set[str] = set()
     for o in close_orders:
         closed_did = _extract_deal_id(o.get("reason", ""))
-        if closed_did:
-            new_our_deals.pop(closed_did, None)
+        if closed_did and closed_did in new_our_deals:
+            new_our_deals[closed_did]["_our_qty"] = 0
+            closed_dids.add(closed_did)
 
+    # 5b. Mark every deal that produced an order as "actioned" so we
+    # never re-enter it on a later cycle, even if our_deals is wiped
+    # or the suggest endpoint re-surfaces the same open deal.
     all_orders = close_orders + partial_orders + new_orders
+    actioned_dids: set[str] = set()
+    for o in all_orders:
+        did = _extract_deal_id(o.get("reason", ""))
+        if did:
+            actioned_dids.add(did)
+    # Merge the in-cycle actioned set into the caller's persistent set.
+    if actioned_deals is not None:
+        actioned_deals |= actioned_dids
+
     deals_actioned = _build_deals_actioned(
         new_orders, partial_orders, close_orders, autofin_holding_by_id
     )
@@ -1030,6 +1078,11 @@ class AutofinSignalAdapter(StrategyAdapter):
         # Order-key set already sent to Telegram — used to de-dupe per-order
         # notifications so we don't spam the chat every poll.
         self._notified_order_keys: set[str] = set()
+        # deal_id set for deals we've EVER issued any order for (entry,
+        # partial-close, or full-close). Persisted across restarts so the
+        # bot doesn't re-enter a deal it previously closed — autofin keeps
+        # suggesting open deals even after we fully close them.
+        self._actioned_deals: set[str] = set()
         # Last time the strategy ran (UTC ISO). Used by the bot to throttle
         # mid-day polls to once per hour.
         self._last_poll_at: str | None = None
@@ -1067,6 +1120,14 @@ class AutofinSignalAdapter(StrategyAdapter):
             self._notified_event_ids = set(
                 str(x) for x in (payload.get("notified_event_ids") or [])
             )
+            # _actioned_deals is the union of: every deal_id we've ever
+            # held with qty > 0 (from our_deals, in case _actioned_deals
+            # wasn't persisted on an older build) plus the explicit set.
+            actioned = set(payload.get("actioned_deals", []) or [])
+            for did, sig in self._our_deals.items():
+                if int(sig.get("_our_qty", 0) or 0) > 0:
+                    actioned.add(str(did))
+            self._actioned_deals = actioned
         except Exception:
             self._our_deals = {}
             self._notified_order_keys = set()
@@ -1074,6 +1135,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             self._last_notification_id = ""
             self._last_notification_poll_at = None
             self._notified_event_ids = set()
+            self._actioned_deals = set()
 
     def _save_state(self, data_dir: Path) -> None:
         path = data_dir / "live" / "autofin_signal_state.json"
@@ -1086,6 +1148,7 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "last_notification_id": self._last_notification_id,
                 "last_notification_poll_at": self._last_notification_poll_at,
                 "notified_event_ids": sorted(self._notified_event_ids),
+                "actioned_deals": sorted(self._actioned_deals),
                 "updatedAt": datetime.now(timezone.utc).isoformat(),
             },
             indent=2,
@@ -1367,6 +1430,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             user_sl_pct=user_sl_pct,
             current_prices=current_prices,
             already_planned_symbols=already_planned_symbols,
+            actioned_deals=self._actioned_deals,
         )
 
         # 9b. Notification-driven mid-day TP/SL detection. Per user feedback

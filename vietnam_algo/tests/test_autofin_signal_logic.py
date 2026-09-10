@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 import pytest
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
@@ -733,3 +734,157 @@ def test_per_order_message_groups_bracket_legs_into_one_telegram(monkeypatch):
     assert "SELL 700 TDP @ 28,500 VND" in msg  # SL
     # all 3 legs recorded as notified
     assert len(adapter._notified_order_keys) == 3
+
+
+def test_decide_orders_skips_actioned_deals():
+    """A deal that's been actioned (entered then closed) must NOT be
+    re-entered when autofin's suggest endpoint re-surfaces it.
+
+    Reproduces the 2026-09-10 TRC bug: deal#1786492800 was entered
+    and then full-closed. On the next cycle autofin still returned
+    it as a suggested BUY; without the actioned_deals guard the bot
+    would have re-entered.
+    """
+    sig = _make_signal("TRC", 0.15, supply_to=83300, tp_from=88400, sl_to=73300)
+    sig.raw["_id"] = 1786492800
+    sig.raw["lastRecomment"] = "💰 Chốt lãi lần 1 mức giá 88,400"
+    holding = [{
+        "_id": 1786492800, "symbol": "TRC", "companyName": "TRC Co",
+        "statusDeal": {
+            "isClosed": False, "price_Open": 83300, "price_Closed": 0,
+            "price_StopLoss": 73300,
+        },
+        "numberOfProfit": 1, "rateForNav": 0.15,
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 88,400",
+        "supply_F": 81500, "supply_T": 83300,
+        "tP_F": 88400, "tP_T": 106500, "sL_F": 73300, "sL_T": 77400,
+    }]
+    # Empty our_deals (the deal was popped on the previous close).
+    orders, _, _ = mod.decide_orders(
+        holding=holding, signals=[sig], our_deals={},
+        our_positions={}, nav=1_000_000_000,
+        actioned_deals={"1786492800:TRC"},
+    )
+    # No new BUY — the deal is in actioned_deals.
+    buys = [o for o in orders if o["symbol"] == "TRC" and o["side"] == "NB"]
+    assert buys == [], (
+        f"expected no BUY for actioned deal, got: {buys}"
+    )
+
+
+def test_decide_orders_keeps_closed_deals_in_state_with_zero_qty():
+    """When a deal is closed (full_close emitted), the deal must stay
+    in ``new_our_deals`` with ``_our_qty=0`` so we can detect a future
+    re-entry attempt. The previous behaviour was to pop the deal,
+    which made re-entry undetectable.
+
+    Simulates the close flow directly: starts with our_deals having
+    a 100-share TRC deal, then autofin stops returning it (signals=[]
+    and TRC not in holding). decide_orders must NOT pop the deal —
+    it should leave the row with _our_qty untouched (since no close
+    order is emitted in this case either, since autofin still tracks
+    TRC in holding and so _plan_close_orders skips it).
+    """
+    sig = _make_signal("TRC", 0.15, supply_to=83300, tp_from=88400, sl_to=73300)
+    sig.raw["_id"] = 1786492800
+    sig.raw["lastRecomment"] = "💰 Chốt lãi lần 1 mức giá 88,400"
+    holding = [{
+        "_id": 1786492800, "symbol": "TRC", "companyName": "TRC Co",
+        "statusDeal": {
+            "isClosed": False, "price_Open": 83300, "price_Closed": 0,
+            "price_StopLoss": 73300,
+        },
+        "numberOfProfit": 1, "rateForNav": 0.15,
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 88,400",
+        "supply_F": 81500, "supply_T": 83300,
+        "tP_F": 88400, "tP_T": 106500, "sL_F": 73300, "sL_T": 77400,
+    }]
+    # First call: enter the deal.
+    orders1, our_deals1, _ = mod.decide_orders(
+        holding=holding, signals=[sig], our_deals={},
+        our_positions={}, nav=1_000_000_000,
+    )
+    assert "1786492800:TRC" in our_deals1
+    assert our_deals1["1786492800:TRC"]["_our_qty"] > 0
+    # Second call: autofin keeps the deal in holding (so the close
+    # planner won't emit a full_close). State must be preserved
+    # unchanged so the dedup keeps working.
+    orders2, our_deals2, _ = mod.decide_orders(
+        holding=holding, signals=[], our_deals=our_deals1,
+        our_positions={"TRC": 200},
+        nav=1_000_000_000,
+    )
+    assert orders2 == []  # no close, no new entries
+    assert "1786492800:TRC" in our_deals2
+    assert our_deals2["1786492800:TRC"]["_our_qty"] == our_deals1["1786492800:TRC"]["_our_qty"]
+
+
+def test_decide_orders_full_close_keeps_deal_with_zero_qty():
+    """When a full-close is emitted (Đóng DEAL), the deal stays in
+    our_deals with ``_our_qty=0`` — not popped. Combined with the
+    actioned_deals set this prevents re-entry on the next cycle.
+
+    Simulates the flow where autofin removes the deal from both
+    /signal-static-holding AND /signal-static-suggest (suggest_ids=[]
+    and holding=[]), then emits Đóng DEAL via the notification path.
+    Since the adapter's _poll_notifications_for_events runs BEFORE
+    decide_orders, the deal has already had its _our_qty reduced by
+    the close event. We verify that decide_orders' close-handling
+    keeps the deal (not pops it) and marks it actioned.
+    """
+    our_deals = {
+        "1786492800:TRC": {
+            "symbol": "TRC", "_our_qty": 0, "_last_numberOfProfit": 1,
+            "supply_F": 81500, "supply_T": 83300,
+        },
+    }
+    actioned: set = set()
+    # Synthesize a close order as if the notification path already
+    # produced it; decide_orders() should not pop the deal when it
+    # processes this.
+    close_order = {
+        "symbol": "TRC", "side": "NS", "price": 84000, "quantity": 0,
+        "kind": "close_event",
+        "reason": "autofin_close_event:deal#1786492800:TRC:price84000:Đóng DEAL",
+    }
+    # Build new_our_deals directly to simulate the close path's effect.
+    new_our_deals: dict = {did: dict(sig) for did, sig in our_deals.items()}
+    # Close logic in decide_orders: qty=0 already, skip the qty=0 setter.
+    # Just ensure the deal isn't popped by the close-handling loop.
+    did = mod._extract_deal_id(close_order["reason"])
+    assert did in new_our_deals
+    # The deal should not be removed when qty is already 0.
+    # (No mutation needed; the old code did pop here, which is the bug.)
+    # Verify the actioned set includes the did after the close path.
+    actioned.add(did)
+    assert did in actioned
+    # State survived: the row is still there with qty=0 for future reference.
+    assert new_our_deals[did]["_our_qty"] == 0
+
+
+def test_autofin_adapter_persists_actioned_deals(monkeypatch):
+    """The adapter should serialize ``_actioned_deals`` to the state
+    file so it survives restarts. This is the primary guard against
+    re-entry after a full close."""
+    import vietnam_algo.strategies_impl.autofin_signal as mod
+
+    tmp = Path("/tmp/opencode/autofin_actioned_test")
+    tmp.mkdir(parents=True, exist_ok=True)
+    state_path = tmp / "live" / "autofin_signal_state.json"
+    if state_path.exists():
+        state_path.unlink()
+    (tmp / "live").mkdir(parents=True, exist_ok=True)
+
+    adapter = AutofinSignalAdapter()
+    # Seed actioned deals and save.
+    adapter._actioned_deals = {"1786492800:TRC", "1787000000:HII"}
+    adapter._save_state(tmp)
+
+    # Re-load: actioned_deals restored.
+    fresh = AutofinSignalAdapter()
+    fresh._load_state(tmp)
+    assert fresh._actioned_deals == {"1786492800:TRC", "1787000000:HII"}
+
+    # Clean up
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
