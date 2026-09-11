@@ -733,9 +733,20 @@ def run_auto_bot(
             # which don't go through run_daily_once → run_momentum_rotation.
             # Fall back to the legacy generate_live_orders() for momentum /
             # hybrid strategies.
+            #
+            # For backtest-style strategies (momentum), the EOD should
+            # always pick the latest trades in the backtest CSV (or
+            # ``today`` if those happen to align). Forcing
+            # ``trade_date=today`` produces an empty plan when the
+            # backtest hasn't been refreshed to the calendar's current
+            # trading day — see the 2026-09-11 incident where the
+            # latest_orders file ended up empty and the briefing then
+            # read a stale Sept 7 fallback. Letting adapters decide
+            # (most pass None → falls back to the latest CSV row) is
+            # safer for dry-run/replay bots.
             if strategy_adapter is not None:
                 result = strategy_adapter.generate_orders(
-                    engine_config, strategy_config, trade_date=today,
+                    engine_config, strategy_config,
                 )
             else:
                 result = generate_live_orders(

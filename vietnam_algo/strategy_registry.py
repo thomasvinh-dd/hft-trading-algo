@@ -45,9 +45,16 @@ class MomentumRotationAdapter(StrategyAdapter):
         trade_date: str | None = None,
     ) -> dict[str, Any]:
         # Use the legacy generate_live_orders path which writes to backtests/.
-        # We also need to copy the CSV into our strategy-named latest_orders
-        # location so different strategies don't clobber each other.
-        result = generate_live_orders(config, strategy_config, trade_date=trade_date)
+        # Pass ``strategy_name=self.name`` so the per-strategy latest_orders
+        # files (data/live/latest_orders.momentum.csv/.json) get the same
+        # contents the start-of-day briefing reads. Without this arg,
+        # ``generate_live_orders`` falls back to the legacy
+        # ``latest_orders.json`` filename, leaving the strategy-namespaced
+        # file stale and the briefing showing yesterday's plan.
+        result = generate_live_orders(
+            config, strategy_config, trade_date=trade_date,
+            strategy_name=self.name,
+        )
         return result
 
 
