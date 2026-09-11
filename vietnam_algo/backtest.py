@@ -1702,6 +1702,7 @@ def save_order_list(result: BacktestResult, data_dir: Path = DEFAULT_DATA_DIR) -
         writer.writeheader()
         for order_id, trade in enumerate(result.trades, start=1):
             writer.writerow({"orderId": order_id, **trade})
+    return path
 
 
 def _initial_cash_from_result(path: Path) -> float | None:
@@ -1726,4 +1727,3 @@ def _initial_cash_from_result(path: Path) -> float | None:
         return float(cash) if cash else None
     except (TypeError, ValueError):
         return None
-    return path
