@@ -878,6 +878,7 @@ def decide_orders(
     current_prices: dict[str, float] | None = None,
     already_planned_symbols: set[str] | None = None,
     actioned_deals: set[str] | None = None,
+    data_dir: "Path | None" = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -912,6 +913,30 @@ def decide_orders(
         Telegram formatting.
     """
     config = config or StrategyConfig()
+
+    # 0. Reconcile _our_deals against the dry-run state (if a path is
+    # provided). The autofin tracking state and the dry-run state can
+    # drift if the state file gets wiped (e.g. during a migration or
+    # manual reset). Without this check, _plan_close_orders() can emit
+    # a full-close for a deal whose position was never recorded in the
+    # dry-run state — leading to "Today's planned orders" showing a
+    # stale SELL for a symbol we don't actually hold. Dry-run is
+    # ground truth; tracking follows.
+    if data_dir is not None:
+        try:
+            from ..dry_run_state import init_dry_run_state as _init_dry
+            _dry = _init_dry(data_dir, strategy_name="autofin_signal")
+            for _did, _sig in list(our_deals.items()):
+                _sym = str(_sig.get("symbol") or "").upper()
+                if not _sym:
+                    continue
+                _dry_pos = _dry.positions.get(_sym)
+                _dry_qty = int(_dry_pos.quantity) if _dry_pos is not None else 0
+                _trk_qty = int(_sig.get("_our_qty", 0) or 0)
+                if _dry_qty == 0 and _trk_qty > 0:
+                    _sig["_our_qty"] = 0
+        except Exception as exc:
+            print(f"[decide_orders] dry-run reconcile skipped: {exc}")
 
     # 1. Build lookup maps from holding snapshot
     autofin_holding_by_id: dict[str, dict[str, Any]] = {}
@@ -1428,6 +1453,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             nav=nav,
             config=strategy_config,
             user_sl_pct=user_sl_pct,
+            data_dir=config.dataDir,
             current_prices=current_prices,
             already_planned_symbols=already_planned_symbols,
             actioned_deals=self._actioned_deals,
