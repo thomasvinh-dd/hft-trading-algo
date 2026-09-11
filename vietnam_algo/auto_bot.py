@@ -532,6 +532,31 @@ def run_auto_bot(
             schedule=schedule,
             holidays=holidays,
         ):
+            # Same data-ready gate as EOD: don't show a briefing that
+            # uses yesterday's prices just because the data-sync owner
+            # hasn't run yet today. We re-use the data_ready_for_eod
+            # sentinel that's stamped after the owner's sync.
+            if not engine_config.syncData:
+                try:
+                    _ready = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
+                    if not _ready.exists() or (
+                        _ready.exists()
+                        and (
+                            __import__("datetime").datetime
+                            .now(__import__("datetime").timezone.utc)
+                            .timestamp()
+                            - _ready.stat().st_mtime
+                        )
+                        / 60
+                        > 60 * 18
+                    ):
+                        print(
+                            f"[{now.isoformat()}] waiting for data-sync owner "
+                            f"to refresh prices before start-of-day briefing"
+                        )
+                        continue
+                except Exception as exc:
+                    print(f"[{now.isoformat()}] data-ready probe failed: {exc}")
             print(f"[{now.isoformat()}] Sending start-of-day briefing")
             try:
                 from .notifier import start_of_day_message
@@ -660,6 +685,33 @@ def run_auto_bot(
                     print(f"[{now.isoformat()}] mid-day poll failed: {exc}")
 
         if should_run_eod(now, state.eodDate, schedule, holidays):
+            # When this bot doesn't own data sync, wait for the data-
+            # sync owner (autofin) to finish refreshing prices + CA
+            # before we proceed. We poll for a sentinel file
+            # ``data_ready_for_eod`` written by the owner; if it's
+            # absent or stale, skip this cycle and try again next.
+            data_ready = True
+            if not engine_config.syncData:
+                try:
+                    from .schedule import utc_now as _utc_now
+                    _ready = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
+                    if not _ready.exists():
+                        print(
+                            f"[{now.isoformat()}] waiting for data-sync owner to "
+                            f"refresh prices/CA before EOD..."
+                        )
+                        data_ready = False
+                    else:
+                        age_min = (_utc_now().timestamp() - _ready.stat().st_mtime) / 60
+                        if age_min > 60:
+                            print(
+                                f"[{now.isoformat()}] data_ready_for_eod is "
+                                f"{age_min:.0f} min old — owner may be stuck"
+                            )
+                except Exception as exc:
+                    print(f"[{now.isoformat()}] data-ready probe failed: {exc}")
+                if not data_ready:
+                    continue  # try again next cycle
             print(f"[{now.isoformat()}] Running EOD data update and order generation")
             notify(f"Vietnam Algo: EOD update started\ntime: {now.isoformat()}\nstrategy: {engine_config.strategy}")
             # Price sync (data sync owner only) — skip when --no-sync-data.
@@ -667,6 +719,15 @@ def run_auto_bot(
             # run regardless; they just read prices from disk.
             if engine_config.syncData:
                 update_dataset(engine_config)
+                # Stamp the data-ready sentinel so peer bots (e.g.
+                # momentum reading from disk) can resume their EOD.
+                try:
+                    from .schedule import utc_now as _utc_now2
+                    _stamp = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
+                    _stamp.parent.mkdir(parents=True, exist_ok=True)
+                    _stamp.write_text(_utc_now2().isoformat())
+                except Exception:
+                    pass
             # Use the strategy adapter's generate_orders() when available.
             # This is the right path for strategies like autofin_signal
             # which don't go through run_daily_once → run_momentum_rotation.
