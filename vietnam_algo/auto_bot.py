@@ -110,19 +110,23 @@ def _apply_dry_run_fills(
     # already the right file for a signal-driven strategy.
     #
     # The dry-run respects the user-configured DRY_RUN_INITIAL_NAV /
-    # MOCK_NAV env var. We deliberately do NOT rescale to match the
-    # backtest's initial cash — the dry-run is its own simulation at
-    # the configured scale, and orders that exceed the dry-run's cash
-    # get clipped by apply_orders_to_state's board-lot / cash checks.
+    # MOCK_NAV env var. To match the backtest's % return profile at a
+    # smaller cash budget, we SCALE each order's quantity by
+    # ``state.initial_nav / backtest_initial_cash``. Without this,
+    # applying 1B-VND-scale trades to a 100M-VND dry-run would clip
+    # most BUYs as insufficient_cash / below_board_lot, producing
+    # nonsensical realized losses (-80% in a single day, etc.).
+    #
+    # Scaling quantities preserves the trade direction (BUY/SELL) and
+    # prices, so the simulated P&L tracks the backtest's % return at
+    # the dry-run's smaller scale.
     full_orders_csv = result.get("orders")
     payload: dict[str, Any] = {}
     items: list[dict[str, Any]] = []
-    print(f"[dry-run] full_orders_csv={full_orders_csv}, exists={Path(str(full_orders_csv)).exists() if full_orders_csv else None}", flush=True)
     if full_orders_csv and Path(str(full_orders_csv)).exists():
         try:
             with open(full_orders_csv, "r", encoding="utf-8", newline="") as f:
                 items = list(_csv.DictReader(f))
-            print(f"[dry-run] loaded {len(items)} items from {full_orders_csv}", flush=True)
         except Exception as exc:
             print(f"[dry-run] failed to read full orders csv {full_orders_csv}: {exc}")
             items = []
@@ -139,6 +143,39 @@ def _apply_dry_run_fills(
             return
     if not isinstance(items, list) or not items:
         return
+    # Scale order quantities to match the dry-run's initial NAV.
+    # Pull the backtest's initial cash from the saved backtest result
+    # (if available) so we know the source scale.
+    qty_scale: float = 1.0
+    try:
+        result_path = result.get("result") if isinstance(result, dict) else None
+        if result_path:
+            from .backtest import _initial_cash_from_result
+            backtest_initial_cash = _initial_cash_from_result(Path(str(result_path)))
+            if (
+                backtest_initial_cash
+                and backtest_initial_cash > 0
+                and state.initial_nav > 0
+                and backtest_initial_cash > state.initial_nav * 1.5
+            ):
+                qty_scale = float(state.initial_nav) / float(backtest_initial_cash)
+                print(
+                    f"[dry-run] scaling order quantities by {qty_scale:.4f} "
+                    f"(dry-run NAV={state.initial_nav:,.0f} vs "
+                    f"backtest initial={backtest_initial_cash:,.0f})"
+                )
+    except Exception as exc:
+        print(f"[dry-run] qty-scale detection failed: {exc}")
+    if qty_scale < 1.0:
+        for o in items:
+            raw_qty = o.get("quantity")
+            try:
+                q = int(float(raw_qty)) if raw_qty not in (None, "") else 0
+            except (TypeError, ValueError):
+                q = 0
+            if q <= 0:
+                continue
+            o["quantity"] = max(1, int(q * qty_scale))
     # SL/TP brackets are CONDITIONAL orders — they should NOT fill at
     # submission time. Treating them as immediate fills caused the bot
     # to instantly close every new entry at a loss (autofin emits
@@ -430,7 +467,10 @@ def run_auto_bot(
                     )
                 save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
-        if should_sync_corporate_actions(now, state.corporateActionDate, schedule, holidays):
+        # Skip CA sync (and price sync in the EOD path below) when this
+        # bot doesn't own data sync. Lets one bot do the heavy API
+        # fetching while the other just reads from disk.
+        if engine_config.syncData and should_sync_corporate_actions(now, state.corporateActionDate, schedule, holidays):
             print(f"[{now.isoformat()}] Syncing Vietstock corporate actions")
             token = os.environ.get("VIETSTOCK_REQUEST_TOKEN", "")
             cookie = os.environ.get("VIETSTOCK_COOKIE", "")
@@ -622,7 +662,11 @@ def run_auto_bot(
         if should_run_eod(now, state.eodDate, schedule, holidays):
             print(f"[{now.isoformat()}] Running EOD data update and order generation")
             notify(f"Vietnam Algo: EOD update started\ntime: {now.isoformat()}\nstrategy: {engine_config.strategy}")
-            update_dataset(engine_config)
+            # Price sync (data sync owner only) — skip when --no-sync-data.
+            # The EOD order-generation / portfolio snapshot steps still
+            # run regardless; they just read prices from disk.
+            if engine_config.syncData:
+                update_dataset(engine_config)
             # Use the strategy adapter's generate_orders() when available.
             # This is the right path for strategies like autofin_signal
             # which don't go through run_daily_once → run_momentum_rotation.

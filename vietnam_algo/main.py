@@ -535,6 +535,10 @@ def add_daily_engine_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--trade-date", default=None, help="optional order execution date to export/submit")
     parser.add_argument("--update-symbols", action="store_true")
     parser.add_argument("--update-prices", action="store_true")
+    parser.add_argument("--sync-data", dest="sync_data", action="store_true", default=True,
+                        help="sync price + corporate-action data each EOD cycle (default: enabled). "
+                             "Disable with --no-sync-data when a peer bot owns data sync.")
+    parser.add_argument("--no-sync-data", dest="sync_data", action="store_false")
     parser.add_argument("--price-limit", type=int, default=DEFAULT_PRICE_LIMIT)
     parser.add_argument("--price-sleep-seconds", type=float, default=1.0)
     parser.add_argument("--max-symbols", type=int, default=0)
@@ -677,6 +681,7 @@ def engine_config_from_args(args: argparse.Namespace) -> EngineConfig:
         strategy=args.strategy,
         updateSymbols=args.update_symbols,
         updatePrices=args.update_prices,
+        syncData=args.sync_data,
         priceLimit=args.price_limit,
         priceSleepSeconds=args.price_sleep_seconds,
         maxSymbols=args.max_symbols,
