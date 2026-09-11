@@ -1702,4 +1702,28 @@ def save_order_list(result: BacktestResult, data_dir: Path = DEFAULT_DATA_DIR) -
         writer.writeheader()
         for order_id, trade in enumerate(result.trades, start=1):
             writer.writerow({"orderId": order_id, **trade})
+
+
+def _initial_cash_from_result(path: Path) -> float | None:
+    """Pull the initial cash used by a saved backtest.
+
+    Reads the first row of ``equityCurve`` from the saved JSON. The
+    dry-run state uses this to scale its initial NAV so the per-order
+    qty from a 1B-VND backtest doesn't get clipped as below_board_lot
+    on a 100M-VND dry-run state.
+    """
+    try:
+        import json as _json
+        payload = _json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    ec = payload.get("equityCurve") or []
+    if not ec:
+        return None
+    first = ec[0] or {}
+    cash = first.get("cash")
+    try:
+        return float(cash) if cash else None
+    except (TypeError, ValueError):
+        return None
     return path

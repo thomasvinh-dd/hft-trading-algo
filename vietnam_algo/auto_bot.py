@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 import os
 import urllib.request
+import csv as _csv
+import json as _json
 from pathlib import Path
 from datetime import datetime
 
@@ -45,6 +47,14 @@ def _apply_dry_run_fills(
        repeated trade history don't accumulate position qty across
        multiple EOD cycles.
 
+    For backtest-driven strategies (momentum), the per-order dedup also
+    lets the state self-heal: if the state file was wiped or the bot
+    crashed mid-replay, the next EOD cycle replay-walks the FULL backtest
+    orders CSV (1442 trades for momentum) and re-applies any trades that
+    haven't been seen yet. The autofin adapter is signal-driven (no
+    historical replay), so it only consumes the items in the latest
+    orders file.
+
     Cash-constrained BUYs are clipped to a board lot (default 100 —
        Vietnamese market) instead of partial fractional shares.
 
@@ -58,28 +68,93 @@ def _apply_dry_run_fills(
         save_dry_run_state,
     )
     state = init_dry_run_state(engine_config.dataDir, strategy_name=strategy_name)
-    json_path = result.get("latestOrdersJson")
-    if not json_path:
-        return
-    try:
-        from pathlib import Path
-        import json as _json
-        payload = _json.loads(Path(json_path).read_text(encoding="utf-8"))
-    except Exception:
-        return
-    items = payload.get("items") if isinstance(payload, dict) else None
+    # If the state is fresh and we're about to replay a backtest that
+    # started with a different initial cash (momentum runs with 1B),
+    # rescale the state to match. Without this the apply would try
+    # to spend 1B-worth of BUYs on a 100M state and most orders would
+    # get clipped as below_board_lot / insufficient_cash.
+    if not state.positions and not state.closed_trades:
+        result_path = result.get("result") if isinstance(result, dict) else None
+        if result_path:
+            try:
+                from .backtest import _initial_cash_from_result
+                initial_cash = _initial_cash_from_result(Path(str(result_path)))
+                if initial_cash and initial_cash > state.cash * 1.5:
+                    print(
+                        f"[dry-run] rescaling {strategy_name!r} state from "
+                        f"{state.cash:,.0f} to backtest initial {initial_cash:,.0f}"
+                    )
+                    state.initial_nav = float(initial_cash)
+                    state.cash = float(initial_cash)
+                    save_dry_run_state(
+                        state, engine_config.dataDir, strategy_name=strategy_name,
+                    )
+            except Exception as exc:
+                print(f"[dry-run] backtest initial-cash detection failed: {exc}")
+    # The momentum adapter exposes the full backtest orders CSV in
+    # ``result["orders"]``. Walking it ensures the state reflects ALL
+    # history, not just today's filtered slice. Autofin leaves
+    # ``result["orders"]`` pointing at the latest-orders.csv which is
+    # already the right file for a signal-driven strategy.
+    full_orders_csv = result.get("orders")
+    payload: dict[str, Any] = {}
+    items: list[dict[str, Any]] = []
+    print(f"[dry-run] full_orders_csv={full_orders_csv}, exists={Path(str(full_orders_csv)).exists() if full_orders_csv else None}", flush=True)
+    if full_orders_csv and Path(str(full_orders_csv)).exists():
+        try:
+            with open(full_orders_csv, "r", encoding="utf-8", newline="") as f:
+                items = list(_csv.DictReader(f))
+            print(f"[dry-run] loaded {len(items)} items from {full_orders_csv}", flush=True)
+        except Exception as exc:
+            print(f"[dry-run] failed to read full orders csv {full_orders_csv}: {exc}")
+            items = []
+    if not items:
+        # Fallback: use the per-date filtered JSON if the full CSV is
+        # missing or unreadable.
+        json_path = result.get("latestOrdersJson")
+        if not json_path:
+            return
+        try:
+            payload = _json.loads(Path(json_path).read_text(encoding="utf-8"))
+            items = list(payload.get("items") or [])
+        except Exception:
+            return
     if not isinstance(items, list) or not items:
         return
     # SL/TP brackets are CONDITIONAL orders — they should NOT fill at
     # submission time. Treating them as immediate fills caused the bot
     # to instantly close every new entry at a loss (autofin emits
-    # BUY + SL SELL as a pair). Only the AUTO entry kind (BUY/NS) is
+    # BUY + SL SELL as a pair). Only the entry kind (BUY/NS) is
     # applied at plan time; bracket arms are tracked separately by
     # the live order ledger.
-    items = [
-        o for o in items
-        if (str(o.get("kind") or "")).lower() not in ("sl", "tp", "tp_bracket")
-    ]
+    #
+    # Filter rules:
+    #   * If the order has ``kind`` set to one of the bracket kinds,
+    #     skip.
+    #   * Otherwise (some adapters don't populate ``kind``), check
+    #     the ``reason`` prefix: ``autofin_sl:``, ``autofin_user_sl:``,
+    #     ``autofin_tp:`` are bracket arms. The momentum adapter writes
+    #     ``kind="entry"|"sl"|"tp"|...`` so the first check handles it.
+    bracket_reasons = ("autofin_sl:", "autofin_user_sl:", "autofin_tp:")
+    bracket_kinds = ("sl", "tp", "tp_bracket")
+    filtered: list[dict[str, Any]] = []
+    skipped_brackets = 0
+    for o in items:
+        kind = str(o.get("kind") or "").lower()
+        reason = str(o.get("reason") or "")
+        if kind in bracket_kinds:
+            skipped_brackets += 1
+            continue
+        if any(reason.startswith(p) for p in bracket_reasons):
+            skipped_brackets += 1
+            continue
+        filtered.append(o)
+    items = filtered
+    if skipped_brackets:
+        print(
+            f"[dry-run] skipped {skipped_brackets} bracket arm(s) "
+            f"(SL/TP — conditional, not filled at plan time)"
+        )
     if not items:
         return
     trade_date = (
