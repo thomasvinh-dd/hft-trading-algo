@@ -68,6 +68,41 @@ def _apply_dry_run_fills(
         save_dry_run_state,
     )
     state = init_dry_run_state(engine_config.dataDir, strategy_name=strategy_name)
+    # Migration: if there's an unsuffixed dry_run_state.json from an
+    # older build (before per-strategy isolation) AND the per-strategy
+    # state file is fresh, copy the unsuffixed state into the
+    # per-strategy file so the bot doesn't lose its portfolio on the
+    # first cycle after the upgrade.
+    if not state.positions and not state.closed_trades and strategy_name:
+        legacy_path = engine_config.dataDir / "live" / "dry_run_state.json"
+        if legacy_path.exists():
+            try:
+                legacy_payload = _json.loads(legacy_path.read_text(encoding="utf-8"))
+                if legacy_payload.get("positions") or legacy_payload.get("closed_trades"):
+                    print(
+                        f"[dry-run] migrating legacy dry_run_state.json → "
+                        f"dry_run_state.{strategy_name}.json"
+                    )
+                    state.initial_nav = float(legacy_payload.get("initial_nav") or state.initial_nav)
+                    state.cash = float(legacy_payload.get("cash") or state.cash)
+                    state.positions = {
+                        sym: DryRunPosition(
+                            symbol=p.get("symbol", sym),
+                            quantity=int(p.get("quantity", 0)),
+                            avg_price=float(p.get("avg_price", 0.0)),
+                            last_price=float(p.get("last_price", 0.0)),
+                            cost_basis=float(p.get("cost_basis", 0.0)),
+                        )
+                        for sym, p in (legacy_payload.get("positions") or {}).items()
+                        if isinstance(p, dict)
+                    }
+                    state.closed_trades = list(legacy_payload.get("closed_trades") or [])
+                    state.realized_pnl = float(legacy_payload.get("realized_pnl") or 0.0)
+                    save_dry_run_state(
+                        state, engine_config.dataDir, strategy_name=strategy_name,
+                    )
+            except Exception as exc:
+                print(f"[dry-run] legacy-state migration failed: {exc}")
     # If the state is fresh and we're about to replay a backtest that
     # started with a different initial cash (momentum runs with 1B),
     # rescale the state to match. Without this the apply would try
@@ -479,6 +514,7 @@ def run_auto_bot(
                 from .notifier import start_of_day_message
                 portfolio_snap = _build_portfolio_snapshot(
                     client, account_no, engine_config, live_submit,
+                    strategy_name=strategy_name,
                 )
                 # read latest_orders JSON for the per-strategy file
                 from .strategy_base import StrategyAdapter
