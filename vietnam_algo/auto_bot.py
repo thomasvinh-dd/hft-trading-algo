@@ -103,34 +103,17 @@ def _apply_dry_run_fills(
                     )
             except Exception as exc:
                 print(f"[dry-run] legacy-state migration failed: {exc}")
-    # If the state is fresh and we're about to replay a backtest that
-    # started with a different initial cash (momentum runs with 1B),
-    # rescale the state to match. Without this the apply would try
-    # to spend 1B-worth of BUYs on a 100M state and most orders would
-    # get clipped as below_board_lot / insufficient_cash.
-    if not state.positions and not state.closed_trades:
-        result_path = result.get("result") if isinstance(result, dict) else None
-        if result_path:
-            try:
-                from .backtest import _initial_cash_from_result
-                initial_cash = _initial_cash_from_result(Path(str(result_path)))
-                if initial_cash and initial_cash > state.cash * 1.5:
-                    print(
-                        f"[dry-run] rescaling {strategy_name!r} state from "
-                        f"{state.cash:,.0f} to backtest initial {initial_cash:,.0f}"
-                    )
-                    state.initial_nav = float(initial_cash)
-                    state.cash = float(initial_cash)
-                    save_dry_run_state(
-                        state, engine_config.dataDir, strategy_name=strategy_name,
-                    )
-            except Exception as exc:
-                print(f"[dry-run] backtest initial-cash detection failed: {exc}")
     # The momentum adapter exposes the full backtest orders CSV in
     # ``result["orders"]``. Walking it ensures the state reflects ALL
     # history, not just today's filtered slice. Autofin leaves
     # ``result["orders"]`` pointing at the latest-orders.csv which is
     # already the right file for a signal-driven strategy.
+    #
+    # The dry-run respects the user-configured DRY_RUN_INITIAL_NAV /
+    # MOCK_NAV env var. We deliberately do NOT rescale to match the
+    # backtest's initial cash — the dry-run is its own simulation at
+    # the configured scale, and orders that exceed the dry-run's cash
+    # get clipped by apply_orders_to_state's board-lot / cash checks.
     full_orders_csv = result.get("orders")
     payload: dict[str, Any] = {}
     items: list[dict[str, Any]] = []
@@ -512,6 +495,48 @@ def run_auto_bot(
             print(f"[{now.isoformat()}] Sending start-of-day briefing")
             try:
                 from .notifier import start_of_day_message
+                # For backtest-driven strategies (momentum), the dry-run
+                # apply (rescale + walk full backtest CSV) only runs in
+                # _apply_dry_run_fills via the EOD path. If the start-
+                # of-day briefing fires before the EOD apply, the
+                # snapshot would show a fresh state (cash=100M, no
+                # positions) even though the EOD will rescale to 1B
+                # and apply all 1442 trades. Run the same apply here
+                # so the briefing reflects the post-rescale state.
+                if not live_submit:
+                    try:
+                        from .strategy_base import StrategyAdapter
+                        _adapter = STRATEGY_REGISTRY.get(engine_config.strategy) if engine_config.strategy else None
+                        _json_name = (_adapter.orders_json_filename if _adapter else "latest_orders.json")
+                        _json_path = (
+                            engine_config.dataDir / engine_config.liveDirName / _json_name
+                        )
+                        if _json_path.exists():
+                            _payload = _json.loads(_json_path.read_text(encoding="utf-8"))
+                            _items = list(_payload.get("items") or [])
+                            if _items:
+                                _fake_result = {
+                                    "orders": str(
+                                        engine_config.dataDir
+                                        / "backtests"
+                                        / "liquid_momentum_rotation_orders.csv"
+                                    ),
+                                    "latestOrdersJson": str(_json_path),
+                                    "latestOrdersCsv": str(_json_path).replace(".json", ".csv"),
+                                    "result": str(
+                                        engine_config.dataDir
+                                        / "backtests"
+                                        / "liquid_momentum_rotation.json"
+                                    ),
+                                    "tradeDate": today,
+                                    "count": len(_items),
+                                }
+                                _apply_dry_run_fills(
+                                    _fake_result, engine_config, account_no,
+                                    strategy_config, strategy_name=strategy_name,
+                                )
+                    except Exception as _exc:
+                        print(f"[{now.isoformat()}] start-of-day dry-run apply failed: {_exc}")
                 portfolio_snap = _build_portfolio_snapshot(
                     client, account_no, engine_config, live_submit,
                     strategy_name=strategy_name,
