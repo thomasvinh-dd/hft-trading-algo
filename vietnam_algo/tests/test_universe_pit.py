@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.universe import (
+from vietnam_algo.libs.universe import (
     bars_until_list,
     build_candidate_price_table,
     build_liquid_universe_as_of,

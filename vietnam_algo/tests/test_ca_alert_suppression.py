@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import unittest
 from unittest.mock import patch, MagicMock
 
-from vietnam_algo.bot_state import AutoBotState, load_state, save_state
+from vietnam_algo.libs.bot_state import AutoBotState, load_state, save_state
 
 
 class CaAlertSuppressionTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class CaAlertSuppressionTests(unittest.TestCase):
         """caAlertSentDate roundtrips through load/save."""
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            from vietnam_algo.data import DEFAULT_DATA_DIR
+            from vietnam_algo.libs.data import DEFAULT_DATA_DIR
             tmpdir = Path(tmp)
             original = AutoBotState(caAlertSentDate="2026-09-09")
             save_state(original, tmpdir, strategy_name="autofin_signal")

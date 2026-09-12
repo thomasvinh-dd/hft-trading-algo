@@ -6,13 +6,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.backtest import (
+from vietnam_algo.libs.backtest import (
     compute_exposure_cap,
     compute_realized_vol,
     compute_vol_scalar,
 )
-from vietnam_algo.config import StrategyConfig
-from vietnam_algo.backtest import EquityPoint
+from vietnam_algo.libs.config import StrategyConfig
+from vietnam_algo.libs.backtest import EquityPoint
 
 
 class ComputeRealizedVolTests(unittest.TestCase):

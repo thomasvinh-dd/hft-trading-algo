@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
-from vietnam_algo.backtest_autofin_daily import (
+from vietnam_algo.libs.backtest_autofin_daily import (
     DayState,
     run_daily_replay_backtest,
 )

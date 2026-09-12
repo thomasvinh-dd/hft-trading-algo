@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import unittest
 
-from vietnam_algo.dry_run_state import (
+from vietnam_algo.libs.dry_run_state import (
     DEFAULT_INITIAL_NAV,
     DryRunState,
     apply_orders_to_state,
@@ -105,7 +105,7 @@ class DryRunStateTests(unittest.TestCase):
     def test_sell_records_realized_pnl(self) -> None:
         state = DryRunState(initial_nav=100_000_000, cash=50_000_000)
         # Build a position manually so we can test a SELL on it.
-        from vietnam_algo.dry_run_state import DryRunPosition
+        from vietnam_algo.libs.dry_run_state import DryRunPosition
         state.positions["HPG"] = DryRunPosition(
             symbol="HPG", quantity=1000, avg_price=20_000,
             last_price=22_000, cost_basis=20_000_000,

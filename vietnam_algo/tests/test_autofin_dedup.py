@@ -17,13 +17,13 @@ from pathlib import Path
 
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
-from vietnam_algo.strategies_impl.autofin_signal import (
+from vietnam_algo.algos.autofin_signal import (
     _order_key,
     _plan_orders_for_new_positions,
     _arm,
     decide_orders,
 )
-from vietnam_algo.autofin_signals import parse_signal
+from vietnam_algo.libs.autofin_signals import parse_signal
 from typing import Any
 
 

@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.dry_run_state import (
+from vietnam_algo.libs.dry_run_state import (
     DryRunState,
     apply_orders_to_state,
 )
@@ -129,7 +129,7 @@ class DryRunApplyGuardsTests(unittest.TestCase):
         """Dedup keys must survive a state save+load round-trip so a bot
         restart doesn't re-apply already-applied orders."""
         import json
-        from vietnam_algo.dry_run_state import save_dry_run_state, load_dry_run_state
+        from vietnam_algo.libs.dry_run_state import save_dry_run_state, load_dry_run_state
 
         tmp = Path("/tmp/opencode/dry_run_dedup_test")
         tmp.mkdir(parents=True, exist_ok=True)

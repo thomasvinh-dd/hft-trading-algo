@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from ..corporate_actions import sync_corporate_actions_incremental
+from vietnam_algo.libs.corporate_actions import sync_corporate_actions_incremental
 
 
 def run_ca_incremental(

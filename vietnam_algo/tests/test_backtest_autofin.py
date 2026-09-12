@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
-import vietnam_algo.backtest_autofin as mod
-from vietnam_algo.backtest_autofin import (
+import vietnam_algo.libs.backtest_autofin as mod
+from vietnam_algo.libs.backtest_autofin import (
     AutofinTrade,
     _round_to_lots,
     _simulate_trade,

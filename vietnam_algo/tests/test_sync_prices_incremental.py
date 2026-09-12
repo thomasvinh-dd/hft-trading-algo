@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.data import PriceBar, sync_prices_incremental
+from vietnam_algo.libs.data import PriceBar, sync_prices_incremental
 
 
 def _make_bar(t: str, close: float) -> PriceBar:
@@ -40,7 +40,7 @@ class SyncPricesIncrementalTests(unittest.TestCase):
 
     def _patch_fetch(self, bars):
         return patch(
-            "vietnam_algo.data.fetch_price_bars",
+            "vietnam_algo.libs.data.fetch_price_bars",
             return_value=bars,
         )
 
@@ -90,7 +90,7 @@ class SyncPricesIncrementalTests(unittest.TestCase):
         self.assertEqual(len(merged["items"]), 2)
 
     def test_fetch_failure_does_not_crash(self) -> None:
-        with patch("vietnam_algo.data.fetch_price_bars", side_effect=RuntimeError("network down")):
+        with patch("vietnam_algo.libs.data.fetch_price_bars", side_effect=RuntimeError("network down")):
             paths = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
         self.assertEqual(paths, [])
         # Existing file untouched

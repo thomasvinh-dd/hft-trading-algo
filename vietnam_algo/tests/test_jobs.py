@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from vietnam_algo.jobs import common_sync, get_otp
-from vietnam_algo.token_store import SHARED_TOKEN_PATH, load_shared_trading_token
+from vietnam_algo.libs.dnse.auth import SHARED_TOKEN_PATH, load_shared_trading_token
 
 
 class _TmpDataDir:
@@ -107,7 +107,7 @@ class TokenFreshnessEdgeCaseTests(unittest.TestCase):
 
     def test_uuid_token_with_recent_issued_at_is_fresh(self) -> None:
         from datetime import datetime, timedelta, timezone
-        from vietnam_algo.token_store import is_token_fresh
+        from vietnam_algo.libs.dnse.auth import is_token_fresh
         issued = (datetime.now(tz=timezone.utc) - timedelta(minutes=5)).isoformat()
         self.assertTrue(
             is_token_fresh("20375f6c-5007-46b1-8b2a-07361590822e", issued_at=issued)
@@ -115,16 +115,16 @@ class TokenFreshnessEdgeCaseTests(unittest.TestCase):
 
     def test_uuid_token_with_old_issued_at_is_stale(self) -> None:
         from datetime import datetime, timedelta, timezone
-        from vietnam_algo.token_store import is_token_fresh
+        from vietnam_algo.libs.dnse.auth import is_token_fresh
         issued = (datetime.now(tz=timezone.utc) - timedelta(hours=24)).isoformat()
         self.assertFalse(
             is_token_fresh("20375f6c-5007-46b1-8b2a-07361590822e", issued_at=issued)
         )
 
     def test_uuid_token_without_issued_at_is_stale(self) -> None:
-        from vietnam_algo.token_store import is_token_fresh
+        from vietnam_algo.libs.dnse.auth import is_token_fresh
         self.assertFalse(is_token_fresh("20375f6c-5007-46b1-8b2a-07361590822e"))
 
     def test_dry_run_placeholder_token_is_never_fresh(self) -> None:
-        from vietnam_algo.token_store import is_token_fresh
+        from vietnam_algo.libs.dnse.auth import is_token_fresh
         self.assertFalse(is_token_fresh("dry-run-token"))

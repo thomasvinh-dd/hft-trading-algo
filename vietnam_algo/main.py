@@ -8,7 +8,8 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
-from .backtest import (
+from .bots.runner import run_auto_bot
+from .libs.backtest import (
     run_hybrid_momentum_breakout_sector,
     run_market_regime_benchmark,
     run_momentum_rotation,
@@ -18,34 +19,46 @@ from .backtest import (
     save_backtest_result,
     save_order_list,
 )
-from .auto_bot import run_auto_bot
-from .config import StrategyConfig
-from .corporate_actions import fetch_vietstock_events, save_corporate_actions, sync_corporate_actions_incremental
-from .daily_engine import EngineConfig, run_daily_once, trading_token_from_email
-from .data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, load_saved_symbols, sync_prices, sync_symbols
-from .data_investing import (
+from .libs.config import StrategyConfig
+from .libs.corporate_actions import (
+    fetch_vietstock_events,
+    save_corporate_actions,
+    sync_corporate_actions_incremental,
+)
+from .libs.daily_engine import (
+    EngineConfig,
+    execute_orders_with_ledger,
+    run_daily_once,
+)
+from .libs.data import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_PRICE_LIMIT,
+    load_saved_symbols,
+    sync_prices,
+    sync_symbols,
+)
+from .libs.data_investing import (
     DEFAULT_INVESTING_PRICES_DIR,
     fetch_investing_history,
     fetch_investing_symbols,
     load_investing_id_map,
+    load_investing_prices as load_investing_prices_func,
     save_investing_id_map,
     sync_investing_prices,
 )
-from .data_investing import (
-    load_investing_prices as load_investing_prices_func,
-)
-from .dnse_client import (
+from .libs.daily_engine import trading_token_from_email
+from .libs.dnse.client import (
     DEFAULT_DNSE_BASE_URL,
     DEFAULT_DNSE_VERSION,
     DnseClient,
     sync_dnse_instruments,
     sync_dnse_prices,
 )
-from .market_calendar import live_trading_dates, sync_market_holidays
-from .notifier import TelegramConfig, notify
-from .risk_controls import live_risk_limits_from_env, validate_live_orders
-from .schedule import TradingSchedule
-from .trading_engine import (
+from .libs.market_calendar import live_trading_dates, sync_market_holidays
+from .libs.notifier import TelegramConfig, notify
+from .libs.risk_controls import live_risk_limits_from_env, validate_live_orders
+from .libs.schedule import TradingSchedule
+from .libs.trading_engine import (
     build_corporate_action_exit_orders,
     apply_sellable_quantity_cap,
     execute_dnse_orders,
@@ -55,8 +68,7 @@ from .trading_engine import (
     price_orders_from_orderbook,
     selected_order_date,
 )
-from .daily_engine import execute_orders_with_ledger
-from .universe import build_liquid_universe, save_liquid_universe
+from .libs.universe import build_liquid_universe, save_liquid_universe
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -583,7 +595,7 @@ def dnse_client_from_args(args: argparse.Namespace) -> DnseClient:
 
 
 def strategy_config_from_args(args: argparse.Namespace) -> StrategyConfig:
-    from .config import UniverseConfig
+    from vietnam_algo.libs.config import UniverseConfig
     universe = UniverseConfig(
         lookbackDays=args.universe_lookback_days,
         minAvgValue=args.universe_min_avg_value,
@@ -1146,13 +1158,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "backtest-autofin-signal":
-        from .backtest_autofin import (
+        from vietnam_algo.libs.backtest_autofin import (
             format_backtest_report,
             run_autofin_backtest,
             run_hindsight_variants,
             write_backtest_outputs,
         )
-        from .notifier import notify
+        from vietnam_algo.libs.notifier import notify
         result = run_autofin_backtest(
             initial_nav=args.initial_nav,
             fee_pct_per_side=args.fee_pct_per_side,
@@ -1189,15 +1201,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "backtest-autofin-daily":
-        from .backtest_autofin_daily import (
+        from vietnam_algo.libs.backtest_autofin_daily import (
             format_daily_replay_report,
             run_daily_replay_backtest,
             write_daily_replay_outputs,
         )
-        from .notifier import notify
+        from vietnam_algo.libs.notifier import notify
         closed_deals = None
         if args.from_cache:
-            from .backtest_autofin import load_closed_deals_from_json
+            from vietnam_algo.libs.backtest_autofin import load_closed_deals_from_json
             closed_deals = load_closed_deals_from_json(args.from_cache)
             print(f"Loaded {len(closed_deals)} closed deals from {args.from_cache}")
         result = run_daily_replay_backtest(
@@ -1235,7 +1247,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dnse-loan-packages":
-        from .dnse_client import load_trading_token
+        from vietnam_algo.libs.dnse.client import load_trading_token
         token = None
         saved_token_path = args.data_dir / "live" / "dnse_trading_token.json"
         if saved_token_path.exists():
@@ -1298,8 +1310,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dnse-quote":
-        from .order_monitor import quote_match_price
-        from .dnse_client import load_trading_token
+        from vietnam_algo.libs.order_monitor import quote_match_price
+        from vietnam_algo.libs.dnse.client import load_trading_token
         client = dnse_client_from_args(args)
         extra = None
         if not args.no_trading_token:
@@ -1376,7 +1388,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dnse-trade-secret":
-        from .otp_reader import latest_email_otp
+        from vietnam_algo.libs.dnse.otp import latest_email_otp
         if not args.gmail_address or not args.gmail_app_password:
             raise RuntimeError(
                 "dnse-trade-secret requires --gmail-address and --gmail-app-password "
@@ -1484,7 +1496,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         actions_path = corporate_actions_file_from_args(args)
         if actions_path:
-            from .corporate_actions import load_corporate_actions
+            from vietnam_algo.libs.corporate_actions import load_corporate_actions
 
             exit_orders, exit_decisions = build_corporate_action_exit_orders(
                 dnse_client_from_args(args),

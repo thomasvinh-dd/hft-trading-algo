@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import unittest
 
-from vietnam_algo.corporate_actions import (
+from vietnam_algo.libs.corporate_actions import (
     _looks_like_json_response,
     validate_vietstock_session,
     fetch_vietstock_session,
@@ -84,7 +84,7 @@ class ValidateSessionTests(unittest.TestCase):
         fake_response.headers.get.return_value = "application/json"
         session = self._fake_session(fake_response)
 
-        with patch("vietnam_algo.corporate_actions.fetch_vietstock_session", return_value=session):
+        with patch("vietnam_algo.libs.corporate_actions.fetch_vietstock_session", return_value=session):
             ok = validate_vietstock_session(session, timeout=5.0)
         self.assertTrue(ok)
 
@@ -101,7 +101,7 @@ class ValidateSessionTests(unittest.TestCase):
         fake_response.headers.get.return_value = "application/json"
         session = self._fake_session(fake_response)
 
-        with patch("vietnam_algo.corporate_actions.fetch_vietstock_session", return_value=session):
+        with patch("vietnam_algo.libs.corporate_actions.fetch_vietstock_session", return_value=session):
             ok = validate_vietstock_session(session, timeout=5.0)
         self.assertFalse(ok, "empty []] is invalid for a 7-day window")
 
@@ -112,7 +112,7 @@ class ValidateSessionTests(unittest.TestCase):
         fake_response.headers.get.return_value = "application/json"
         session = self._fake_session(fake_response)
 
-        with patch("vietnam_algo.corporate_actions.fetch_vietstock_session", return_value=session):
+        with patch("vietnam_algo.libs.corporate_actions.fetch_vietstock_session", return_value=session):
             ok = validate_vietstock_session(session, timeout=5.0)
         self.assertFalse(ok)
 
@@ -123,7 +123,7 @@ class ValidateSessionTests(unittest.TestCase):
         fake_response.headers.get.return_value = "application/json"
         session = self._fake_session(fake_response)
 
-        with patch("vietnam_algo.corporate_actions.fetch_vietstock_session", return_value=session):
+        with patch("vietnam_algo.libs.corporate_actions.fetch_vietstock_session", return_value=session):
             ok = validate_vietstock_session(session, timeout=5.0)
         self.assertFalse(ok)
 
@@ -134,7 +134,7 @@ class ValidateSessionTests(unittest.TestCase):
         fake_response.headers.get.return_value = "text/html; charset=utf-8"
         session = self._fake_session(fake_response)
 
-        with patch("vietnam_algo.corporate_actions.fetch_vietstock_session", return_value=session):
+        with patch("vietnam_algo.libs.corporate_actions.fetch_vietstock_session", return_value=session):
             ok = validate_vietstock_session(session, timeout=5.0)
         self.assertFalse(ok)
 
@@ -145,7 +145,7 @@ class ValidateSessionTests(unittest.TestCase):
         fake_response.headers.get.return_value = ""
         session = self._fake_session(fake_response)
 
-        with patch("vietnam_algo.corporate_actions.fetch_vietstock_session", return_value=session):
+        with patch("vietnam_algo.libs.corporate_actions.fetch_vietstock_session", return_value=session):
             ok = validate_vietstock_session(session, timeout=5.0)
         self.assertFalse(ok)
 
@@ -159,7 +159,7 @@ class ValidateSessionTests(unittest.TestCase):
         session.token = "TEST"
         session.opener.open.side_effect = urllib.error.URLError("connection refused")
 
-        with patch("vietnam_algo.corporate_actions.fetch_vietstock_session", return_value=session):
+        with patch("vietnam_algo.libs.corporate_actions.fetch_vietstock_session", return_value=session):
             ok = validate_vietstock_session(session, timeout=5.0)
         self.assertFalse(ok)
 

@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
-import vietnam_algo.strategies_impl.autofin_signal as mod
-from vietnam_algo.strategies_impl.autofin_signal import (
+import vietnam_algo.algos.autofin_signal as mod
+from vietnam_algo.algos.autofin_signal import (
     AutofinSignalAdapter,
     _plan_orders_for_new_positions,
     _plan_close_orders,
@@ -560,7 +560,7 @@ def test_format_cycle_summary_handles_none_portfolio():
 
 
 def test_start_of_day_message_shows_portfolio_and_orders(tmp_path, monkeypatch):
-    from vietnam_algo.notifier import start_of_day_message
+    from vietnam_algo.libs.notifier import start_of_day_message
     portfolio = {
         "balance": {"totalCash": 50_000_000, "availableCash": 30_000_000},
         "positions": [
@@ -601,7 +601,7 @@ def test_start_of_day_message_shows_portfolio_and_orders(tmp_path, monkeypatch):
 
 
 def test_start_of_day_message_handles_empty_orders(tmp_path):
-    from vietnam_algo.notifier import start_of_day_message
+    from vietnam_algo.libs.notifier import start_of_day_message
     msg = start_of_day_message(
         portfolio=None,
         today="2026-09-07",
@@ -615,7 +615,7 @@ def test_start_of_day_message_handles_empty_orders(tmp_path):
 
 
 def test_should_run_start_of_day_respects_trading_calendar():
-    from vietnam_algo.schedule import (
+    from vietnam_algo.libs.schedule import (
         VIETNAM_TZ, should_run_start_of_day, TradingSchedule,
     )
     from datetime import datetime
@@ -644,7 +644,7 @@ def test_per_order_message_contains_bot_id_signal_and_dnse_order(monkeypatch):
       2. what signal triggered the order
       3. the actual DNSE order
     """
-    import vietnam_algo.strategies_impl.autofin_signal as mod
+    import vietnam_algo.algos.autofin_signal as mod
     sent: list[str] = []
     monkeypatch.setattr(mod, "notify", lambda text, config=None: sent.append(text) or {"ok": True})
 
@@ -679,7 +679,7 @@ def test_per_order_message_contains_bot_id_signal_and_dnse_order(monkeypatch):
 
 def test_per_order_message_not_re_notified_when_unchanged(monkeypatch):
     """The same order should not be re-notified on the next cycle."""
-    import vietnam_algo.strategies_impl.autofin_signal as mod
+    import vietnam_algo.algos.autofin_signal as mod
     sent: list[str] = []
     monkeypatch.setattr(mod, "notify", lambda text, config=None: sent.append(text) or {"ok": True})
 
@@ -705,7 +705,7 @@ def test_per_order_message_not_re_notified_when_unchanged(monkeypatch):
 def test_per_order_message_groups_bracket_legs_into_one_telegram(monkeypatch):
     """A new-entry BUY+TP+SL bracket should produce ONE Telegram message,
     not three (the user wants one notification per deal action)."""
-    import vietnam_algo.strategies_impl.autofin_signal as mod
+    import vietnam_algo.algos.autofin_signal as mod
     sent: list[str] = []
     monkeypatch.setattr(mod, "notify", lambda text, config=None: sent.append(text) or {"ok": True})
 
@@ -866,7 +866,7 @@ def test_autofin_adapter_persists_actioned_deals(monkeypatch):
     """The adapter should serialize ``_actioned_deals`` to the state
     file so it survives restarts. This is the primary guard against
     re-entry after a full close."""
-    import vietnam_algo.strategies_impl.autofin_signal as mod
+    import vietnam_algo.algos.autofin_signal as mod
 
     tmp = Path("/tmp/opencode/autofin_actioned_test")
     tmp.mkdir(parents=True, exist_ok=True)

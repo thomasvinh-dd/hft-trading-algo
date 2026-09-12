@@ -1,0 +1,64 @@
+"""StrategyAdapter ABC + helpers, shared by all algorithms.
+
+This module is intentionally tiny and dependency-free so both
+the registry and individual algorithm modules can import from it
+without circular dependencies. Lives under ``vietnam_algo.algos``
+so the public name stays ``from vietnam_algo.algos.base import
+StrategyAdapter``.
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+from vietnam_algo.libs.config import StrategyConfig
+from vietnam_algo.libs.daily_engine import EngineConfig
+
+
+class StrategyAdapter(ABC):
+    """Base class for a registered trading strategy."""
+
+    name: str = ""
+    description: str = ""
+    env_filename: str = ""  # e.g. ".env.vietnam-algo-best-ca-fixed-delay6"; "" → default
+
+    @abstractmethod
+    def generate_orders(
+        self,
+        config: EngineConfig,
+        strategy_config: StrategyConfig,
+        trade_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Run the strategy and return the same payload as generate_live_orders."""
+        ...
+
+    def format_cycle_summary(
+        self,
+        result: dict[str, Any],
+        portfolio: dict[str, Any] | None = None,
+    ) -> str:
+        """Format a Telegram message for this strategy's EOD summary.
+
+        ``portfolio`` is the live portfolio snapshot (cash, NAV,
+        positions) the auto_bot fetched. The base implementation
+        forwards it to ``eod_summary_message`` if provided;
+        subclasses may override to format per-strategy context.
+        """
+        from .notifier import eod_summary_message
+        return eod_summary_message(result, portfolio=portfolio)
+
+    @property
+    def backtest_csv_name(self) -> str:
+        return f"{self.name}_rotation_orders.csv" if self.name else "live_orders.csv"
+
+    @property
+    def orders_csv_filename(self) -> str:
+        return f"latest_orders.{self.name}.csv" if self.name else "latest_orders.csv"
+
+    @property
+    def orders_json_filename(self) -> str:
+        return f"latest_orders.{self.name}.json" if self.name else "latest_orders.json"
+
+    @property
+    def state_filename(self) -> str:
+        return f"auto_bot_state.{self.name}.json" if self.name else "auto_bot_state.json"

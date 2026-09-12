@@ -1,7 +1,7 @@
 """Tests for autofin_signals parsing + signal-to-order logic."""
 from __future__ import annotations
 
-from vietnam_algo.autofin_signals import AutofinSignal, parse_signal
+from vietnam_algo.libs.autofin_signals import AutofinSignal, parse_signal
 
 
 def test_parse_signal_basic():

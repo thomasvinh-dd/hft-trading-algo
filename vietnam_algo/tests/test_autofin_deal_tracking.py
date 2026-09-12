@@ -4,8 +4,8 @@ from __future__ import annotations
 import sys
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
-import vietnam_algo.strategies_impl.autofin_signal as mod
-from vietnam_algo.strategies_impl.autofin_signal import (
+import vietnam_algo.algos.autofin_signal as mod
+from vietnam_algo.algos.autofin_signal import (
     _deal_id,
     _parse_partial_close,
     _plan_close_orders,

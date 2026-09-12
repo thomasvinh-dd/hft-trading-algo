@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from vietnam_algo.token_store import parse_jwt_expiry, is_token_fresh
+from vietnam_algo.libs.dnse.auth import parse_jwt_expiry, is_token_fresh
 
 
 def _make_jwt(exp_unix: float) -> str:

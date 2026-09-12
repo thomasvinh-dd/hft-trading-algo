@@ -14,8 +14,8 @@ from typing import Any
 
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
-import vietnam_algo.strategies_impl.autofin_signal as mod
-from vietnam_algo.strategies_impl.autofin_signal import (
+import vietnam_algo.algos.autofin_signal as mod
+from vietnam_algo.algos.autofin_signal import (
     _expand_signals_with_held_unentered,
     _plan_orders_for_new_positions,
     decide_orders,

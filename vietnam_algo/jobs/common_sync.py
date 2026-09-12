@@ -34,9 +34,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..corporate_actions import sync_corporate_actions_incremental
-from ..data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, sync_prices, sync_symbols
-from ..schedule import is_trading_day, local_date, vietnam_now
+from vietnam_algo.libs.corporate_actions import sync_corporate_actions_incremental
+from vietnam_algo.libs.data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, sync_prices, sync_symbols
+from vietnam_algo.libs.schedule import is_trading_day, local_date, vietnam_now
 
 
 DATA_DIR = DEFAULT_DATA_DIR

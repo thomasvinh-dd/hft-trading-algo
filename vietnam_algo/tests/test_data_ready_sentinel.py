@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.daily_engine import EngineConfig
+from vietnam_algo.libs.daily_engine import EngineConfig
 
 
 class DataReadySentinelTests(unittest.TestCase):

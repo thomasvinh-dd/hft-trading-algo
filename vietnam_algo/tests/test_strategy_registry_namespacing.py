@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.strategy_registry import MomentumRotationAdapter
-from vietnam_algo.daily_engine import generate_live_orders, EngineConfig
+from vietnam_algo.algos.registry import MomentumRotationAdapter
+from vietnam_algo.libs.daily_engine import generate_live_orders, EngineConfig
 
 
 class MomentumAdapterNamespacingTests(unittest.TestCase):
@@ -47,7 +47,7 @@ class MomentumAdapterNamespacingTests(unittest.TestCase):
 
         adapter = MomentumRotationAdapter()
         with patch(
-            "vietnam_algo.strategy_registry.generate_live_orders",
+            "vietnam_algo.algos.registry.generate_live_orders",
             side_effect=fake_generate_live_orders,
         ):
             adapter.generate_orders(

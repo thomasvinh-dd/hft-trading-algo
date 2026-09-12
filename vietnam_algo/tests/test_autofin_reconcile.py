@@ -14,12 +14,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.dry_run_state import (
+from vietnam_algo.libs.dry_run_state import (
     DryRunPosition,
     DryRunState,
     save_dry_run_state,
 )
-from vietnam_algo.strategies_impl.autofin_signal import decide_orders
+from vietnam_algo.algos.autofin_signal import decide_orders
 
 
 class AutofinReconcileTests(unittest.TestCase):

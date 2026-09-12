@@ -14,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import unittest
 
-from vietnam_algo.autofin_signals import AutofinNotification, parse_notification
-from vietnam_algo.strategies_impl.autofin_signal import (
+from vietnam_algo.libs.autofin_signals import AutofinNotification, parse_notification
+from vietnam_algo.algos.autofin_signal import (
     _event_to_partial_orders,
     _is_trading_event,
 )

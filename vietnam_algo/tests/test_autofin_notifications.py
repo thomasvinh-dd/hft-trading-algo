@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import unittest
 
-from vietnam_algo.autofin_signals import (
+from vietnam_algo.libs.autofin_signals import (
     AutofinNotification,
     parse_notification,
 )

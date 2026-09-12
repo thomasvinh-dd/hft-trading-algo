@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.dry_run_state import (
+from vietnam_algo.libs.dry_run_state import (
     DryRunState,
     _state_path,
     apply_orders_to_state,
@@ -81,10 +81,10 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
         BUY + SL SELL pair; the SELL (kind='sl') was being applied
         as an immediate fill, locking in losses on every new entry.
         """
-        from vietnam_algo.auto_bot import _apply_dry_run_fills
+        from vietnam_algo.bots.runner import _apply_dry_run_fills
         import json
-        from vietnam_algo.config import StrategyConfig
-        from vietnam_algo.daily_engine import EngineConfig
+        from vietnam_algo.libs.config import StrategyConfig
+        from vietnam_algo.libs.daily_engine import EngineConfig
 
         engine_config = EngineConfig(
             dataDir=self.tmp, strategy="autofin_signal",
@@ -131,10 +131,10 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
         the SL/TP bracket arms are detectable via the ``reason``
         prefix. Without the secondary filter the apply would treat
         them as immediate fills."""
-        from vietnam_algo.auto_bot import _apply_dry_run_fills
+        from vietnam_algo.bots.runner import _apply_dry_run_fills
         import json
-        from vietnam_algo.config import StrategyConfig
-        from vietnam_algo.daily_engine import EngineConfig
+        from vietnam_algo.libs.config import StrategyConfig
+        from vietnam_algo.libs.daily_engine import EngineConfig
 
         engine_config = EngineConfig(
             dataDir=self.tmp, strategy="autofin_signal",
@@ -187,9 +187,9 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
         """
         import csv as _csv
         import io
-        from vietnam_algo.auto_bot import _apply_dry_run_fills
-        from vietnam_algo.config import StrategyConfig
-        from vietnam_algo.daily_engine import EngineConfig
+        from vietnam_algo.bots.runner import _apply_dry_run_fills
+        from vietnam_algo.libs.config import StrategyConfig
+        from vietnam_algo.libs.daily_engine import EngineConfig
 
         engine_config = EngineConfig(
             dataDir=self.tmp, strategy="momentum",

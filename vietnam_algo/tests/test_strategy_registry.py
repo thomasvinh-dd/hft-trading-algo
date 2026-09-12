@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from vietnam_algo.strategy_registry import (
+from vietnam_algo.algos.registry import (
     STRATEGY_REGISTRY,
     StrategyAdapter,
     get_strategy,
@@ -46,7 +46,7 @@ def test_strategy_adapter_filenames_are_namespaced():
 
 def test_empty_name_falls_back_to_legacy_filenames():
     """Empty-name strategy produces the legacy non-namespaced paths."""
-    from vietnam_algo.strategy_registry import _EmptyStrategy
+    from vietnam_algo.algos.registry import _EmptyStrategy
     legacy = _EmptyStrategy()
     assert legacy.orders_csv_filename == "latest_orders.csv"
     assert legacy.orders_json_filename == "latest_orders.json"

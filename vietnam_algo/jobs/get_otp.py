@@ -35,10 +35,10 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..daily_engine import trading_token_from_email
-from ..data import DEFAULT_DATA_DIR, read_json, write_json
-from ..dnse_client import DnseClient
-from ..token_store import parse_jwt_expiry
+from vietnam_algo.libs.daily_engine import trading_token_from_email
+from vietnam_algo.libs.data import DEFAULT_DATA_DIR, read_json, write_json
+from vietnam_algo.libs.dnse.client import DnseClient
+from vietnam_algo.libs.dnse.auth import parse_jwt_expiry
 
 
 SHARED_TOKEN_PATH = DEFAULT_DATA_DIR / "live" / "dnse_trading_token.json"
@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     environment (same as the auto-trading-bot), runs ``run()``, and
     returns 0/1. Designed for cron invocation — exit 0 on success.
     """
-    from ..main import dnse_client_from_args  # deferred to avoid a
+    from vietnam_algo.main import dnse_client_from_args  # deferred to avoid a
                                               # cycle in some test runners
     api_key = os.environ.get("DNSE_API_KEY", "")
     api_secret = os.environ.get("DNSE_API_SECRET", "")

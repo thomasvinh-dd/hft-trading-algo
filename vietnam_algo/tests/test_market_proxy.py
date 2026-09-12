@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.backtest import precompute_market_proxy, market_proxy_closes
+from vietnam_algo.libs.backtest import precompute_market_proxy, market_proxy_closes
 
 
 class FakePriceBar:
