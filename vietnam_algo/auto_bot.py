@@ -21,7 +21,35 @@ from .schedule import (
     should_sync_corporate_actions, should_send_heartbeat, vietnam_now,
 )
 from .strategy_registry import STRATEGY_REGISTRY, get_strategy
-from .token_store import ensure_fresh_trading_token
+from .token_store import (
+    SHARED_TOKEN_PATH,
+    ensure_fresh_trading_token,
+    load_shared_trading_token,
+)
+
+
+def _hydrate_shared_token_into_state(state, data_dir) -> bool:
+    """Copy the latest DNSE token from the shared file into the
+    bot's in-memory state if it's fresh enough.
+
+    Returns True when the token was hydrated (and ``state.tradingToken``
+    is now usable), False otherwise (caller falls back to lazy refresh).
+    """
+    shared = load_shared_trading_token(data_dir)
+    if not shared:
+        return False
+    from .token_store import is_token_fresh
+    if not is_token_fresh(
+        shared["token"],
+        issued_at=shared.get("issued_at"),
+    ):
+        return False
+    state.tradingToken = shared["token"]
+    if shared.get("expires_at"):
+        state.tokenExpiry = shared["expires_at"]
+    if hasattr(state, "tokenDate") and shared.get("date"):
+        state.tokenDate = shared["date"]
+    return True
 
 
 def _apply_dry_run_fills(
@@ -395,8 +423,16 @@ def run_auto_bot(
             else:
                 print(f"[{now.isoformat()}] Generating and submitting latest orders")
                 notify(f"Vietnam Algo: submit cycle started\ntime: {now.isoformat()}\nliveSubmit: {live_submit}")
-                # Lazy refresh: only fetch a token if (a) live mode AND
-                # (b) we don't have a fresh one. Dry-run just sets a placeholder.
+                # Prefer the shared token file written by
+                # ``vietnam_algo.jobs.get_otp`` (cron @ 08:30 ICT).
+                # The hybrid lazy-refresh below only fires when the
+                # shared file is missing or stale, which is the
+                # documented degraded mode for a single-bot deployment
+                # that hasn't adopted the cron job yet.
+                if not live_submit:
+                    _hydrate_shared_token_into_state(
+                        state, engine_config.dataDir,
+                    )
                 def _refresh_and_notify(msg: str) -> None:
                     # Called from inside ensure_fresh_trading_token — keep
                     # the notify path uniform with the rest of the bot.

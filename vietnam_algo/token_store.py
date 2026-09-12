@@ -11,11 +11,23 @@ This module provides:
   - is_token_fresh(token, leeway_seconds=300): True if token is present
     AND not expiring within `leeway_seconds`
   - ensure_fresh_trading_token(client, state, account_no, live_submit,
-      notify_fn): if state.tradingToken is missing OR stale, refresh.
+    notify_fn): if state.tradingToken is missing OR stale, refresh.
     In dry-run mode, sets a placeholder. Returns the resulting token.
 
 The auto-bot's main loop should NOT refresh the token on a schedule; it
 should only refresh when a submit cycle is about to run.
+
+Decoupled OTP (2026-09-12)
+--------------------------
+
+With two bots on the same VPS for the same DNSE account, we now have a
+dedicated ``vietnam_algo.jobs.get_otp`` job that's cron'd at 08:30 ICT.
+It writes the fresh token to ``SHARED_TOKEN_PATH`` (default:
+``data/live/dnse_trading_token.json``). The bots' submit-cycle refresh
+path now prefers the shared file via ``load_shared_trading_token`` —
+they only fall back to a self-refresh when the shared file is missing
+or stale. This keeps the DNSE OTP flow serialised at exactly one
+request per trading day.
 """
 from __future__ import annotations
 
@@ -24,7 +36,15 @@ import json
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
+
+
+# Shared token file written by ``vietnam_algo.jobs.get_otp.run``.
+# Other code paths should always go through ``load_shared_trading_token``
+# so the location stays single-sourced.
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+SHARED_TOKEN_PATH = DEFAULT_DATA_DIR / "live" / "dnse_trading_token.json"
 
 
 def parse_jwt_expiry(token: str) -> datetime | None:
@@ -54,19 +74,59 @@ def parse_jwt_expiry(token: str) -> datetime | None:
     return None
 
 
-def is_token_fresh(token: str | None, leeway_seconds: int = 300) -> bool:
+def is_token_fresh(
+    token: str | None,
+    leeway_seconds: int = 300,
+    issued_at: str | None = None,
+) -> bool:
     """True if token is set AND not expiring within `leeway_seconds`.
 
     `leeway_seconds` defaults to 5 minutes — a token about to expire
     in <5min is treated as stale so we have time to refresh before use.
+
+    Tokens that aren't JWTs (DNSE rotated to plain UUIDs in
+    2026-08) don't carry a parseable ``exp`` claim, so we fall back
+    to the ``issued_at`` ISO timestamp: if the caller hands us the
+    issuance time we accept the token as fresh when it's <12h old,
+    otherwise we treat it as stale.
     """
     if not token or token == "dry-run-token":
         return False
     expiry = parse_jwt_expiry(token)
-    if expiry is None:
-        # Can't determine expiry — assume stale to force a refresh.
-        return False
-    return (expiry - datetime.now(tz=timezone.utc)).total_seconds() > leeway_seconds
+    if expiry is not None:
+        return (expiry - datetime.now(tz=timezone.utc)).total_seconds() > leeway_seconds
+    if issued_at:
+        try:
+            issued = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
+        except Exception:
+            return False
+        age = (datetime.now(tz=timezone.utc) - issued).total_seconds()
+        # DNSE UUID tokens are good for the entire trading day;
+        # treat anything <12h old as fresh. Older tokens need a refresh.
+        return 0 <= age <= 12 * 3600
+    # No way to verify expiry — assume stale to force a refresh.
+    return False
+
+
+def load_shared_trading_token(data_dir: Path | None = None) -> dict[str, Any] | None:
+    """Read the shared DNSE trading token written by the OTP job.
+
+    Returns None if the file is missing or unreadable. The job writes:
+      ``{"token", "account_no", "issued_at", "expires_at", "date"}``
+
+    ``data_dir`` is honoured for tests that want a sandbox path;
+    production callers pass ``engine_config.dataDir``.
+    """
+    path = data_dir / "live" / "dnse_trading_token.json" if data_dir else SHARED_TOKEN_PATH
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not payload.get("token"):
+        return None
+    return payload
 
 
 def ensure_fresh_trading_token(

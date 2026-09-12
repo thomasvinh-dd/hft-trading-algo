@@ -502,6 +502,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="list all registered trading strategies",
     )
 
+    # Decoupled jobs — run on cron, see vietnam_algo/jobs/.
+    # ``run-get-otp``     : DNSE email OTP -> shared trading token
+    # ``run-common-sync`` : price + CA refresh + EOD sentinel
+    subparsers.add_parser(
+        "run-get-otp",
+        help="fetch DNSE email-OTP trading token into the shared file "
+             "(data/live/dnse_trading_token.json). Designed for cron at 08:30 ICT.",
+    )
+    common_sync_parser = subparsers.add_parser(
+        "run-common-sync",
+        help="refresh shared price + corporate-action data and stamp "
+             "the data_ready_for_eod sentinel for the bots. Designed for "
+             "cron at 08:30 / 15:15 ICT.",
+    )
+    common_sync_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="force a fresh run even if the same day's run already "
+             "happened (does not skip the sentinel re-stamp).",
+    )
+
     return parser
 
 
@@ -1606,6 +1627,21 @@ def main(argv: list[str] | None = None) -> int:
             if entry["env"]:
                 print(f"    env: vietnam_algo/env/{entry['env']}")
         return 0
+
+    if args.command == "run-get-otp":
+        from .jobs import get_otp
+        # Don't re-parse sys.argv — main.py already parsed out the
+        # subcommand. Pass argv=[] so the nested parser sees no
+        # positional work to do.
+        return get_otp.main(argv=[])
+
+    if args.command == "run-common-sync":
+        from .jobs import common_sync
+        # See note on run-get-otp above; the dispatch here hands the
+        # already-parsed --force through to common_sync.
+        if getattr(args, "force", False):
+            return common_sync.main(["--force"])
+        return common_sync.main(argv=[])
 
     return 2
 
