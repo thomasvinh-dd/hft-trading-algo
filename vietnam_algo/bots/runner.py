@@ -48,6 +48,78 @@ from vietnam_algo.libs.schedule import (
 )
 
 
+def _build_db_for_bot() -> Any:
+    """Open a single DbClient for the bot's lifetime.
+
+    The pool is created lazily on first write; we never connect at
+    startup so a Postgres outage doesn't block the bot from
+    starting. ``None`` is returned when the bot has been told to
+    skip mirroring via ``HFT_MIRROR_TO_DB=0``.
+    """
+    import os
+
+    if os.environ.get("HFT_MIRROR_TO_DB", "1") == "0":
+        return None
+    try:
+        from vietnam_algo.libs.db import DbClient
+    except ImportError:
+        return None
+    return DbClient.from_default()
+
+
+def _emit_cycle(
+    db: Any,
+    strategy: str,
+    event_type: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    message: str | None = None,
+    local_date: str | None = None,
+    occurred_at: Any | None = None,
+) -> None:
+    """Write a ``cycle_events`` row in Postgres (best-effort)."""
+    if db is None:
+        return
+    try:
+        from vietnam_algo.libs.db_sync import emit_cycle_event
+        emit_cycle_event(
+            db,
+            strategy=strategy,
+            event_type=event_type,
+            payload=payload,
+            message=message,
+            local_date=local_date,
+            occurred_at=occurred_at,
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        print(f"[cycle_events] emit '{event_type}' failed: {exc}")
+
+
+def _mirror_daily_report(
+    db: Any,
+    *,
+    strategy: str,
+    source: str,
+    snapshot: dict[str, Any],
+    raw_message: str | None,
+    local_date: str,
+) -> None:
+    """Write a ``daily_reports`` row in Postgres (best-effort)."""
+    if db is None:
+        return
+    try:
+        from vietnam_algo.libs.db_sync import mirror_daily_report
+        payload = dict(snapshot or {})
+        payload.setdefault("report_date", local_date)
+        payload["raw_message"] = raw_message
+        mirror_daily_report(
+            db, strategy=strategy, source=source,
+            report=payload, local_date=local_date,
+        )
+    except Exception as exc:  # pragma: no cover
+        print(f"[daily_reports] write '{source}' failed: {exc}")
+
+
 def _hydrate_shared_token_into_state(state, data_dir) -> bool:
     """Copy the latest DNSE token from the shared file into the
     bot's in-memory state if it's fresh enough.
@@ -406,9 +478,25 @@ def run_auto_bot(
     ``strategy_name`` namespaces per-strategy state files
     (auto_bot_state.{name}.json) so multiple strategies can run
     side-by-side on the same VPS without clobbering each other.
+
+    Side effects
+    ------------
+
+    Every cycle emits a ``cycle_events`` row to Postgres (best-effort)
+    so dashboards / audit queries can answer "what did the bot do
+    today?". EOD and start-of-day also write a structured
+    ``daily_reports`` row.
     """
     strategy_adapter = get_strategy(engine_config.strategy) if engine_config.strategy else None
     bot_start_time = vietnam_now()
+    _db = _build_db_for_bot()
+    _emit_cycle(_db, strategy_name or engine_config.strategy or "?",
+                "bot_started",
+                payload={"live_submit": live_submit,
+                         "strategy": engine_config.strategy,
+                         "loan_package_id": loan_package_id},
+                local_date=local_date(bot_start_time),
+                occurred_at=bot_start_time)
     while True:
         now = vietnam_now()
         today = local_date(now)
@@ -508,6 +596,12 @@ def run_auto_bot(
                         raise
                     continue
                 print(result)
+                _emit_cycle(
+                    _db, strategy_name or engine_config.strategy or "?",
+                    "submit",
+                    payload={"date": today, "result_status": result.get("status")},
+                    local_date=today,
+                )
                 if result.get("submitComplete") or not live_submit:
                     state.orderSubmitDate = today
                 else:
@@ -677,7 +771,29 @@ def run_auto_bot(
                     account=account_no,
                 )
                 notify(msg)
+                _emit_cycle(
+                    _db, strategy_name or engine_config.strategy or "?",
+                    "start_of_day",
+                    payload={"date": today, "items": len(_items)},
+                    message=msg[:500],
+                    local_date=today,
+                )
+                if isinstance(portfolio_snap, dict):
+                    _mirror_daily_report(
+                        _db,
+                        strategy=strategy_name or engine_config.strategy or "?",
+                        source="start_of_day",
+                        snapshot=portfolio_snap,
+                        raw_message=msg,
+                        local_date=today,
+                    )
             except Exception as exc:
+                _emit_cycle(
+                    _db, strategy_name or engine_config.strategy or "?",
+                    "start_of_day_error",
+                    payload={"date": today, "err": str(exc)[:200]},
+                    local_date=today,
+                )
                 notify(
                     "\n".join(
                         [
@@ -845,9 +961,26 @@ def run_auto_bot(
                 # Use strategy-specific formatter if available, else default.
                 # Both now accept the live portfolio snapshot.
                 if strategy_adapter is not None:
-                    notify(strategy_adapter.format_cycle_summary(result, portfolio=portfolio_snap))
+                    eod_msg = strategy_adapter.format_cycle_summary(result, portfolio=portfolio_snap)
                 else:
-                    notify(eod_summary_message(result, portfolio=portfolio_snap))
+                    eod_msg = eod_summary_message(result, portfolio=portfolio_snap)
+                notify(eod_msg)
+                _emit_cycle(
+                    _db, strategy_name or engine_config.strategy or "?",
+                    "eod",
+                    payload={"date": today, "count": result.get("count", 0)},
+                    message=eod_msg[:500],
+                    local_date=today,
+                )
+                if isinstance(portfolio_snap, dict):
+                    _mirror_daily_report(
+                        _db,
+                        strategy=strategy_name or engine_config.strategy or "?",
+                        source="eod",
+                        snapshot=portfolio_snap,
+                        raw_message=eod_msg,
+                        local_date=today,
+                    )
             state.eodDate = today
             save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
@@ -883,6 +1016,13 @@ def run_auto_bot(
                 uptime_seconds=uptime_s,
             )
             notify(msg)
+            _emit_cycle(
+                _db, strategy_name or engine_config.strategy or "?",
+                "heartbeat",
+                payload={"date": today, "proxy_check": proxy_check,
+                         "uptime_s": uptime_s, "pid": pid},
+                local_date=today,
+            )
             state.lastHeartbeatDate = today
             save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 

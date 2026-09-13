@@ -38,7 +38,7 @@ import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -492,6 +492,434 @@ class DbClient:
             cur.execute("SELECT date FROM market_holidays")
             return {row[0].isoformat() for row in cur.fetchall()}
 
+    # ------------------------------------------------------------------ #
+    # order_ledger
+    # ------------------------------------------------------------------ #
+
+    def upsert_order_ledger(
+        self,
+        rows: Iterable[dict[str, Any]],
+    ) -> int:
+        """Bulk-upsert into ``order_ledger``.
+
+        Each dict must have at minimum ``runId``, ``sourceOrderId``,
+        ``symbol``, ``side``. The full ``lastDetail`` payload is
+        preserved in the ``last_detail`` JSONB column.
+        """
+        records = []
+        for row in rows:
+            required = ("runId", "sourceOrderId", "symbol", "side")
+            if not all(row.get(k) for k in required):
+                continue
+            records.append((
+                str(row["runId"]),
+                int(row["sourceOrderId"]),
+                _parse_date(row.get("sourceDate") or row.get("source_date")),
+                str(row["symbol"]).upper(),
+                str(row["side"]).upper(),
+                int(row.get("quantity") or 0),
+                float(row.get("price") or 0),
+                row.get("reason"),
+                str(row.get("status") or "unknown"),
+                row.get("dnseOrderId") or row.get("dnse_order_id") or None,
+                _parse_dt(row.get("createdAt") or row.get("created_at")) or _utc_now(),
+                _parse_dt(row.get("updatedAt") or row.get("updated_at")) or _utc_now(),
+                Json(row.get("lastDetail") or row.get("last_detail")) if (row.get("lastDetail") or row.get("last_detail")) else None,
+                row.get("error"),
+            ))
+        if not records:
+            return 0
+        with self.cursor(commit=True) as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO order_ledger (
+                    run_id, source_order_id, source_date, symbol, side,
+                    quantity, price, reason, status, dnse_order_id,
+                    created_at, updated_at, last_detail, error
+                ) VALUES %s
+                ON CONFLICT (run_id, source_order_id, symbol, side) DO UPDATE SET
+                    source_date = EXCLUDED.source_date,
+                    quantity = EXCLUDED.quantity,
+                    price = EXCLUDED.price,
+                    reason = EXCLUDED.reason,
+                    status = EXCLUDED.status,
+                    dnse_order_id = COALESCE(EXCLUDED.dnse_order_id, order_ledger.dnse_order_id),
+                    created_at = COALESCE(order_ledger.created_at, EXCLUDED.created_at),
+                    updated_at = EXCLUDED.updated_at,
+                    last_detail = COALESCE(EXCLUDED.last_detail, order_ledger.last_detail),
+                    error = COALESCE(EXCLUDED.error, order_ledger.error)
+                """,
+                records,
+            )
+        return len(records)
+
+    def replace_order_ledger_for_run(
+        self,
+        run_id: str,
+        rows: Iterable[dict[str, Any]],
+    ) -> int:
+        """Replace the full set of ledger rows for ``run_id``.
+
+        Used by ``save_ledger`` which owns the entire ledger per run.
+        The transaction deletes the prior set and inserts the new
+        set in a single transaction so we never see a half-written
+        ledger.
+        """
+        record_list = list(rows)
+        with self.cursor(commit=True) as cur:
+            cur.execute("DELETE FROM order_ledger WHERE run_id = %s", (run_id,))
+        if not record_list:
+            return 0
+        return self.upsert_order_ledger(record_list)
+
+    def count_order_ledger(self, *, run_id: str | None = None) -> int:
+        with self.cursor() as cur:
+            if run_id:
+                cur.execute("SELECT count(*) FROM order_ledger WHERE run_id = %s", (run_id,))
+            else:
+                cur.execute("SELECT count(*) FROM order_ledger")
+            return int(cur.fetchone()[0])
+
+    def read_order_ledger(
+        self,
+        *,
+        run_id: str | None = None,
+        symbol: str | None = None,
+        status: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        clauses, args = [], []
+        if run_id:
+            clauses.append("run_id = %s")
+            args.append(run_id)
+        if symbol:
+            clauses.append("symbol = %s")
+            args.append(symbol)
+        if status:
+            clauses.append("status = %s")
+            args.append(status)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "SELECT run_id, source_order_id, source_date, symbol, side, "
+            "quantity, price, reason, status, dnse_order_id, "
+            "created_at, updated_at, last_detail, error "
+            f"FROM order_ledger {where} ORDER BY updated_at DESC LIMIT {int(limit)}"
+        )
+        with self.cursor() as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+        return [
+            {
+                "runId": r[0],
+                "sourceOrderId": r[1],
+                "sourceDate": r[2].isoformat() if r[2] else None,
+                "symbol": r[3],
+                "side": r[4],
+                "quantity": r[5],
+                "price": float(r[6]),
+                "reason": r[7],
+                "status": r[8],
+                "dnseOrderId": r[9] or "",
+                "createdAt": r[10].isoformat() if r[10] else None,
+                "updatedAt": r[11].isoformat() if r[11] else None,
+                "lastDetail": r[12],
+                "error": r[13] or "",
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------ #
+    # daily_reports
+    # ------------------------------------------------------------------ #
+
+    def upsert_daily_report(self, report: dict[str, Any]) -> int:
+        """Upsert one row in ``daily_reports``.
+
+        Required: ``strategy``, ``report_date`` (YYYY-MM-DD),
+        ``source`` ('start_of_day' | 'eod' | 'heartbeat'), ``cash``,
+        ``nav``.
+        """
+        if not all(report.get(k) for k in ("strategy", "report_date", "source")):
+            return 0
+        positions = report.get("positions") or {}
+        closed_trades = report.get("closed_trades") or []
+        with self.cursor(commit=True) as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO daily_reports (
+                    strategy, report_date, source,
+                    initial_nav, cash, cash_total, stock_value, nav,
+                    realized_pnl, unrealized_pnl, total_pnl, pnl_pct_vs_initial,
+                    positions, closed_trades,
+                    planned_orders_count, applied_orders_count,
+                    clipped_orders_count, skipped_orders_count,
+                    raw_message
+                ) VALUES %s
+                ON CONFLICT (strategy, report_date, source) DO UPDATE SET
+                    initial_nav = EXCLUDED.initial_nav,
+                    cash = EXCLUDED.cash,
+                    cash_total = EXCLUDED.cash_total,
+                    stock_value = EXCLUDED.stock_value,
+                    nav = EXCLUDED.nav,
+                    realized_pnl = EXCLUDED.realized_pnl,
+                    unrealized_pnl = EXCLUDED.unrealized_pnl,
+                    total_pnl = EXCLUDED.total_pnl,
+                    pnl_pct_vs_initial = EXCLUDED.pnl_pct_vs_initial,
+                    positions = EXCLUDED.positions,
+                    closed_trades = EXCLUDED.closed_trades,
+                    planned_orders_count = EXCLUDED.planned_orders_count,
+                    applied_orders_count = EXCLUDED.applied_orders_count,
+                    clipped_orders_count = EXCLUDED.clipped_orders_count,
+                    skipped_orders_count = EXCLUDED.skipped_orders_count,
+                    raw_message = EXCLUDED.raw_message,
+                    fetched_at = now()
+                """,
+                [(
+                    str(report["strategy"]),
+                    _parse_date(report["report_date"]),
+                    str(report["source"]),
+                    _to_float(report.get("initial_nav")),
+                    _to_float(report.get("cash"), 0.0),
+                    _to_float(report.get("cash_total")),
+                    _to_float(report.get("stock_value")),
+                    _to_float(report.get("nav"), 0.0),
+                    _to_float(report.get("realized_pnl"), 0.0),
+                    _to_float(report.get("unrealized_pnl"), 0.0),
+                    _to_float(report.get("total_pnl"), 0.0),
+                    _to_float(report.get("pnl_pct_vs_initial")),
+                    Json(positions),
+                    Json(closed_trades),
+                    int(report.get("planned_orders_count") or 0),
+                    int(report.get("applied_orders_count") or 0),
+                    int(report.get("clipped_orders_count") or 0),
+                    int(report.get("skipped_orders_count") or 0),
+                    report.get("raw_message"),
+                )],
+            )
+        return 1
+
+    def read_daily_reports(
+        self,
+        strategy: str,
+        *,
+        since: date | None = None,
+        until: date | None = None,
+        source: str | None = None,
+        limit: int = 365,
+    ) -> list[dict[str, Any]]:
+        clauses, args = ["strategy = %s"], [strategy]
+        if since:
+            clauses.append("report_date >= %s")
+            args.append(since)
+        if until:
+            clauses.append("report_date <= %s")
+            args.append(until)
+        if source:
+            clauses.append("source = %s")
+            args.append(source)
+        where = "WHERE " + " AND ".join(clauses)
+        sql = (
+            "SELECT report_date, source, initial_nav, cash, cash_total, "
+            "stock_value, nav, realized_pnl, unrealized_pnl, total_pnl, "
+            "pnl_pct_vs_initial, planned_orders_count, applied_orders_count, "
+            "clipped_orders_count, skipped_orders_count, fetched_at "
+            f"FROM daily_reports {where} ORDER BY report_date DESC, source LIMIT {int(limit)}"
+        )
+        with self.cursor() as cur:
+            cur.execute(sql, args)
+            return [
+                {
+                    "report_date": r[0].isoformat(),
+                    "source": r[1],
+                    "initial_nav": _opt_float(r[2]),
+                    "cash": float(r[3]),
+                    "cash_total": _opt_float(r[4]),
+                    "stock_value": _opt_float(r[5]),
+                    "nav": float(r[6]),
+                    "realized_pnl": float(r[7]),
+                    "unrealized_pnl": float(r[8]),
+                    "total_pnl": float(r[9]),
+                    "pnl_pct_vs_initial": _opt_float(r[10]),
+                    "planned_orders_count": r[11],
+                    "applied_orders_count": r[12],
+                    "clipped_orders_count": r[13],
+                    "skipped_orders_count": r[14],
+                    "fetched_at": r[15].isoformat(),
+                }
+                for r in cur.fetchall()
+            ]
+
+    # ------------------------------------------------------------------ #
+    # cycle_events
+    # ------------------------------------------------------------------ #
+
+    def insert_cycle_event(
+        self,
+        *,
+        strategy: str,
+        event_type: str,
+        occurred_at: datetime | None = None,
+        local_date: date | str | None = None,
+        payload: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> int:
+        when = occurred_at or datetime.now(tz=timezone.utc)
+        ld = _parse_date(local_date) if local_date else None
+        with self.cursor(commit=True) as cur:
+            cur.execute(
+                """
+                INSERT INTO cycle_events
+                    (strategy, event_type, occurred_at, local_date, payload, message)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING event_id
+                """,
+                (
+                    str(strategy),
+                    str(event_type),
+                    when,
+                    ld,
+                    Json(payload or {}),
+                    message,
+                ),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+
+    def read_cycle_events(
+        self,
+        *,
+        strategy: str | None = None,
+        event_type: str | None = None,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses, args = [], []
+        if strategy:
+            clauses.append("strategy = %s")
+            args.append(strategy)
+        if event_type:
+            clauses.append("event_type = %s")
+            args.append(event_type)
+        if since:
+            clauses.append("occurred_at >= %s")
+            args.append(since)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "SELECT event_id, strategy, event_type, occurred_at, local_date, "
+            "payload, message "
+            f"FROM cycle_events {where} ORDER BY occurred_at DESC LIMIT {int(limit)}"
+        )
+        with self.cursor() as cur:
+            cur.execute(sql, args)
+            return [
+                {
+                    "event_id": r[0],
+                    "strategy": r[1],
+                    "event_type": r[2],
+                    "occurred_at": r[3].isoformat(),
+                    "local_date": r[4].isoformat() if r[4] else None,
+                    "payload": r[5],
+                    "message": r[6],
+                }
+                for r in cur.fetchall()
+            ]
+
+    # ------------------------------------------------------------------ #
+    # latest_orders
+    # ------------------------------------------------------------------ #
+
+    def replace_latest_orders(
+        self,
+        *,
+        strategy: str,
+        trade_date: date | str,
+        items: Iterable[dict[str, Any]],
+    ) -> int:
+        """Replace the entire plan for ``(strategy, trade_date)``.
+
+        Used by ``export_orders_for_date`` which owns the full plan
+        for one date per strategy. The previous set is wiped before
+        the new one is written so we never see a half-written plan.
+        """
+        td = _parse_date(trade_date)
+        if td is None:
+            return 0
+        items_list = list(items)
+        with self.cursor(commit=True) as cur:
+            cur.execute(
+                "DELETE FROM latest_orders WHERE strategy = %s AND trade_date = %s",
+                (strategy, td),
+            )
+        if not items_list:
+            return 0
+        rows = []
+        for i, item in enumerate(items_list):
+            rows.append((
+                strategy,
+                td,
+                i,
+                str(item.get("symbol") or "").upper(),
+                str(item.get("side") or "").upper(),
+                _to_int(item.get("quantity")),
+                _to_float(item.get("price"), 0.0),
+                item.get("reason"),
+                _to_int(item.get("sourceOrderId") or item.get("source_order_id")),
+                _to_float(item.get("value")),
+                _to_float(item.get("fee")),
+                item.get("kind"),
+                Json(item),
+            ))
+        with self.cursor(commit=True) as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO latest_orders (
+                    strategy, trade_date, plan_index, symbol, side,
+                    quantity, price, reason, source_order_id, value, fee, kind, payload
+                ) VALUES %s
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def read_latest_orders(
+        self,
+        *,
+        strategy: str,
+        trade_date: date | str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses, args = ["strategy = %s"], [strategy]
+        if trade_date:
+            clauses.append("trade_date = %s")
+            args.append(_parse_date(trade_date))
+        where = "WHERE " + " AND ".join(clauses)
+        sql = (
+            "SELECT trade_date, plan_index, symbol, side, quantity, price, "
+            "reason, source_order_id, value, fee, kind "
+            f"FROM latest_orders {where} ORDER BY trade_date DESC, plan_index LIMIT {int(limit)}"
+        )
+        with self.cursor() as cur:
+            cur.execute(sql, args)
+            return [
+                {
+                    "trade_date": r[0].isoformat(),
+                    "plan_index": r[1],
+                    "symbol": r[2],
+                    "side": r[3],
+                    "quantity": r[4],
+                    "price": float(r[5]),
+                    "reason": r[6],
+                    "source_order_id": r[7],
+                    "value": _opt_float(r[8]),
+                    "fee": _opt_float(r[9]),
+                    "kind": r[10],
+                }
+                for r in cur.fetchall()
+            ]
+
 
 # ---------------------------------------------------------------------- #
 # Helpers
@@ -530,4 +958,50 @@ def _parse_date(value: Any) -> date | None:
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except ValueError:
+        return None
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    s = str(value).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+def _to_float(value: Any, default: float | None = None) -> float | None:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(value: Any, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _opt_float(value: Any) -> float | None:
+    """Convert DB NUMERIC to float; returns None for NULL values."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return None

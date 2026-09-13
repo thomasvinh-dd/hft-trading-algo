@@ -73,7 +73,7 @@ def load_ledger(data_dir: Path = DEFAULT_DATA_DIR) -> dict[str, LedgerOrder]:
 
 def save_ledger(ledger: dict[str, LedgerOrder], data_dir: Path = DEFAULT_DATA_DIR) -> Path:
     rows = sorted(ledger.values(), key=lambda item: (item.runId, item.sourceOrderId, item.symbol, item.side))
-    return write_json(
+    path = write_json(
         ledger_path(data_dir),
         {
             "updatedAt": utc_now(),
@@ -81,6 +81,37 @@ def save_ledger(ledger: dict[str, LedgerOrder], data_dir: Path = DEFAULT_DATA_DI
             "items": [asdict(row) for row in rows],
         },
     )
+    # Best-effort mirror into Postgres. Failures are logged but never
+    # break the JSON write — see libs.db_sync.mirror_order_ledger.
+    _maybe_mirror_to_db(rows)
+    return path
+
+
+def _maybe_mirror_to_db(rows: list[LedgerOrder]) -> None:
+    """Mirror the freshly-written ledger rows into Postgres.
+
+    Best-effort: a Postgres outage must not break the JSON pipeline.
+    Each ``LedgerOrder`` is converted to a plain dict so we don't
+    pull psycopg2 / DbClient into the order_ledger import graph.
+    """
+    import os
+
+    if os.environ.get("HFT_MIRROR_TO_DB", "1") == "0":
+        return
+    try:
+        from .db import DbClient, DbError
+        from .db_sync import mirror_order_ledger
+    except ImportError as exc:  # pragma: no cover — psycopg2 missing
+        print(f"[save_ledger] skipping Postgres mirror (no psycopg2): {exc}")
+        return
+
+    db = DbClient.from_default()
+    payload = [asdict(r) for r in rows]
+    result = mirror_order_ledger(db, payload, run_id=None)
+    if result is None:
+        # mirror_order_ledger already logged via _safe
+        return
+    print(f"[save_ledger] mirrored {result} ledger rows to Postgres")
 
 
 def order_status_from_detail(detail: dict[str, Any] | list[Any]) -> str:

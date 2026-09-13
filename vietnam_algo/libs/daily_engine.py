@@ -91,6 +91,7 @@ def export_orders_for_date(
     trade_date: str | None = None,
     csv_filename: str = "latest_orders.csv",
     json_filename: str = "latest_orders.json",
+    strategy_name: str = "",
 ) -> tuple[Path, Path, str | None, int]:
     with orders_csv.open("r", encoding="utf-8", newline="") as file:
         rows = list(csv.DictReader(file))
@@ -114,7 +115,42 @@ def export_orders_for_date(
             "items": selected,
         },
     )
+    # Mirror the plan into Postgres so dashboards can query the
+    # latest orders without parsing JSON files. Best-effort: a
+    # Postgres outage must not break the JSON pipeline.
+    _maybe_mirror_latest_orders_to_db(
+        strategy=strategy_name or json_filename.split(".")[0],
+        trade_date=selected_date or "",
+        items=selected,
+    )
     return csv_path, json_path, selected_date, len(selected)
+
+
+def _maybe_mirror_latest_orders_to_db(
+    *,
+    strategy: str,
+    trade_date: str,
+    items: list[dict],
+) -> None:
+    import os
+
+    if not strategy or not trade_date:
+        return
+    if os.environ.get("HFT_MIRROR_TO_DB", "1") == "0":
+        return
+    try:
+        from .db import DbClient, DbError
+        from .db_sync import mirror_latest_orders
+    except ImportError as exc:  # pragma: no cover
+        print(f"[export_orders_for_date] skipping Postgres mirror (no psycopg2): {exc}")
+        return
+    db = DbClient.from_default()
+    result = mirror_latest_orders(
+        db, strategy=strategy, trade_date=trade_date, items=items,
+    )
+    if result is None:
+        return
+    print(f"[export_orders_for_date] mirrored {result} orders to Postgres")
 
 
 def update_dataset(config: EngineConfig) -> None:
@@ -231,6 +267,7 @@ def generate_live_orders(
         trade_date=trade_date,
         csv_filename=csv_name,
         json_filename=json_name,
+        strategy_name=strategy_name,
     )
     result_payload = {
         "result": str(result_path),
