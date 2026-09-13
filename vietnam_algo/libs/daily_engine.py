@@ -145,12 +145,53 @@ def update_dataset(config: EngineConfig) -> None:
     # re-fetching the full ``priceLimit``-bar history every cycle and
     # keeps the data fresh for EOD mark-to-market and order generation.
     from .data import sync_prices_incremental
-    sync_prices_incremental(
+
+    paths = sync_prices_incremental(
         symbols,
         config.dataDir,
         sleep_seconds=config.priceSleepSeconds,
         incremental_limit=10,
     )
+    # Mirror into Postgres if configured (env HFT_MIRROR_TO_DB=1, default on).
+    _maybe_mirror_prices_to_db(symbols, config.dataDir, paths)
+
+
+def _maybe_mirror_prices_to_db(
+    symbols: Sequence[str],
+    data_dir: Path,
+    paths: Sequence[Path],
+) -> None:
+    """Mirror the freshly-written price JSON files into Postgres.
+
+    Best-effort: a Postgres outage must not break the bot's JSON
+    pipeline. ``mirror_*`` helpers swallow ``DbError`` and log.
+    """
+    import os
+
+    if os.environ.get("HFT_MIRROR_TO_DB", "1") == "0":
+        return
+    try:
+        from .db import DbClient, DbError
+        from .db_sync import mirror_prices
+    except ImportError as exc:  # pragma: no cover — psycopg2 missing
+        print(f"[update_dataset] skipping Postgres mirror (no psycopg2): {exc}")
+        return
+
+    db = DbClient.from_default()
+    touched = 0
+    for symbol, path in zip(symbols, paths):
+        try:
+            payload = read_json(path)
+        except Exception as exc:
+            print(f"[update_dataset] mirror read {symbol}: {exc}")
+            continue
+        bars = payload.get("items") if isinstance(payload, dict) else None
+        if not bars:
+            continue
+        result = mirror_prices(db, symbol, bars)
+        if result:
+            touched += 1
+    print(f"[update_dataset] mirrored {touched}/{len(symbols)} price files to Postgres")
 
 
 def generate_live_orders(
