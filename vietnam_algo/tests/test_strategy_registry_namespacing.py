@@ -47,7 +47,7 @@ class MomentumAdapterNamespacingTests(unittest.TestCase):
 
         adapter = MomentumRotationAdapter()
         with patch(
-            "vietnam_algo.algos.registry.generate_live_orders",
+            "vietnam_algo.algos.momentum.generate_live_orders",
             side_effect=fake_generate_live_orders,
         ):
             adapter.generate_orders(
