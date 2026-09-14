@@ -233,3 +233,120 @@ class DryRunApplyGuardsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TotalPnlAndMarketSellTests(unittest.TestCase):
+    """Regression tests for the 2026-09-14 dry-run reporting bug.
+
+    Two issues:
+      1. ``DryRunState.total_pnl`` was computed as
+         ``realized + unrealized``, which silently dropped the 0.15%
+         fee a BUY charges against cash. After several BUYs the
+         "total P&L" line showed 0 while the NAV was actually below
+         the initial NAV.
+      2. autofin emits ``full_close`` SELLs with ``price: 0`` (a
+         market order to close). The apply loop did ``if price <= 0:
+         continue`` and dropped them silently, so the dry-run state
+         kept showing the old qty even after the bot had signalled
+         a full close.
+    """
+
+    def test_total_pnl_includes_fees(self) -> None:
+        """BUY 1100 @ 27100 with 0.15% fees should leave total_pnl
+        negative by ~45k (the fee), not zero."""
+        state = DryRunState(initial_nav=100_000_000, cash=100_000_000)
+        apply_orders_to_state(
+            state,
+            [{"side": "BUY", "symbol": "HDB", "price": 27_100, "quantity": 1100}],
+            fees_bps=15.0,
+        )
+        # total_pnl = portfolio_value - initial_nav
+        #            = (cash + stock_value) - initial_nav
+        #            = (70_054_505 + 29_810_000) - 100_000_000
+        #            = -135_495  (the fee)
+        self.assertAlmostEqual(
+            state.total_pnl,
+            -29_810_000 * 0.0015,  # ≈ -44,715 if no fees on price
+            places=0,
+        )
+        # Old (buggy) formula:
+        self.assertNotEqual(state.total_pnl, 0.0)
+
+    def test_total_pnl_equals_portfolio_minus_initial(self) -> None:
+        """After any sequence of BUYs and SELLs, total_pnl must equal
+        portfolio_value - initial_nav."""
+        state = DryRunState(initial_nav=100_000_000, cash=100_000_000)
+        apply_orders_to_state(
+            state,
+            [
+                {"side": "BUY", "symbol": "HDB", "price": 27_100, "quantity": 1100},
+                {"side": "BUY", "symbol": "QNS", "price": 48_900, "quantity": 500},
+                {"side": "SELL", "symbol": "HDB", "price": 26_900, "quantity": 1100},
+            ],
+            fees_bps=15.0,
+        )
+        self.assertAlmostEqual(
+            state.total_pnl, state.portfolio_value - state.initial_nav, places=2,
+        )
+
+    def test_full_close_with_zero_price_uses_last_price(self) -> None:
+        """autofin emits full_close SELL with price=0 (market order).
+        The apply should fill at the position's last_price."""
+        state = DryRunState(initial_nav=100_000_000, cash=100_000_000)
+        # BUY at 27,100, then mark to market at 26,900
+        apply_orders_to_state(
+            state,
+            [
+                {"side": "BUY", "symbol": "HDB", "price": 27_100, "quantity": 1100},
+                {"side": "MARK", "symbol": "HDB", "price": 26_900, "quantity": 0},
+            ],
+            fees_bps=15.0,
+        )
+        # Pretend mark-to-market: the test bypasses the real mark logic,
+        # so we set last_price directly via the position object.
+        state.positions["HDB"].last_price = 26_900
+
+        # Now emit a full_close market SELL — price=0 should resolve
+        # to last_price (26_900), close the position, and book the
+        # realized P&L against avg_price (27,100).
+        fills = apply_orders_to_state(
+            state,
+            [
+                {
+                    "side": "NS", "symbol": "HDB", "price": 0,
+                    "quantity": 1100, "kind": "full_close",
+                    "reason": "autofin_full_close:HDB",
+                },
+            ],
+            fees_bps=15.0,
+        )
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0]["status"], "applied")
+        self.assertEqual(fills[0]["price"], 26_900)
+        self.assertNotIn("HDB", state.positions)
+        # Realized loss ≈ (26,900 - 27,100) * 1100 = -220,000
+        self.assertAlmostEqual(state.realized_pnl, -220_000, places=0)
+
+    def test_full_close_falls_back_to_avg_price(self) -> None:
+        """If last_price is also 0, fall back to avg_price."""
+        state = DryRunState(initial_nav=100_000_000, cash=100_000_000)
+        apply_orders_to_state(
+            state,
+            [{"side": "BUY", "symbol": "HDB", "price": 27_100, "quantity": 1100}],
+            fees_bps=15.0,
+        )
+        # last_price is 0 (never marked). full_close should still
+        # close at avg_price (27,100), realising ≈ 0 P&L.
+        fills = apply_orders_to_state(
+            state,
+            [{"side": "NS", "symbol": "HDB", "price": 0, "quantity": 1100}],
+            fees_bps=15.0,
+        )
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0]["status"], "applied")
+        self.assertEqual(fills[0]["price"], 27_100)
+        self.assertAlmostEqual(state.realized_pnl, 0.0, places=0)
+
+
+if __name__ == "__main__":
+    unittest.main()

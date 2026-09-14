@@ -865,7 +865,9 @@ def run_auto_bot(
             data_ready = True
             if not engine_config.syncData:
                 try:
-                    from vietnam_algo.libs.schedule import utc_now as _utc_now
+                    from datetime import datetime as _dt, timezone as _tz
+                    def _utc_now() -> _dt:
+                        return _dt.now(tz=_tz.utc)
                     _ready = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
                     if not _ready.exists():
                         print(
@@ -894,10 +896,10 @@ def run_auto_bot(
                 # Stamp the data-ready sentinel so peer bots (e.g.
                 # momentum reading from disk) can resume their EOD.
                 try:
-                    from vietnam_algo.libs.schedule import utc_now as _utc_now2
+                    from datetime import datetime as _dt2, timezone as _tz2
                     _stamp = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
                     _stamp.parent.mkdir(parents=True, exist_ok=True)
-                    _stamp.write_text(_utc_now2().isoformat())
+                    _stamp.write_text(_dt2.now(tz=_tz2).isoformat())
                 except Exception:
                     pass
             # Use the strategy adapter's generate_orders() when available.

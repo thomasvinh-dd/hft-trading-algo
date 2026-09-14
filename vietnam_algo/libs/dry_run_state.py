@@ -84,7 +84,14 @@ class DryRunState:
 
     @property
     def total_pnl(self) -> float:
-        return self.realized_pnl + self.total_unrealized_pnl
+        # Total P&L = portfolio_value - initial_nav, NOT
+        # realized + unrealized. The latter ignores trading fees
+        # (BUYs deduct 0.15% from cash but SELLs credit only the
+        # raw proceeds, so the fee becomes a silent loss unless
+        # we measure against the initial NAV). See 2026-09-14
+        # incident where the bot reported "total P&L: 0" while the
+        # NAV was actually 148k below initial.
+        return self.portfolio_value - self.initial_nav
 
     @property
     def total_return_pct(self) -> float:
@@ -294,8 +301,24 @@ def apply_orders_to_state(
             price = float(o.get("price") or 0)
         except (TypeError, ValueError):
             continue
-        if price <= 0:
+        # Market SELLs (full_close / reduce) come in with price=0
+        # because autofin emits "sell at market". Falling back to the
+        # position's last_price keeps the dry-run state in sync;
+        # falling back to avg_price is the last-resort. BUYs still
+        # require a real price (>0) — we can't spend money we don't
+        # know the cost of.
+        if price <= 0 and side == "BUY":
             continue
+        pos_for_price = state.positions.get(sym)
+        if price <= 0:
+            if pos_for_price is not None:
+                price = (
+                    pos_for_price.last_price
+                    if pos_for_price.last_price > 0
+                    else pos_for_price.avg_price
+                )
+            if price <= 0:
+                continue
 
         # Dedup: skip if we've already applied this exact order.
         dedup = _dedup_key({**o, "symbol": sym, "side": side_raw})
