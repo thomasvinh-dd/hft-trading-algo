@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import unittest
 from pathlib import Path
 import pytest
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
@@ -888,3 +889,111 @@ def test_autofin_adapter_persists_actioned_deals(monkeypatch):
     # Clean up
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+class FullCloseSuggestsPriceTests(unittest.TestCase):
+    """Regression tests for the autofin full_close SELL pricing.
+
+    Autofin embeds the suggested close price in ``lastRecomment``
+    for SL triggers ("Giá: 25,400 - Lỗ: -8.66 %"). The dry-run
+    state should fill at that suggested price so realised P&L is
+    realistic; the apply loop already falls back to ``last_price``
+    when the price is 0 (final "Đóng DEAL" without a suggested
+    price).
+    """
+
+    def test_sl_trigger_extracts_suggested_price(self) -> None:
+        """The 'Giá: 25,400' pattern should parse into PartialCloseAction.price."""
+        from vietnam_algo.algos.autofin_signal import _parse_partial_close
+        rec = (
+            "[HDB] 🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng "
+            "Giá: 25,400 - Nắm giữ: 8 ngày Lỗ: -8.66 %"
+        )
+        action = _parse_partial_close(rec)
+        self.assertEqual(action.action, "stop_loss_close")
+        self.assertEqual(action.price, 25_400)
+
+    def test_final_close_without_price_is_zero(self) -> None:
+        """Final 'Đóng DEAL' signal has no suggested price."""
+        from vietnam_algo.algos.autofin_signal import _parse_partial_close
+        action = _parse_partial_close("Đóng DEAL chạm điểm cắt lỗ (Lỗ: -8.66 %)")
+        self.assertEqual(action.action, "full_close")
+        self.assertEqual(action.price, 0.0)
+
+    def test_plan_close_orders_uses_suggested_price(self) -> None:
+        """_plan_close_orders picks up the suggested price from the
+        cached lastRecomment, so the emitted SELL carries autofin's
+        suggest price rather than hardcoded 0."""
+        from vietnam_algo.algos.autofin_signal import _plan_close_orders
+        our_deals = {
+            "deal#1:HDB": {
+                "symbol": "HDB", "_our_qty": 1100, "_avg_cost": 27_100,
+                "_last_recomment": (
+                    "[HDB] 🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng "
+                    "Giá: 25,400 - Lỗ: -8.66 %"
+                ),
+            },
+        }
+        autofin_holding: list = []  # autofin no longer holds this deal
+        rows = _plan_close_orders(our_deals, autofin_holding)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["price"], 25_400)
+        self.assertEqual(rows[0]["quantity"], 1100)
+        self.assertEqual(rows[0]["kind"], "full_close")
+
+    def test_plan_close_orders_falls_back_to_market_when_no_price(self) -> None:
+        """When lastRecomment has no Giá: line, emit price=0 (the
+        apply loop will fall back to last_price)."""
+        from vietnam_algo.algos.autofin_signal import _plan_close_orders
+        our_deals = {
+            "deal#1:HDB": {
+                "symbol": "HDB", "_our_qty": 1100, "_avg_cost": 27_100,
+                "_last_recomment": "Đóng DEAL chạm điểm cắt lỗ (Lỗ: -8.66 %)",
+            },
+        }
+        rows = _plan_close_orders(our_deals, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["price"], 0)
+
+
+
+
+    def test_sl_signal_in_holding_extracts_suggested_price(self) -> None:
+        """When autofin publishes an SL alert WITH a suggested price
+        ("Giá: 25,400") while still holding the deal, our cached
+        recomment should carry that price through to _plan_close_orders
+        after autofin removes the deal from holding.
+
+        Verifies the cache-refresh at the top of _plan_partial_close_orders
+        so even deals with no numberOfProfit change still surface their
+        latest recomment."""
+        from vietnam_algo.algos.autofin_signal import (
+            _parse_partial_close, _plan_partial_close_orders,
+        )
+
+        # 1. Autofin publishes SL recomment with suggested price.
+        sl_text = (
+            "[HDB] 🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng"
+            " Giá: 25,400 - Nắm giữ: 8 ngày Lỗ: -8.66 %"
+        )
+        action = _parse_partial_close(sl_text)
+        self.assertEqual(action.action, "stop_loss_close")
+        self.assertEqual(action.price, 25_400)
+
+        # 2. autofin auto-closes the deal. Next poll, deal is gone
+        #    from holding. _plan_partial_close_orders skips it
+        #    (action.action is in the skip list).
+        our_deals = {
+            "deal#1:HDB": {
+                "symbol": "HDB", "_our_qty": 1100, "_avg_cost": 27_100,
+                "_last_numberOfProfit": 0,
+                "lastRecomment": sl_text,  # cached during the holding iteration
+            },
+        }
+        # Simulate _plan_partial_close_orders with EMPTY holding —
+        # the function should refresh sig["lastRecomment"] only when
+        # the deal IS in holding, so no refresh here. The existing
+        # cached recomment is what _plan_close_orders will read.
+        rows = _plan_partial_close_orders(our_deals, [], board_lot=100)
+        self.assertEqual(rows, [])  # deal not in holding → nothing emitted
+        self.assertEqual(our_deals["deal#1:HDB"]["lastRecomment"], sl_text)

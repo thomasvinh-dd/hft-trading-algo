@@ -382,6 +382,17 @@ def _plan_close_orders(
     (still a recommended open position). Only when the deal is in
     neither do we mirror-autofin by closing it.
 
+    The SELL price comes from autofin's recomment when available::
+
+      - autofin exits with a suggested price
+        ("[HDB] 🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng"
+         + "Giá: 25,400 - Lỗ: -8.66 %") → use ``Giá: 25,400``.
+      - autofin exits without a price ("Đóng DEAL ...") → ``price=0``.
+        The apply loop falls back to the position's last_price.
+
+    In live mode, DNSE fills at market regardless of the price we
+    send; the field is preserved here for the audit trail.
+
     `our_held_deal_ids` is a map: deal_id → original signal (so we know
     the symbol + qty + the deal we opened).
     """
@@ -396,10 +407,19 @@ def _plan_close_orders(
         qty = sig.get("_our_qty", 0)
         if qty <= 0:
             continue
+        # Autofin's lastRecomment (cached in our state when we first
+        # observed the deal) often carries the suggested close price
+        # for SL triggers ("Giá: 25,400"). Parse it the same way the
+        # partial-close parser does. Falls back to 0 (market) when
+        # the recomment has no price — the apply loop fills at
+        # last_price in that case.
+        rec = str(sig.get("_last_recomment") or sig.get("lastRecomment") or "")
+        action = _parse_partial_close(rec)
+        price = action.price if action.price > 0 else 0
         rows.append({
             "symbol": symbol,
             "side": "NS",
-            "price": 0,  # market order to close
+            "price": price,
             "quantity": _round_to_lots(qty, board_lot),
             "kind": "full_close",
             "reason": f"autofin_closed:deal#{did}",
@@ -418,6 +438,18 @@ class PartialCloseAction:
 
 
 _PARTIAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Stop-loss close: autofin publishes this when an SL is hit and
+    # recommends closing the deal. The format is something like::
+    #   "[HDB] 🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng"
+    #   "Giá: 25,400 - Nắm giữ: 8 ngày"
+    #   "Lỗ: -8.66 %"
+    # We match the first line and extract the suggested close price from
+    # the Giá: line. The percent field is informational; the SL signal
+    # is always 100% (full close) per autofin convention.
+    (re.compile(
+        r"Chạm\s*điểm\s*cắt\s*lỗ.*cân\s*nhắc\s*hạ\s*([\d,\.]+)\s*%\s*tỷ\s*trọng",
+        re.IGNORECASE,
+    ), "stop_loss_close"),
     (re.compile(r"Chốt lãi lần\s*(\d+)(?:\s*mức giá\s*([\d,\.]+))?", re.IGNORECASE), "take_profit_lap"),
     (re.compile(r"Hạ tỷ trọng lần\s*(\d+)", re.IGNORECASE), "reduce_lap"),
     (re.compile(r"Chốt lãi\s*([\d,\.]+)\s*%\s*bảo toàn vốn", re.IGNORECASE), "capital_protect"),
@@ -444,12 +476,30 @@ def _parse_partial_close(recomment: str) -> PartialCloseAction:
 
     Returns ``PartialCloseAction("unknown")`` when the text does not match
     any known partial-close pattern.
+
+    Autofin embeds the suggested price in the recomment text. We
+    extract it for every action so the dry-run state can record a
+    realistic fill price. Typical patterns::
+
+      - Take-profit lap:  "Chốt lãi lần 1 mức giá 15,000"
+      - Reduce lap:       "Hạ tỷ trọng lần 1" + "Giá: 25,400 - Nắm giữ: 8 ngày"
+      - Capital protect:  "Chốt lãi 28.57% bảo toàn vốn tại 27,200"
+      - Full close (SL):  "[HDB] 🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng"
+                         + "Giá: 25,400 - Lỗ: -8.66 %"
+      - Full close (final): "Đóng DEAL chạm điểm cắt lỗ"   (no price)
     """
     rec = (recomment or "").strip()
     for pat, action in _PARTIAL_PATTERNS:
         m = pat.search(rec)
         if not m:
             continue
+        if action == "stop_loss_close":
+            # "🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng" +
+            # "Giá: 25,400 - Nắm giữ: 8 ngày" + "Lỗ: -8.66 %"
+            pct = _parse_percent(m.group(1))
+            price_m = re.search(r"Giá\s*:\s*([\d,\.]+)", rec)
+            price = _parse_vnd(price_m.group(1)) if price_m else 0.0
+            return PartialCloseAction(action=action, percent=pct, price=price)
         if action == "take_profit_lap":
             lap = int(m.group(1))
             price = _parse_vnd(m.group(2)) if m.group(2) else 0.0
@@ -467,7 +517,10 @@ def _parse_partial_close(recomment: str) -> PartialCloseAction:
             price = _parse_vnd(price_m.group(1)) if price_m else 0.0
             return PartialCloseAction(action=action, percent=pct, price=price)
         if action == "full_close":
-            return PartialCloseAction(action=action)
+            # "Đóng DEAL" — final close with no suggested price.
+            price_m = re.search(r"Giá\s*:\s*([\d,\.]+)", rec)
+            price = _parse_vnd(price_m.group(1)) if price_m else 0.0
+            return PartialCloseAction(action=action, price=price)
     return PartialCloseAction(action="unknown")
 
 
@@ -497,12 +550,27 @@ def _plan_partial_close_orders(
 
     rows: list[dict[str, Any]] = []
     for did, sig in our_held_deals.items():
+        # Always refresh the cached recomment from the LATEST autofin
+        # payload, even when the numberOfProfit hasn't incremented.
+        # This ensures that when autofin emits an SL alert
+        # ("🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng Giá: 25,400")
+        # right before auto-closing the deal, _plan_close_orders picks
+        # up the suggested price on the next cycle (after autofin
+        # removed the deal from holding).
+        if did in autofin_by_id:
+            latest_rec = str(autofin_by_id[did].get("lastRecomment") or "")
+            if latest_rec:
+                sig["lastRecomment"] = latest_rec
         if did not in autofin_by_id:
             continue
         h = autofin_by_id[did]
         rec = str(h.get("lastRecomment") or "")
         action = _parse_partial_close(rec)
-        if action.action in ("unknown", "full_close"):
+        # "stop_loss_close" → 100% sell at autofin's suggested price;
+        # handled by ``_plan_close_orders`` because it doesn't depend
+        # on ``numberOfProfit``. "full_close" (Đóng DEAL) → handled
+        # there too.
+        if action.action in ("unknown", "full_close", "stop_loss_close"):
             continue
 
         cur_nP = int(h.get("numberOfProfit") or 0)
