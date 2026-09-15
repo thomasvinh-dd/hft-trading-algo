@@ -997,3 +997,128 @@ class FullCloseSuggestsPriceTests(unittest.TestCase):
         rows = _plan_partial_close_orders(our_deals, [], board_lot=100)
         self.assertEqual(rows, [])  # deal not in holding → nothing emitted
         self.assertEqual(our_deals["deal#1:HDB"]["lastRecomment"], sl_text)
+
+
+class CloseRequiresClosingSignalsTests(unittest.TestCase):
+    """Regression tests for the 2026-09-14 HDB false-positive.
+
+    Background: autofin briefly removed HDB from ``/signal-static-holding``
+    while the deal was still active (autofin was about to republish it
+    as a fresh "Khuyến nghị đầu tư" suggestion). The bot's old logic
+    closed any deal missing from holding + suggest, which fired a
+    SELL for HDB even though autofin still had it.
+
+    Fix: only close a deal when it appears in ``/closing-signals``
+    (autofin's explicit "Đóng DEAL" trigger). Absence from holding +
+    suggest is NOT sufficient.
+    """
+
+    def test_hold_to_suggest_does_not_emit_close(self) -> None:
+        """A deal present in autofin suggest but missing from
+        /signal-static-holding is a fresh re-recommendation. Do not
+        close it."""
+        from vietnam_algo.algos.autofin_signal import _plan_close_orders
+        our_deals = {
+            "1786492800:HDB": {
+                "symbol": "HDB", "_our_qty": 1100, "_avg_cost": 27_100,
+                "_last_recomment": "Khuyến nghị đầu tư",
+            },
+        }
+        rows = _plan_close_orders(
+            our_deals, [],
+            autofin_closing_ids=set(),
+            autofin_suggest_ids=set(),
+        )
+        self.assertEqual(rows, [], "absent-from-holding must not emit close")
+
+    def test_closing_signals_triggers_full_close(self) -> None:
+        """When autofin publishes a close event for a held deal,
+        _plan_close_orders emits the SELL with autofin's suggested
+        price (from the cached lastRecomment)."""
+        from vietnam_algo.algos.autofin_signal import _plan_close_orders
+        our_deals = {
+            "1786492800:HDB": {
+                "symbol": "HDB", "_our_qty": 1100, "_avg_cost": 27_100,
+                "_last_recomment": (
+                    "[HDB] 🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng "
+                    "Giá: 25,400 - Lỗ: -8.66 %"
+                ),
+            },
+        }
+        rows = _plan_close_orders(
+            our_deals, [],
+            autofin_closing_ids={"1786492800:HDB"},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["price"], 25_400)
+        self.assertEqual(rows[0]["kind"], "full_close")
+
+    def test_closing_signals_ignores_deals_we_dont_hold(self) -> None:
+        from vietnam_algo.algos.autofin_signal import _plan_close_orders
+        our_deals = {
+            "other_deal:VHM": {
+                "symbol": "VHM", "_our_qty": 100, "_avg_cost": 70_000,
+            },
+        }
+        rows = _plan_close_orders(
+            our_deals, [],
+            autofin_closing_ids={"1786492800:HDB"},  # not in our_deals
+        )
+        self.assertEqual(rows, [])
+
+    def test_closing_signals_no_match_emits_nothing(self) -> None:
+        """Live mode: empty closing_ids → emit nothing (don't fall
+        back to absence-based closing)."""
+        from vietnam_algo.algos.autofin_signal import _plan_close_orders
+        our_deals = {
+            "deal#1:HDB": {
+                "symbol": "HDB", "_our_qty": 1100, "_avg_cost": 27_100,
+            },
+        }
+        rows = _plan_close_orders(
+            our_deals, [], autofin_closing_ids=set(),
+        )
+        self.assertEqual(rows, [])
+
+    def test_closing_signals_does_not_use_absence_fallback(self) -> None:
+        """Live mode: autofin briefly drops a deal from holding but
+        doesn't publish a close. The live bot must NOT close."""
+        from vietnam_algo.algos.autofin_signal import _plan_close_orders
+        our_deals = {
+            "1786492800:HDB": {
+                "symbol": "HDB", "_our_qty": 1100, "_avg_cost": 27_100,
+            },
+        }
+        # Live mode: closing_ids is provided (even if empty).
+        # autofin published no close event.
+        rows = _plan_close_orders(
+            our_deals,
+            [],  # autofin_holding empty (transient)
+            autofin_closing_ids=set(),  # no close event
+        )
+        self.assertEqual(
+            rows, [],
+            "live bot must not emit close on absence alone — the 2026-09-14 bug",
+        )
+
+    def test_backtest_uses_absence_fallback(self) -> None:
+        """Backtest mode: autofin_closing_ids=None → fall back to
+        absence-based closing (any deal missing from holding+suggest)."""
+        from vietnam_algo.algos.autofin_signal import _plan_close_orders
+        our_deals = {
+            "111:VHM": {"symbol": "VHM", "_our_qty": 100, "_avg_cost": 70_000},
+        }
+        # autofin_closing_ids=None → absence-based.
+        # autofin_holding is empty → VHM is "gone" → emit close.
+        rows = _plan_close_orders(our_deals, [], autofin_closing_ids=None)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], "VHM")
+
+        # If autofin still has the deal, do not close.
+        autofin_holding = [{"_id": 111, "symbol": "VHM"}]
+        rows = _plan_close_orders(
+            our_deals, autofin_holding, autofin_closing_ids=None,
+        )
+        self.assertEqual(rows, [])
+
+

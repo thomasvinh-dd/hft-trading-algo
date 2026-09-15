@@ -372,59 +372,101 @@ def _plan_orders_for_new_positions(
 def _plan_close_orders(
     our_held_deal_ids: dict[str, dict[str, Any]],
     autofin_holding: list[dict[str, Any]],
+    autofin_closing_ids: set[str] | None = None,
     autofin_suggest_ids: set[str] | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
 ) -> list[dict[str, Any]]:
-    """Emit SELL orders for deals we hold that autofin no longer holds.
+    """Emit SELL orders for deals we hold that autofin has closed.
 
-    A deal is considered "still active in autofin" if it's in either
-    the holding list (currently held by autofin) or the suggest list
-    (still a recommended open position). Only when the deal is in
-    neither do we mirror-autofin by closing it.
+    Two close strategies are supported:
 
-    The SELL price comes from autofin's recomment when available::
+    1. **Live bot (preferred):** ``autofin_closing_ids`` is the
+       authoritative close trigger — when autofin's ``/closing-signals``
+       explicitly publishes a close for a deal we hold, we mirror with
+       a SELL at autofin's suggested price. We do NOT close on
+       absence from ``/signal-static-holding`` alone (or holding +
+       suggest), because autofin's automation can briefly drop a deal
+       from holding while it's still active — closing on absence alone
+       caused the 2026-09-14 HDB false-positive.
 
-      - autofin exits with a suggested price
-        ("[HDB] 🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng"
-         + "Giá: 25,400 - Lỗ: -8.66 %") → use ``Giá: 25,400``.
-      - autofin exits without a price ("Đóng DEAL ...") → ``price=0``.
-        The apply loop falls back to the position's last_price.
+    2. **Backtest / historical replay:** ``autofin_closing_ids`` is
+       ``None``. In that case we fall back to absence from holding +
+       suggest: any deal we hold that's no longer in either list was
+       closed by autofin (best inference available historically). This
+       matches the original logic the test_backtest_fixed_sizing suite
+       was written against.
 
-    In live mode, DNSE fills at market regardless of the price we
-    send; the field is preserved here for the audit trail.
+    The SELL price for each row comes from autofin's recomment when
+    available (parsed via ``_parse_partial_close``):
+
+      - "[HDB] 🛑 Chạm điểm cắt lỗ ... Giá: 25,400 - Lỗ: -8.66 %"
+        → use ``Giá: 25,400``.
+      - "Đóng DEAL ..." (no suggested price) → ``price=0``. The apply
+        loop falls back to ``last_price`` in dry-run; in live mode
+        DNSE fills at market.
 
     `our_held_deal_ids` is a map: deal_id → original signal (so we know
     the symbol + qty + the deal we opened).
     """
     rows: list[dict[str, Any]] = []
-    autofin_open_ids = {_deal_id(d) for d in autofin_holding if _deal_id(d)}
-    if autofin_suggest_ids:
-        autofin_open_ids |= autofin_suggest_ids
-    for did, sig in our_held_deal_ids.items():
-        if did in autofin_open_ids:
-            continue
-        symbol = sig.get("symbol", "?")
-        qty = sig.get("_our_qty", 0)
-        if qty <= 0:
-            continue
-        # Autofin's lastRecomment (cached in our state when we first
-        # observed the deal) often carries the suggested close price
-        # for SL triggers ("Giá: 25,400"). Parse it the same way the
-        # partial-close parser does. Falls back to 0 (market) when
-        # the recomment has no price — the apply loop fills at
-        # last_price in that case.
-        rec = str(sig.get("_last_recomment") or sig.get("lastRecomment") or "")
-        action = _parse_partial_close(rec)
-        price = action.price if action.price > 0 else 0
-        rows.append({
-            "symbol": symbol,
-            "side": "NS",
-            "price": price,
-            "quantity": _round_to_lots(qty, board_lot),
-            "kind": "full_close",
-            "reason": f"autofin_closed:deal#{did}",
-        })
+    if autofin_closing_ids is not None:
+        # Live bot: only close deals autofin explicitly said it closed.
+        # Empty closing_ids means autofin published no close events
+        # today → nothing to mirror.
+        if not autofin_closing_ids:
+            return rows
+        # Emit close for deals IN closing_ids (deals autofin closed).
+        deals_to_close = set(autofin_closing_ids)
+        for did, sig in our_held_deal_ids.items():
+            if did not in deals_to_close:
+                continue
+            rows.extend(_emit_full_close_row(did, sig, board_lot))
+    else:
+        # Backtest / fallback: absence from holding + suggest means
+        # autofin has closed this deal.
+        still_open = {_deal_id(d) for d in autofin_holding if _deal_id(d)}
+        if autofin_suggest_ids:
+            still_open |= autofin_suggest_ids
+        # Emit close for deals NOT in still_open (i.e. autofin exited them).
+        for did, sig in our_held_deal_ids.items():
+            if did in still_open:
+                continue
+            rows.extend(_emit_full_close_row(did, sig, board_lot))
     return rows
+
+
+def _emit_full_close_row(
+    did: str,
+    sig: dict[str, Any],
+    board_lot: int,
+) -> list[dict[str, Any]]:
+    """Build the full_close SELL row(s) for a single deal.
+
+    Returns an empty list if the deal has no qty to sell. Today this
+    always returns 0 or 1 row, but factored out so both live and
+    backtest paths stay in sync.
+    """
+    qty = sig.get("_our_qty", 0)
+    if qty <= 0:
+        return []
+    symbol = sig.get("symbol", "?")
+    # Autofin's lastRecomment (cached in our state when we first
+    # observed the deal) often carries the suggested close price
+    # for SL triggers ("Giá: 25,400"). Parse it the same way the
+    # partial-close parser does. Falls back to 0 (market) when
+    # the recomment has no price — the apply loop fills at
+    # last_price in that case.
+    rec = str(sig.get("_last_recomment") or sig.get("lastRecomment") or "")
+    action = _parse_partial_close(rec)
+    price = action.price if action.price > 0 else 0
+    return [{
+        "symbol": symbol,
+        "side": "NS",
+        "price": price,
+        "quantity": _round_to_lots(qty, board_lot),
+        "kind": "full_close",
+        "reason": f"autofin_closed:deal#{did}",
+    }]
 
 
 @dataclass(frozen=True)
@@ -948,6 +990,7 @@ def decide_orders(
     already_planned_symbols: set[str] | None = None,
     actioned_deals: set[str] | None = None,
     data_dir: "Path | None" = None,
+    autofin_closing_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -979,7 +1022,13 @@ def decide_orders(
             signal dict, with ``_our_qty`` and ``_last_numberOfProfit``
             updated to reflect the orders issued).
         ``deals_actioned``: per-deal grouping of orders, suitable for
-        Telegram formatting.
+            Telegram formatting.
+    autofin_closing_ids : optional ``{deal_id, ...}`` set pulled from
+        ``/closing-signals``. When non-empty, only deals in this set
+        get a full_close SELL — see ``_plan_close_orders`` docstring
+        for why we don't close on absence from holding/suggest alone.
+        ``None`` (the default) keeps the historical absence-based
+        behavior so backtests don't change.
     """
     config = config or StrategyConfig()
 
@@ -1081,7 +1130,13 @@ def decide_orders(
         if sig.get("_our_qty", 0) > 0
     }
     suggest_ids = {_deal_id(s.raw) for s in signals if s.raw.get("_id")}
-    close_orders = _plan_close_orders(our_real_deals, holding, suggest_ids, board_lot=board_lot)
+    close_orders = _plan_close_orders(
+        our_real_deals,
+        holding,
+        autofin_closing_ids=autofin_closing_ids,
+        autofin_suggest_ids=suggest_ids,
+        board_lot=board_lot,
+    )
 
     # 4b. CRITICAL FIX (2026-09-07): don't re-enter deals that are being
     # closed in this same iteration. The previous logic added held
@@ -1425,6 +1480,16 @@ class AutofinSignalAdapter(StrategyAdapter):
         except Exception as exc:
             notify(f"⚠️ autofin fetch_closing failed: {exc}")
             closing = []
+        # Build the closing_ids set: deal_id = _id + ":" + symbol.
+        # These are the AUTHORITATIVE close trigger — see
+        # _plan_close_orders for why we no longer close on absence
+        # from /signal-static-holding alone (2026-09-14 HDB
+        # false-positive).
+        closing_ids: set[str] = set()
+        for c in closing:
+            cid = _deal_id(c.raw if hasattr(c, "raw") else c)
+            if cid:
+                closing_ids.add(cid)
         # 4. /signal-static-risk — risk positions (for alerts)
         try:
             risk = client.fetch_risk(page_size=50)
@@ -1526,6 +1591,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             current_prices=current_prices,
             already_planned_symbols=already_planned_symbols,
             actioned_deals=self._actioned_deals,
+            autofin_closing_ids=closing_ids,
         )
 
         # 9b. Notification-driven mid-day TP/SL detection. Per user feedback
