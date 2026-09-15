@@ -44,7 +44,7 @@ class StrategyAdapter(ABC):
         forwards it to ``eod_summary_message`` if provided;
         subclasses may override to format per-strategy context.
         """
-        from .notifier import eod_summary_message
+        from vietnam_algo.libs.notifier import eod_summary_message
         return eod_summary_message(result, portfolio=portfolio)
 
     @property
