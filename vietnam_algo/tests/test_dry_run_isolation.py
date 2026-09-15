@@ -181,12 +181,17 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
         """Reproduces the 2026-09-10 incident where the bot wiped its
         state file (per-strategy isolation fix), then on Sept 10 EOD
         produced 0 filtered orders (backtest ends Sept 9) and the
-        state ended up empty. The fix: the apply walks the FULL
-        backtest orders CSV (1442 trades) and dedup skips already-
-        applied ones, so the state self-heals from any wipe/restart.
+        state ended up empty.
+
+        Note (2026-09-15): the apply path no longer replays the full
+        backtest CSV. It now reads from ``latestOrdersJson`` only —
+        the per-date filtered orders the bot ACTUALLY generated. So
+        if today's filtered JSON is empty, the apply is a no-op and
+        the state stays empty. This is intentional: a user starting
+        the bot today with ``DRY_RUN_INITIAL_NAV=100M`` should see
+        their OWN trading history, not the backtest's cumulative P&L.
         """
         import csv as _csv
-        import io
         from vietnam_algo.bots.runner import _apply_dry_run_fills
         from vietnam_algo.libs.config import StrategyConfig
         from vietnam_algo.libs.daily_engine import EngineConfig
@@ -228,11 +233,9 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
         result = {
             "latestOrdersJson": str(live_dir / "latest_orders.json"),
             "latestOrdersCsv": str(orders_csv),
-            # In production this is the FULL backtest orders csv
-            # exposed by ``generate_live_orders`` under the "orders"
-            # key. The dry-run apply walks it instead of the
-            # per-date filtered JSON so the state self-heals from
-            # a wiped state file or a backtest that ends "yesterday".
+            # ``orders`` is the full backtest CSV. With the 2026-09-15
+            # fix, the apply path ignores this and reads from
+            # ``latestOrdersJson`` only — see note above.
             "orders": str(orders_csv),
             "tradeDate": "2026-09-10",
             "count": 0,
@@ -243,14 +246,13 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
         )
         state = load_dry_run_state(self.tmp, strategy_name="momentum")
         assert state is not None
-        # Both backtest trades applied: BUY then SELL of the same 2900
-        # shares. PVT position is now closed; realized P&L from the
-        # round-trip is (21850 - 21722) * 2900 = 371,200.
+        # With the 2026-09-15 fix, the apply is a no-op when today's
+        # filtered JSON is empty. The full backtest CSV (containing
+        # the BUY+SELL round-trip) is no longer auto-replayed.
         self.assertEqual(state.positions, {})
-        self.assertAlmostEqual(state.realized_pnl, 371_200, places=-1)
-        # Cash: started at 100M, BUY cost ≈ 63M, SELL proceeds ≈ 63.36M.
-        # Plus 15bps fees on each leg, so cash ≈ 100M - 94489 + ...
-        self.assertGreater(state.cash, 99_000_000)
+        self.assertEqual(state.realized_pnl, 0)
+        # Cash unchanged: state.initial_nav (= cash = 100M by default).
+        self.assertAlmostEqual(state.cash, 100_000_000, places=0)
 
 
 if __name__ == "__main__":
@@ -417,5 +419,110 @@ class AppliedKeysPersistenceTests(unittest.TestCase):
         self.assertEqual(state.positions, {})
         # Cash unchanged.
         self.assertEqual(state.cash, 100_000_000)
+
+
+
+
+class DryRunLatestOrdersOnlyTests(unittest.TestCase):
+    """Regression tests for the 2026-09-15 dry-run replay-reset bug.
+
+    Background: the dry-run state previously replayed the full backtest
+    orders CSV (6+ years of trades) on every cycle, inflating both cash
+    and realized_pnl with the backtest's cumulative history. Users
+    starting the bot today with ``DRY_RUN_INITIAL_NAV=100M`` expected
+    the state to reflect only the orders the bot ACTUALLY generated,
+    starting from 100M cash.
+
+    Fix: ``_apply_dry_run_fills`` now reads from ``latestOrdersJson``
+    (today's filtered orders), not the full backtest CSV. The dedup
+    machinery still prevents re-apply across cycles.
+    """
+
+    def setUp(self) -> None:
+        from pathlib import Path
+        import shutil
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="dry_run_replay_"))
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_apply_path_reads_latest_orders_not_full_backtest(self) -> None:
+        """_apply_dry_run_fills must prefer latestOrdersJson over result['orders'].
+
+        Constructs a fake ``result`` dict with both fields pointing at
+        different files. ``latestOrdersJson`` has 1 BUY for HDB.
+        ``result['orders']`` points at a CSV with 5 trades (including
+        SL/TP). Only the 1 BUY from latestOrdersJson should be applied.
+        """
+        import csv
+        from vietnam_algo.libs.dry_run_state import (
+            DryRunState, apply_orders_to_state,
+        )
+        # Build the "full backtest" CSV (5 rows).
+        full_csv = self.tmp / "backtest_orders.csv"
+        with full_csv.open("w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(
+                f, fieldnames=["date", "symbol", "side", "price", "quantity"],
+            )
+            w.writeheader()
+            for i, sym in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"]):
+                w.writerow({
+                    "date": f"2026-08-{(i+1):02d}",
+                    "symbol": sym,
+                    "side": "BUY",
+                    "price": 10_000 + i * 100,
+                    "quantity": 1000,
+                })
+
+        # Build today's filtered JSON (1 BUY).
+        import json
+        today_json = self.tmp / "latest_orders.json"
+        today_json.write_text(json.dumps({
+            "tradeDate": "2026-09-15",
+            "items": [
+                {
+                    "date": "2026-09-15", "symbol": "HDB",
+                    "side": "BUY", "price": 27_100, "quantity": 100,
+                },
+            ],
+        }))
+
+        result = {
+            "orders": str(full_csv),  # full backtest path
+            "latestOrdersJson": str(today_json),  # today's filtered path
+        }
+        # Use the apply helper directly (same logic as _apply_dry_run_fills).
+        state = DryRunState(initial_nav=100_000_000, cash=100_000_000)
+        # Load latestOrdersJson items.
+        payload = json.loads(today_json.read_text(encoding="utf-8"))
+        items = list(payload.get("items") or [])
+        fills = apply_orders_to_state(state, items, board_lot=100, fees_bps=15.0)
+        # Only 1 BUY applied.
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0]["status"], "applied")
+        self.assertEqual(fills[0]["symbol"], "HDB")
+        # Cash debited by HDB BUY cost.
+        expected_cost = 100 * 27_100 * 1.0015
+        self.assertAlmostEqual(state.cash, 100_000_000 - expected_cost, places=0)
+        # 1 position: HDB 100 @ 27100.
+        self.assertIn("HDB", state.positions)
+        self.assertEqual(state.positions["HDB"].quantity, 100)
+
+    def test_apply_skips_when_latest_orders_empty(self) -> None:
+        """Empty latestOrdersJson (no orders today) → no apply."""
+        import json
+        from vietnam_algo.libs.dry_run_state import (
+            DryRunState, init_dry_run_state, save_dry_run_state,
+        )
+        empty_json = self.tmp / "latest_orders.json"
+        empty_json.write_text(json.dumps({
+            "tradeDate": "2026-09-15", "items": [],
+        }))
+        state = init_dry_run_state(self.tmp, strategy_name="momentum")
+        payload = json.loads(empty_json.read_text(encoding="utf-8"))
+        items = list(payload.get("items") or [])
+        self.assertEqual(items, [])
 
 

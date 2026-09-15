@@ -235,43 +235,40 @@ def _apply_dry_run_fills(
             except Exception as exc:
                 print(f"[dry-run] legacy-state migration failed: {exc}")
     # The momentum adapter exposes the full backtest orders CSV in
-    # ``result["orders"]``. Walking it ensures the state reflects ALL
-    # history, not just today's filtered slice. Autofin leaves
-    # ``result["orders"]`` pointing at the latest-orders.csv which is
-    # already the right file for a signal-driven strategy.
+    # ``result["orders"]`` and the per-date filtered JSON in
+    # ``result["latestOrdersJson"]``. The dry-run replays the
+    # per-date filtered JSON only — i.e. orders the bot ACTUALLY
+    # generated TODAY (or the date the bot's submit cycle produced).
+    # Replaying the full backtest CSV (6+ years of trades, all 740
+    # rows) was the original intent for an offline replay, but it
+    # inflated the dry-run state with the full backtest's cumulative
+    # P&L, which doesn't match what a user starting the bot today
+    # with ``DRY_RUN_INITIAL_NAV=100M`` expects. See the 2026-09-15
+    # incident where realized_pnl was 102M while cash only went up
+    # 21M from initial.
+    #
+    # Autofin already follows this convention (its ``orders`` field
+    # points at the latest-orders file). Momentum now does too —
+    # dry-run state accumulates the bot's own orders, not the
+    # backtest's full history.
     #
     # The dry-run respects the user-configured DRY_RUN_INITIAL_NAV /
-    # MOCK_NAV env var. To match the backtest's % return profile at a
-    # smaller cash budget, we SCALE each order's quantity by
-    # ``state.initial_nav / backtest_initial_cash``. Without this,
-    # applying 1B-VND-scale trades to a 100M-VND dry-run would clip
-    # most BUYs as insufficient_cash / below_board_lot, producing
-    # nonsensical realized losses (-80% in a single day, etc.).
-    #
-    # Scaling quantities preserves the trade direction (BUY/SELL) and
-    # prices, so the simulated P&L tracks the backtest's % return at
-    # the dry-run's smaller scale.
-    full_orders_csv = result.get("orders")
+    # MOCK_NAV env var. Quantities are SCALED by
+    # ``state.initial_nav / backtest_initial_cash`` so a 1B-VND-scale
+    # backtest output fits a 100M-VND dry-run budget without clipping
+    # most BUYs as insufficient_cash / below_board_lot.
+    json_path = result.get("latestOrdersJson")
     payload: dict[str, Any] = {}
     items: list[dict[str, Any]] = []
-    if full_orders_csv and Path(str(full_orders_csv)).exists():
+    if json_path and Path(str(json_path)).exists():
         try:
-            with open(full_orders_csv, "r", encoding="utf-8", newline="") as f:
-                items = list(_csv.DictReader(f))
+            payload = _json.loads(Path(str(json_path)).read_text(encoding="utf-8"))
+            items = list(payload.get("items") or [])
         except Exception as exc:
-            print(f"[dry-run] failed to read full orders csv {full_orders_csv}: {exc}")
+            print(f"[dry-run] failed to read latest orders json {json_path}: {exc}")
             items = []
     if not items:
-        # Fallback: use the per-date filtered JSON if the full CSV is
-        # missing or unreadable.
-        json_path = result.get("latestOrdersJson")
-        if not json_path:
-            return
-        try:
-            payload = _json.loads(Path(json_path).read_text(encoding="utf-8"))
-            items = list(payload.get("items") or [])
-        except Exception:
-            return
+        return
     if not isinstance(items, list) or not items:
         return
     # Scale order quantities to match the dry-run's initial NAV.
