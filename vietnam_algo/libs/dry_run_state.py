@@ -66,6 +66,16 @@ class DryRunState:
     positions: dict[str, DryRunPosition] = field(default_factory=dict)
     realized_pnl: float = 0.0
     closed_trades: list[dict[str, Any]] = field(default_factory=list)
+    # Dedup keys for trades already applied. Stored SEPARATELY from
+    # ``closed_trades`` because that list is capped at 200 for display
+    # purposes — older dedup markers would be silently truncated, and
+    # the bot would then re-apply the same historical trades on each
+    # EOD cycle, inflating ``state.realized_pnl`` (see 2026-09-15:
+    # realized_pnl was 102M while cash only went up 21M from initial —
+    # 5.7B in notional BUY/SELL volume re-applied tens of thousands of
+    # times). The set is unbounded; entries are added on every apply
+    # call and never removed for the lifetime of the bot.
+    applied_keys: set[str] = field(default_factory=set)
     created_at: str = ""
     updated_at: str = ""
 
@@ -106,6 +116,7 @@ class DryRunState:
             "cash": self.cash,
             "realized_pnl": self.realized_pnl,
             "closed_trades": list(self.closed_trades)[-200:],
+            "applied_keys": sorted(self.applied_keys),
             "positions": {
                 sym: asdict(p) for sym, p in self.positions.items()
             },
@@ -126,6 +137,7 @@ class DryRunState:
             positions=positions,
             realized_pnl=float(payload.get("realized_pnl") or 0),
             closed_trades=list(payload.get("closed_trades") or []),
+            applied_keys=set(str(k) for k in (payload.get("applied_keys") or [])),
             created_at=str(payload.get("created_at") or ""),
             updated_at=str(payload.get("updated_at") or ""),
         )
@@ -242,11 +254,16 @@ def _dedup_key(order: dict[str, Any]) -> str:
 
 
 def _get_applied_keys(state: DryRunState) -> set[str]:
-    keys: set[str] = set()
-    for t in state.closed_trades:
-        if isinstance(t, dict) and t.get("applied_keys"):
-            keys.update(str(k) for k in t["applied_keys"])
-    return keys
+    """Set of trade-keys already applied to ``state``.
+
+    Reads from ``state.applied_keys`` (unbounded, persisted). The
+    legacy implementation read from marker entries inside
+    ``state.closed_trades`` which is capped at 200 — that caused
+    the 2026-09-15 bug where dedup keys were silently truncated and
+    the bot re-applied historical trades on every cycle, inflating
+    realized_pnl to 102M while cash only went up 21M.
+    """
+    return set(state.applied_keys)
 
 
 def apply_orders_to_state(
@@ -422,13 +439,12 @@ def apply_orders_to_state(
         else:
             state.positions[sym] = pos
 
-    # Persist the dedup keys in a closed_trades marker entry so the
-    # next call to apply_orders_to_state sees them.
+    # Persist the dedup keys on the state directly (unbounded).
+    # Storing them inside ``closed_trades`` (capped at 200) caused
+    # silent truncation → dedup keys forgotten → old trades re-applied
+    # on every cycle, inflating realized_pnl (2026-09-15).
     if applied_now:
-        state.closed_trades.append({
-            "note": "_applied_keys",
-            "applied_keys": applied_now,
-        })
+        state.applied_keys.update(applied_now)
     return fills
 
 

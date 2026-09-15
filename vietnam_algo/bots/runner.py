@@ -218,6 +218,17 @@ def _apply_dry_run_fills(
                     }
                     state.closed_trades = list(legacy_payload.get("closed_trades") or [])
                     state.realized_pnl = float(legacy_payload.get("realized_pnl") or 0.0)
+                    # Recover dedup keys from the legacy marker entries
+                    # stored inside ``closed_trades``. Older bots kept the
+                    # applied_keys there before this commit. Empty set
+                    # is fine — apply_orders_to_state will treat every
+                    # trade as new and re-apply once on the first cycle
+                    # after migration, then dedup going forward.
+                    legacy_keys: set[str] = set()
+                    for t in state.closed_trades:
+                        if isinstance(t, dict) and t.get("applied_keys"):
+                            legacy_keys.update(str(k) for k in t["applied_keys"])
+                    state.applied_keys.update(legacy_keys)
                     save_dry_run_state(
                         state, engine_config.dataDir, strategy_name=strategy_name,
                     )

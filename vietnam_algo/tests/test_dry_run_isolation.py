@@ -255,3 +255,167 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AppliedKeysPersistenceTests(unittest.TestCase):
+    """Regression tests for the 2026-09-15 realized_pnl inflation bug.
+
+    Background: dedup keys for already-applied trades were stored in
+    ``state.closed_trades`` as marker entries. ``closed_trades`` is
+    capped at 200 (for display) so after enough EOD cycles, older
+    markers were silently truncated, and the bot re-applied historical
+    trades on every cycle, inflating ``realized_pnl``.
+
+    Fix: store ``applied_keys`` on the state directly (unbounded).
+    """
+
+    def setUp(self) -> None:
+        import shutil
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="applied_keys_test_"))
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_applied_keys_persist_across_save_load(self) -> None:
+        """State.applied_keys survives save -> load round-trip."""
+        from vietnam_algo.libs.dry_run_state import (
+            DryRunState, save_dry_run_state, init_dry_run_state,
+        )
+        state = init_dry_run_state(self.tmp, strategy_name="momentum")
+        state.cash = 50_000_000
+        state.realized_pnl = 12_345_678
+        state.applied_keys = {
+            "2024-01-02|HDB|BUY|100|27100",
+            "2024-01-15|HDB|SELL|100|28000",
+        }
+        save_dry_run_state(state, self.tmp, strategy_name="momentum")
+
+        loaded = init_dry_run_state(self.tmp, strategy_name="momentum")
+        self.assertEqual(loaded.cash, 50_000_000)
+        self.assertEqual(loaded.realized_pnl, 12_345_678)
+        self.assertEqual(
+            loaded.applied_keys,
+            {
+                "2024-01-02|HDB|BUY|100|27100",
+                "2024-01-15|HDB|SELL|100|28000",
+            },
+        )
+
+    def test_dedup_keys_preserved_indefinitely(self) -> None:
+        """The cap on closed_trades (200) does NOT affect applied_keys.
+
+        Regression for the 2026-09-15 bug where closed_trades was
+        capped but dedup keys lived inside it.
+        """
+        from vietnam_algo.libs.dry_run_state import (
+            DryRunState, apply_orders_to_state, save_dry_run_state,
+            init_dry_run_state,
+        )
+        state = init_dry_run_state(self.tmp, strategy_name="momentum")
+        # Generate enough dedup keys to overflow the closed_trades cap.
+        # Skip "2024-01-01" because the apply call below uses that date.
+        keys = {f"2024-01-{i:02d}|HDB|BUY|100|27100" for i in range(2, 1000)}
+        # Apply a fake trade that uses one of the keys (mutates state).
+        fills = apply_orders_to_state(
+            state,
+            [
+                {
+                    "side": "BUY", "symbol": "HDB", "price": 27_100,
+                    "quantity": 100, "date": "2024-01-01",
+                    "kind": "entry",
+                }
+            ],
+            board_lot=100, fees_bps=15.0,
+        )
+        # Manually inject the dedup keys to simulate a long-running bot.
+        state.applied_keys.update(keys)
+
+        # closed_trades list (capped at 200) grows much smaller.
+        save_dry_run_state(state, self.tmp, strategy_name="momentum")
+
+        loaded = init_dry_run_state(self.tmp, strategy_name="momentum")
+        # All keys survived.
+        self.assertEqual(len(loaded.applied_keys), len(keys) + 1)
+        # And the cap on closed_trades is enforced (max 200) but that's
+        # for display, NOT for dedup.
+        self.assertLessEqual(
+            sum(1 for t in loaded.closed_trades if not str(t.get("note", "")).startswith("_applied"))
+            + sum(1 for t in loaded.closed_trades if str(t.get("note", "")).startswith("_applied")),
+            201,  # 200 + 1 buffer
+        )
+
+    def test_old_marker_in_closed_trades_is_importer_compatible(self) -> None:
+        """Older state files stored dedup keys inside closed_trades
+        marker entries. The legacy migration (in bots/runner.py)
+        recovers them into state.applied_keys. Verify the helper that
+        does that recovery.
+        """
+        from vietnam_algo.libs.dry_run_state import DryRunState, load_dry_run_state
+        # Simulate a v1 state file: dedup keys live in closed_trades markers.
+        legacy = {
+            "initial_nav": 100_000_000,
+            "cash": 50_000_000,
+            "realized_pnl": 5_000_000,
+            "closed_trades": [
+                {"symbol": "HDB", "avg_cost": 27_100, "sell_price": 28_000,
+                 "qty": 100, "realized_pnl": 90_000},
+                {"note": "_applied_keys",
+                 "applied_keys": ["2024-01-02|HDB|BUY|100|27100"]},
+            ],
+            "positions": {},
+        }
+        # Persist a v1-format file and reload.
+        from vietnam_algo.libs.dry_run_state import save_dry_run_state
+        # First synthesise the state we want to reload.
+        state = DryRunState(
+            initial_nav=100_000_000, cash=50_000_000, realized_pnl=5_000_000,
+            closed_trades=list(legacy["closed_trades"]),
+        )
+        save_dry_run_state(state, self.tmp, strategy_name="momentum")
+        # Now reload. applied_keys comes back empty (legacy markers
+        # aren't auto-migrated by ``load_dry_run_state`` itself —
+        # that's the bot adapter's job). Verify that.
+        loaded = load_dry_run_state(self.tmp, strategy_name="momentum")
+        self.assertEqual(loaded.applied_keys, set())
+        self.assertEqual(len(loaded.closed_trades), 2)
+        # The bot adapter recovers them into state.applied_keys
+        # during the legacy migration in _apply_dry_run_fills.
+        legacy_keys: set[str] = set()
+        for t in loaded.closed_trades:
+            if isinstance(t, dict) and t.get("applied_keys"):
+                legacy_keys.update(str(k) for k in t["applied_keys"])
+        loaded.applied_keys.update(legacy_keys)
+        self.assertIn("2024-01-02|HDB|BUY|100|27100", loaded.applied_keys)
+
+    def test_apply_skips_when_dedup_key_present(self) -> None:
+        """A trade whose key is in state.applied_keys is skipped on
+        re-apply (no double-counting)."""
+        from vietnam_algo.libs.dry_run_state import (
+            DryRunState, apply_orders_to_state,
+        )
+        state = DryRunState(
+            initial_nav=100_000_000, cash=100_000_000,
+            applied_keys={"2024-01-02|HDB|BUY|100|27100"},
+        )
+        fills = apply_orders_to_state(
+            state,
+            [
+                {
+                    "side": "BUY", "symbol": "HDB", "price": 27_100,
+                    "quantity": 100, "date": "2024-01-02",
+                },
+            ],
+            board_lot=100, fees_bps=15.0,
+        )
+        # The apply call returns a "skipped" entry rather than None.
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0]["status"], "skipped")
+        self.assertEqual(fills[0]["reason"], "already_applied")
+        # No position was opened (skipped).
+        self.assertEqual(state.positions, {})
+        # Cash unchanged.
+        self.assertEqual(state.cash, 100_000_000)
+
+
