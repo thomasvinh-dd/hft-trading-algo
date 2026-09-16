@@ -379,6 +379,77 @@ def heartbeat_message(
     return "\n".join(lines)
 
 
+def _filter_orders_by_portfolio(
+    items: list[dict[str, Any]],
+    portfolio: dict[str, Any] | None,
+    board_lot: int = 100,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Split ``items`` into (fillable, skipped_reasons).
+
+    A SELL is fillable when the portfolio holds positive qty of that
+    symbol. A BUY is fillable when ``qty * price`` (rounded to a
+    board lot) fits inside ``available_cash``. When ``portfolio`` is
+    missing or non-dict, no filtering is applied (legacy behaviour).
+    """
+    if not isinstance(portfolio, dict) or not items:
+        return list(items), []
+    positions_raw = portfolio.get("positions") or []
+    balance = portfolio.get("balance") or {}
+    available_cash = float(
+        balance.get("availableCash")
+        if balance.get("availableCash") is not None
+        else balance.get("totalCash")
+        or 0
+    )
+    held: dict[str, int] = {}
+    for p in positions_raw:
+        if not isinstance(p, dict):
+            continue
+        sym = str(p.get("symbol") or "").upper().strip()
+        qty = int(p.get("quantity") or 0)
+        if sym and qty > 0:
+            held[sym] = max(held.get(sym, 0), qty)
+    fillable: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for o in items:
+        sym = str(o.get("symbol") or "").upper().strip()
+        side = str(o.get("side") or "").upper().strip()
+        try:
+            qty = int(float(o.get("quantity") or 0))
+            price = float(o.get("price") or 0)
+        except (TypeError, ValueError):
+            skipped.append(f"{side or '?'} {sym or '?'}: malformed qty/price")
+            continue
+        if qty <= 0 or price <= 0 or not sym:
+            skipped.append(f"{side or '?'} {sym or '?'}: missing qty/price")
+            continue
+        # Normalise side to BUY/SELL (autofin uses NB/NS as legacy codes).
+        if side in ("NB", "B"):
+            side = "BUY"
+        elif side in ("NS", "S"):
+            side = "SELL"
+        if side == "SELL":
+            if held.get(sym, 0) <= 0:
+                skipped.append(
+                    f"SELL {qty} {sym} @ {int(price):,} VND (no position held)"
+                )
+                continue
+        elif side == "BUY":
+            # Round down to nearest board lot for the cost check (the
+            # apply phase also rounds to lots, so this matches what the
+            # bot would actually fill).
+            lot_qty = (qty // max(board_lot, 1)) * max(board_lot, 1)
+            cost = lot_qty * price * 1.0015  # include 15bps fees
+            if available_cash > 0 and cost > available_cash:
+                skipped.append(
+                    f"BUY {qty} {sym} @ {int(price):,} VND "
+                    f"(cost ~{int(cost):,} VND > cash {int(available_cash):,} VND)"
+                )
+                continue
+        fillable.append(o)
+    return fillable, skipped
+
+
 def portfolio_section_lines(
     portfolio: dict[str, Any] | None,
     top_n: int = 8,
@@ -626,6 +697,7 @@ def start_of_day_message(
     orders_json_path: str | None = None,
     strategy_name: str = "momentum",
     account: str = "?",
+    board_lot: int = 100,
 ) -> str:
     """Morning Telegram briefing sent before the 09:16 submit cycle.
 
@@ -634,6 +706,31 @@ def start_of_day_message(
       - today's planned orders (read from latest_orders JSON — these
         were generated at yesterday's EOD and will be submitted at
         09:16 ICT)
+
+    Order filtering (added 2026-09-16, user feedback on momentum
+    dry-run reset): the latest_orders.json is generated from a
+    backtest that walks the strategy's full history. When the
+    dry-run state has been reset to NAV=100M with empty positions
+    (or a smaller portfolio than the backtest assumes), some
+    orders in the JSON would never actually fill: a SELL for a
+    symbol we don't hold (the apply phase silently drops it with
+    ``no_position``), or a BUY that exceeds available cash.
+
+    To keep the briefing honest, we filter the items list against
+    the current portfolio snapshot:
+
+      - ``SELL sym X``: skipped if the portfolio holds 0 shares of
+        ``sym``.
+      - ``BUY sym X``: skipped if ``qty * price > available_cash``
+        (rough check, ignoring fees — the apply phase does the
+        authoritative clip).
+
+    If all items are filtered out, the message reads "No fillable
+    orders today" instead of listing an empty plan.
+
+    Skipped orders are summarised in a separate line so the user
+    still sees the backtest's intent — but the actionable section
+    only contains orders that can actually execute.
     """
     today = today or datetime.now().strftime("%Y-%m-%d")
     lines: list[str] = [
@@ -651,10 +748,15 @@ def start_of_day_message(
             items = list(payload.get("items") or [])
         except Exception:
             items = []
-    if items:
+    # Filter items against the current portfolio so the briefing only
+    # lists orders that can actually fill.
+    fillable, skipped = _filter_orders_by_portfolio(items, portfolio, board_lot=board_lot)
+    if fillable:
         lines.append("")
-        lines.append(f"📋 Today's planned orders ({len(items)}) — submitted at 09:16 ICT:")
-        for o in items[:20]:
+        lines.append(
+            f"📋 Today's planned orders ({len(fillable)}) — submitted at 09:16 ICT:"
+        )
+        for o in fillable[:20]:
             sym = o.get("symbol", "?")
             side = o.get("side", "?")
             price = o.get("price", 0)
@@ -665,8 +767,25 @@ def start_of_day_message(
             qty = o.get("quantity", 0)
             reason = str(o.get("reason") or "")[:30]
             lines.append(f"  • {side} {qty} {sym} @ {price_s} VND  ({reason})")
-        if len(items) > 20:
-            lines.append(f"  ... and {len(items) - 20} more")
+        if len(fillable) > 20:
+            lines.append(f"  ... and {len(fillable) - 20} more")
+    elif items:
+        # All items filtered out — say so instead of pretending we have a
+        # plan that would actually do nothing.
+        lines.append("")
+        lines.append(
+            "📋 No fillable orders today "
+            f"({len(items)} plan(s) skipped — see reasons below)."
+        )
+    if skipped:
+        lines.append("")
+        lines.append(
+            f"  ⏭ Skipped (no portfolio state to act on):"
+        )
+        for s in skipped[:10]:
+            lines.append(f"    • {s}")
+        if len(skipped) > 10:
+            lines.append(f"    ... and {len(skipped) - 10} more")
     else:
         lines.append("")
         lines.append("ℹ️  No orders planned for today "

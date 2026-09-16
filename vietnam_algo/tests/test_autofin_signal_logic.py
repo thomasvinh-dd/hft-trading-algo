@@ -572,11 +572,14 @@ def test_start_of_day_message_shows_portfolio_and_orders(tmp_path, monkeypatch):
         "totals": {"stockValue": 27_500_000, "portfolioValue": 57_500_000,
                    "totalUnrealizedPnl": 1_374_000, "totalUnrealizedPnlPct": 2.45, "positionCount": 1},
     }
+    # Use a SELL that we CAN actually fill (we hold 1000 HCM) — the
+    # earlier version used a BUY that exceeded cash, which now gets
+    # filtered out by the cash-aware filter (see test_start_of_day_message_filters_unfillable_orders_below).
     orders_json = tmp_path / "latest_orders.json"
     orders_json.write_text(json.dumps({
         "count": 1, "items": [
-            {"symbol": "HCM", "side": "BUY", "price": 26126, "quantity": 3000,
-             "reason": "top_rank", "date": "2026-09-07"},
+            {"symbol": "HCM", "side": "SELL", "price": 27500, "quantity": 500,
+             "reason": "rank_exit", "date": "2026-09-07"},
         ],
     }))
     msg = start_of_day_message(
@@ -594,11 +597,179 @@ def test_start_of_day_message_shows_portfolio_and_orders(tmp_path, monkeypatch):
     assert "CURRENT PORTFOLIO" in msg
     assert "30,000,000" in msg
     assert "NAV:" in msg
-    # Today's planned orders section
+    # Today's planned orders section — the SELL is fillable so it appears.
     assert "Today's planned orders" in msg
-    assert "BUY 3000 HCM" in msg
+    assert "SELL 500 HCM" in msg
     # Next-step hint
     assert "09:16 ICT" in msg
+
+
+def test_start_of_day_message_filters_unfillable_orders_below(tmp_path):
+    """User-reported scenario (2026-09-16): portfolio has 0 cash +
+    0 positions, but latest_orders.json lists 2 SELL signals. The
+    start-of-day briefing should NOT list those SELLs as actionable
+    orders — they would just be silently dropped by the apply
+    phase. Filter them out and surface in a skipped summary instead.
+    """
+    from vietnam_algo.libs.notifier import start_of_day_message
+    portfolio = {
+        "mode": "dry_run",
+        "balance": {"totalCash": 100_000_000, "availableCash": 100_000_000},
+        "positions": [],  # empty — just reset
+        "totals": {"stockValue": 0, "portfolioValue": 100_000_000,
+                   "totalUnrealizedPnl": 0, "positionCount": 0},
+    }
+    orders_json = tmp_path / "latest_orders.json"
+    orders_json.write_text(json.dumps({
+        "count": 2, "items": [
+            {"symbol": "BAF", "side": "SELL", "price": 31918, "quantity": 6000,
+             "reason": "market_bear_exit"},
+            {"symbol": "BSR", "side": "SELL", "price": 27622, "quantity": 7000,
+             "reason": "market_bear_exit"},
+        ],
+    }))
+    msg = start_of_day_message(
+        portfolio=portfolio,
+        today="2026-09-16",
+        orders_json_path=str(orders_json),
+        strategy_name="momentum",
+        account="0003937868",
+    )
+    # Split into the actionable section (between 📋 and ⏭) and the
+    # skipped summary (after ⏭) so we can assert they appear in the
+    # right place.
+    if "⏭" in msg:
+        actionable, skipped_section = msg.split("⏭", 1)
+    else:
+        actionable, skipped_section = msg, ""
+    # The SELLs should NOT appear in the actionable section.
+    assert "Today's planned orders" not in actionable, (
+        "Actionable section should NOT list un-fillable SELLs: " + actionable
+    )
+    assert "SELL 6000 BAF" not in actionable
+    assert "SELL 7000 BSR" not in actionable
+    # Instead, the briefing should say "no fillable orders" and list
+    # the skipped reasons.
+    assert "No fillable orders today" in actionable
+    # The skipped summary captures the un-fillable orders so the user
+    # still sees the backtest's intent.
+    assert "BAF" in skipped_section
+    assert "BSR" in skipped_section
+    assert "no position" in skipped_section
+
+
+def test_start_of_day_message_keeps_fillable_orders_and_skips_unfillable(tmp_path):
+    """When the plan has BOTH a fillable and an unfillable order, the
+    briefing should list the fillable one and surface the unfillable
+    one in the skipped summary (don't drop the backtest's intent
+    silently)."""
+    from vietnam_algo.libs.notifier import start_of_day_message
+    portfolio = {
+        "mode": "dry_run",
+        "balance": {"totalCash": 50_000_000, "availableCash": 50_000_000},
+        "positions": [
+            # We hold HCM, so the SELL is fillable.
+            {"symbol": "HCM", "quantity": 1000, "avgPrice": 27000,
+             "marketPrice": 27500, "marketValue": 27_500_000,
+             "costBasis": 27_000_000, "unrealizedPnl": 500_000,
+             "unrealizedPnlPct": 1.85},
+            # We don't hold VHM, so the SELL is NOT fillable.
+        ],
+        "totals": {"stockValue": 27_500_000, "portfolioValue": 77_500_000,
+                   "totalUnrealizedPnl": 500_000, "positionCount": 1},
+    }
+    orders_json = tmp_path / "latest_orders.json"
+    orders_json.write_text(json.dumps({
+        "count": 2, "items": [
+            {"symbol": "HCM", "side": "SELL", "price": 27500, "quantity": 500,
+             "reason": "rank_exit"},
+            {"symbol": "VHM", "side": "SELL", "price": 70000, "quantity": 200,
+             "reason": "rank_exit"},
+        ],
+    }))
+    msg = start_of_day_message(
+        portfolio=portfolio,
+        today="2026-09-16",
+        orders_json_path=str(orders_json),
+        strategy_name="momentum",
+        account="0003937868",
+    )
+    # Split sections.
+    if "⏭" in msg:
+        actionable, skipped_section = msg.split("⏭", 1)
+    else:
+        actionable, skipped_section = msg, ""
+    # Fillable SELL appears in the actionable section.
+    assert "Today's planned orders" in actionable
+    assert "SELL 500 HCM" in actionable
+    # Unfillable SELL does NOT appear in the actionable section.
+    assert "SELL 200 VHM" not in actionable
+    # The skipped summary captures it.
+    assert "SELL 200 VHM" in skipped_section
+    assert "VHM" in skipped_section
+    assert "no position" in skipped_section
+
+
+def test_start_of_day_message_filters_buy_when_cash_short(tmp_path):
+    """BUY where cost > available cash is filtered out and shown in the
+    skipped summary."""
+    from vietnam_algo.libs.notifier import start_of_day_message
+    portfolio = {
+        "mode": "dry_run",
+        "balance": {"totalCash": 5_000_000, "availableCash": 5_000_000},
+        "positions": [],
+        "totals": {"stockValue": 0, "portfolioValue": 5_000_000,
+                   "totalUnrealizedPnl": 0, "positionCount": 0},
+    }
+    orders_json = tmp_path / "latest_orders.json"
+    orders_json.write_text(json.dumps({
+        "count": 1, "items": [
+            {"symbol": "EXP", "side": "BUY", "price": 50000, "quantity": 1000,
+             "reason": "top_rank"},
+        ],
+    }))
+    msg = start_of_day_message(
+        portfolio=portfolio,
+        today="2026-09-16",
+        orders_json_path=str(orders_json),
+        strategy_name="momentum",
+        account="0003937868",
+    )
+    # BUY too expensive — should NOT appear in the actionable section.
+    if "⏭" in msg:
+        actionable, skipped_section = msg.split("⏭", 1)
+    else:
+        actionable, skipped_section = msg, ""
+    assert "Today's planned orders" not in actionable
+    assert "BUY 1000 EXP" not in actionable
+    # Skipped summary captures it.
+    assert "EXP" in skipped_section
+    assert "cost" in skipped_section
+    assert "cash" in skipped_section
+
+
+def test_start_of_day_message_handles_no_portfolio():
+    """Legacy behaviour: when no portfolio is passed, the briefing lists
+    all items as before (no filtering — caller didn't opt in)."""
+    from vietnam_algo.libs.notifier import start_of_day_message
+    from pathlib import Path
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        orders_json = Path(td) / "latest_orders.json"
+        orders_json.write_text(json.dumps({
+            "count": 1, "items": [
+                {"symbol": "AAA", "side": "BUY", "price": 10000, "quantity": 100,
+                 "reason": "test"},
+            ],
+        }))
+        msg = start_of_day_message(
+            portfolio=None,
+            today="2026-09-16",
+            orders_json_path=str(orders_json),
+            strategy_name="momentum",
+            account="0003937868",
+        )
+        assert "BUY 100 AAA" in msg  # No filter applied — appears unconditionally.
 
 
 def test_start_of_day_message_handles_empty_orders(tmp_path):
