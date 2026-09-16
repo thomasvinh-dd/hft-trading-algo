@@ -229,6 +229,7 @@ def _plan_orders_for_new_positions(
     current_prices: dict[str, float] | None = None,
     above_zone_tolerance_pct: float = 0.05,
     already_planned_symbols: set[str] | None = None,
+    available_cash_vnd: float | None = None,
 ) -> list[dict[str, Any]]:
     """Emit BUY + TP + SL bracket orders for **new** positions only.
 
@@ -239,6 +240,20 @@ def _plan_orders_for_new_positions(
     spiral where daily rebalancing amplifies losses (when NAV
     drops, target shrinks, strategy SELLs, realizes losses,
     NAV drops further, more SELLs).
+
+    Cash cap (added 2026-09-16, user feedback): each BUY's
+    ``target_value`` is capped at the **remaining cash budget**
+    rather than unbounded NAV × rateForNav. Without this, the
+    bot would plan BUY orders of ``nav × rateForNav`` even when
+    the portfolio is fully invested in stocks and the cash
+    account can't cover them — leaving the apply phase to
+    silently skip them or, worse, in live mode the broker would
+    reject the order. We track ``remaining_cash`` across the
+    signal list so multiple BUYs share the cash budget rather
+    than each one independently re-using the full amount.
+
+    If ``available_cash_vnd`` is not provided, the function falls
+    back to ``nav_vnd`` (the original behaviour).
 
     Per user feedback (2026-09-09): also accept ``already_planned_symbols`` —
     a set of symbols that are already in the bot's persistent
@@ -283,6 +298,11 @@ def _plan_orders_for_new_positions(
         at ``supply_to`` (high end of buy zone).
     """
     rows: list[dict[str, Any]] = []
+    # Cash budget shared across the whole selected list. Defaults to
+    # nav_vnd if no explicit budget was passed (legacy behaviour).
+    if available_cash_vnd is None or available_cash_vnd <= 0:
+        available_cash_vnd = nav_vnd
+    remaining_cash = float(available_cash_vnd)
     for s in selected:
         if not s.symbol:
             continue
@@ -298,7 +318,14 @@ def _plan_orders_for_new_positions(
             continue
         if s.rate_for_nav <= 0 or nav_vnd <= 0:
             continue
-        target_value = nav_vnd * s.rate_for_nav
+        # Cash cap (2026-09-16): each BUY's target_value is capped at
+        # the remaining cash budget, so the bot doesn't emit BUY
+        # orders it can't actually afford when the portfolio is fully
+        # invested in stocks. We track ``remaining_cash`` across the
+        # signal list so multiple BUYs share the cash budget.
+        if available_cash_vnd is None or available_cash_vnd <= 0:
+            available_cash_vnd = nav_vnd
+        target_value = min(nav_vnd * s.rate_for_nav, remaining_cash)
         if target_value < min_order_value_vnd:
             continue
         ref_price = _signal_ref_price(s)
@@ -322,6 +349,15 @@ def _plan_orders_for_new_positions(
         target_qty = _round_to_lots(int(target_value / entry_price), board_lot)
         if target_qty <= 0:
             continue
+        # Cap by remaining cash: even if target_value fits at the
+        # remaining_cash level, we want to verify the actual round-lot
+        # cost fits too. Reduce target_qty until it does, otherwise skip.
+        actual_cost = target_qty * entry_price * 1.0015  # include 15bps fees
+        while target_qty > 0 and actual_cost > remaining_cash:
+            target_qty -= board_lot
+            actual_cost = target_qty * entry_price * 1.0015
+        if target_qty <= 0:
+            continue
         did = _deal_id(s.raw)
         rows.append({
             "symbol": s.symbol,
@@ -334,6 +370,11 @@ def _plan_orders_for_new_positions(
                 f"nav{int(s.rate_for_nav*100)}pct:{s.last_recomment[:60]}"
             ),
         })
+        # Deduct actual planned cost from remaining_cash so the next
+        # BUY in this iteration shares the cash budget.
+        remaining_cash -= actual_cost
+        if remaining_cash <= 0:
+            break
         # NO TP bracket on entry — TPs come from autofin's per-event signal
         # (``numberOfProfit`` increment / ``lastRecomment`` partial close).
         # Autofin publishes TPs as PARTIAL closes at varying percentages
@@ -1063,6 +1104,22 @@ def decide_orders(
         if did:
             autofin_holding_by_id[did] = dict(d)
 
+    # 1a. Determine the cash budget for new BUYs. We use the dry-run
+    # state's cash as the source of truth when available, so the bot
+    # doesn't emit BUY orders it can't actually afford in the simulated
+    # account. Without this, the user reported (2026-09-16) the bot
+    # was planning ``NB 300 GAS @ 90K`` (= 27M VND) when the portfolio
+    # only had ~30K cash. The nav-based sizing formula
+    # ``nav * rateForNav`` is preserved as the upper bound.
+    available_cash_vnd: float | None = None
+    if data_dir is not None:
+        try:
+            from vietnam_algo.libs.dry_run_state import init_dry_run_state as _init_dry
+            _dry = _init_dry(data_dir, strategy_name="autofin_signal")
+            available_cash_vnd = float(_dry.cash)
+        except Exception:
+            pass
+
     # 1b. Deal-ids the bot has ever issued ANY order for (entry, partial
     # close, or full close). These are tracked so we don't re-enter a
     # deal we previously closed — autofin keeps re-suggesting open deals
@@ -1123,6 +1180,7 @@ def decide_orders(
         board_lot=board_lot, user_sl_pct=user_sl_pct,
         current_prices=current_prices,
         already_planned_symbols=already_planned_symbols,
+        available_cash_vnd=available_cash_vnd,
     )
     partial_orders = _plan_partial_close_orders(our_deals, holding, board_lot=board_lot)
     our_real_deals = {

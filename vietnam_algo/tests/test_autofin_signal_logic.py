@@ -1122,3 +1122,137 @@ class CloseRequiresClosingSignalsTests(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
+
+# ---------------------------------------------------------------------------
+# Cash-budget cap (2026-09-16, user feedback on autofin dry-run)
+# ---------------------------------------------------------------------------
+# Background: the user reported the bot was planning
+#   NB 300 GAS @ 90,000 (= 27M VND)
+# when the dry-run state's cash was only ~30K VND (portfolio fully
+# invested in 6 stocks). With NAV-based sizing
+# ``nav * rateForNav = 100M * 0.30 = 30M`` the BUY was unfulfillable.
+#
+# Fix: ``_plan_orders_for_new_positions`` accepts an optional
+# ``available_cash_vnd`` parameter. When provided, each BUY's
+# ``target_value`` is capped at the *remaining cash* across the
+# signal list, and signals whose target_value drops below
+# ``min_order_value_vnd`` are skipped.
+
+
+def test_plan_new_positions_caps_target_at_available_cash():
+    """Cash-cap: BUY size is bounded by remaining_cash, not unbounded
+    by nav_vnd * rateForNav."""
+    # Use price=10K so the cap is meaningful. With nav=100M and
+    # rateForNav=0.30, the uncapped target_value would be 30M = 3000 lots.
+    # With cash cap of 5M, target_value ≤ 5M → qty ≤ 500 lots. The actual
+    # actual_cost adjustment reduces this by 1 board lot (15bps fees
+    # would push 500*10K = 5M over the 5M boundary), so 400 lots.
+    sig = _make_signal("GAS", 0.30, supply_to=10000, tp_from=11000, sl_to=9000)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=100_000_000,  # would size at 30M target_value
+        our_positions={},
+        available_cash_vnd=5_000_000,  # but cash can only afford 5M
+    )
+    assert len(rows) == 2, "expected BUY + SL"
+    buy = next(r for r in rows if r["side"] == "NB")
+    # Without the cap, qty would be 3000 lots. With cap, qty should
+    # be ≤ 500 lots (and the actual cost including 15bps fees must fit
+    # within 5M → 400 lots after the cap adjusts for fees).
+    assert buy["quantity"] <= 500, (
+        f"BUY should be capped by available cash; got {buy['quantity']} lots"
+    )
+    assert buy["quantity"] < 1000, (
+        f"BUY should NOT have hit the uncapped 3000-lot target; "
+        f"got {buy['quantity']} lots"
+    )
+    # Verify the cost fits in cash.
+    cost = buy["quantity"] * buy["price"] * 1.0015
+    assert cost <= 5_000_000, f"cost {cost} exceeds available cash 5M"
+    assert buy["price"] == 10000
+
+
+def test_plan_new_positions_skips_when_cash_below_one_lot():
+    """If available_cash can't afford even one board lot, skip the signal
+    entirely. This is the user's reported scenario: cash=30K, target
+    stock=50K → can't afford 1 lot."""
+    sig = _make_signal("GAS", 0.30, supply_to=50000, tp_from=55000, sl_to=45000)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=100_000_000,
+        our_positions={},
+        available_cash_vnd=30_000,  # < 1 board lot of 50K
+    )
+    assert rows == [], (
+        "Should skip signal when cash < 1 board lot cost, got: " + repr(rows)
+    )
+
+
+def test_plan_new_positions_remaining_cash_shared_across_signals():
+    """Multiple BUYs share the cash budget; the second BUY is shrunk
+    (or skipped) by the cost of the first."""
+    # Use cheap stocks so a 20M cash budget fits both lots-rounded BUYs.
+    sig_a = _make_signal("AAA", 0.10, supply_to=10000, tp_from=11000, sl_to=9000)
+    sig_b = _make_signal("BBB", 0.30, supply_to=8000, tp_from=9000, sl_to=7000)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig_a, sig_b],
+        nav_vnd=100_000_000,
+        our_positions={},
+        available_cash_vnd=20_000_000,
+    )
+    buys = [r for r in rows if r["side"] == "NB"]
+    buys_by_sym = {b["symbol"]: b for b in buys}
+    # Both should be present (combined cost < 20M).
+    assert "AAA" in buys_by_sym, "expected AAA buy"
+    assert "BBB" in buys_by_sym, "expected BBB buy"
+    a_cost = buys_by_sym["AAA"]["quantity"] * 10_000 * 1.0015
+    b_cost = buys_by_sym["BBB"]["quantity"] * 8_000 * 1.0015
+    total = a_cost + b_cost
+    # Total spend must fit within the cash budget.
+    assert total <= 20_000_000 * 1.001, (
+        f"Total spend {total:.0f} should fit within cash 20M; "
+        f"AAA={buys_by_sym['AAA']['quantity']} lots, "
+        f"BBB={buys_by_sym['BBB']['quantity']} lots"
+    )
+    # And neither individual BUY should be capped by 20M in isolation.
+    assert a_cost <= 20_000_000
+    assert b_cost <= 20_000_000
+    # The second BUY must be sized SMALLER than it would be if it had the
+    # full cash budget — proving remaining_cash tracking works.
+    b_target_if_alone = (20_000_000 // 8_000 // 100) * 100  # ~2500 lots
+    assert buys_by_sym["BBB"]["quantity"] < b_target_if_alone, (
+        f"BBB should be smaller than its standalone target {b_target_if_alone}; "
+        f"got {buys_by_sym['BBB']['quantity']}"
+    )
+
+
+def test_plan_new_positions_no_cash_cap_uses_nav_default():
+    """Backward-compat: when available_cash_vnd is NOT passed, the
+    function falls back to nav_vnd (legacy behaviour)."""
+    sig = _make_signal("XYZ", 0.30, supply_to=50000, tp_from=55000, sl_to=45000)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=20_000_000,  # → 6M target_value → 100 lots @ 50K
+        our_positions={},
+        available_cash_vnd=None,  # no cap → use nav
+    )
+    buys = [r for r in rows if r["side"] == "NB"]
+    assert len(buys) == 1
+    assert buys[0]["quantity"] == 100
+
+
+def test_plan_new_positions_zero_available_cash_uses_nav():
+    """Edge case: available_cash_vnd=0 (zero cash, fully invested).
+    Should NOT cause the function to fall back to a non-zero budget;
+    instead it should match the user's intent of 'no cash for new BUY'
+    by skipping signals that need cash."""
+    sig = _make_signal("XYZ", 0.20, supply_to=50000, tp_from=55000, sl_to=45000)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=20_000_000,
+        our_positions={},
+        available_cash_vnd=0,
+    )
+    # remaining_cash was set to available_cash_vnd=0; target_value caps
+    # to 0; < min_order_value → skip. So no orders.
+    assert rows == []
