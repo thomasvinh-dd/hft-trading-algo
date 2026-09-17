@@ -694,16 +694,25 @@ def run_auto_bot(
             # uses yesterday's prices just because the data-sync owner
             # hasn't run yet today. We re-use the data_ready_for_eod
             # sentinel that's stamped after the owner's sync.
+            #
+            # IMPORTANT: set ``data_ready = False`` and ``continue``
+            # AFTER the whole block, not from inside the wait print
+            # (see 2026-09-17 incident: a direct ``continue`` here
+            # bypassed the ``time.sleep(sleep_seconds)`` at the bottom
+            # of the while-loop, hammering the log at ~16k prints/sec
+            # until the disk filled). The same flag-then-continue-at-end
+            # pattern is used for the EOD wait block below.
+            data_ready = True
             if not engine_config.syncData:
                 try:
+                    from datetime import datetime as _dt_sod, timezone as _tz_sod
+                    def _utc_now_sod() -> _dt_sod:
+                        return _dt_sod.now(tz=_tz_sod.utc)
                     _ready = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
                     if not _ready.exists() or (
                         _ready.exists()
                         and (
-                            __import__("datetime").datetime
-                            .now(__import__("datetime").timezone.utc)
-                            .timestamp()
-                            - _ready.stat().st_mtime
+                            _utc_now_sod().timestamp() - _ready.stat().st_mtime
                         )
                         / 60
                         > 60 * 18
@@ -712,9 +721,11 @@ def run_auto_bot(
                             f"[{now.isoformat()}] waiting for data-sync owner "
                             f"to refresh prices before start-of-day briefing"
                         )
-                        continue
+                        data_ready = False
                 except Exception as exc:
                     print(f"[{now.isoformat()}] data-ready probe failed: {exc}")
+            if not data_ready:
+                continue
             print(f"[{now.isoformat()}] Sending start-of-day briefing")
             try:
                 from vietnam_algo.libs.notifier import start_of_day_message
