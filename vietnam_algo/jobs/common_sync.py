@@ -36,6 +36,7 @@ from pathlib import Path
 
 from vietnam_algo.libs.corporate_actions import sync_corporate_actions_incremental
 from vietnam_algo.libs.data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, load_saved_symbols, sync_prices, sync_prices_incremental, sync_symbols
+from vietnam_algo.libs.notifier import notify
 from vietnam_algo.libs.schedule import is_trading_day, local_date, vietnam_now
 
 
@@ -138,7 +139,7 @@ def run() -> CommonSyncResult:
 
     sleep_seconds = float(os.environ.get("COMMON_SYNC_SLEEP_SECONDS", "0.2"))
     incremental_limit = int(os.environ.get("COMMON_SYNC_INCREMENTAL_LIMIT", "10"))
-    paths = sync_prices_incremental(
+    paths, fetch_errors = sync_prices_incremental(
         symbols,
         DATA_DIR,
         timeout=30,
@@ -146,6 +147,23 @@ def run() -> CommonSyncResult:
         incremental_limit=incremental_limit,
     )
     print(f"[common_sync] prices refreshed: {len(paths)} (incremental)")
+    if fetch_errors:
+        # Surface the failure so an operator notices upstream regressions
+        # even when the cron job itself succeeds. Threshold: >5% of the
+        # universe failing (per the user's 2026-09-18 alert policy).
+        failure_pct = (len(fetch_errors) / max(len(symbols), 1)) * 100.0
+        sample = ", ".join(f"{sym}({err[:40]})" for sym, err in fetch_errors[:5])
+        msg = (
+            f"⚠️ Vietnam Algo: market-data price fetch errors\n"
+            f"date: {today}\n"
+            f"failed: {len(fetch_errors)}/{len(symbols)} symbols ({failure_pct:.1f}%)\n"
+            f"first failures: {sample}"
+        )
+        if failure_pct > 5.0:
+            print(f"[common_sync] {msg}", file=sys.stderr)
+            notify(msg)
+        else:
+            print(f"[common_sync] price fetch errors (below 5% threshold): {len(fetch_errors)}")
 
     # CA: ``sync_corporate_actions_incremental`` is itself idempotent —
     # it tracks a ``fromDate`` cursor in process memory; we wrap a
@@ -192,7 +210,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run()
     except Exception as exc:
+        # Surface hard failures (network down, 0 symbols, etc.) to
+        # Telegram so an operator notices even when the cron run is
+        # silent. The bot's outer loop has its own alert path for
+        # bot-driven runs; this is the cron-job equivalent.
+        err = f"🚨 Vietnam Algo: common_sync FAILED\ndate: {local_date(vietnam_now())}\nerror: {type(exc).__name__}: {exc}"
         print(f"[common_sync] FAILED: {exc}", file=sys.stderr)
+        notify(err)
         return 1
     print(json.dumps(result.__dict__, indent=2))
     return 0

@@ -22,6 +22,15 @@ class AutoBotState:
     # successful sync (we clear it in save_state when sync succeeds).
     caAlertSentDate: str = ""
     last_ca_sync_error: str = ""  # most recent error message, for status display
+    # Once-per-day suppression for the "market data stale" alert
+    # (sentinel too old / sample latest bar too old). Reset by
+    # ``runner.py`` when the next heartbeat / cycle confirms freshness.
+    dataStaleAlertSentDate: str = ""
+    # Once-per-day suppression for the "fetch error during market data
+    # sync" alert (>5% of symbols failing). Reset by ``runner.py`` on
+    # the next successful sync run.
+    dataFetchErrorAlertSentDate: str = ""
+    lastDataSyncErrorSummary: str = ""  # e.g. "3/1535 symbols failed" for status
 
 
 def state_path(data_dir: Path = DEFAULT_DATA_DIR, strategy_name: str = "") -> Path:
@@ -52,6 +61,9 @@ def load_state(data_dir: Path = DEFAULT_DATA_DIR, strategy_name: str = "") -> Au
         tradingToken=str(payload.get("tradingToken", "")),
         caAlertSentDate=str(payload.get("caAlertSentDate") or ""),
         last_ca_sync_error=str(payload.get("last_ca_sync_error") or ""),
+        dataStaleAlertSentDate=str(payload.get("dataStaleAlertSentDate") or ""),
+        dataFetchErrorAlertSentDate=str(payload.get("dataFetchErrorAlertSentDate") or ""),
+        lastDataSyncErrorSummary=str(payload.get("lastDataSyncErrorSummary") or ""),
     )
 
 

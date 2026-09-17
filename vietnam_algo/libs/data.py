@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 import time
 import urllib.error
 import urllib.parse
@@ -284,7 +285,7 @@ def sync_prices_incremental(
     timeout: float = 30.0,
     sleep_seconds: float = 0.2,
     incremental_limit: int = 10,
-) -> list[Path]:
+) -> tuple[list[Path], list[tuple[str, str]]]:
     """Incrementally append new bars to existing price files.
 
     For each symbol:
@@ -294,11 +295,17 @@ def sync_prices_incremental(
         most-recent bars from the upstream API, merge with existing bars
         by deduping on ``time``, and persist the merged result.
 
-    Returns the list of paths that were written (newest bar timestamp
-    moved forward).
+    Returns ``(paths, errors)``:
+      - ``paths``: list of paths whose newest bar moved forward
+        (or that had no existing file and got one written).
+      - ``errors``: list of ``(symbol, error_message)`` tuples for any
+        per-symbol fetch that raised. The function never raises on
+        per-symbol fetch failures — callers can decide whether to alert
+        based on ``len(errors) / total``.
     """
     data_dir = ensure_data_dir(data_dir)
     paths: list[Path] = []
+    errors: list[tuple[str, str]] = []
     total = len(symbols)
     new_bars_added = 0
     for index, symbol in enumerate(symbols, start=1):
@@ -308,7 +315,9 @@ def sync_prices_incremental(
         try:
             fresh_bars = fetch_price_bars(symbol, limit=incremental_limit, timeout=timeout)
         except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
             print(f"[{index}/{total}] fetch {ticker} FAILED: {exc}")
+            errors.append((ticker, err))
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
             continue
@@ -355,9 +364,90 @@ def sync_prices_incremental(
             time.sleep(sleep_seconds)
     print(
         f"sync_prices_incremental done: {len(paths)} files updated,"
-        f" {new_bars_added} new bars appended across {total} symbols."
+        f" {new_bars_added} new bars appended across {total} symbols,"
+        f" {len(errors)} fetch errors."
     )
-    return paths
+    return paths, errors
+
+
+def get_market_data_freshness(
+    data_dir: Path = DEFAULT_DATA_DIR,
+    sample_symbols: tuple[str, ...] = ("HPG", "VHM", "FPT", "VIC", "HDB"),
+) -> dict[str, Any]:
+    """Return market-data freshness signals for alert/health-check use.
+
+    Output keys:
+      - ``sentinel_exists``: bool — does ``data/live/data_ready_for_eod``
+        exist?
+      - ``sentinel_age_hours``: float | None — age of the sentinel file
+        in hours (None if missing). Computed as ``now - mtime``.
+      - ``sentinel_mtime``: str | None — ISO8601 UTC mtime (None if missing).
+      - ``sample_size``: int — number of sample symbols actually found on
+        disk.
+      - ``sample_total``: int — total symbols requested.
+      - ``median_latest_bar_age_days``: float | None — median of
+        ``today - latest_bar.time`` across sample symbols. None if no
+        sample symbols had any bars.
+      - ``oldest_sample_symbol``: str | None — symbol with the oldest
+        latest bar (None if no sample data).
+      - ``fresh``: bool — ``True`` iff sentinel_age_hours <= 25 AND
+        median_latest_bar_age_days <= 2.0.
+
+    The thresholds match the alerts wired into ``common_sync.run()`` and
+    the bot heartbeat block (see ``libs/notifier.py`` and
+    ``jobs/common_sync.py``).
+    """
+    now = datetime.now(UTC)
+    result: dict[str, Any] = {
+        "sentinel_exists": False,
+        "sentinel_age_hours": None,
+        "sentinel_mtime": None,
+        "sample_size": 0,
+        "sample_total": len(sample_symbols),
+        "median_latest_bar_age_days": None,
+        "oldest_sample_symbol": None,
+        "fresh": False,
+    }
+    sentinel_path = data_dir / "live" / "data_ready_for_eod"
+    if sentinel_path.exists():
+        mtime = datetime.fromtimestamp(sentinel_path.stat().st_mtime, tz=UTC)
+        age_seconds = (now - mtime).total_seconds()
+        result["sentinel_exists"] = True
+        result["sentinel_age_hours"] = round(age_seconds / 3600.0, 2)
+        result["sentinel_mtime"] = mtime.isoformat()
+    ages_days: list[tuple[str, float]] = []
+    for sym in sample_symbols:
+        path = data_dir / "prices" / f"{sym}.json"
+        if not path.exists():
+            continue
+        rows = load_saved_price_bars(path)
+        if not rows:
+            continue
+        last_time_str = str(rows[-1].get("time") or "")
+        if not last_time_str:
+            continue
+        try:
+            last_dt = datetime.fromisoformat(last_time_str.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=UTC)
+        age_days = (now - last_dt).total_seconds() / 86400.0
+        ages_days.append((sym, age_days))
+    if ages_days:
+        result["sample_size"] = len(ages_days)
+        median_age = statistics.median(a for _, a in ages_days)
+        result["median_latest_bar_age_days"] = round(median_age, 2)
+        result["oldest_sample_symbol"] = max(ages_days, key=lambda x: x[1])[0]
+    sentinel_fresh = (
+        result["sentinel_age_hours"] is not None and result["sentinel_age_hours"] <= 25.0
+    )
+    bars_fresh = (
+        result["median_latest_bar_age_days"] is not None
+        and result["median_latest_bar_age_days"] <= 2.0
+    )
+    result["fresh"] = bool(sentinel_fresh and bars_fresh)
+    return result
 
 
 def saved_price_file_has_items(path: Path) -> bool:

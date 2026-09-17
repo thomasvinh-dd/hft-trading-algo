@@ -18,6 +18,7 @@ from vietnam_algo.libs.daily_engine import (
     run_daily_once,
     update_dataset,
 )
+from vietnam_algo.libs.data import get_market_data_freshness
 from vietnam_algo.libs.dnse.client import DnseClient
 from vietnam_algo.libs.dnse.auth import (
     SHARED_TOKEN_PATH,
@@ -1025,6 +1026,50 @@ def run_auto_bot(
                     proxy_check = {"ok": True, "latency_ms": (_t.time() - t0) * 1000}
                 except Exception as exc:
                     proxy_check = {"ok": False, "error": str(exc)[:120]}
+            # Probe data freshness (sentinel age + sample-symbol latest
+            # bars). Once-per-day alert if stale — so an operator
+            # notices when the cron job or upstream is broken even if
+            # the bot is otherwise healthy.
+            try:
+                freshness = get_market_data_freshness(engine_config.dataDir)
+            except Exception as exc:
+                freshness = {"fresh": False, "error": str(exc)[:120]}
+            if not freshness.get("fresh", False):
+                if state.dataStaleAlertSentDate != today:
+                    sentinel_age = freshness.get("sentinel_age_hours")
+                    median_age = freshness.get("median_latest_bar_age_days")
+                    parts = [
+                        "⚠️ Vietnam Algo: market data STALE",
+                        f"strategy: {strategy_name or engine_config.strategy or '?'}",
+                        f"date: {today}",
+                    ]
+                    if sentinel_age is not None:
+                        parts.append(f"data_ready_for_eod age: {sentinel_age}h (threshold 25h)")
+                    elif freshness.get("sentinel_exists") is False:
+                        parts.append("data_ready_for_eod sentinel missing")
+                    if median_age is not None:
+                        parts.append(
+                            f"sample latest-bar median age: {median_age}d (threshold 2d)"
+                        )
+                        if freshness.get("oldest_sample_symbol"):
+                            parts.append(
+                                f"oldest sample: {freshness['oldest_sample_symbol']}"
+                            )
+                    if "error" in freshness:
+                        parts.append(f"probe error: {freshness['error']}")
+                    notify("\n".join(parts))
+                    state.dataStaleAlertSentDate = today
+                    save_state(
+                        state, engine_config.dataDir, strategy_name=strategy_name
+                    )
+            else:
+                # Healthy — clear any prior suppression so we'll alert
+                # again if it goes stale in the future.
+                if state.dataStaleAlertSentDate:
+                    state.dataStaleAlertSentDate = ""
+                    save_state(
+                        state, engine_config.dataDir, strategy_name=strategy_name
+                    )
             uptime_s = (now - bot_start_time).total_seconds() if bot_start_time else None
             pid = os.getpid()
             msg = heartbeat_message(
@@ -1035,13 +1080,15 @@ def run_auto_bot(
                 proxy_check=proxy_check,
                 pid=pid,
                 uptime_seconds=uptime_s,
+                freshness=freshness,
             )
             notify(msg)
             _emit_cycle(
                 _db, strategy_name or engine_config.strategy or "?",
                 "heartbeat",
                 payload={"date": today, "proxy_check": proxy_check,
-                         "uptime_s": uptime_s, "pid": pid},
+                         "uptime_s": uptime_s, "pid": pid,
+                         "data_fresh": freshness.get("fresh")},
                 local_date=today,
             )
             state.lastHeartbeatDate = today

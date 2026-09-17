@@ -53,7 +53,8 @@ class SyncPricesIncrementalTests(unittest.TestCase):
             _make_bar("2026-09-05", 104),  # new
         ]
         with self._patch_fetch(new_bars):
-            paths = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+            paths, errors = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+        self.assertEqual(errors, [])
         self.assertEqual(len(paths), 1)
         merged = json.loads(paths[0].read_text())
         items = merged["items"]
@@ -73,7 +74,8 @@ class SyncPricesIncrementalTests(unittest.TestCase):
             _make_bar("2026-09-03", 102),
         ]
         with self._patch_fetch(new_bars):
-            paths = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+            paths, errors = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+        self.assertEqual(errors, [])
         # No new bars → no write
         self.assertEqual(paths, [])
 
@@ -84,15 +86,20 @@ class SyncPricesIncrementalTests(unittest.TestCase):
             _make_bar("2026-09-05", 51),
         ]
         with self._patch_fetch(new_bars):
-            paths = sync_prices_incremental(["BBB"], self.tmp, sleep_seconds=0)
+            paths, errors = sync_prices_incremental(["BBB"], self.tmp, sleep_seconds=0)
+        self.assertEqual(errors, [])
         self.assertEqual(len(paths), 1)
         merged = json.loads(paths[0].read_text())
         self.assertEqual(len(merged["items"]), 2)
 
     def test_fetch_failure_does_not_crash(self) -> None:
         with patch("vietnam_algo.libs.data.fetch_price_bars", side_effect=RuntimeError("network down")):
-            paths = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+            paths, errors = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
         self.assertEqual(paths, [])
+        # The fetch error is reported via the errors tuple
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][0], "AAA")
+        self.assertIn("network down", errors[0][1])
         # Existing file untouched
         merged = json.loads((self.tmp / "prices" / "AAA.json").read_text())
         self.assertEqual(len(merged["items"]), 3)
@@ -107,7 +114,8 @@ class SyncPricesIncrementalTests(unittest.TestCase):
             _make_bar("2026-09-03", 999),
         ]
         with self._patch_fetch(new_bars):
-            paths = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+            paths, errors = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+        self.assertEqual(errors, [])
         self.assertEqual(paths, [])
         merged = json.loads((self.tmp / "prices" / "AAA.json").read_text())
         # First close stays at 100 (not overwritten)
@@ -115,7 +123,8 @@ class SyncPricesIncrementalTests(unittest.TestCase):
 
     def test_handles_empty_fetch_response(self) -> None:
         with self._patch_fetch([]):
-            paths = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+            paths, errors = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+        self.assertEqual(errors, [])
         # No new bars → no write
         self.assertEqual(paths, [])
 
@@ -127,7 +136,8 @@ class SyncPricesIncrementalTests(unittest.TestCase):
             _make_bar("2026-09-06", 106),
         ]
         with self._patch_fetch(new_bars):
-            paths = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+            paths, errors = sync_prices_incremental(["AAA"], self.tmp, sleep_seconds=0)
+        self.assertEqual(errors, [])
         merged = json.loads(paths[0].read_text())
         times = [r["time"] for r in merged["items"]]
         self.assertEqual(times, sorted(times))

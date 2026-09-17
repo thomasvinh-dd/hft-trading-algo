@@ -74,6 +74,65 @@ class CommonSyncStateTests(unittest.TestCase):
                 self.assertFalse(common_sync.already_done_today("2026-09-12"))
 
 
+class CommonSyncAlertingTests(unittest.TestCase):
+    """common_sync must alert on (a) >5% price fetch errors and
+    (b) full job failure. Below-threshold errors stay silent."""
+
+    def _setup_data_dir(self, tmp: Path) -> None:
+        (tmp / "prices").mkdir(parents=True, exist_ok=True)
+        for sym in ("AAA", "BBB", "CCC"):
+            (tmp / "prices" / f"{sym}.json").write_text(
+                json.dumps({"source": "test", "symbol": sym, "count": 0, "items": []})
+            )
+
+    def test_main_alerts_on_full_failure(self) -> None:
+        with _TmpDataDir() as tmp:
+            self._setup_data_dir(tmp)
+            with unittest.mock.patch.object(common_sync, "DATA_DIR", tmp), \
+                 unittest.mock.patch.object(common_sync, "TRADE_STATE", tmp / "live" / "common_sync_state.json"), \
+                 unittest.mock.patch.object(common_sync, "SENTINEL_PATH", tmp / "live" / "data_ready_for_eod"), \
+                 unittest.mock.patch.object(common_sync, "run", side_effect=RuntimeError("boom")), \
+                 unittest.mock.patch("vietnam_algo.jobs.common_sync.notify") as notify_mock:
+                rc = common_sync.main([])
+            self.assertEqual(rc, 1)
+            self.assertTrue(notify_mock.called)
+            sent_text = notify_mock.call_args[0][0]
+            self.assertIn("common_sync FAILED", sent_text)
+            self.assertIn("boom", sent_text)
+
+    def _run_with_mocks(self, tmp: Path, symbols: list[str], errors: list[tuple[str, str]]) -> unittest.mock.Mock:
+        self._setup_data_dir(tmp)
+        fake_helpers = unittest.mock.MagicMock(run_ca_incremental=lambda **kw: [])
+        with unittest.mock.patch.object(common_sync, "DATA_DIR", tmp), \
+             unittest.mock.patch.object(common_sync, "TRADE_STATE", tmp / "live" / "common_sync_state.json"), \
+             unittest.mock.patch.object(common_sync, "SENTINEL_PATH", tmp / "live" / "data_ready_for_eod"), \
+             unittest.mock.patch.object(common_sync, "sync_symbols"), \
+             unittest.mock.patch.object(common_sync, "load_saved_symbols", return_value=symbols), \
+             unittest.mock.patch.object(common_sync, "is_trading_day", return_value=True), \
+             unittest.mock.patch.object(common_sync, "sync_prices_incremental", return_value=([], errors)), \
+             unittest.mock.patch("vietnam_algo.jobs.common_sync.notify") as notify_mock, \
+             unittest.mock.patch.dict(sys.modules, {"vietnam_algo.jobs._helpers": fake_helpers}):
+            common_sync.run()
+        return notify_mock
+
+    def test_price_fetch_errors_above_5pct_alert(self) -> None:
+        with _TmpDataDir() as tmp:
+            symbols = [f"SYM{i:03d}" for i in range(200)]
+            errors = [(s, "ConnectionError: timeout") for s in symbols[:11]]
+            notify_mock = self._run_with_mocks(tmp, symbols, errors)
+        self.assertTrue(notify_mock.called)
+        sent_text = notify_mock.call_args[0][0]
+        self.assertIn("market-data price fetch errors", sent_text)
+        self.assertIn("11/200", sent_text)
+
+    def test_price_fetch_errors_below_5pct_no_alert(self) -> None:
+        with _TmpDataDir() as tmp:
+            symbols = [f"SYM{i:03d}" for i in range(200)]
+            errors = [(s, "ConnectionError: timeout") for s in symbols[:5]]  # 2.5%
+            notify_mock = self._run_with_mocks(tmp, symbols, errors)
+        self.assertFalse(notify_mock.called)
+
+
 class LoadSharedTokenTests(unittest.TestCase):
     def test_load_returns_none_when_file_missing(self) -> None:
         with _TmpDataDir() as tmp:

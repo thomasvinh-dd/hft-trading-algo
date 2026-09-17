@@ -306,6 +306,7 @@ def heartbeat_message(
     proxy_check: dict[str, Any] | None,
     pid: int | None = None,
     uptime_seconds: float | None = None,
+    freshness: dict[str, Any] | None = None,
 ) -> str:
     """Daily "I'm alive" notification with current bot status snapshot.
 
@@ -313,6 +314,7 @@ def heartbeat_message(
       - Bot uptime (process start time)
       - Last successful cycle dates (token, submit, EOD, CA sync, market holidays)
       - Proxy configuration and (optional) last connectivity check
+      - Market-data freshness (sentinel age + sample-symbol bar ages)
       - Account + mode
     """
     lines = ["💓 Vietnam Algo: DAILY HEARTBEAT"]
@@ -346,6 +348,29 @@ def heartbeat_message(
             ("lastHeartbeatDate", "heartbeat"),
         ]:
             lines.append(f"last-{label}: {state.get(key) or '(none yet)'}")
+
+    # market-data freshness
+    if freshness is not None:
+        fresh = freshness.get("fresh")
+        sentinel_age = freshness.get("sentinel_age_hours")
+        median_age = freshness.get("median_latest_bar_age_days")
+        sentinel_mtime = freshness.get("sentinel_mtime")
+        if fresh is True:
+            lines.append("data: fresh")
+        elif fresh is False:
+            bits = []
+            if sentinel_age is not None:
+                bits.append(f"sentinel={sentinel_age}h")
+            elif sentinel_mtime is None and not freshness.get("sentinel_exists"):
+                bits.append("sentinel=MISSING")
+            if median_age is not None:
+                bits.append(f"sample-bar-median={median_age}d")
+                if freshness.get("oldest_sample_symbol"):
+                    bits.append(f"oldest={freshness['oldest_sample_symbol']}")
+            if "error" in freshness:
+                bits.append(f"probe-err={freshness['error'][:40]}")
+            lines.append("data: STALE (" + ", ".join(bits) + ")")
+        # (None fresh state is treated as unknown; emit nothing.)
 
     # proxy
     if proxy_url:
