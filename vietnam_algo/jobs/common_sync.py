@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vietnam_algo.libs.corporate_actions import sync_corporate_actions_incremental
-from vietnam_algo.libs.data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, sync_prices, sync_symbols
+from vietnam_algo.libs.data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, load_saved_symbols, sync_prices, sync_prices_incremental, sync_symbols
 from vietnam_algo.libs.schedule import is_trading_day, local_date, vietnam_now
 
 
@@ -130,24 +130,22 @@ def run() -> CommonSyncResult:
         )
 
     print(f"[common_sync] refreshing symbols + prices + CA for {today}")
-    symbols = sync_symbols(DATA_DIR)
+    sync_symbols(DATA_DIR)
+    symbols = load_saved_symbols(DATA_DIR)
     print(f"[common_sync] symbols: {len(symbols)}")
     if not symbols:
         raise RuntimeError("sync_symbols returned 0 symbols — aborting")
 
-    # ``skip_existing=True`` is the default; ``price_limit`` caps how
-    # many days we ask for in the HTTP call.
-    price_limit = int(os.environ.get("COMMON_SYNC_PRICE_LIMIT", str(DEFAULT_PRICE_LIMIT)))
     sleep_seconds = float(os.environ.get("COMMON_SYNC_SLEEP_SECONDS", "0.2"))
-    paths = sync_prices(
+    incremental_limit = int(os.environ.get("COMMON_SYNC_INCREMENTAL_LIMIT", "10"))
+    paths = sync_prices_incremental(
         symbols,
         DATA_DIR,
-        price_limit,
         timeout=30,
         sleep_seconds=sleep_seconds,
-        skip_existing=True,
+        incremental_limit=incremental_limit,
     )
-    print(f"[common_sync] prices refreshed: {len(paths)}")
+    print(f"[common_sync] prices refreshed: {len(paths)} (incremental)")
 
     # CA: ``sync_corporate_actions_incremental`` is itself idempotent —
     # it tracks a ``fromDate`` cursor in process memory; we wrap a

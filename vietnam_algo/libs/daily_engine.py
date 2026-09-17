@@ -209,6 +209,7 @@ def _maybe_mirror_prices_to_db(
     try:
         from .db import DbClient, DbError
         from .db_sync import mirror_prices
+        from .data import read_json
     except ImportError as exc:  # pragma: no cover — psycopg2 missing
         print(f"[update_dataset] skipping Postgres mirror (no psycopg2): {exc}")
         return
