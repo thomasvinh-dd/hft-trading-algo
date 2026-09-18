@@ -53,10 +53,80 @@ def _load_env_credentials() -> tuple[str, str]:
     return email, password
 
 
+def _env_partial_close_fraction() -> float | None:
+    """Read ``AUTOFIN_PARTIAL_CLOSE_FRACTION`` from env, or None.
+
+    The env var lets the operator force a specific partial-close
+    fraction (e.g. ``AUTOFIN_PARTIAL_CLOSE_FRACTION=0.10`` for
+    autofin's "Tỷ trọng 10% danh mục nắm giữ" recommendation) when
+    autofin's API doesn't expose the value in ``lastRecomment``.
+    Must be a float in (0, 1].
+    """
+    raw = os.environ.get("AUTOFIN_PARTIAL_CLOSE_FRACTION", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if 0 < value <= 1:
+        return value
+    return None
+
+
 def _round_to_lots(quantity: int, board_lot: int = DEFAULT_BOARD_LOT) -> int:
     if quantity <= 0:
         return 0
     return (quantity // board_lot) * board_lot
+
+
+def _round_up_to_lots(quantity: int, board_lot: int = DEFAULT_BOARD_LOT) -> int:
+    """Round UP to the next board lot (vs ``_round_to_lots`` which rounds down).
+
+    Partial-close orders need round-up: when autofin says "sell 10% of
+    position", ``10% × 600 = 60`` shares but Vietnamese boards trade
+    in lots of 100. Rounding down would skip the order entirely;
+    rounding up emits the smallest lot that exceeds the desired qty.
+    """
+    if quantity <= 0:
+        return 0
+    return ((quantity + board_lot - 1) // board_lot) * board_lot
+
+
+def _extract_partial_fraction(
+    recomment_text: str | None,
+    *,
+    default: float = 1 / 3,
+    env_fraction: float | None = None,
+) -> float:
+    """Determine the partial-close fraction for a TP / reduce step.
+
+    Resolution order:
+      1. If ``recomment_text`` contains ``"Tỷ trọng X %"`` (autofin's
+         UI uses this label for the post-TP target weight), parse X
+         and use X/100 as the fraction. The pattern is loose on
+         whitespace because autofin's HTML stripping produces
+         irregular spacing ("Tỷ trọng 10 %" vs "Tỷ trọng  5%").
+      2. If ``env_fraction`` is provided (from
+         ``AUTOFIN_PARTIAL_CLOSE_FRACTION`` env var), use it.
+      3. Fall back to ``default`` (1/3, the historical behavior).
+
+    Returns a fraction in (0, 1]. The caller rounds the resulting
+    qty up to the next board lot.
+    """
+    import re as _re
+    if recomment_text:
+        m = _re.search(r"T\u1ef7\s*tr\u1ecdng\s*([\d\.,]+)\s*%", recomment_text)
+        if m:
+            try:
+                pct = float(m.group(1).replace(",", ""))
+                if 0 < pct <= 100:
+                    return pct / 100.0
+            except (TypeError, ValueError):
+                pass
+    if env_fraction is not None and 0 < env_fraction <= 1:
+        return env_fraction
+    return default
 
 
 def _signal_ref_price(s: AutofinSignal) -> float:
@@ -721,14 +791,28 @@ def _plan_partial_close_orders(
         sig["_our_qty"] = our_qty
 
         if action.action in ("take_profit_lap", "reduce_lap"):
-            delta = our_qty // 3
+            # Fraction: try to extract from "Tỷ trọng X %" in the recomment
+            # text (autofin's per-TP target weight). Falls back to
+            # AUTOFIN_PARTIAL_CLOSE_FRACTION env var, then to 1/3.
+            env_frac = _env_partial_close_fraction()
+            fraction = _extract_partial_fraction(
+                rec,
+                default=1 / 3,
+                env_fraction=env_frac,
+            )
+            delta = int(our_qty * fraction)
         elif action.action == "capital_protect":
             # action.percent is in % (e.g. 28.57) → convert to fraction
             delta = int(our_qty * action.percent / 100)
         else:
             continue
 
-        delta = _round_to_lots(delta, board_lot)
+        # Partial closes ROUND UP to the next board lot — when autofin
+        # says "sell 10%" and we hold 600, the math is 60 shares, but
+        # Vietnamese boards trade in lots of 100. Rounding down would
+        # skip the order entirely (60 < 100) and we'd miss the partial
+        # close. Rounding up emits the smallest valid lot (100).
+        delta = _round_up_to_lots(delta, board_lot)
         if delta < board_lot:
             continue
 

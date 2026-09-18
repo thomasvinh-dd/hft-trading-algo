@@ -279,8 +279,16 @@ def test_partial_close_skips_deal_autofin_no_longer_holds():
     assert rows == []  # full close handled by _plan_close_orders
 
 
-def test_partial_close_sub_lot_qty_skipped():
-    """If delta < 1 board lot, skip the partial close."""
+def test_partial_close_sub_lot_rounds_up_to_lot():
+    """Delta < 1 board lot ROUNDS UP to 1 lot.
+
+    autofin's "Tỷ trọng 10% danh mục" style recommendations give a
+    delta < 1 board lot for small positions (e.g. 10% × 200 = 20
+    shares). Vietnamese boards trade in lots of 100, so rounding
+    down would skip the order entirely — the user explicitly
+    wanted round-up behavior (per feedback 2026-09-18: 10% × 600 =
+    60 → 100 shares, not 60 → 0).
+    """
     our_deals = {
         "666:X": {"symbol": "X", "_our_qty": 200, "_last_numberOfProfit": 0},
     }
@@ -289,6 +297,8 @@ def test_partial_close_sub_lot_qty_skipped():
         "lastRecomment": "💰 Chốt lãi lần 1 mức giá 10,000",
         "tP_F": 10000,
     }]
-    # 200 // 3 = 66, rounded to 100 lots = 0 → skipped
+    # 200 // 3 = 66, rounded UP to 100 = 1 lot.
     rows = _plan_partial_close_orders(our_deals, autofin_holding)
-    assert rows == []
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "X"
+    assert rows[0]["quantity"] == 100

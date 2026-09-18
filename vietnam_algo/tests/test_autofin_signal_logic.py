@@ -1564,6 +1564,89 @@ class PartialCloseUsesPositionsGroundTruthTests(unittest.TestCase):
         )
         assert rows == []
 
+    def test_partial_close_uses_10pct_when_recomment_has_ty_trong(self) -> None:
+        """When autofin says 'Tỷ trọng 10% danh mục nắm giữ' in the
+        recomment text (or history), use 10% as the fraction.
+
+        Real-world case: ASP holding 600 shares, autofin TP step says
+        'Tỷ trọng 10 %' → 60 shares, round up to 100 = 1 lot."""
+        # Reach into _extract_partial_fraction via the module path.
+        frac = mod._extract_partial_fraction(
+            "💰 Chốt lãi lần 1 mức giá 15,800\n"
+            "Tỷ trọng 10 % danh mục nắm giữ\n"
+            "Nắm giữ: 7 ngày"
+        )
+        self.assertAlmostEqual(frac, 0.10, places=4)
+
+    def test_partial_close_asp_10pct_rounds_up_to_100(self) -> None:
+        """ASP 600 shares × 10% = 60, round UP to 100 = 1 lot."""
+        our_deals = {
+            "1789084800:ASP": {
+                "symbol": "ASP",
+                "_our_qty": 0,
+                "_last_numberOfProfit": 0,
+            }
+        }
+        holding = [{
+            "_id": 1789084800, "symbol": "ASP",
+            "lastRecomment": (
+                "💰 Chốt lãi lần 1 mức giá 15,800\n"
+                "Tỷ trọng 10 % danh mục nắm giữ\n"
+                "Nắm giữ: 7 ngày"
+            ),
+            "numberOfProfit": 1,
+            "tP_F": 15800,
+        }]
+        rows = mod._plan_partial_close_orders(
+            our_deals, holding,
+            our_positions={"ASP": 600},
+            board_lot=100,
+        )
+        assert len(rows) == 1
+        assert rows[0]["symbol"] == "ASP"
+        # 600 * 0.10 = 60 → round UP to 100 = 1 lot.
+        assert rows[0]["quantity"] == 100
+        assert rows[0]["price"] == 15800
+
+    def test_partial_close_env_fraction_overrides_default(self) -> None:
+        """``AUTOFIN_PARTIAL_CLOSE_FRACTION=0.10`` makes the bot sell
+        10% of holding even when the recomment doesn't include
+        'Tỷ trọng X%' (e.g. when autofin's API exposes only the
+        short-form lastRecomment, not the full HTML)."""
+        import os
+        from unittest.mock import patch
+        from vietnam_algo.algos.autofin_signal import (
+            _extract_partial_fraction,
+            _env_partial_close_fraction,
+        )
+        with patch.dict(
+            "os.environ",
+            {"AUTOFIN_PARTIAL_CLOSE_FRACTION": "0.10"},
+        ):
+            frac = _extract_partial_fraction(
+                "💰 Chốt lãi lần 1 mức giá 15,800",  # no Tỷ trọng line
+                env_fraction=_env_partial_close_fraction(),
+            )
+        self.assertAlmostEqual(frac, 0.10, places=4)
+
+    def test_partial_close_falls_back_to_one_third_without_env(self) -> None:
+        """When neither the recomment nor the env var has a fraction,
+        fall back to the historical 1/3 default."""
+        import os
+        from unittest.mock import patch
+        from vietnam_algo.algos.autofin_signal import (
+            _extract_partial_fraction,
+            _env_partial_close_fraction,
+        )
+        with patch.dict("os.environ", {}, clear=False):
+            # Make sure AUTOFIN_PARTIAL_CLOSE_FRACTION isn't set.
+            os.environ.pop("AUTOFIN_PARTIAL_CLOSE_FRACTION", None)
+            frac = _extract_partial_fraction(
+                "💰 Chốt lãi lần 1 mức giá 15,800",
+                env_fraction=_env_partial_close_fraction(),
+            )
+        self.assertAlmostEqual(frac, 1 / 3, places=4)
+
     def test_partial_close_fires_when_recomment_changed(self) -> None:
         """Even if nP is unchanged, a recomment change re-triggers
         the partial close (catches state-desync recovery and autofin
