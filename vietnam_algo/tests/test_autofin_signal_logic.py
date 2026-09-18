@@ -6,6 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 import pytest
+from typing import Any
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
 import vietnam_algo.algos.autofin_signal as mod
@@ -1427,3 +1428,136 @@ def test_plan_new_positions_zero_available_cash_uses_nav():
     # remaining_cash was set to available_cash_vnd=0; target_value caps
     # to 0; < min_order_value → skip. So no orders.
     assert rows == []
+
+
+class PartialCloseUsesPositionsGroundTruthTests(unittest.TestCase):
+    """Regression tests for the 2026-09-18 incident where
+    ``_our_qty`` in the autofin tracking state was 0 for every deal
+    even though the dry-run state held 6 positions, so partial closes
+    never fired. The fix uses ``our_positions`` (DNSE / dry-run) as
+    ground truth for sizing and filtering.
+    """
+
+    def _autofin_asp_holding(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "_id": 1789084800,
+                "symbol": "ASP",
+                "lastRecomment": "💰 Chốt lãi lần 1 mức giá 15,800",
+                "numberOfProfit": 1,
+                "tP_F": 15800,
+                "statusDeal": {"isClosed": False},
+            }
+        ]
+
+    def test_partial_close_fires_when_our_qty_is_zero_but_position_exists(self) -> None:
+        """Reproduce the ASP bug: tracking _our_qty=0, but dry-run
+        state shows 600 shares. The partial close must still fire."""
+        our_deals = {
+            "1789084800:ASP": {
+                "symbol": "ASP",
+                "_our_qty": 0,  # the bug
+                "_last_numberOfProfit": 0,  # nP went 0→1 in this cycle
+            }
+        }
+        holding = self._autofin_asp_holding()
+        our_positions = {"ASP": 600}  # ground truth from dry-run
+        rows = mod._plan_partial_close_orders(
+            our_deals, holding, our_positions=our_positions, board_lot=100,
+        )
+        # 600 // 3 = 200 shares
+        assert len(rows) == 1
+        assert rows[0]["symbol"] == "ASP"
+        assert rows[0]["quantity"] == 200
+        # Tracking state is repaired for next cycle AND decremented by
+        # the partial close (so it reflects "what we still hold").
+        assert our_deals["1789084800:ASP"]["_our_qty"] == 400
+
+    def test_partial_close_skips_when_no_position_in_dry_run(self) -> None:
+        """Defense check: if both dry-run AND _our_qty are 0, don't fire."""
+        our_deals = {
+            "1789084800:ASP": {
+                "symbol": "ASP",
+                "_our_qty": 0,  # also zero
+                "_last_numberOfProfit": 0,
+            }
+        }
+        holding = self._autofin_asp_holding()
+        our_positions = {}  # we sold everything
+        rows = mod._plan_partial_close_orders(
+            our_deals, holding, our_positions=our_positions, board_lot=100,
+        )
+        assert rows == []
+
+    def test_partial_close_uses_tp_price_when_recomment_provides_one(self) -> None:
+        """When autofin suggests a specific TP price, use it (not market)."""
+        our_deals = {
+            "1789084800:ASP": {
+                "symbol": "ASP",
+                "_our_qty": 0,
+                "_last_numberOfProfit": 0,
+            }
+        }
+        holding = self._autofin_asp_holding()
+        rows = mod._plan_partial_close_orders(
+            our_deals, holding,
+            our_positions={"ASP": 900},
+            board_lot=100,
+        )
+        assert len(rows) == 1
+        assert rows[0]["price"] == 15800  # from "mức giá 15,800"
+
+    def test_full_close_uses_positions_when_our_qty_is_zero(self) -> None:
+        """Same defense for full close: trust positions over stale _our_qty."""
+        our_deals = {
+            "1789084800:HDB": {
+                "symbol": "HDB",
+                "_our_qty": 0,  # stale
+                "lastRecomment": "",
+            }
+        }
+        rows = mod._plan_close_orders(
+            our_deals, [],
+            our_positions={"HDB": 1100},
+            autofin_closing_ids={"1789084800:HDB"},
+            board_lot=100,
+        )
+        assert len(rows) == 1
+        assert rows[0]["symbol"] == "HDB"
+        assert rows[0]["quantity"] == 1100
+        # Tracking state is repaired.
+        assert our_deals["1789084800:HDB"]["_our_qty"] == 1100
+
+    def test_partial_close_falls_back_to_our_qty_when_positions_unspecified(self) -> None:
+        """Backward compat: older callers (backtests) without positions
+        still work — fall back to ``_our_qty`` in the deal dict."""
+        our_deals = {
+            "1789084800:ASP": {
+                "symbol": "ASP",
+                "_our_qty": 600,
+                "_last_numberOfProfit": 0,
+            }
+        }
+        holding = self._autofin_asp_holding()
+        # No our_positions kwarg — fallback path
+        rows = mod._plan_partial_close_orders(our_deals, holding, board_lot=100)
+        assert len(rows) == 1
+        assert rows[0]["quantity"] == 200
+
+    def test_partial_close_skips_when_nP_did_not_increment(self) -> None:
+        """No new TP step announced → no partial close (prevents
+        re-firing on the same announcement across cycles)."""
+        our_deals = {
+            "1789084800:ASP": {
+                "symbol": "ASP",
+                "_our_qty": 0,
+                "_last_numberOfProfit": 1,  # already saw TP1
+            }
+        }
+        holding = self._autofin_asp_holding()  # nP still 1
+        rows = mod._plan_partial_close_orders(
+            our_deals, holding,
+            our_positions={"ASP": 600},
+            board_lot=100,
+        )
+        assert rows == []

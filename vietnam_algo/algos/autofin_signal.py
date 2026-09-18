@@ -413,6 +413,7 @@ def _plan_orders_for_new_positions(
 def _plan_close_orders(
     our_held_deal_ids: dict[str, dict[str, Any]],
     autofin_holding: list[dict[str, Any]],
+    our_positions: dict[str, int] | None = None,
     autofin_closing_ids: set[str] | None = None,
     autofin_suggest_ids: set[str] | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
@@ -446,6 +447,12 @@ def _plan_close_orders(
         loop falls back to ``last_price`` in dry-run; in live mode
         DNSE fills at market.
 
+    ``our_positions`` is the authoritative source of held qty (DNSE in
+    live mode, dry-run state in dry-run mode). When omitted (older
+    callers / backtests), falls back to ``_our_qty`` from each deal —
+    which works for tests but can be wrong in production (see the
+    2026-09-18 incident).
+
     `our_held_deal_ids` is a map: deal_id → original signal (so we know
     the symbol + qty + the deal we opened).
     """
@@ -461,7 +468,7 @@ def _plan_close_orders(
         for did, sig in our_held_deal_ids.items():
             if did not in deals_to_close:
                 continue
-            rows.extend(_emit_full_close_row(did, sig, board_lot))
+            rows.extend(_emit_full_close_row(did, sig, our_positions, board_lot))
     else:
         # Backtest / fallback: absence from holding + suggest means
         # autofin has closed this deal.
@@ -472,13 +479,14 @@ def _plan_close_orders(
         for did, sig in our_held_deal_ids.items():
             if did in still_open:
                 continue
-            rows.extend(_emit_full_close_row(did, sig, board_lot))
+            rows.extend(_emit_full_close_row(did, sig, our_positions, board_lot))
     return rows
 
 
 def _emit_full_close_row(
     did: str,
     sig: dict[str, Any],
+    our_positions: dict[str, int] | None,
     board_lot: int,
 ) -> list[dict[str, Any]]:
     """Build the full_close SELL row(s) for a single deal.
@@ -487,10 +495,18 @@ def _emit_full_close_row(
     always returns 0 or 1 row, but factored out so both live and
     backtest paths stay in sync.
     """
-    qty = sig.get("_our_qty", 0)
+    symbol = sig.get("symbol", "?")
+    # Use live qty from our_positions (DNSE / dry-run), falling back
+    # to _our_qty only if absent (e.g. symbol not yet in our_positions
+    # or older caller without positions).
+    positions = our_positions or {}
+    qty = int(positions.get(symbol, 0))
+    if qty <= 0:
+        qty = int(sig.get("_our_qty", 0))
     if qty <= 0:
         return []
-    symbol = sig.get("symbol", "?")
+    # Repair the tracking state for next cycle.
+    sig["_our_qty"] = qty
     # Autofin's lastRecomment (cached in our state when we first
     # observed the deal) often carries the suggested close price
     # for SL triggers ("Giá: 25,400"). Parse it the same way the
@@ -610,6 +626,7 @@ def _parse_partial_close(recomment: str) -> PartialCloseAction:
 def _plan_partial_close_orders(
     our_held_deals: dict[str, dict[str, Any]],
     autofin_holding: list[dict[str, Any]],
+    our_positions: dict[str, int] | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
 ) -> list[dict[str, Any]]:
     """Emit partial SELL orders for deals we hold that autofin still holds
@@ -622,14 +639,27 @@ def _plan_partial_close_orders(
       - Bootstrap: on first cycle (no ``_last_numberOfProfit`` in state),
         record the current value but do NOT issue any partial close
 
-    Mutates the deal dicts in-place to update ``_last_numberOfProfit`` and
-    ``_our_qty`` so the next cycle plans from the correct baseline.
+    The actual position qty comes from ``our_positions`` (built from the
+    dry-run state in dry-run mode or from DNSE in live mode) — NOT from
+    ``sig.get("_our_qty", 0)``, which can drift out of sync with the
+    actual fills after a cash-clipped BUY. See the 2026-09-18 incident
+    where every tracked deal had ``_our_qty=0`` even though the dry-run
+    state held 6 positions. The fix uses the source of truth.
+
+    When ``our_positions`` is None/empty (older callers / backtests that
+    don't pass it), fall back to ``_our_qty`` from the deal dict so the
+    historical test suite keeps working.
+
+    Mutates the deal dicts in-place to update ``_last_numberOfProfit``
+    so the next cycle plans from the correct baseline.
     """
     autofin_by_id: dict[str, dict[str, Any]] = {}
     for d in autofin_holding:
         did = _deal_id(d)
         if did:
             autofin_by_id[did] = d
+
+    positions = our_positions or {}
 
     rows: list[dict[str, Any]] = []
     for did, sig in our_held_deals.items():
@@ -665,9 +695,18 @@ def _plan_partial_close_orders(
         if cur_nP <= last_nP:
             continue
 
-        our_qty = int(sig.get("_our_qty", 0))
+        # Use the live position qty, NOT the stale _our_qty. This is
+        # the root-cause fix for the 2026-09-18 incident where ASP
+        # (600 shares held) was missed because _our_qty=0 after a
+        # cash-clipped BUY never reconciled back to tracking. Fall
+        # back to _our_qty only when no positions map was supplied.
+        symbol = str(sig.get("symbol", "") or "")
+        our_qty = int(positions.get(symbol, sig.get("_our_qty", 0)))
         if our_qty <= 0:
             continue
+        # Repair the tracking state for next cycle so the new logic
+        # has fresh data too.
+        sig["_our_qty"] = our_qty
 
         if action.action in ("take_profit_lap", "reduce_lap"):
             delta = our_qty // 3
@@ -720,6 +759,7 @@ def _event_to_partial_orders(
     event_title: str,
     event_body: str,
     our_deals: dict[str, dict[str, Any]],
+    our_positions: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Convert a single autofin notification event into one or more SELL orders.
 
@@ -736,6 +776,13 @@ def _event_to_partial_orders(
     deals and the event says "[HII] 💰 Chốt lãi ...", we attribute
     the partial-close to HII.
 
+    ``our_positions`` is the authoritative held-qty source. We use it
+    to size the partial close (and to filter out symbols we don't
+    actually hold), with ``_our_qty`` as a fallback. See the
+    2026-09-18 incident: tracking _our_qty was 0 for every deal even
+    though dry-run state had positions, so notifications never fired
+    partial closes.
+
     Returns a list of SELL order dicts (same shape as
     ``_plan_partial_close_orders``). Empty list if the event doesn't
     parse or we don't have a matching tracked position.
@@ -749,11 +796,19 @@ def _event_to_partial_orders(
 
     # Find the matching tracked deal for this symbol.
     our_match: dict[str, Any] | None = None
+    our_match_id: str | None = None
     for did, sig in our_deals.items():
-        if str(sig.get("symbol") or "").upper() == symbol and int(sig.get("_our_qty", 0)) > 0:
-            our_match = sig
-            our_match_id = did
-            break
+        if str(sig.get("symbol") or "").upper() == symbol:
+            # Prefer our_positions (DNSE / dry-run state) over
+            # _our_qty for the held check. Fall back to _our_qty
+            # when our_positions isn't supplied (older callers).
+            positions = our_positions or {}
+            held_qty = int(positions.get(symbol, sig.get("_our_qty", 0)))
+            if held_qty > 0:
+                our_match = sig
+                our_match["_our_qty"] = held_qty  # repair tracking
+                our_match_id = did
+                break
     if our_match is None:
         return []
 
@@ -1092,8 +1147,13 @@ def decide_orders(
                 _dry_pos = _dry.positions.get(_sym)
                 _dry_qty = int(_dry_pos.quantity) if _dry_pos is not None else 0
                 _trk_qty = int(_sig.get("_our_qty", 0) or 0)
-                if _dry_qty == 0 and _trk_qty > 0:
-                    _sig["_our_qty"] = 0
+                # Bidirectional sync: dry-run state is ground truth.
+                # Without the dry→tracking branch, a cash-clipped BUY
+                # that left _our_qty=0 in tracking but 600 in dry-run
+                # (2026-09-18 ASP incident) never heals — every subsequent
+                # cycle would still skip this deal's close logic.
+                if _dry_qty != _trk_qty:
+                    _sig["_our_qty"] = _dry_qty
         except Exception as exc:
             print(f"[decide_orders] dry-run reconcile skipped: {exc}")
 
@@ -1182,15 +1242,23 @@ def decide_orders(
         already_planned_symbols=already_planned_symbols,
         available_cash_vnd=available_cash_vnd,
     )
-    partial_orders = _plan_partial_close_orders(our_deals, holding, board_lot=board_lot)
+    partial_orders = _plan_partial_close_orders(
+        our_deals, holding, our_positions=our_positions, board_lot=board_lot,
+    )
+    # Filter to deals we actually hold — use our_positions (DNSE /
+    # dry-run state) as ground truth. _our_qty in our_deals can be
+    # stale (e.g. after a cash-clipped BUY never reconciled back to
+    # tracking, see 2026-09-18 incident); our_positions is always
+    # authoritative because the caller built it from the live source.
     our_real_deals = {
         did: sig for did, sig in our_deals.items()
-        if sig.get("_our_qty", 0) > 0
+        if our_positions.get(str(sig.get("symbol", "") or ""), 0) > 0
     }
     suggest_ids = {_deal_id(s.raw) for s in signals if s.raw.get("_id")}
     close_orders = _plan_close_orders(
         our_real_deals,
         holding,
+        our_positions=our_positions,
         autofin_closing_ids=autofin_closing_ids,
         autofin_suggest_ids=suggest_ids,
         board_lot=board_lot,
@@ -1433,7 +1501,10 @@ class AutofinSignalAdapter(StrategyAdapter):
         for ev in new_events:
             if not _is_trading_event(ev.tags):
                 continue
-            partials = _event_to_partial_orders(ev.title, ev.body, self._our_deals)
+            partials = _event_to_partial_orders(
+                ev.title, ev.body, self._our_deals,
+                our_positions=getattr(self, "_positions", None),
+            )
             for o in partials:
                 # Mark this notification id as notified so we don't reprocess.
                 self._notified_event_ids.add(str(ev.id))
@@ -1580,6 +1651,14 @@ class AutofinSignalAdapter(StrategyAdapter):
                 positions = dict(positions)
             except ValueError:
                 pass
+
+        # Cache the authoritative position map on the adapter so the
+        # notification poll (called later in this same cycle) can size
+        # partial closes from it. Without this, the poll would fall back
+        # to ``_our_qty`` from our_deals — which can be 0 when the
+        # autofin tracking state drifted out of sync with the dry-run
+        # state (2026-09-18 incident, see _plan_partial_close_orders).
+        self._positions = positions
 
         # 5c. User-defined stop-loss (overrides autofin's loose SL with
         # a tighter one). Read from env so it can be tuned per-environment.
