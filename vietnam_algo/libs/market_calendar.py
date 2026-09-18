@@ -75,6 +75,14 @@ def parse_market_holidays(text: str) -> list[MarketHoliday]:
 
 
 def save_market_holidays(holidays: list[MarketHoliday], data_dir: Path = DEFAULT_DATA_DIR, source: str = MARKET_HOLIDAY_HOSE_URL) -> Path:
+    """Persist the holiday list.
+
+    The file carries an explicit ``syncedAt`` (UTC ISO8601) timestamp
+    so the next-sync decision can be made without consulting the bot
+    state file (which is per-strategy, ephemeral, and gets cleared on
+    state-file migrations). The bot's ``marketHolidaySyncDate`` field
+    is updated separately as a convenience for the heartbeat.
+    """
     path = market_holiday_path(data_dir)
     write_json(
         path,
@@ -83,6 +91,7 @@ def save_market_holidays(holidays: list[MarketHoliday], data_dir: Path = DEFAULT
             "market": "Vietnam",
             "exchangeReference": "HOSE",
             "timezone": "Asia/Ho_Chi_Minh",
+            "syncedAt": utc_now(),
             "updatedAt": utc_now(),
             "count": len(holidays),
             "holidays": [asdict(holiday) for holiday in holidays],
@@ -100,6 +109,27 @@ def load_market_holidays(data_dir: Path = DEFAULT_DATA_DIR) -> set[str]:
     return {str(row.get("date")) for row in rows if isinstance(row, dict) and row.get("date")}
 
 
+def _last_holiday_sync_at(data_dir: Path = DEFAULT_DATA_DIR) -> str | None:
+    """Return the ``syncedAt`` ISO timestamp from the holidays file.
+
+    Returns ``None`` if the file is missing or has no timestamp (e.g.
+    older format before this field existed).
+    """
+    path = market_holiday_path(data_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = read_json(path)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    ts = payload.get("syncedAt") or payload.get("updatedAt")
+    if isinstance(ts, str) and ts:
+        return ts
+    return None
+
+
 def sync_market_holidays(data_dir: Path = DEFAULT_DATA_DIR, timeout: float = 30.0) -> dict[str, Any]:
     text = fetch_market_holiday_page(timeout=timeout)
     holidays = parse_market_holidays(text)
@@ -107,13 +137,63 @@ def sync_market_holidays(data_dir: Path = DEFAULT_DATA_DIR, timeout: float = 30.
     return {"path": str(path), "count": len(holidays), "dates": [holiday.date for holiday in holidays]}
 
 
-def should_sync_market_holidays(last_sync_date: str | None, today: str, interval_days: int = 7) -> bool:
+def should_sync_market_holidays(
+    last_sync_date: str | None,
+    today: str,
+    interval_days: int = 30,
+    data_dir: Path | None = None,
+) -> bool:
+    """Decide whether to re-fetch the market-holidays calendar.
+
+    Vietnam's HOSE publishes its holiday calendar once a year (typically
+    in December for the following year). Daily re-syncs are wasteful and
+    mislead operators reading the heartbeat — a fresh ``syncedAt``
+    looks like "new holidays were added" when in practice nothing
+    changed. The previous default of 7 days was too aggressive.
+
+    Returns ``True`` (sync now) when:
+      - We've never synced (``last_sync_date`` is None/empty), OR
+      - ``interval_days`` or more have elapsed since ``last_sync_date``,
+        AND
+      - The on-disk holidays file is missing OR also older than the
+        interval (defense in depth: catches the case where the bot
+        state field was cleared by a manual reset but the holidays
+        file itself is still fresh).
+
+    Returns ``False`` (skip) otherwise — the cached holidays are
+    authoritative until the interval elapses.
+    """
+    # Never synced in this bot's state → defer to the data-file check.
     if not last_sync_date:
-        return True
+        if data_dir is None:
+            return True
+        last_sync_iso = _last_holiday_sync_at(data_dir)
+        if last_sync_iso is None:
+            return True  # no file at all → fetch
+        # File exists and has a syncedAt → use it instead of state.
+        last_sync_date = last_sync_iso[:10]
     try:
-        return (date.fromisoformat(today) - date.fromisoformat(last_sync_date)).days >= interval_days
+        last_dt = date.fromisoformat(last_sync_date[:10])
+        today_dt = date.fromisoformat(today)
     except ValueError:
+        # Unparseable → be conservative and fetch.
         return True
+    if (today_dt - last_dt).days < interval_days:
+        return False
+    # Belt-and-suspenders: if the data file itself is also stale, sync;
+    # otherwise skip (the bot state is what's authoritative for the
+    # cron-style cadence — operators can clear it to force a refresh).
+    if data_dir is not None:
+        file_sync_iso = _last_holiday_sync_at(data_dir)
+        if file_sync_iso is None:
+            return True  # file missing → fetch
+        try:
+            file_dt = date.fromisoformat(file_sync_iso[:10])
+        except ValueError:
+            return True
+        if (today_dt - file_dt).days < interval_days:
+            return False
+    return True
 
 
 def trading_dates_between(start_date: str, end_date: str, holidays: set[str] | None = None) -> list[str]:
