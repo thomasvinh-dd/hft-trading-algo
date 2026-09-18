@@ -35,7 +35,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from vietnam_algo.libs.autofin_signals import AutofinClient, AutofinSignal, parse_signal
+from vietnam_algo.libs.autofin_signals import (
+    AutofinClient,
+    AutofinSignal,
+    latest_partial_close_fraction,
+    parse_signal,
+)
 from vietnam_algo.libs.config import StrategyConfig
 from vietnam_algo.libs.daily_engine import EngineConfig
 from vietnam_algo.libs.notifier import notify
@@ -698,6 +703,7 @@ def _plan_partial_close_orders(
     autofin_holding: list[dict[str, Any]],
     our_positions: dict[str, int] | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
+    autofin_fractions: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Emit partial SELL orders for deals we hold that autofin still holds
     but whose ``numberOfProfit`` has increased since the previous cycle.
@@ -708,6 +714,18 @@ def _plan_partial_close_orders(
       - Price: explicit price from recomment → else ``tP_F`` → else market
       - Bootstrap: on first cycle (no ``_last_numberOfProfit`` in state),
         record the current value but do NOT issue any partial close
+
+    Sizing source priority for take_profit_lap / reduce_lap steps:
+      1. ``autofin_fractions[did]`` — the per-step "Tỷ trọng X %" fraction
+         pulled from autofin's ``/signal-deals`` history. This is
+         the SOURCE OF TRUTH (per user feedback 2026-09-18: autofin
+         tells us the fraction; don't override with a fixed env value).
+      2. "Tỷ trọng X %" embedded in the recomment text (some history
+         entries include the multi-line text).
+      3. ``AUTOFIN_PARTIAL_CLOSE_FRACTION`` env var (operator
+         override for cases where autofin's API doesn't expose the
+         fraction).
+      4. Default 1/3 (historical behavior).
 
     The actual position qty comes from ``our_positions`` (built from the
     dry-run state in dry-run mode or from DNSE in live mode) — NOT from
@@ -791,15 +809,28 @@ def _plan_partial_close_orders(
         sig["_our_qty"] = our_qty
 
         if action.action in ("take_profit_lap", "reduce_lap"):
-            # Fraction: try to extract from "Tỷ trọng X %" in the recomment
-            # text (autofin's per-TP target weight). Falls back to
-            # AUTOFIN_PARTIAL_CLOSE_FRACTION env var, then to 1/3.
+            # Fraction resolution (priority order):
+            #   1. autofin_fractions[did] — the per-step "Tỷ trọng X %"
+            #      pulled from autofin's /signal-deals history. SOURCE
+            #      OF TRUTH per user feedback 2026-09-18 — autofin
+            #      tells us the fraction; don't override with a fixed
+            #      env value.
+            #   2. "Tỷ trọng X %" embedded in the recomment text (some
+            #      history entries include the multi-line text).
+            #   3. AUTOFIN_PARTIAL_CLOSE_FRACTION env var (operator
+            #      override for cases where autofin's API doesn't expose
+            #      the fraction).
+            #   4. Default 1/3 (historical behavior).
+            autofin_frac = (autofin_fractions or {}).get(did)
             env_frac = _env_partial_close_fraction()
-            fraction = _extract_partial_fraction(
-                rec,
-                default=1 / 3,
-                env_fraction=env_frac,
-            )
+            if autofin_frac is not None:
+                fraction = autofin_frac
+            else:
+                fraction = _extract_partial_fraction(
+                    rec,
+                    default=1 / 3,
+                    env_fraction=env_frac,
+                )
             delta = int(our_qty * fraction)
         elif action.action == "capital_protect":
             # action.percent is in % (e.g. 28.57) → convert to fraction
@@ -1183,6 +1214,7 @@ def decide_orders(
     actioned_deals: set[str] | None = None,
     data_dir: "Path | None" = None,
     autofin_closing_ids: set[str] | None = None,
+    autofin_fractions: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -1191,6 +1223,13 @@ def decide_orders(
     time-of-day, no DNSE calls — so this function can be replayed
     against any historical snapshot, which is what the daily
     backtest does.
+
+    ``autofin_fractions`` maps deal_id → partial-close fraction
+    (e.g. ``0.10`` for "Tỷ trọng 10%") read from autofin's
+    ``/signal-deals`` history. When a deal has an entry in this
+    map, that fraction OVERRIDES the env-var / 1/3 default. When
+    missing, the function falls back to
+    ``AUTOFIN_PARTIAL_CLOSE_FRACTION`` env var, then to 1/3.
 
     Parameters
     ----------
@@ -1339,7 +1378,11 @@ def decide_orders(
         available_cash_vnd=available_cash_vnd,
     )
     partial_orders = _plan_partial_close_orders(
-        our_deals, holding, our_positions=our_positions, board_lot=board_lot,
+        our_deals,
+        holding,
+        our_positions=our_positions,
+        board_lot=board_lot,
+        autofin_fractions=autofin_fractions,
     )
     # Filter to deals we actually hold — use our_positions (DNSE /
     # dry-run state) as ground truth. _our_qty in our_deals can be
@@ -1721,6 +1764,32 @@ class AutofinSignalAdapter(StrategyAdapter):
         except Exception as exc:
             notify(f"⚠️ autofin fetch_risk failed: {exc}")
             risk = []
+        # 4b. Fetch each holding's full recomment history so partial
+        # closes can honour autofin's per-step "Tỷ trọng X %" fraction
+        # (the live /signal-static-holding endpoint only returns a
+        # short lastRecomment like "💰 Chốt lãi lần 1 mức giá 15,800";
+        # the "Tỷ trọng" line lives in hisRecomment from /signal-deals).
+        # Without this, partial closes fall back to the 1/3 default
+        # which is wrong for ASP today (autofin says 10%).
+        autofin_fractions: dict[str, float] = {}
+        for h in holding:
+            sym = h.get("symbol") or h.get("stockCode")
+            if not sym:
+                continue
+            try:
+                deals = client.fetch_deals(symbol=sym, page_size=5)
+            except Exception as exc:
+                print(f"[autofin_signal] fetch_deals({sym}) failed: {exc}")
+                continue
+            if not deals:
+                continue
+            result = latest_partial_close_fraction(deals[0])
+            if result is None:
+                continue
+            frac, _raw_text = result
+            did = _deal_id(h)
+            if did:
+                autofin_fractions[did] = frac
         # 5. fetch our current DNSE positions for sizing
         try:
             from vietnam_algo.libs.dnse.client import DnseClient
@@ -1825,6 +1894,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             already_planned_symbols=already_planned_symbols,
             actioned_deals=self._actioned_deals,
             autofin_closing_ids=closing_ids,
+            autofin_fractions=autofin_fractions,
         )
 
         # 9b. Notification-driven mid-day TP/SL detection. Per user feedback

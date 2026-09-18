@@ -1647,6 +1647,121 @@ class PartialCloseUsesPositionsGroundTruthTests(unittest.TestCase):
             )
         self.assertAlmostEqual(frac, 1 / 3, places=4)
 
+    def test_partial_close_uses_autofin_provided_fraction(self) -> None:
+        """SOURCE OF TRUTH: autofin's ``/signal-deals`` history
+        supplies the per-step fraction (e.g. "Tỷ trọng 10 %"). When
+        the adapter passes that into ``decide_orders`` via the
+        ``autofin_fractions`` map, the partial close uses it — even
+        if ``AUTOFIN_PARTIAL_CLOSE_FRACTION`` is set to a different
+        value (autofin overrides the env).
+
+        Per user feedback 2026-09-18: "autofin will suggest the
+        close fraction for us, like 'Tỷ trọng 10%' will be 10%
+        partial close, not the default set in our env".
+        """
+        our_deals = {
+            "1789084800:ASP": {
+                "symbol": "ASP",
+                "_our_qty": 0,
+                "_last_numberOfProfit": 0,
+                "_last_recomment": "",
+            }
+        }
+        # Recomment is the SHORT form (no "Tỷ trọng X%" line) — that's
+        # all /signal-static-holding returns. autofin_fractions carries
+        # the long-form fraction from /signal-deals.
+        holding = [{
+            "_id": 1789084800, "symbol": "ASP",
+            "lastRecomment": "💰 Chốt lãi lần 1 mức giá 15,800",
+            "numberOfProfit": 1,
+            "tP_F": 15800,
+            "statusDeal": {"isClosed": False},
+        }]
+        rows = mod._plan_partial_close_orders(
+            our_deals,
+            holding,
+            our_positions={"ASP": 600},
+            board_lot=100,
+            autofin_fractions={"1789084800:ASP": 0.10},  # from autofin
+        )
+        assert len(rows) == 1
+        assert rows[0]["symbol"] == "ASP"
+        # 600 * 0.10 = 60 → round UP to 100 = 1 lot.
+        assert rows[0]["quantity"] == 100
+        assert rows[0]["price"] == 15800
+
+    def test_partial_close_autofin_fraction_overrides_env(self) -> None:
+        """When autofin provides 0.10 but the env var says 0.20,
+        autofin's value wins (per user feedback 2026-09-18)."""
+        import os
+        from unittest.mock import patch
+        from vietnam_algo.algos.autofin_signal import (
+            _env_partial_close_fraction,
+        )
+        with patch.dict(
+            "os.environ",
+            {"AUTOFIN_PARTIAL_CLOSE_FRACTION": "0.20"},
+        ):
+            our_deals = {
+                "1789084800:ASP": {
+                    "symbol": "ASP",
+                    "_our_qty": 0,
+                    "_last_numberOfProfit": 0,
+                    "_last_recomment": "",
+                }
+            }
+            holding = [{
+                "_id": 1789084800, "symbol": "ASP",
+                "lastRecomment": "💰 Chốt lãi lần 1 mức giá 15,800",
+                "numberOfProfit": 1,
+                "tP_F": 15800,
+                "statusDeal": {"isClosed": False},
+            }]
+            rows = mod._plan_partial_close_orders(
+                our_deals,
+                holding,
+                our_positions={"ASP": 1000},
+                board_lot=100,
+                autofin_fractions={"1789084800:ASP": 0.10},
+            )
+        # autofin says 10% (100 shares), NOT env's 20% (200 shares).
+        assert rows[0]["quantity"] == 100
+
+    def test_partial_close_falls_back_to_env_when_no_autofin_fraction(self) -> None:
+        """When autofin doesn't provide a fraction (e.g. partial fail
+        of the /signal-deals fetch), fall back to the env var."""
+        import os
+        from unittest.mock import patch
+        with patch.dict(
+            "os.environ",
+            {"AUTOFIN_PARTIAL_CLOSE_FRACTION": "0.15"},
+        ):
+            our_deals = {
+                "1789084800:ASP": {
+                    "symbol": "ASP",
+                    "_our_qty": 0,
+                    "_last_numberOfProfit": 0,
+                    "_last_recomment": "",
+                }
+            }
+            holding = [{
+                "_id": 1789084800, "symbol": "ASP",
+                "lastRecomment": "💰 Chốt lãi lần 1 mức giá 15,800",
+                "numberOfProfit": 1,
+                "tP_F": 15800,
+                "statusDeal": {"isClosed": False},
+            }]
+            # autofin_fractions is None (fetch failed / no history).
+            rows = mod._plan_partial_close_orders(
+                our_deals,
+                holding,
+                our_positions={"ASP": 1000},
+                board_lot=100,
+                autofin_fractions=None,
+            )
+        # env=0.15: 1000 * 0.15 = 150 → round UP to 200 = 2 lots.
+        assert rows[0]["quantity"] == 200
+
     def test_partial_close_fires_when_recomment_changed(self) -> None:
         """Even if nP is unchanged, a recomment change re-triggers
         the partial close (catches state-desync recovery and autofin

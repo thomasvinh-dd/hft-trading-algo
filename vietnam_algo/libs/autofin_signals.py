@@ -298,6 +298,59 @@ def parse_recommendation_history(raw_deal: dict[str, Any]) -> list[dict[str, Any
     return events
 
 
+def latest_partial_close_fraction(raw_deal: dict[str, Any]) -> tuple[float, str] | None:
+    """Return ``(fraction, raw_text)`` for the deal's most recent TP /
+    reduce / capital_protect event, or ``None`` if no such event.
+
+    autofin's recommendation history (``hisRecomment``) embeds the
+    per-step sell fraction as ``"Tỷ trọng X %"`` (e.g. ``"Tỷ trọng 10 %
+    danh mục nắm giữ"`` = "sell 10% of current position"). The live
+    ``/signal-static-holding`` API only returns the SHORT
+    ``lastRecomment`` (``"💰 Chốt lãi lần 1 mức giá 15,800"``) — it
+    strips the ``Tỷ trọng X %`` line. To get the fraction we have to
+    read the full history via ``/signal-deals``.
+
+    Returns the fraction (0..1) and the raw text of the most recent
+    TP / reduce / capital_protect event. Returns ``None`` when:
+      - the deal has no history events,
+      - the most recent event is a "khuyến nghị" (entry) — no TP yet,
+      - the history has no ``"Tỷ trọng X %"`` and the action isn't a
+        capital_protect (which embeds its own %).
+
+    For a "💰 Chốt lãi lần N" TP step without ``"Tỷ trọng X %"``,
+    returns ``None`` — the caller should fall back to its default
+    (typically 1/3).
+    """
+    events = parse_recommendation_history(raw_deal)
+    if not events:
+        return None
+    # Walk from the most recent event backwards; skip entry events
+    # ("khuyến nghị") and find the most recent actionable one.
+    for ev in reversed(events):
+        action = ev.get("action")
+        if action in ("tp", "reduce"):
+            # tp/reduce events: fraction is "Tỷ trọng X %" if present
+            # in the raw text, else defaults to 1/3 in the parser.
+            # The library's parse_recommendation_history returns 1/3
+            # as fallback when "Tỷ trọng" is missing — but we want
+            # to distinguish "autofin said 1/3" from "autofin said
+            # nothing". Heuristic: re-check the raw text.
+            raw_text = ev.get("raw", "")
+            if "Tỷ trọng" in raw_text:
+                return ev["fraction"], raw_text
+            # No explicit "Tỷ trọng" → library fell back to 1/3.
+            # Trust autofin's UI default (1/3).
+            return 1 / 3, raw_text
+        if action == "capital_protect":
+            # "Chốt lãi X % bảo toàn vốn" embeds the fraction directly.
+            return ev["fraction"], ev.get("raw", "")
+        if action == "close":
+            # Full close is 100% — but partial_close_orders handles
+            # close via _plan_close_orders, not this helper. Skip.
+            return None
+    return None
+
+
 def _read_token_cache(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
