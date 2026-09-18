@@ -313,9 +313,83 @@ def _write_token_cache(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
-def _token_still_valid(payload: dict[str, Any]) -> bool:
-    """Refresh if older than 6 days or if missing."""
-    return (time.time() - payload.get("_savedAt", 0)) < 6 * 86400
+def _jwt_exp_seconds(payload: dict[str, Any]) -> float | None:
+    """Best-effort extraction of the JWT ``exp`` claim.
+
+    autofin's login response embeds the token as ``accessToken``
+    (a JWT). The payload dict mirrors what autofin returns plus
+    ``_savedAt`` (file mtime). We try the JWT itself first (the
+    canonical source of truth), then fall back to top-level /
+    nested ``exp`` fields, then ``None``.
+
+    Decoding the JWT is a base64 + json split on '.' — no signature
+    verification, just reading the public claim. If any step
+    fails (malformed token, missing claim), we return ``None``
+    so the caller falls back to the mtime heuristic.
+    """
+    # 1. Try the JWT payload itself (the canonical source).
+    token = payload.get("accessToken")
+    if isinstance(token, str) and token.count(".") >= 1:
+        try:
+            payload_b64 = token.split(".")[1]
+            # base64url → base64 with padding
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            decoded = json.loads(
+                __import__("base64")
+                .urlsafe_b64decode(payload_b64.encode("ascii"))
+                .decode("utf-8", errors="replace")
+            )
+            exp = decoded.get("exp")
+            if isinstance(exp, (int, float)) and exp > 0:
+                return float(exp)
+        except Exception:
+            pass
+    # 2. Top-level exp (some autofin payloads include it).
+    exp = payload.get("exp")
+    if isinstance(exp, (int, float)) and exp > 0:
+        return float(exp)
+    # 3. Nested exp (data.exp, session.exp, user.exp).
+    for nested_key in ("data", "session", "user"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            inner = nested.get("exp")
+            if isinstance(inner, (int, float)) and inner > 0:
+                return float(inner)
+    return None
+
+
+def _token_still_valid(
+    payload: dict[str, Any],
+    leeway_seconds: int = 3600,
+    max_age_seconds: int = 6 * 86400,
+) -> bool:
+    """Refresh if the token is about to expire OR if it's been cached
+    too long.
+
+    Two independent triggers, both must pass to consider the cached
+    token usable:
+
+      1. **JWT ``exp`` claim** (when available): if the token's
+         declared expiry is within ``leeway_seconds`` from now, treat
+         it as expired. This catches server-side revocations and TTL
+         shortenings that the file mtime wouldn't notice.
+      2. **File mtime**: if the cache is older than
+         ``max_age_seconds`` (default 6 days), refresh. Belt-and-
+         suspenders fallback for tokens without an ``exp`` claim.
+
+    Returns True only when the token is safe to use for at least
+    one more API call. Returns False when the cache is missing the
+    ``accessToken`` key entirely (treated as unusable).
+    """
+    if not payload.get("accessToken"):
+        return False
+    exp = _jwt_exp_seconds(payload)
+    if exp is not None:
+        if exp <= time.time() + leeway_seconds:
+            return False
+        return True
+    # No exp claim — fall back to mtime heuristic.
+    return (time.time() - payload.get("_savedAt", 0)) < max_age_seconds
 
 
 class AutofinClient:
@@ -340,17 +414,27 @@ class AutofinClient:
         self.request_timeout = request_timeout
         self._token: str | None = None
         self._user_id: int | None = None
+        # Track when the in-memory token expires so get_token() can
+        # proactively refresh before the server starts returning 401.
+        # Populated by _load_cached_token / _save_tokens; consulted
+        # by get_token() before returning the in-memory copy.
+        self._token_exp: float | None = None  # Unix seconds, from JWT exp
+        self._token_saved_at: float | None = None  # file mtime fallback
 
     def _load_cached_token(self) -> str | None:
         cached = _read_token_cache(self.token_cache_path)
         if cached and _token_still_valid(cached) and cached.get("accessToken"):
             self._token = cached["accessToken"]
+            self._token_exp = _jwt_exp_seconds(cached)
+            self._token_saved_at = float(cached.get("_savedAt", 0)) or None
             return self._token
         return None
 
     def _save_tokens(self, payload: dict[str, Any]) -> None:
         self._token = payload.get("accessToken")
+        self._token_exp = _jwt_exp_seconds(payload)
         _write_token_cache(self.token_cache_path, payload)
+        self._token_saved_at = float(payload.get("_savedAt", 0)) or None
 
     def _post_login(self) -> dict[str, Any]:
         body = json.dumps(
@@ -389,9 +473,41 @@ class AutofinClient:
         return payload["accessToken"]
 
     def get_token(self) -> str:
+        """Return a valid access token, refreshing proactively when stale.
+
+        Three paths:
+          1. No in-memory token: try the on-disk cache (which already
+             validates expiry via ``_token_still_valid``). If valid,
+             use it; otherwise login fresh.
+          2. In-memory token but no longer valid (JWT ``exp`` in the
+             past or beyond the leeway, OR file mtime past the
+             6-day fallback window): refresh proactively.
+          3. In-memory token still valid: return it directly. This is
+             the fast path that avoids disk I/O on every API call.
+
+        The reactive 401 retry in ``_request_with_token_refresh`` is
+        the safety net for cases where the server revokes a token
+        that our cache still considers fresh.
+        """
         if self._token is None:
-            self._ensure_token()
-        return self._token  # type: ignore[return-value]
+            cached = self._load_cached_token()
+            if cached:
+                return cached
+            # No valid cache → login fresh.
+            return self._ensure_token(force_refresh=True)
+        # In-memory token present — check whether it's still valid
+        # (JWT exp / mtime). Build a synthetic payload that mirrors
+        # what _token_still_valid expects.
+        synthetic = {"accessToken": self._token}
+        if self._token_exp is not None:
+            synthetic["exp"] = self._token_exp
+        if self._token_saved_at is not None:
+            synthetic["_savedAt"] = self._token_saved_at
+        if _token_still_valid(synthetic):
+            return self._token  # type: ignore[return-value]
+        # Token is expired (or about to be). Refresh proactively so
+        # the next API call doesn't have to pay the 401 retry cost.
+        return self._ensure_token(force_refresh=True)
 
     def get_user_id(self) -> int:
         """Return the cached autofin user id, or 581 (default from sample URL).
@@ -404,6 +520,55 @@ class AutofinClient:
             return self._user_id
         return 581
 
+    def _request_with_token_refresh(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout: float | None = None,
+    ) -> Any:
+        """GET ``url`` with the current token; on HTTP 401, refresh the
+        token once and retry.
+
+        Consolidates the 401-retry pattern that was duplicated across
+        ``fetch_signals``, ``fetch_notifications``, and the three
+        ``_fetch_paginated`` callers. ``get_token()`` handles proactive
+        refresh (JWT exp / mtime), this method handles reactive
+        refresh (server rejected the token we sent). Both layers are
+        needed: the server can revoke a token that we still consider
+        fresh (e.g. password change, manual logout).
+
+        Returns the parsed JSON payload (dict or list). Raises the
+        last HTTP error if both attempts fail.
+        """
+        effective_timeout = timeout if timeout is not None else self.request_timeout
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            if attempt == 0:
+                # Fast path: use the (proactively-refreshed) in-memory
+                # or cached token.
+                token = self.get_token()
+            else:
+                # Reactive refresh path: skip the cache (which may
+                # still appear valid locally) and force a fresh login.
+                self._token = None
+                self._token_exp = None
+                self._token_saved_at = None
+                token = self._ensure_token(force_refresh=True)
+            req = urllib.request.Request(url, method="GET", headers=dict(headers))
+            req.add_header("Cookie", f"token={token}")
+            try:
+                with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                # Only refresh on 401, and only once (attempt==0).
+                if exc.code == 401 and attempt == 0:
+                    continue
+                raise
+        # Defensive: loop should always raise on second attempt failure.
+        raise last_exc if last_exc else RuntimeError(f"Autofin request failed: {url}")
+
     def fetch_signals(
         self,
         page_size: int = 20,
@@ -411,14 +576,12 @@ class AutofinClient:
         sort_by: str = "Time_Open",
         sort_type: int = -1,
     ) -> list[AutofinSignal]:
-        token = self.get_token()
         url = (
             f"{self.signals_url}?pageSize={page_size}&pageIndex={page_index}"
             f"&sortBy={sort_by}&sortType={sort_type}"
         )
-        req = urllib.request.Request(
+        payload = self._request_with_token_refresh(
             url,
-            method="GET",
             headers={
                 "accept": "*/*",
                 "origin": "https://www.autofin.vn",
@@ -426,29 +589,6 @@ class AutofinClient:
                 "user-agent": "Mozilla/5.0",
             },
         )
-        req.add_header("Cookie", f"token={token}")
-        for attempt in range(2):
-            try:
-                with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
-                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-            except urllib.error.HTTPError as e:
-                # 401 → token expired, force refresh and retry once
-                if e.code == 401 and attempt == 0:
-                    self._token = None
-                    token = self._ensure_token(force_refresh=True)
-                    req = urllib.request.Request(
-                        url,
-                        method="GET",
-                        headers={
-                            "accept": "*/*",
-                            "origin": "https://www.autofin.vn",
-                            "referer": "https://www.autofin.vn/",
-                            "user-agent": "Mozilla/5.0",
-                        },
-                    )
-                    req.add_header("Cookie", f"token={token}")
-                    continue
-                raise
         items = payload.get("data") or []
         if not isinstance(items, list):
             return []
@@ -485,15 +625,13 @@ class AutofinClient:
         ``numberOfProfit`` deltas.
         """
         # Trigger login if we don't have a token yet (also captures userId).
-        token = self.get_token()
         uid = self.get_user_id()
         url = (
             f"{self.notifications_url}?uid={uid}&topics={topics}"
             f"&number={number}&skip={skip}"
         )
-        req = urllib.request.Request(
+        payload = self._request_with_token_refresh(
             url,
-            method="GET",
             headers={
                 "accept": "*/*",
                 "origin": "https://www.autofin.vn",
@@ -501,29 +639,6 @@ class AutofinClient:
                 "user-agent": "Mozilla/5.0",
             },
         )
-        req.add_header("Cookie", f"token={token}")
-        for attempt in range(2):
-            try:
-                with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
-                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-                break
-            except urllib.error.HTTPError as e:
-                if e.code == 401 and attempt == 0:
-                    self._token = None
-                    token = self._ensure_token(force_refresh=True)
-                    req = urllib.request.Request(
-                        url,
-                        method="GET",
-                        headers={
-                            "accept": "*/*",
-                            "origin": "https://www.autofin.vn",
-                            "referer": "https://www.autofin.vn/",
-                            "user-agent": "Mozilla/5.0",
-                        },
-                    )
-                    req.add_header("Cookie", f"token={token}")
-                    continue
-                raise
         # API returns {"data": [...], "errorMessage": ..., "statusCode": ...}.
         items = payload.get("data") or []
         if not isinstance(items, list):
@@ -729,7 +844,6 @@ class AutofinClient:
         page_index: int,
         symbol: str | None = None,
     ) -> list[dict[str, Any]]:
-        token = self.get_token()
         params: dict[str, object] = {"pageSize": page_size, "pageIndex": page_index}
         if symbol:
             params["symbol"] = symbol.upper()
@@ -737,9 +851,8 @@ class AutofinClient:
             f"https://api.autofin.vn/gateway/api/gw/v1/signals/{endpoint}?"
             + urllib.parse.urlencode(params)
         )
-        req = urllib.request.Request(
+        payload = self._request_with_token_refresh(
             url,
-            method="GET",
             headers={
                 "accept": "*/*",
                 "origin": "https://www.autofin.vn",
@@ -747,28 +860,5 @@ class AutofinClient:
                 "user-agent": "Mozilla/5.0",
             },
         )
-        req.add_header("Cookie", f"token={token}")
-        for attempt in range(2):
-            try:
-                with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
-                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-                break
-            except urllib.error.HTTPError as e:
-                if e.code == 401 and attempt == 0:
-                    self._token = None
-                    token = self._ensure_token(force_refresh=True)
-                    req = urllib.request.Request(
-                        url,
-                        method="GET",
-                        headers={
-                            "accept": "*/*",
-                            "origin": "https://www.autofin.vn",
-                            "referer": "https://www.autofin.vn/",
-                            "user-agent": "Mozilla/5.0",
-                        },
-                    )
-                    req.add_header("Cookie", f"token={token}")
-                    continue
-                raise
         items = payload.get("data") or []
         return items if isinstance(items, list) else []
