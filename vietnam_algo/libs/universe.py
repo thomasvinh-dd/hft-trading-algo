@@ -7,7 +7,7 @@ from pathlib import Path
 from .data import DEFAULT_DATA_DIR, PriceBar, read_json, utc_now, write_json
 
 
-DEFAULT_EXCHANGES = {"HOSE", "HNX"}
+DEFAULT_EXCHANGES = {"HOSE", "HNX", "STO"}
 DEFAULT_EXCLUDED_PREFIXES = ("FUE", "E1", "FU")
 DEFAULT_MAX_STALE_DAYS = 30
 

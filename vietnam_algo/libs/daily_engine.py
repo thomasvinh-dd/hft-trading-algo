@@ -60,7 +60,7 @@ class EngineConfig:
     # When False, the bot skips both price sync (update_dataset) and
     # corporate-action sync, reading from disk instead. Use this for
     # bots that share data with a designated data-sync owner to avoid
-    # hitting vietnamfinance.vn / Vietstock API twice per EOD cycle.
+    # hitting DNSE / Vietstock API twice per EOD cycle.
     syncData: bool = True
     priceLimit: int = 1825
     priceSleepSeconds: float = 1.0

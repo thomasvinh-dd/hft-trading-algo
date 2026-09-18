@@ -457,22 +457,44 @@ class DnseClient:
 
     def list_instruments_paginated(
         self,
-        limit: int = 100,
-        page_size_max: int = 30,
+        limit: int = 200,
+        page_size_max: int = 100,
     ) -> list[dict[str, Any]]:
+        """Fetch every instrument across all pages.
+
+        ``page_size_max`` is the largest page size we'll request. DNSE
+        caps at 100 per request, so passing anything larger is wasted.
+        ``limit`` is the upper bound on pages we'll fetch (safety
+        against runaway loops if the upstream keeps returning full
+        pages forever).
+
+        The "is there another page?" check uses the raw response length
+        rather than ``len(parse_instruments(...))`` — DNSE returns ~3k
+        instruments total but only ~1500 of them are stocks (the rest
+        are futures/derivatives, filtered out by ``parse_instruments``).
+        A page of 30 raw items typically parses down to ~26 stocks,
+        which would otherwise look like a partial page and terminate
+        the loop too early.
+        """
         page = 1
         all_rows: list[dict[str, Any]] = []
+        meta_total = 0
         while True:
             response = self.get_instruments(limit=page_size_max, page=page)
-            rows = parse_instruments(response)
-            if not rows:
-                break
-            all_rows.extend(rows)
-            meta_total = 0
             if isinstance(response, dict):
-                meta_total = int(response.get("total") or 0)
+                raw = response.get("data") or []
+                if not meta_total:
+                    meta_total = int(response.get("total") or 0)
+            else:
+                raw = response
+            if not raw:
+                break
+            all_rows.extend(parse_instruments(response))
             page += 1
-            if len(rows) < page_size_max:
+            # Stop when the upstream signals "no more" via a partial
+            # raw page (DNSE always returns exactly ``limit`` items
+            # while more pages exist).
+            if len(raw) < page_size_max:
                 break
             if meta_total and len(all_rows) >= meta_total:
                 break

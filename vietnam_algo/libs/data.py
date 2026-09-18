@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .dnse.client import DEFAULT_DAILY_BAR_TYPE, DnseClient, parse_instruments
+from .dnse.client import parse_price_bars as _dnse_parse_price_bars
 
-VIETNAM_FINANCE_URL = "https://data.vietnamfinance.vn"
+
 # Runtime data lives at vietnam_algo/data/, NOT inside libs/. The
 # module moved from vietnam_algo/data.py to vietnam_algo/libs/data.py
 # during the 2026-09 restructure; we hard-code the data dir relative
@@ -20,6 +20,13 @@ VIETNAM_FINANCE_URL = "https://data.vietnamfinance.vn"
 # still on the expected path.
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEFAULT_PRICE_LIMIT = 1825
+
+# Marker we stamp into ``symbols.json`` so downstream code can tell
+# whether the universe was sourced from DNSE (only source as of
+# 2026-09-18 — the previous ``vietnamfinance.vn`` scraper was
+# rate-limited and removed). Kept as a constant for symmetry with
+# the per-symbol price files.
+DATA_SOURCE_DNSE = "dnse-openapi"
 
 
 @dataclass(frozen=True)
@@ -51,80 +58,80 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def fetch_json(url: str, timeout: float = 30.0, max_retries: int = 3) -> Any:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Referer": "https://data.vietnamfinance.vn/",
-            "User-Agent": "Mozilla/5.0 market-bot-vietnam-algo/0.1",
-        },
-        method="GET",
-    )
-    for attempt in range(max_retries + 1):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 429 and attempt < max_retries:
-                retry_after = retry_after_seconds(detail, default=30.0)
-                print(f"Rate limited; sleeping {retry_after:.0f}s before retrying {url}")
-                time.sleep(retry_after)
-                continue
-            raise RuntimeError(f"{url} -> HTTP {exc.code} {detail}") from exc
-        except (TimeoutError, urllib.error.URLError) as exc:
-            reason = getattr(exc, "reason", exc)
-            if attempt < max_retries:
-                sleep_seconds = 2.0 * (attempt + 1)
-                print(f"Request failed: {reason}; sleeping {sleep_seconds:.0f}s before retrying {url}")
-                time.sleep(sleep_seconds)
-                continue
-            raise RuntimeError(f"{url} -> {reason}") from exc
-    raise RuntimeError(f"{url} -> request failed")
+def _build_dnse_client() -> DnseClient:
+    """Build a DnseClient from env vars. Raises if creds are missing.
 
-
-def retry_after_seconds(detail: str, default: float) -> float:
-    try:
-        payload = json.loads(detail)
-    except json.JSONDecodeError:
-        return default
-    try:
-        return max(float(payload.get("retryAfterSeconds") or default), 1.0)
-    except (TypeError, ValueError):
-        return default
+    We read directly from os.environ so this works in the standalone
+    cron job (``common_sync``) without needing a fully-constructed
+    EngineConfig — the same DNSE_API_KEY / DNSE_API_SECRET are
+    already required by the trading bot, so reuse them.
+    """
+    api_key = os.environ.get("DNSE_API_KEY", "").strip()
+    api_secret = os.environ.get("DNSE_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        raise RuntimeError(
+            "DNSE_API_KEY / DNSE_API_SECRET not set — required for "
+            "data sync. Export them from vietnam_algo/env/.env.autofin-signal."
+        )
+    return DnseClient(api_key=api_key, api_secret=api_secret)
 
 
 def parse_symbols(payload: Any) -> tuple[list[StockSymbol], dict[str, Any]]:
-    rows = payload.get("data", []) if isinstance(payload, dict) else []
-    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+    """Map DNSE ``/market/instruments`` rows onto ``StockSymbol``.
+
+    DNSE exposes {symbol, isin, shortName, name, symbolType, listedDate,
+    marketId, securityGroupId, indexName}. We pick what maps cleanly
+    onto the legacy StockSymbol shape and leave the rest as None:
+      - ticker      ← symbol
+      - companyName ← name (fallback: shortName)
+      - exchangeCode← "STO" (DNSE's stock marketId). The universe
+        filter accepts this code, so HOSE/HNX/UPCoM tickers all
+        pass through. Distinguishing individual exchanges would
+        require a per-symbol ``/price/{sym}/secdef`` round-trip;
+        we skip that to keep the daily sync at one API call per
+        symbol (the OHLC one).
+      - sectorName  ← None (DNSE's public API does not expose
+        ICB/sector classification).
+      - The numeric fields (closePrice / volume / marketCap / …)
+        all stay None; they used to come from vietnamfinance's
+        /api/stocks payload, which has no DNSE equivalent on
+        the public instruments endpoint.
+    """
+    rows = parse_instruments(payload)
     symbols: list[StockSymbol] = []
     for row in rows:
-        ticker = str(row.get("ticker", "")).strip().upper()
+        ticker = str(row.get("symbol") or "").strip().upper()
         if not ticker:
             continue
+        name = row.get("name") or row.get("shortName")
         symbols.append(
             StockSymbol(
                 ticker=ticker,
-                companyName=row.get("companyName"),
-                exchangeCode=row.get("exchangeCode"),
-                sectorName=row.get("sectorName"),
-                closePrice=number_or_none(row.get("closePrice")),
-                changePercent=number_or_none(row.get("changePercent")),
-                volume=number_or_none(row.get("volume")),
-                value=number_or_none(row.get("value")),
-                marketCap=number_or_none(row.get("marketCap")),
-                peRatio=number_or_none(row.get("peRatio")),
-                tradeDate=row.get("tradeDate"),
+                companyName=str(name) if name else None,
+                exchangeCode="STO",
+                sectorName=None,
+                closePrice=None,
+                changePercent=None,
+                volume=None,
+                value=None,
+                marketCap=None,
+                peRatio=None,
+                tradeDate=None,
             )
         )
-    return symbols, dict(meta) if isinstance(meta, dict) else {}
+    return symbols, {}
 
 
 def parse_price_bars(payload: Any) -> list[PriceBar]:
-    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    """Map DNSE ``/price/ohlc`` response onto ``PriceBar``.
+
+    DNSE returns parallel arrays ``t/o/h/l/c/v`` (unix seconds +
+    floats). The existing ``libs/dnse/client.py:parse_price_bars``
+    already converts these to ``{time, open, high, low, close, volume}``
+    dicts; we wrap that here so callers get ``PriceBar`` instances
+    sorted ascending by time.
+    """
+    rows = parse_price_bars_dnse(payload)
     bars: list[PriceBar] = []
     for row in rows:
         try:
@@ -143,13 +150,9 @@ def parse_price_bars(payload: Any) -> list[PriceBar]:
     return sorted(bars, key=lambda item: item.time)
 
 
-def number_or_none(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+def parse_price_bars_dnse(payload: Any) -> list[dict[str, Any]]:
+    """Convert DNSE's ``{t:[..], o:[..], ...}`` shape to list of dicts."""
+    return _dnse_parse_price_bars(payload)
 
 
 def ensure_data_dir(data_dir: Path = DEFAULT_DATA_DIR) -> Path:
@@ -167,34 +170,55 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def fetch_symbols_page(page: int, limit: int, sort: str, order: str, timeout: float) -> tuple[list[StockSymbol], dict[str, Any]]:
-    params = urllib.parse.urlencode({"page": page, "limit": limit, "sort": sort, "order": order})
-    payload = fetch_json(f"{VIETNAM_FINANCE_URL}/api/stocks?{params}", timeout=timeout)
-    return parse_symbols(payload)
+def fetch_all_symbols(
+    limit: int = 100,
+    sort: str = "popular",
+    order: str = "desc",
+    timeout: float = 30.0,
+) -> list[StockSymbol]:
+    """Fetch the full VN stock universe via DNSE ``/market/instruments``.
 
-
-def fetch_all_symbols(limit: int = 50, sort: str = "popular", order: str = "desc", timeout: float = 30.0) -> list[StockSymbol]:
-    symbols: list[StockSymbol] = []
-    seen: set[str] = set()
-    page = 1
-    total_pages = 1
-    while page <= total_pages:
-        page_symbols, meta = fetch_symbols_page(page, limit, sort, order, timeout)
-        for symbol in page_symbols:
-            if symbol.ticker not in seen:
-                symbols.append(symbol)
-                seen.add(symbol.ticker)
-        total_pages = int(meta.get("totalPages") or total_pages)
-        if not page_symbols:
-            break
-        page += 1
+    DNSE returns ~3000 instruments including derivatives and bonds;
+    ``parse_instruments`` filters to ``marketId == "STO"`` (stocks
+    only). We paginate at the rate-limit-friendly page size of 100
+    and dedupe by ticker.
+    """
+    client = _build_dnse_client()
+    rows = client.list_instruments_paginated(limit=100, page_size_max=min(100, max(1, limit)))
+    symbols, _ = parse_symbols({"data": rows})
     return symbols
 
 
-def fetch_price_bars(symbol: str, limit: int = DEFAULT_PRICE_LIMIT, timeout: float = 30.0) -> list[PriceBar]:
-    clean_symbol = urllib.parse.quote(symbol.strip().upper())
-    params = urllib.parse.urlencode({"limit": limit})
-    payload = fetch_json(f"{VIETNAM_FINANCE_URL}/api/stock/{clean_symbol}/prices?{params}", timeout=timeout)
+def fetch_price_bars(
+    symbol: str,
+    limit: int = DEFAULT_PRICE_LIMIT,
+    timeout: float = 30.0,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> list[PriceBar]:
+    """Fetch daily OHLC bars for ``symbol`` via DNSE ``/price/ohlc``.
+
+    When ``from_date`` / ``to_date`` are provided, DNSE returns only
+    that window (cheaper — used by the daily incremental sync).
+    Otherwise we walk back ``limit`` calendar days from today.
+    Resolution is fixed at ``"1D"`` (daily bars); the ``1`` (intraday)
+    resolution is rarely useful for backtests and DNSE caps response
+    size for it.
+    """
+    client = _build_dnse_client()
+    if to_date is None:
+        to_date = datetime.now(tz=UTC).date().isoformat()
+    if from_date is None:
+        end = datetime.strptime(to_date, "%Y-%m-%d").date()
+        lookback_days = max(int(limit), 30)
+        from_date = (end - timedelta(days=lookback_days)).isoformat()
+    payload = client.get_ohlc(
+        bar_type=DEFAULT_DAILY_BAR_TYPE,
+        symbol=symbol.strip().upper(),
+        resolution="1D",
+        from_date=from_date,
+        to_date=to_date,
+    )
     return parse_price_bars(payload)
 
 
@@ -204,7 +228,7 @@ def save_symbols(symbols: list[StockSymbol], data_dir: Path = DEFAULT_DATA_DIR) 
     write_json(
         path,
         {
-            "source": f"{VIETNAM_FINANCE_URL}/api/stocks",
+            "source": DATA_SOURCE_DNSE,
             "fetchedAt": utc_now(),
             "count": len(symbols),
             "items": [asdict(symbol) for symbol in symbols],
@@ -220,7 +244,7 @@ def save_price_bars(symbol: str, bars: list[PriceBar], data_dir: Path = DEFAULT_
     write_json(
         path,
         {
-            "source": f"{VIETNAM_FINANCE_URL}/api/stock/{ticker}/prices",
+            "source": DATA_SOURCE_DNSE,
             "symbol": ticker,
             "fetchedAt": utc_now(),
             "count": len(bars),
@@ -286,14 +310,19 @@ def sync_prices_incremental(
     sleep_seconds: float = 0.2,
     incremental_limit: int = 10,
 ) -> tuple[list[Path], list[tuple[str, str]]]:
-    """Incrementally append new bars to existing price files.
+    """Incrementally append new bars to existing price files via DNSE.
 
     For each symbol:
-      - If no existing file, fetch full ``incremental_limit`` bars (cheap
-        fallback — full history will be built up over the next refreshes).
-      - If existing file is present, fetch only ``incremental_limit``
-        most-recent bars from the upstream API, merge with existing bars
-        by deduping on ``time``, and persist the merged result.
+      - If no existing file, fetch a longer history (``bootstrap_days``)
+        so the universe build has enough lookback. Cheap on DNSE.
+      - If existing file is present, compute from_date as the last-bar
+        date (minus a 7-day overlap to absorb upstream revisions) and
+        fetch only the small window. Merge by deduping on ``time``.
+
+    The DNSE API takes explicit ``from_date`` / ``to_date`` parameters
+    (the previous ``vietnamfinance.vn`` scraper only returned the most
+    recent N bars). That lets us shrink each call to ~7 calendar days
+    per existing symbol instead of 10 unaligned bars.
 
     Returns ``(paths, errors)``:
       - ``paths``: list of paths whose newest bar moved forward
@@ -308,12 +337,33 @@ def sync_prices_incremental(
     errors: list[tuple[str, str]] = []
     total = len(symbols)
     new_bars_added = 0
+    today = datetime.now(tz=UTC).date()
+    bootstrap_days = 90  # used when a symbol has no existing file
+    overlap_days = 7  # safety overlap so we catch upstream revisions
     for index, symbol in enumerate(symbols, start=1):
         ticker = symbol.strip().upper()
         path = data_dir / "prices" / f"{ticker}.json"
         existing_rows = load_saved_price_bars(path)
+        # Decide the fetch window. DNSE expects YYYY-MM-DD.
+        if existing_rows:
+            try:
+                last_dt = datetime.fromisoformat(
+                    str(existing_rows[-1].get("time") or "").replace("Z", "+00:00")
+                ).date()
+            except ValueError:
+                last_dt = today - timedelta(days=bootstrap_days)
+            from_date = (last_dt - timedelta(days=overlap_days)).isoformat()
+        else:
+            from_date = (today - timedelta(days=bootstrap_days)).isoformat()
+        to_date = today.isoformat()
         try:
-            fresh_bars = fetch_price_bars(symbol, limit=incremental_limit, timeout=timeout)
+            fresh_bars = fetch_price_bars(
+                symbol,
+                limit=incremental_limit,
+                timeout=timeout,
+                from_date=from_date,
+                to_date=to_date,
+            )
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             print(f"[{index}/{total}] fetch {ticker} FAILED: {exc}")
@@ -325,7 +375,6 @@ def sync_prices_incremental(
         fresh_rows = [asdict(b) for b in fresh_bars]
         # existing rows already have the same shape (time/open/high/low/close/volume)
         seen = {str(r.get("time")) for r in existing_rows}
-        before = len(existing_rows)
         merged = list(existing_rows)
         for row in fresh_rows:
             t = str(row.get("time"))
