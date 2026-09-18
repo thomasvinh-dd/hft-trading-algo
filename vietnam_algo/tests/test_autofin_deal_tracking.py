@@ -253,11 +253,16 @@ def test_partial_close_capital_protect_uses_pct():
 
 def test_partial_close_skips_when_numberOfProfit_unchanged():
     our_deals = {
-        "444:VPI": {"symbol": "VPI", "_our_qty": 300, "_last_numberOfProfit": 1},
+        "444:VPI": {
+            "symbol": "VPI",
+            "_our_qty": 300,
+            "_last_numberOfProfit": 1,
+            "_last_recomment": "💰 Chốt lãi lần 1 mức giá 64,900",
+        },
     }
     autofin_holding = [{
         "_id": 444, "symbol": "VPI", "numberOfProfit": 1,  # unchanged
-        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 64,900",
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 64,900",  # also unchanged
         "tP_F": 64900,
     }]
     rows = _plan_partial_close_orders(our_deals, autofin_holding)

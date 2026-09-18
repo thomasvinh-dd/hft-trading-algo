@@ -688,11 +688,23 @@ def _plan_partial_close_orders(
 
         cur_nP = int(h.get("numberOfProfit") or 0)
         last_nP = int(sig.get("_last_numberOfProfit", -1))
+        last_rec = str(sig.get("_last_recomment") or "")
         if last_nP < 0:
             sig["_last_numberOfProfit"] = cur_nP
             sig["_last_recomment"] = rec
             continue
-        if cur_nP <= last_nP:
+        # Fire when EITHER:
+        #   (a) ``numberOfProfit`` incremented (TP1 → TP2 → TP3 steps), OR
+        #   (b) the recomment text changed — catches the case where
+        #       autofin re-announces the same step (e.g. after a
+        #       state-desync bug wiped our _last_recomment), OR where
+        #       autofin switches between TP / reduce / capital_protect
+        #       actions for the same nP. Without (b), a bot that
+        #       tracked an nP but never had valid qty (so couldn't
+        #       act) would silently never re-fire on the same step.
+        nP_changed = cur_nP > last_nP
+        recomment_changed = bool(rec) and rec != last_rec
+        if not (nP_changed or recomment_changed):
             continue
 
         # Use the live position qty, NOT the stale _our_qty. This is

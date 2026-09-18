@@ -1545,19 +1545,47 @@ class PartialCloseUsesPositionsGroundTruthTests(unittest.TestCase):
         assert rows[0]["quantity"] == 200
 
     def test_partial_close_skips_when_nP_did_not_increment(self) -> None:
-        """No new TP step announced → no partial close (prevents
-        re-firing on the same announcement across cycles)."""
+        """No new TP step AND no recomment change → no partial close
+        (prevents re-firing on the same announcement across cycles)."""
         our_deals = {
             "1789084800:ASP": {
                 "symbol": "ASP",
                 "_our_qty": 0,
                 "_last_numberOfProfit": 1,  # already saw TP1
+                # Same recomment as the holding entry → no change.
+                "_last_recomment": "💰 Chốt lãi lần 1 mức giá 15,800",
             }
         }
-        holding = self._autofin_asp_holding()  # nP still 1
+        holding = self._autofin_asp_holding()  # nP still 1, same rec
         rows = mod._plan_partial_close_orders(
             our_deals, holding,
             our_positions={"ASP": 600},
             board_lot=100,
         )
         assert rows == []
+
+    def test_partial_close_fires_when_recomment_changed(self) -> None:
+        """Even if nP is unchanged, a recomment change re-triggers
+        the partial close (catches state-desync recovery and autofin
+        switching action types for the same nP step)."""
+        our_deals = {
+            "1789084800:ASP": {
+                "symbol": "ASP",
+                "_our_qty": 0,
+                "_last_numberOfProfit": 1,
+                # Old recomment (e.g. from a buggy previous cycle where
+                # we couldn't act). Autofin now re-issued a different
+                # recomment for the same nP.
+                "_last_recomment": "🛡️ Chốt lãi 5% bảo toàn vốn",
+            }
+        }
+        holding = self._autofin_asp_holding()  # nP=1, recomment "TP1"
+        rows = mod._plan_partial_close_orders(
+            our_deals, holding,
+            our_positions={"ASP": 600},
+            board_lot=100,
+        )
+        # Fires on recomment change.
+        assert len(rows) == 1
+        assert rows[0]["symbol"] == "ASP"
+        assert rows[0]["quantity"] == 200
