@@ -254,7 +254,21 @@ def parse_instruments(payload: Any) -> list[dict[str, Any]]:
         if not symbol:
             continue
         market = item.get("marketId") or item.get("market") or ""
-        if market and market != "STO":
+        # DNSE markets:
+        #   STO = HOSE + HNX stocks   (securityGroupId="ST")
+        #   UPX = UPCoM stocks        (securityGroupId="ST")
+        #   STX = ETFs                (securityGroupId="ST" but listed
+        #         alongside warrants; we currently exclude to avoid
+        #         bloating the symbols list with non-equity cash
+        #         instruments)
+        #   DVX = derivatives / futures
+        #   HCX = bonds / covered warrants
+        # We keep STO + UPX so the universe covers all 3 real-world
+        # Vietnamese exchanges. See 2026-09-19 incident where QNS
+        # (UPCoM, marketId="UPX") was dropped from the symbols list
+        # and the price file never refreshed, leaving the bot with
+        # yesterday's close.
+        if market and market not in ("STO", "UPX"):
             continue
         out.append(
             {

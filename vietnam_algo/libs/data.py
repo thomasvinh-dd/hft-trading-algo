@@ -84,12 +84,10 @@ def parse_symbols(payload: Any) -> tuple[list[StockSymbol], dict[str, Any]]:
     onto the legacy StockSymbol shape and leave the rest as None:
       - ticker      ← symbol
       - companyName ← name (fallback: shortName)
-      - exchangeCode← "STO" (DNSE's stock marketId). The universe
-        filter accepts this code, so HOSE/HNX/UPCoM tickers all
-        pass through. Distinguishing individual exchanges would
-        require a per-symbol ``/price/{sym}/secdef`` round-trip;
-        we skip that to keep the daily sync at one API call per
-        symbol (the OHLC one).
+      - exchangeCode← marketId ("STO" for HOSE/HNX stocks, "UPX" for
+        UPCoM). DNSE does not distinguish HOSE vs HNX in this field;
+        a per-symbol ``/price/{sym}/secdef`` call would, but we skip
+        it to keep the daily sync at one API call per symbol.
       - sectorName  ← None (DNSE's public API does not expose
         ICB/sector classification).
       - The numeric fields (closePrice / volume / marketCap / …)
@@ -98,17 +96,32 @@ def parse_symbols(payload: Any) -> tuple[list[StockSymbol], dict[str, Any]]:
         the public instruments endpoint.
     """
     rows = parse_instruments(payload)
+    # DNSE wraps instruments under ``data``; we re-extract marketId
+    # from the raw payload since parse_instruments strips it. Fall
+    # back to "STO" if the wrapping is missing.
+    market_by_symbol: dict[str, str] = {}
+    if isinstance(payload, dict):
+        raw_items = payload.get("data") or []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                sym = item.get("symbol")
+                mid = item.get("marketId") or item.get("market")
+                if sym and mid:
+                    market_by_symbol[str(sym).upper()] = str(mid)
     symbols: list[StockSymbol] = []
     for row in rows:
         ticker = str(row.get("symbol") or "").strip().upper()
         if not ticker:
             continue
         name = row.get("name") or row.get("shortName")
+        exchange = market_by_symbol.get(ticker, "STO")
         symbols.append(
             StockSymbol(
                 ticker=ticker,
                 companyName=str(name) if name else None,
-                exchangeCode="STO",
+                exchangeCode=exchange,
                 sectorName=None,
                 closePrice=None,
                 changePercent=None,
@@ -130,6 +143,16 @@ def parse_price_bars(payload: Any) -> list[PriceBar]:
     already converts these to ``{time, open, high, low, close, volume}``
     dicts; we wrap that here so callers get ``PriceBar`` instances
     sorted ascending by time.
+
+    Unit conversion: DNSE returns prices in *thousands of VND*
+    (e.g. ``27.5`` for HDB = 27,500 VND). The legacy
+    vietnamfinance.vn source returned absolute VND
+    (``close: 27500.0``). All downstream code — mark-to-market,
+    MV calculations, BUY sizing, autofin signal entry gates —
+    assumes absolute VND, so we multiply by 1000 here at the
+    boundary. See 2026-09-19 incident where the bot marked QNS
+    to 27.5 VND instead of 27,500 VND because the parse path
+    passed DNSE's kVND value through unchanged.
     """
     rows = parse_price_bars_dnse(payload)
     bars: list[PriceBar] = []
@@ -138,10 +161,10 @@ def parse_price_bars(payload: Any) -> list[PriceBar]:
             bars.append(
                 PriceBar(
                     time=str(row["time"]),
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
+                    open=float(row["open"]) * 1000,
+                    high=float(row["high"]) * 1000,
+                    low=float(row["low"]) * 1000,
+                    close=float(row["close"]) * 1000,
                     volume=float(row.get("volume") or 0),
                 )
             )
@@ -179,13 +202,48 @@ def fetch_all_symbols(
     """Fetch the full VN stock universe via DNSE ``/market/instruments``.
 
     DNSE returns ~3000 instruments including derivatives and bonds;
-    ``parse_instruments`` filters to ``marketId == "STO"`` (stocks
-    only). We paginate at the rate-limit-friendly page size of 100
+    ``parse_instruments`` filters to ``marketId in {"STO", "UPX"}``
+    (HOSE/HNX + UPCoM stocks — both have ``securityGroupId="ST"``).
+    We paginate at the rate-limit-friendly page size of 100
     and dedupe by ticker.
+
+    Note: we feed ``parse_symbols`` the raw API response (one dict
+    per page) rather than the already-parsed rows from
+    ``parse_instruments`` — we need ``marketId`` on each row so
+    the resulting ``StockSymbol.exchangeCode`` preserves the
+    HOSE-vs-UPCoM distinction (STO vs UPX). Pre-2026-09-19 this
+    was wired backwards and every ticker ended up stamped as
+    ``STO`` regardless of its real exchange, which caused the
+    QNS/UPCoM price files to never refresh.
     """
     client = _build_dnse_client()
-    rows = client.list_instruments_paginated(limit=100, page_size_max=min(100, max(1, limit)))
-    symbols, _ = parse_symbols({"data": rows})
+    page_size = min(100, max(1, limit))
+    symbols: list[StockSymbol] = []
+    seen: set[str] = set()
+    page = 1
+    pages_fetched = 0
+    while pages_fetched < limit:
+        response = client.get_instruments(limit=page_size, page=page)
+        if isinstance(response, dict):
+            raw = response.get("data") or []
+            meta_total = int(response.get("total") or 0)
+        else:
+            raw = response
+            meta_total = 0
+        if not raw:
+            break
+        page_symbols, _ = parse_symbols(response)
+        for sym in page_symbols:
+            if sym.ticker in seen:
+                continue
+            seen.add(sym.ticker)
+            symbols.append(sym)
+        page += 1
+        pages_fetched += 1
+        if len(raw) < page_size:
+            break
+        if meta_total and len(symbols) >= meta_total:
+            break
     return symbols
 
 

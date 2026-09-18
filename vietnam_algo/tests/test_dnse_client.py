@@ -122,6 +122,88 @@ def test_parse_instruments_filters_sto_only() -> None:
     assert [it["symbol"] for it in out] == ["VCB", "HPG"]
 
 
+def test_parse_instruments_keeps_upx_for_upcom_stocks() -> None:
+    """UPCoM stocks (e.g. QNS, VGT) have ``marketId="UPX"``.
+
+    Pre-2026-09-19 the filter only kept ``marketId="STO"`` which
+    silently dropped all UPCoM tickers — the price sync skipped
+    them and the bot marked-to-market using yesterday's close.
+    See QNS incident 2026-09-19: bot reported 50,100 VND but the
+    real Sep 18 close was 49,800 VND because the QNS price file
+    had never been refreshed past Sep 17.
+    """
+    raw = {
+        "data": [
+            {"symbol": "QNS", "marketId": "UPX", "shortName": "Đường Quảng Ngãi"},
+            {"symbol": "VGT", "marketId": "UPX"},
+            {"symbol": "VCB", "marketId": "STO"},
+            {"symbol": "VN30F1M", "marketId": "DVX"},  # derivatives: skip
+            {"symbol": "E1VFVN30", "marketId": "STX"},  # ETF: skip
+            {"symbol": "BAB118001", "marketId": "HCX"},  # bond: skip
+        ]
+    }
+    out = parse_instruments(raw)
+    assert [it["symbol"] for it in out] == ["QNS", "VGT", "VCB"]
+
+
+def test_data_parse_price_bars_converts_kvnd_to_vnd() -> None:
+    """DNSE returns prices in *thousands of VND*.
+
+    The legacy vietnamfinance.vn source returned absolute VND
+    (e.g. ``close: 27500.0`` for HDB). All downstream code
+    (mark-to-market, MV calc, autofin BUY sizing) assumes
+    absolute VND, so the data-layer wrapper multiplies by 1000.
+    Without this the bot would mark a position to 27.5 VND
+    instead of 27,500 VND (QNS / HDB Sep 18 incident 2026-09-19).
+    """
+    from vietnam_algo.libs.data import parse_price_bars
+    raw = {
+        "t": [1789610400, 1789696800],  # Sep 17, 18
+        "o": [27.5, 27.3],
+        "h": [27.8, 27.7],
+        "l": [27.4, 27.2],
+        "c": [27.6, 27.5],
+        "v": [100, 200],
+    }
+    bars = parse_price_bars(raw)
+    assert len(bars) == 2
+    # DNSE convention: kVND → multiply by 1000
+    assert bars[0].close == 27_600.0  # 27.6 * 1000
+    assert bars[1].close == 27_500.0
+    assert bars[0].open == 27_500.0
+    assert bars[1].high == 27_700.0
+
+
+def test_universe_load_price_bars_handles_both_items_and_bars_keys() -> None:
+    """Legacy vietnamfinance files used ``items``; new DNSE writes
+    ``bars``. The loader must accept either so the bot works
+    during the migration window.
+    """
+    import json
+    from pathlib import Path
+    from vietnam_algo.libs.universe import load_price_bars
+    tmp = Path("/tmp/_universe_load_test")
+    tmp.mkdir(exist_ok=True)
+    prices_dir = tmp / "prices"
+    prices_dir.mkdir(exist_ok=True)
+    (prices_dir / "HPG.json").write_text(json.dumps({
+        "items": [
+            {"time": "2026-09-17", "open": 21200, "high": 21250,
+             "low": 20950, "close": 20950, "volume": 100},
+        ]
+    }))
+    (prices_dir / "QNS.json").write_text(json.dumps({
+        "bars": [
+            {"time": "2026-09-18", "open": 49800, "high": 50000,
+             "low": 49500, "close": 49800, "volume": 50},
+        ]
+    }))
+    hpg = load_price_bars("HPG", data_dir=tmp)
+    qns = load_price_bars("QNS", data_dir=tmp)
+    assert hpg[0].close == 20950.0
+    assert qns[0].close == 49800.0
+
+
 def test_parse_accounts_picks_id_and_derivative_status() -> None:
     payload = {
         "name": "Test",

@@ -7,7 +7,7 @@ from pathlib import Path
 from .data import DEFAULT_DATA_DIR, PriceBar, read_json, utc_now, write_json
 
 
-DEFAULT_EXCHANGES = {"HOSE", "HNX", "STO"}
+DEFAULT_EXCHANGES = {"HOSE", "HNX", "UPCOM", "STO", "UPX"}
 DEFAULT_EXCLUDED_PREFIXES = ("FUE", "E1", "FU")
 DEFAULT_MAX_STALE_DAYS = 30
 
@@ -31,8 +31,21 @@ def load_symbol_metadata(data_dir: Path = DEFAULT_DATA_DIR) -> dict[str, dict[st
 
 def load_price_bars(symbol: str, data_dir: Path = DEFAULT_DATA_DIR) -> list[PriceBar]:
     payload = read_json(data_dir / "prices" / f"{symbol.upper()}.json")
+    # Two on-disk shapes coexist:
+    #   - ``items`` — legacy vietnamfinance.vn format (absolute VND).
+    #     Each file was created by the old fetcher and stores
+    #     ``{time, open, high, low, close, volume}`` directly.
+    #   - ``bars``  — DNSE fetcher format. Already converted to
+    #     absolute VND by ``libs/data.py:parse_price_bars`` (which
+    #     multiplies the upstream kVND by 1000 at parse time).
+    # 2026-09-19: read either key so the bot works during the
+    # transition window where some files are still legacy and
+    # others have been refreshed by the DNSE sync.
+    raw_items = payload.get("items")
+    if raw_items is None:
+        raw_items = payload.get("bars") or []
     bars: list[PriceBar] = []
-    for item in payload.get("items", []):
+    for item in raw_items:
         try:
             bars.append(
                 PriceBar(
