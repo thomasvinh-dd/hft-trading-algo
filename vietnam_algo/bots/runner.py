@@ -296,6 +296,16 @@ def _apply_dry_run_fills(
     except Exception as exc:
         print(f"[dry-run] qty-scale detection failed: {exc}")
     if qty_scale < 1.0:
+        # Round scaled quantities DOWN to the board lot so the
+        # resulting fill matches a valid Vietnamese lot size.
+        # 2026-09-19 incident: scaling 6200 × 0.1 = 620 shares (6.2
+        # lots — invalid). The new EOD path overrides initialCash
+        # so this branch usually doesn't fire, but we keep it as a
+        # safety net for callers that don't take that path.
+        # Use 100 as default since ``board_lot`` is computed later
+        # in the function — at this point we haven't seen the
+        # strategy config yet.
+        _scale_lot = 100
         for o in items:
             raw_qty = o.get("quantity")
             try:
@@ -304,7 +314,8 @@ def _apply_dry_run_fills(
                 q = 0
             if q <= 0:
                 continue
-            o["quantity"] = max(1, int(q * qty_scale))
+            scaled = q * qty_scale
+            o["quantity"] = max(_scale_lot, int(scaled // _scale_lot) * _scale_lot)
     # SL/TP brackets are CONDITIONAL orders — they should NOT fill at
     # submission time. Treating them as immediate fills caused the bot
     # to instantly close every new entry at a loss (autofin emits
@@ -347,12 +358,45 @@ def _apply_dry_run_fills(
         or ""
     )
     marker_key = f"_applied:{trade_date}"
-    # Dedup: skip if we've already applied orders for this tradeDate.
+    # Dedup: skip if the same orders (by per-order key) have already
+    # been applied for this tradeDate. We rely on the per-order
+    # dedup inside apply_orders_to_state (state.applied_keys) rather
+    # than a coarse trade_date marker.
+    #
+    # The previous marker-based dedup was too aggressive: when the
+    # backtest was rerun with different parameters (e.g. initialCash
+    # overridden to the user's dry-run NAV), the new orders had
+    # different qtys/symbols but the same trade_date — and the
+    # marker dedup blocked every order from being applied, leaving
+    # the dry-run portfolio stuck on stale positions. See the
+    # 2026-09-19 momentum incident: BUY 600 BSR @ 28,679 (new
+    # 100M-NAV backtest) was silently dropped because the prior
+    # run had stamped _applied:2026-09-15 with qty=6200.
+    #
+    # The per-order dedup (date+symbol+side+qty+price) is sufficient
+    # to prevent double-applies on bot restarts because the keys
+    # are stable as long as the order is unchanged. New orders get
+    # fresh keys and apply normally.
     if any(
         isinstance(t, dict) and t.get("note") == marker_key
         for t in state.closed_trades[-100:]
     ):
-        return
+        # Already applied once today — but check if any of today's
+        # planned orders haven't been seen yet. If yes, log a note
+        # and continue past the marker so the new orders apply.
+        existing_keys = set(state.applied_keys)
+        new_keys = {
+            f"{it.get('date', '')}|{it.get('symbol', '')}|"
+            f"{it.get('side', '')}|{int(float(it.get('quantity', 0)))}|"
+            f"{float(it.get('price', 0))}"
+            for it in items
+        }
+        if new_keys.issubset(existing_keys):
+            return
+        print(
+            f"[dry-run] marker {marker_key} present but {len(new_keys - existing_keys)} "
+            f"new order(s) detected — re-applying today's plan"
+        )
     # Use the same board lot and fee the strategy uses for real orders
     # so dry-run cash accounting matches what live mode would do.
     if strategy_config is not None:
@@ -943,8 +987,48 @@ def run_auto_bot(
                     engine_config, strategy_config,
                 )
             else:
+                # In dry-run mode the bot's order sizes should match
+                # the operator's configured NAV scale (DRY_RUN_INITIAL_NAV
+                # / MOCK_NAV), not the 1B-VND default. Otherwise the
+                # backtest emits 6200-share BUYs that get scaled to
+                # 620 shares (6.2 lots — invalid Vietnamese board lot)
+                # during the dry-run fill replay, leaving the
+                # order file's quantity out of sync with the
+                # resulting position. Run the backtest directly at
+                # the dry-run NAV so lots come out native.
+                # Pre-2026-09-19 the runner did this via a
+                # post-hoc qty_scale in _apply_dry_run_fills, which
+                # broke the board-lot rounding and produced the
+                # mismatch the operator flagged in the
+                # BSR 6200/620 incident.
+                strat_cfg = strategy_config
+                if not live_submit:
+                    try:
+                        from vietnam_algo.libs.dry_run_state import (
+                            init_dry_run_state,
+                        )
+                        _dry = init_dry_run_state(
+                            engine_config.dataDir,
+                            strategy_name=strategy_name,
+                        )
+                        if (
+                            _dry.initial_nav > 0
+                            and _dry.initial_nav
+                            < float(strat_cfg.initialCash) * 0.99
+                        ):
+                            from dataclasses import replace as _dc_replace
+                            strat_cfg = _dc_replace(
+                                strat_cfg,
+                                initialCash=float(_dry.initial_nav),
+                            )
+                            print(
+                                f"[eod] dry-run: backtest initialCash "
+                                f"overridden to {strat_cfg.initialCash:,.0f}"
+                            )
+                    except Exception as exc:
+                        print(f"[eod] dry-run initialCash override failed: {exc}")
                 result = generate_live_orders(
-                    engine_config, strategy_config, strategy_name=strategy_name,
+                    engine_config, strat_cfg, strategy_name=strategy_name,
                     notify_telegram=False,
                 )
             print(result)
