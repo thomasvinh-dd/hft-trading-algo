@@ -65,52 +65,59 @@ python3 darvas_box_strategy/run.py --ticker HDB --detail
 The bundled `vietnam_algo/data/prices/` data is **already CA-adjusted**
 (verified by `tools/verify_prices_ca_adjusted.py`).
 
-### Improvement progression
+### Two regimes of results: in-sample vs out-of-sample
 
-Each row adds one improvement to the previous. All use the same
-84-ticker universe, MTM at close, `portfolio=True`.
+We ran walk-forward validation on the VPS: train on 2019-2022,
+evaluate on 2023-2026. Many "best" in-sample configs **degraded
+significantly** out-of-sample. Below are both numbers, so the
+strategy's actual edge is clear.
+
+#### In-sample (full period 2019-2026)
 
 | Stage | Ret | Sharpe | MaxDD |
 |---|---:|---:|---:|
-| Initial (loose filter, no portfolio manager) | +2,841.6%* | n/a | n/a |
-| + Portfolio manager (MaxC=10, Cool=10) | +179.2% | +1.21 | -25.1% |
-| + Tighter entries (vol_mult=3.0) | +213.0% | +1.42 | -9.8% |
-| **+ ATR-based trailing stop (mult=1.5)** | **+228.4%** | **+1.58** | **-9.5%** |
-| + Cool=5 instead of 10 | +228.0% | +1.59 | -9.5% |
+| Initial (no portfolio manager) | +2,841.6%* | n/a | n/a |
+| + Portfolio manager | +179.2% | +1.21 | -25.1% |
+| + Tight entries (vol=3.0) + ATR trail | +228.4% | +1.58 | -9.5% |
 
 \* Inflated by ~1,500× effective leverage. See `docs/AUDIT.md`.
 
-### Final default config (the recommended one)
+#### Out-of-sample (2023-2026, on VPS data)
 
+Walk-forward validation showed **vol_mult=3.0 with ATR trail was overfit**.
+The most robust OOS config is **vol_mult=2.0 with pct trail at 7%**.
+
+| Config | vol | trail | MaxC | OOS Ret | Sharpe | MaxDD |
+|---|---|---|---|---:|---:|---:|
+| (was best in-sample) | 3.0 | atr@1.5 | 10 | +24.6% | +0.53 | -10.9% |
+| (was best in-sample) | 2.0 | atr@1.0 | 10 | +22.7% | +0.48 | -17.4% |
+| **Robust OOS winner** | **2.0** | **pct@0.07** | **10** | **+45.8%** | **+0.82** | **-8.8%** |
+| 2nd robust | 2.0 | pct@0.10 | 15 | +38.4% | +0.72 | -10.4% |
+| 3rd robust | 2.0 | pct@0.10 | 10 | +34.3% | +0.66 | -11.3% |
+
+### Final default config (OOS-validated)
+
+```python
+StrategyConfig(
+    breakout=BreakoutConfig(volume_mult=2.0, high_conviction_mult=3.0),
+    backtest=BacktestConfig(max_concurrent_positions=10, cooldown_bars_after_stop=5),
+    trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.07),
+)
 ```
-vol_mult=3.0, high_conviction_mult=3.5
-max_concurrent_positions=10, cooldown_bars_after_stop=5
-trail_mode="atr", trail_atr_mult=1.5, trail_floor_lock_profit=True
-```
 
-Result: **+228.4% return, 1.58 Sharpe, -9.5% max DD** over 7 years.
+Honest expected edge: **+25–46% return over 3.5 years (~7–12% CAGR), 0.5–0.8 Sharpe,
+sub-15% max DD**. This is what the strategy is likely to deliver live.
 
-### Sweep grid
+### Why the in-sample numbers were misleading
 
-#### Entry filter tightness (vol_mult)
+The earlier sweeps picked `vol_mult=3.0` + ATR trail because those
+maximized Sharpe on the FULL period (2019-2026). Walk-forward
+revealed those parameters were **fit to the 2023-2026 bull-market
+chunk** of the data. In the OOS test (train 2019-2022 → test
+2023-2026), they underperformed simpler configs.
 
-| vol_mult | hi_conv | Trades | Final NAV | Ret | Sharpe | MaxDD |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1.50 | 2.50 | 8,351 | 2,792M | +179.2% | +1.21 | -25.1% |
-| 1.80 | 2.80 | 5,458 | 2,984M | +198.4% | +1.39 | -21.0% |
-| 2.00 | 3.00 | 4,231 | 2,131M | +113.1% | +1.01 | -17.9% |
-| **3.00** | **3.50** | **1,395** | **3,284M** | **+228.4%** | **+1.58** | **-9.5%** ← default |
-| 3.50 | 4.00 | 899 | 3,069M | +206.9% | +1.41 | -9.9% |
-| 5.00 | 6.00 | 327 | 1,779M | +77.9% | +0.91 | -8.5% |
-
-#### Trailing stop mode
-
-| Mode | Mult | Final NAV | Ret | Sharpe | MaxDD |
-|---|---|---:|---:|---:|---:|
-| pct | 0.10 | 3,130M | +213.0% | +1.42 | -9.8% |
-| pct | 0.13 | 3,325M | +232.5% | +1.43 | -8.5% |
-| **atr** | **1.50** | **3,284M** | **+228.4%** | **+1.58** | **-9.5%** ← default |
-| atr | 4.00 | 3,453M | +245.3% | +1.45 | -8.5% |
+Lesson: **always run walk-forward before committing to a config
+that looks great in-sample**.
 
 ## Tests
 

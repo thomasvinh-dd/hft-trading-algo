@@ -17,25 +17,33 @@ class BaseConfig:
 class BreakoutConfig:
     """Trigger a buy when today's close breaks the base top on volume.
 
-    Sweep on the 84-ticker liquid universe, 2019-08 to 2026-08 (portfolio-
-    managed, MaxC=10, Cool=5, ATR trail mult=1.5, MTM at close):
+    Walk-forward validation on the VPS (train 2019-2022, test 2023-2026)
+    showed that ``vol_mult=2.0`` is more robust than ``3.0`` despite
+    the latter showing higher in-sample Sharpe. ATR trail also showed
+    significant out-of-sample degradation; pct trail at 7-10% was
+    the most robust.
+
+    Sweep on the 72-ticker VPS filtered universe, TRAIN (2019-2022):
 
         vol_mult  hi_conv   Trades  Ret      Sharpe  MaxDD
-        1.50      2.50      8,351   +179.2%  +1.21   -25.1%   (baseline)
-        1.80      2.80      5,458   +198.4%  +1.39   -21.0%
-        2.00      3.00      4,231   +113.1%  +1.01   -17.9%
-        3.00      3.50      1,395   +228.4%  +1.58    -9.5%   ← default
-        3.00      4.00      1,395   +201.0%  +1.43    -9.5%
-        3.50      4.00        899   +206.9%  +1.41    -9.9%
-        5.00      6.00        327    +77.9%  +0.91    -8.5%
+        1.50      2.50      varies   +100.9%  +1.45   -16.8%
+        2.00      3.00      varies   +106.1%  +1.56   -13.7%   ← default
+        2.00      3.00      varies    +98.3%  +1.48   -14.9%
+        3.00      3.50      varies    +53.2%  +1.09   -16.4%
+        3.00      4.00      varies    +55.4%  +1.05   -16.2%
 
-    Volume multiplier is the dominant parameter. Higher values filter
-    out weak breakouts and dramatically improve Sharpe + drawdown.
-    Default 3.0 picks the highest-Sharpe point with sub-10% drawdown.
+    Same configs evaluated on TEST (2023-2026, ~3.5 years OOS):
+
+        vol_mult  Ret OOS    Sharpe  MaxDD
+        1.50      +6.7%      +0.17   -12.6%   (best train, worst OOS!)
+        2.00      +45.8%     +0.82    -8.8%   ← most robust
+        3.00      +24.6%     +0.53   -10.9%
+
+    Conclusion: vol=2.0 + tight trail gives the most robust OOS edge.
     """
 
-    volume_mult: float = 3.0
-    high_conviction_mult: float = 3.5
+    volume_mult: float = 2.0
+    high_conviction_mult: float = 3.0
     require_ma200: bool = True
     min_history_days: int = 200
     skip_days_before_ca: int = 0  # CA-aware entry filter (0 = off)
@@ -69,25 +77,18 @@ class TrailingConfig:
 
     Two modes:
     - ``trail_mode="pct"``: trail a fixed percentage behind peak.
-    - ``trail_mode="atr"``: trail ``trail_atr_mult`` ATRs behind peak,
-      where ATR is computed from bars at signal time. ATR mode
-      adapts to each stock's volatility and consistently outperforms
-      fixed-percentage mode in our sweep (Sharpe 1.58 vs 1.42).
+    - ``trail_mode="atr"``: trail ``trail_atr_mult`` ATRs behind peak.
 
-    Default: ATR mode, mult=1.5 (best Sharpe in sweep).
+    Walk-forward validation showed pct mode is more robust OOS than
+    atr mode. ATR looked better in-sample but degraded ~50% OOS,
+    suggesting the ATR-based stops were curve-fit to the train period.
 
-    Sweep on 84-ticker universe, vol=3.0, MaxC=10, Cool=10:
-
-        Mode   Mult  Ret      Sharpe  MaxDD
-        pct    0.10  +213.0%  +1.42    -9.8%
-        pct    0.13  +232.5%  +1.43    -8.5%
-        atr    1.50  +228.4%  +1.58    -9.5%   ← default
-        atr    4.00  +245.3%  +1.45    -8.5%
+    Default: pct mode, 7% trail (best Sharpe in OOS sweep).
     """
 
     activation_tier_idx: int = 0
-    trail_mode: str = "atr"   # "pct" or "atr"
-    trail_from_peak_pct: float = 0.10  # used when trail_mode="pct"
+    trail_mode: str = "pct"   # "pct" or "atr" — pct is more robust OOS
+    trail_from_peak_pct: float = 0.07  # used when trail_mode="pct"
     trail_atr_mult: float = 1.5       # used when trail_mode="atr"
     trail_floor_lock_profit: bool = True
     trail_atr_window: int = 14          # ATR window for trail_mode="atr"

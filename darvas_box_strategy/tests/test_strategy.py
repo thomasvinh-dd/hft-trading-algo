@@ -333,6 +333,17 @@ class PortfolioDefaultsTests(unittest.TestCase):
         cfg = StrategyConfig()
         self.assertEqual(cfg.backtest.cooldown_bars_after_stop, 5)
 
+    def test_default_volume_mult_is_two(self):
+        """OOS-validated: vol_mult=2.0 is the most robust setting."""
+        cfg = StrategyConfig()
+        self.assertEqual(cfg.breakout.volume_mult, 2.0)
+
+    def test_default_trail_is_pct(self):
+        """OOS-validated: pct trail beats atr trail on out-of-sample data."""
+        cfg = StrategyConfig()
+        self.assertEqual(cfg.trailing.trail_mode, "pct")
+        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.07)
+
 
 if __name__ == "__main__":
     unittest.main()
