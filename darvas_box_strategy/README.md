@@ -97,8 +97,11 @@ The bot uses the curated **70-ticker HOSE blue chip list** in
 Add to crontab for end-of-day summary (after VN market close at 15:00 ICT):
 
 ```cron
-0 16 * * 1-5  cd /root/hft-trading-algo && python3 -m darvas_box_strategy.bot.cli send-report >> /tmp/darvas_report.log 2>&1
-0 9 * * 1-5   cd /root/hft-trading-algo && python3 -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> /tmp/darvas_signals.log 2>&1
+# 09:00 ICT (02:00 UTC) — pre-market signal scan
+0 2 * * 1-5  cd /root/hft-trading-algo && set -a && . /root/hft-trading-algo/vietnam_algo/env/.env.telegram && set +a && PYTHONPATH=/root/hft-trading-algo python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> /root/logs/darvas_signals.log 2>&1
+
+# 16:00 ICT (09:00 UTC) — end-of-day backtest report
+0 9 * * 1-5  cd /root/hft-trading-algo && set -a && . /root/hft-trading-algo/vietnam_algo/env/.env.telegram && set +a && PYTHONPATH=/root/hft-trading-algo python3 -u -m darvas_box_strategy.bot.cli send-report >> /root/logs/darvas_report.log 2>&1
 ```
 
 ### Report format
