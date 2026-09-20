@@ -47,10 +47,16 @@ class BreakoutConfig:
     require_ma200: bool = True
     min_history_days: int = 200
     skip_days_before_ca: int = 0  # CA-aware entry filter (0 = off)
-    require_close_above_ma: int = 20  # require close > MA(20); 0 = off
+    require_close_above_ma: int = 20  # require close > MA(N); 0 = off
+    require_close_above_weekly_ma: int = 0  # require daily close > weekly MA(N*5); 0 = off
     regime_index_path: str = ""      # path to market index JSON; "" = off
     regime_ma_window: int = 50       # MA window for regime check
     regime_require_above_ma: bool = True  # require index > MA at signal time
+    sector_data_path: str = ""       # path to symbols.json with sectorName; "" = off
+    sector_momentum_window: int = 60  # days for sector momentum calculation
+    sector_min_momentum: float = 0.0  # filter: only trade sectors with momentum > this
+    ml_model_path: str = ""          # path to trained sklearn model; "" = off
+    ml_min_prob: float = 0.5         # min predicted P(win) to take signal
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,9 @@ class BacktestConfig:
     max_concurrent_positions: int = 10
     cooldown_bars_after_stop: int = 5  # bars to skip after SL_HARD/SL_SCALE exit
     max_holding_bars: int = 0  # time stop: close if not profitable after N bars; 0 = off
+    vol_target_pct: float = 0.02  # target daily vol; if >0, size = (vol_target_pct * nav) / atr_pct
+    vol_target_floor: float = 0.05  # minimum size fraction when vol-targeting
+    vol_target_ceiling: float = 0.30  # maximum size fraction when vol-targeting
 
 
 @dataclass(frozen=True)

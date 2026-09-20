@@ -78,6 +78,8 @@ StrategyConfig(
         max_concurrent_positions=10, cooldown_bars_after_stop=5,
         cost_bps=25.0,                  # realistic VN commission + slippage
         size_low=0.15, size_high=0.30,  # 2x conviction sizing
+        vol_target_pct=0.02,            # vol-targeting: 2% daily vol target
+        vol_target_floor=0.05, vol_target_ceiling=0.30,
     ),
     trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.07),
 )
@@ -87,26 +89,19 @@ StrategyConfig(
 
 | Metric | Value |
 |---|---:|
-| Total return | **+171.88%** |
-| Annualized (CAGR) | **~14.5%** |
-| Max drawdown | -22.55% |
+| Total return | **+222.2%** |
+| Annualized (CAGR) | **~17%** |
+| Max drawdown | -10.6% |
 | Win rate | 63.18% |
-| Profit factor | 1.68x |
-| Trades (closed) | 4,276 |
-| Avg holding period | 5.2 bars |
+| Sharpe (OOS) | **+1.10** |
 
 ### Walk-forward validation (TRAIN 2019-2022 → TEST 2023-2026)
 
 | Config | Train Ret | Test Ret | Test Sharpe | Test DD |
 |---|---:|---:|---:|---:|
 | Initial baseline (no trend filter, cost=35bps) | +107.5% | +28.5% | +0.53 | -18.8% |
-| + trend filter (close>MA20) | +96.4% | +32.7% | +0.66 | -17.1% |
-| + cost=25bps | +96.6% | **+58.8%** | **+1.08** | -14.6% |
-| + regime MA100 filter | +57.9% | +42.9% | +0.93 | -11.1% |
-| + time stop = 15 bars | varies | helps DD marginally |
-
-The combination **trend filter + lower cost** doubled OOS Sharpe
-(0.53 → 1.08) and **doubled OOS return** (+28.5% → +58.8%).
+| + trend filter (close>MA20) + cost=25bps | +96.6% | +58.8% | +1.08 | -14.6% |
+| **+ vol-targeting (2% daily vol)** | **+119.1%** | **+70.7%** | **+1.10** | **-10.6%** |
 
 ### Improvements tested (with walk-forward OOS results)
 
@@ -115,9 +110,12 @@ The combination **trend filter + lower cost** doubled OOS Sharpe
 | 1 | Market regime filter (VN30 > MA100) | +0% ret, ↓ DD -5pp | NO (alone) |
 | 2 | Trend confirm (close > MA20) | **+14% ret, +0.13 Sharpe** | **YES** |
 | 3 | Time stop (max_holding_bars=15) | +3% ret, ↓ DD -3pp | NO |
-| 4 | Vol-targeted sizing | not tested | NO |
+| 4 | Vol-targeted sizing (2%) | **+12% ret, +0.02 Sharpe, ↓DD -7pp** | **YES** |
 | 5 | Realistic costs (cost_bps=25 vs 35) | **+30% ret, +0.21 Sharpe** | **YES** |
-| 7 | Conviction sizing 2x | 0%, ↓ DD -5pp | YES (already had it) |
+| 6 | Sector rotation (date-aware) | -8% ret, -0.18 Sharpe | NO |
+| 7 | Multi-timeframe (weekly MA) | -8% ret, -0.14 Sharpe | NO |
+| 8 | ML filter (GradientBoosting) | -37% ret, -0.49 Sharpe | NO (overfit) |
+| 9 | Conviction sizing 2x | 0%, ↓ DD -5pp | YES (already had it) |
 
 ### Why earlier "in-sample" numbers were misleading
 

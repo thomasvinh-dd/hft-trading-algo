@@ -1,12 +1,14 @@
 """Signal generation: breakout trigger + position sizing."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Sequence
 
 from .base_detector import Base
 from .config import StrategyConfig
 from .data_loader import PriceBar, atr as _atr
+from .filters import compute_weekly_ma, lookup_sector_momentum
 
 
 @dataclass(frozen=True)
@@ -83,8 +85,87 @@ def _regime_ok(breakout_bar, cfg, market_bars):
     return above if cfg.breakout.regime_require_above_ma else not above
 
 
+def _sector_ok(breakout_bar, ticker, cfg, sector_momentum_by_date):
+    """Check sector momentum filter using as-of-date lookup."""
+    if not cfg.breakout.sector_data_path:
+        return True
+    if not sector_momentum_by_date:
+        return True
+    mom = lookup_sector_momentum(sector_momentum_by_date, breakout_bar.date, ticker)
+    if mom is None:
+        return True  # no sector data, allow
+    return mom >= cfg.breakout.sector_min_momentum
+
+
+def _weekly_ma_ok(breakout_bar, bars, breakout_idx, cfg):
+    """Check weekly MA filter."""
+    if cfg.breakout.require_close_above_weekly_ma <= 0:
+        return True
+    weekly_ma = compute_weekly_ma(bars[: breakout_idx + 1],
+                                   cfg.breakout.require_close_above_weekly_ma)
+    if weekly_ma is None:
+        return True
+    return breakout_bar.close > weekly_ma
+
+
+def _extract_features(bars, idx, base, signal):
+    """Build a feature vector for the ML model."""
+    if idx < 60:
+        return None
+    breakout_bar = bars[idx]
+    closes = [b.close for b in bars[: idx + 1]]
+    # 1. momentum_20 (20-day return)
+    mom_20 = closes[-1] / closes[-21] - 1.0 if len(closes) >= 21 else 0.0
+    # 2. momentum_60 (60-day return)
+    mom_60 = closes[-1] / closes[-61] - 1.0 if len(closes) >= 61 else 0.0
+    # 3. ATR_pct (volatility)
+    atr_v = _atr(bars[: idx + 1], window=14) or 0.0
+    atr_pct = atr_v / closes[-1] if closes[-1] > 0 else 0.0
+    # 4. volume ratio (today's volume vs avg)
+    avg_vol = _avg_volume(bars, idx - 1) or 1.0
+    vol_ratio = breakout_bar.volume / avg_vol
+    # 5. range_pct of base
+    rng_pct = base.range_pct if base else 0.0
+    # 6. distance to MA20
+    if len(closes) >= 20:
+        ma20 = sum(closes[-20:]) / 20
+        dist_ma20 = closes[-1] / ma20 - 1.0
+    else:
+        dist_ma20 = 0.0
+    # 7. days in base
+    days_in_base = base.days_in_base if base else 0
+    # 8. close > MA50
+    above_ma50 = 0.0
+    if len(closes) >= 50:
+        ma50 = sum(closes[-50:]) / 50
+        above_ma50 = 1.0 if closes[-1] > ma50 else 0.0
+    # 9. close > MA200
+    above_ma200 = 0.0
+    if len(closes) >= 200:
+        ma200 = sum(closes[-200:]) / 200
+        above_ma200 = 1.0 if closes[-1] > ma200 else 0.0
+    return [mom_20, mom_60, atr_pct, vol_ratio, rng_pct,
+            dist_ma20, days_in_base, above_ma50, above_ma200]
+
+
+def _vol_targeted_size_pct(atr_value, entry_price, cfg, conviction):
+    """Volatility-targeted position size as a fraction of nav."""
+    target_vol = cfg.backtest.vol_target_pct
+    if target_vol <= 0 or atr_value is None or entry_price <= 0:
+        # fall back to default sizing
+        return cfg.backtest.size_high if conviction == "high" else cfg.backtest.size_low
+    atr_pct = atr_value / entry_price
+    if atr_pct <= 0:
+        return cfg.backtest.size_low
+    size = target_vol / atr_pct
+    # apply ceiling and floor
+    size = max(cfg.backtest.vol_target_floor, min(cfg.backtest.vol_target_ceiling, size))
+    return size
+
+
 def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
-                    market_bars=None):
+                    market_bars=None, sector_momentum_by_date=None,
+                    ml_model=None):
     breakout_idx = base.end_idx + 1
     if as_of_idx is None:
         as_of_idx = breakout_idx
@@ -114,9 +195,28 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
         if ma_n is None or breakout_bar.close <= ma_n:
             return None
 
+    # Multi-timeframe: require close > weekly MA(N)
+    if not _weekly_ma_ok(breakout_bar, bars, breakout_idx, cfg):
+        return None
+
     # Market regime filter
     if not _regime_ok(breakout_bar, cfg, market_bars):
         return None
+
+    # Sector rotation filter
+    if not _sector_ok(breakout_bar, base.ticker, cfg, sector_momentum_by_date):
+        return None
+
+    # ML filter
+    if ml_model is not None:
+        features = _extract_features(bars, breakout_idx, base, breakout_bar)
+        if features is not None:
+            try:
+                prob = ml_model.predict_proba([features])[0][1]
+                if prob < cfg.breakout.ml_min_prob:
+                    return None
+            except Exception:
+                pass
 
     if cfg.breakout.skip_days_before_ca > 0 and upcoming_ca:
         for ev in upcoming_ca:
@@ -125,7 +225,15 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
                 return None
 
     conviction = _conviction(breakout_bar.volume, avg_vol, cfg.breakout)
-    size_pct = cfg.backtest.size_high if conviction == "high" else cfg.backtest.size_low
+
+    # ATR at signal time (for ATR-based trailing stop and vol-targeting)
+    atr_value = _atr(bars[: breakout_idx + 1], window=cfg.trailing.trail_atr_window)
+
+    # Sizing: vol-targeted or conviction-based
+    if cfg.backtest.vol_target_pct > 0:
+        size_pct = _vol_targeted_size_pct(atr_value, breakout_bar.close, cfg, conviction)
+    else:
+        size_pct = cfg.backtest.size_high if conviction == "high" else cfg.backtest.size_low
     position_value = nav * size_pct
     shares = int(position_value // breakout_bar.close)
     if shares <= 0:
@@ -138,9 +246,6 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
     sl_buffer = 1.0 - cfg.exits.sl_buffer_pct
     sl_F = base.base_low * sl_buffer
     sl_T = (base.base_low + breakout_bar.close) / 2.0
-
-    # ATR at signal time (for ATR-based trailing stop)
-    atr_value = _atr(bars[: breakout_idx + 1], window=cfg.trailing.trail_atr_window)
 
     return Signal(
         ticker=base.ticker,

@@ -65,7 +65,8 @@ class BacktestResult:
 
 
 def _scan_ticker(bars, ticker, cfg, *, dividend_per_share=None, upcoming_ca=None,
-                  market_bars=None):
+                  market_bars=None, sector_momentum_by_date=None,
+                  ml_model=None):
     """Yield simulated TradeResults for every signal in the bars."""
     if len(bars) < cfg.breakout.min_history_days:
         return
@@ -78,6 +79,8 @@ def _scan_ticker(bars, ticker, cfg, *, dividend_per_share=None, upcoming_ca=None
         signal = generate_signal(
             bars, base, nav=nav, cfg=cfg, as_of_idx=i,
             upcoming_ca=upcoming_ca, market_bars=market_bars,
+            sector_momentum_by_date=sector_momentum_by_date,
+            ml_model=ml_model,
         )
         if signal is None:
             continue
@@ -268,6 +271,26 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
         if path.exists():
             market_bars = load_price_bars(path)
 
+    # Build sector momentum map if sector filter is configured
+    sector_momentum_by_date = None
+    sector_map = {}
+    bars_by_ticker_for_sector = {}
+    if cfg.breakout.sector_data_path:
+        from .filters import build_sector_map
+        sector_map = build_sector_map(cfg.breakout.sector_data_path)
+
+    # Load ML model if configured
+    ml_model = None
+    if cfg.breakout.ml_model_path:
+        from pathlib import Path as _P
+        mp = _P(cfg.breakout.ml_model_path)
+        if mp.exists():
+            try:
+                import joblib
+                ml_model = joblib.load(mp)
+            except Exception as e:
+                print(f"Warning: failed to load ML model: {e}")
+
     from .data_loader import load_price_bars as _load_price_bars  # for inner branches
 
     if tickers is not None:
@@ -283,6 +306,8 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
             else:
                 adj_bars, div = raw_bars, {}
             universe.append((t.upper(), adj_bars, div))
+            if sector_map:
+                bars_by_ticker_for_sector[t.upper()] = adj_bars
     else:
         universe = []
         for meta, raw_bars in iter_universe(prices_dir, cfg):
@@ -292,6 +317,15 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
             else:
                 adj_bars, div = raw_bars, {}
             universe.append((meta.ticker, adj_bars, div))
+            if sector_map:
+                bars_by_ticker_for_sector[meta.ticker] = adj_bars
+
+    if sector_map:
+        from .filters import build_sector_momentum_by_date
+        sector_momentum_by_date = build_sector_momentum_by_date(
+            bars_by_ticker_for_sector, sector_map,
+            window=cfg.breakout.sector_momentum_window,
+        )
 
     # Build a bars cache for MTM lookups (only used when portfolio=True)
     bars_by_ticker = {ticker: bars for ticker, bars, _ in universe}
@@ -312,6 +346,8 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
             dividend_per_share=dividend_per_share,
             upcoming_ca=ticker_events,
             market_bars=market_bars,
+            sector_momentum_by_date=sector_momentum_by_date,
+            ml_model=ml_model,
         ):
             result.trades.append(trade)
             result.total_dividend_income += trade.dividend_income
