@@ -85,23 +85,37 @@ StrategyConfig(
 )
 ```
 
-### Final result on 71-ticker VPS filtered universe (2019-2026)
+### **IMPORTANT: Universe size dramatically affects results**
 
-| Metric | Value |
-|---|---:|
-| Total return | **+222.2%** |
-| Annualized (CAGR) | **~17%** |
-| Max drawdown | -10.6% |
-| Win rate | 63.18% |
-| Sharpe (OOS) | **+1.10** |
+Strategy edge is concentrated in the most liquid stocks. Returns
+degrade significantly as we add illiquid / penny-stock names:
+
+| Universe | Tickers | Trades | Ret | Sharpe | DD |
+|---|---:|---:|---:|---:|---:|
+| **Old curated (HOSE large caps)** | 71 | ~4,000 | **+222.2%** | ~1.20 | -10.6% |
+| Liquid (≥1B VND avg value) | 241 | 14,749 | +87.4% | +0.64 | -28.9% |
+| Loose liquid (≥200M VND) | 374 | 24,478 | +120.2% | +0.62 | -22.1% |
+| Full universe (no filter) | 1,000 | 61,455 | +80.6% | +0.42 | -26.9% |
+
+**The early +222% result was on a small curated universe** (the 71
+most-liquid HOSE blue chips). The **realistic edge for live trading
+is closer to +80-120% over 7.5 years** (~10-15% CAGR), with
+~0.5-0.7 Sharpe and ~22-29% max drawdown.
 
 ### Walk-forward validation (TRAIN 2019-2022 → TEST 2023-2026)
+
+On the **241-ticker liquid universe** (closest to live trading):
 
 | Config | Train Ret | Test Ret | Test Sharpe | Test DD |
 |---|---:|---:|---:|---:|
 | Initial baseline (no trend filter, cost=35bps) | +107.5% | +28.5% | +0.53 | -18.8% |
 | + trend filter (close>MA20) + cost=25bps | +96.6% | +58.8% | +1.08 | -14.6% |
-| **+ vol-targeting (2% daily vol)** | **+119.1%** | **+70.7%** | **+1.10** | **-10.6%** |
+| + vol-targeting (2% daily vol) | +119.1% | +70.7% | +1.10 | -10.6% |
+
+(Note: this walk-forward was originally run on 71 curated tickers
+where the OOS result was +70.7%. On the broader 241-ticker universe,
+the same config yields ~+30-40% OOS based on full-period comparison
+ratios.)
 
 ### Improvements tested (with walk-forward OOS results)
 
@@ -116,6 +130,7 @@ StrategyConfig(
 | 7 | Multi-timeframe (weekly MA) | -8% ret, -0.14 Sharpe | NO |
 | 8 | ML filter (GradientBoosting) | -37% ret, -0.49 Sharpe | NO (overfit) |
 | 9 | Conviction sizing 2x | 0%, ↓ DD -5pp | YES (already had it) |
+| 10 | **Universe filter (liquid only)** | **-65% to -135% ret** if relaxed | **YES (essential)** |
 
 ### Why earlier "in-sample" numbers were misleading
 
@@ -125,8 +140,16 @@ revealed those parameters were **fit to the 2023-2026 bull-market
 chunk** of the data. In the OOS test (train 2019-2022 → test
 2023-2026), they underperformed simpler configs.
 
-Lesson: **always run walk-forward before committing to a config
-that looks great in-sample**.
+Additionally, **the universe size was not carefully controlled**
+in early sweeps — the headline +222% was on 71 curated tickers,
+not the full VN market. Expanding the universe cuts returns
+significantly because the strategy edge is concentrated in the
+most-liquid HOSE blue chips.
+
+Lessons:
+1. **Always run walk-forward before committing to a config**
+2. **Always test on multiple universe sizes** to check robustness
+3. **Liquidity filter is essential** — penny stocks dilute returns
 
 ## Tests
 
