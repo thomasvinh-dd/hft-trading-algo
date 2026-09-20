@@ -60,6 +60,60 @@ python3 darvas_box_strategy/run.py --quiet   # portfolio=False default... wait, 
 python3 darvas_box_strategy/run.py --ticker HDB --detail
 ```
 
+## Telegram Bot (`darvas_box_strategy/bot/`)
+
+Send reports and signal alerts to a Telegram chat. Uses the same
+Telegram bot token from `vietnam_algo/env/.env.telegram`.
+
+```bash
+# Send a test message
+python3 -m bot.cli send-test
+
+# Run backtest on HOSE blue chips and send report to Telegram
+python3 -m bot.cli send-report
+
+# Scan for current breakout signals
+python3 -m bot.cli scan-signals --lookback 1
+
+# All commands accept --dry-run to print instead of send
+python3 -m bot.cli send-report --dry-run
+python3 -m bot.cli scan-signals --dry-run --lookback 5
+
+# Show the default config
+python3 -m bot.cli show-config
+```
+
+### Setup
+
+Telegram credentials are loaded automatically from:
+1. `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` environment variables
+2. `vietnam_algo/env/.env.telegram` file (used by both this bot and the autofin bot)
+
+The bot uses the curated **70-ticker HOSE blue chip list** in
+`data/hose_blue_chips.json` (top 70 by 20-day average traded value).
+
+### Daily cron (optional)
+
+Add to crontab for end-of-day summary (after VN market close at 15:00 ICT):
+
+```cron
+0 16 * * 1-5  cd /root/hft-trading-algo && python3 -m darvas_box_strategy.bot.cli send-report >> /tmp/darvas_report.log 2>&1
+0 9 * * 1-5   cd /root/hft-trading-algo && python3 -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> /tmp/darvas_signals.log 2>&1
+```
+
+### Report format
+
+The report includes:
+- Total return, max DD, Sharpe
+- Period, tickers scanned, total trades
+- Win rate, avg win/loss, profit factor
+- Exit reason breakdown
+- Top 5 winners / losers
+- Last 10 trades
+- Top 10 tickers by PnL
+
+Signal alerts include: ticker, entry price, position size, stop losses.
+
 ## Results (VPS data, 2019–2026)
 
 The bundled `vietnam_algo/data/prices/` data is **already CA-adjusted**
