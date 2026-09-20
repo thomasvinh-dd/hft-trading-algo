@@ -59,7 +59,7 @@ from .autofin_signals import AutofinClient
 from .data import DEFAULT_DATA_DIR, write_json
 
 
-DEFAULT_INITIAL_NAV = 1_000_000_000  # 1B VND
+DEFAULT_INITIAL_NAV = 100_000_000  # 100M VND — matches dry_run_state.DEFAULT_INITIAL_NAV
 DEFAULT_BOARD_LOT = 100
 # DNSE retail default (0.12% per side) — applied as a fraction of value
 DEFAULT_FEE_PCT_PER_SIDE = 0.0012
@@ -291,6 +291,33 @@ def run_autofin_backtest(
     Use ``run_hindsight_variants()`` to see what specific hindsight
     filters would have done; those numbers should not be reported
     as live-trading expectations.
+
+    Sizing model and its limitations
+    --------------------------------
+
+    Each new position is sized off the **running NAV** (``nav * rate``)
+    — the original ``initial_nav`` plus cumulative realized P&L. With
+    the default ``initial_nav=100M`` and ``rate=0.15`` each position
+    starts at ~15M VND; after wins the bot compounds up, after losses
+    it shrinks. This matches what a fully-invested strategy would do
+    if every deal were processed sequentially with no overlap.
+
+    The backtest does NOT model concurrent positions: deals are
+    processed in ``time_Open`` order and each is fully resolved
+    (entry → partials → close) before the next starts. Real autofin
+    signals run 5+ deals simultaneously, so the bot's live NAV
+    budget is shared across open positions, not per-deal. If you want
+    portfolio-managed sizing, see ``libs/daily_engine.py`` /
+    ``algos/autofin_signal.py`` — the live path tracks
+    ``available_cash`` from the dry-run state and caps each new BUY
+    at the cash that would actually be free.
+
+    Pre-2026-09-19 the default ``initial_nav`` was 1B VND, which made
+    every signal size as if you had the full 1B to invest (a 150M
+    position per signal at rate=0.15). The default is now 100M to
+    match ``libs/dry_run_state.DEFAULT_INITIAL_NAV`` and the
+    operator's dry-run NAV. Pass ``--initial-nav=1000000000`` to
+    reproduce the legacy sizing.
     """
     if client is None:
         client = AutofinClient(

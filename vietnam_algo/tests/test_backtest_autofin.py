@@ -390,4 +390,32 @@ def test_backtest_time_weighted_sharpe_present():
     client = FakeClient(deals)
     result = run_autofin_backtest(initial_nav=1_000_000_000, client=client)
     assert "sharpe_time_weighted" in result
+
+
+def test_default_initial_nav_matches_dry_run_state():
+    """The backtest default ``initial_nav`` must match
+    ``libs/dry_run_state.DEFAULT_INITIAL_NAV`` (100M VND). Otherwise
+    every signal sizes as if the operator had 1B to invest and the
+    backtest result is disconnected from the dry-run reality.
+
+    2026-09-19 user feedback: "Without portfolio management, every
+    signal sizes as if it has the full 1B VND NAV." The pre-fix
+    default was 1B; this test guards against it regressing.
+    """
+    from vietnam_algo.libs.dry_run_state import DEFAULT_INITIAL_NAV as DRY_DEFAULT
+    from vietnam_algo.libs.backtest_autofin import DEFAULT_INITIAL_NAV as BT_DEFAULT
+    assert BT_DEFAULT == DRY_DEFAULT, (
+        f"backtest default {BT_DEFAULT} != dry-run default {DRY_DEFAULT}"
+    )
+    # And the value should be reasonable — not the legacy 1B scale.
+    assert BT_DEFAULT <= 100_000_000, (
+        f"backtest default {BT_DEFAULT} > 100M — too large for the "
+        f"operator's dry-run NAV scale. Pass --initial-nav explicitly "
+        f"if you want a larger scale."
+    )
+    # And the live backtest actually produces a numeric Sharpe when
+    # the test deals are processed at the new default.
+    deals = [_make_closed_deal(), _make_closed_deal(symbol="X", deal_id="2", p_open=10000, p_close=12000)]
+    client = FakeClient(deals)
+    result = run_autofin_backtest(client=client)  # default initial_nav
     assert isinstance(result["sharpe_time_weighted"], (int, float))

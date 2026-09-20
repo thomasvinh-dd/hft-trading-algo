@@ -210,8 +210,10 @@ def build_parser() -> argparse.ArgumentParser:
     autofin_bt.add_argument(
         "--initial-nav",
         type=float,
-        default=1_000_000_000,
-        help="starting NAV in VND (default 1B)",
+        default=100_000_000,
+        help="starting NAV in VND (default 100M — matches the bot's "
+             "DRY_RUN_INITIAL_NAV scale; pass --initial-nav=1000000000 "
+             "for the legacy 1B scale)",
     )
     autofin_bt.add_argument(
         "--fee-pct-per-side",
