@@ -344,6 +344,209 @@ class PortfolioDefaultsTests(unittest.TestCase):
         self.assertEqual(cfg.trailing.trail_mode, "pct")
         self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.07)
 
+    def test_default_require_close_above_ma_is_20(self):
+        """OOS-validated: requiring close>MA20 doubles OOS Sharpe."""
+        cfg = StrategyConfig()
+        self.assertEqual(cfg.breakout.require_close_above_ma, 20)
+
+    def test_default_cost_bps_is_25(self):
+        """Realistic VN-market round-trip cost (commission + slippage)."""
+        cfg = StrategyConfig()
+        self.assertEqual(cfg.backtest.cost_bps, 25.0)
+
+    def test_default_max_holding_bars_is_zero(self):
+        """Time stop is opt-in."""
+        cfg = StrategyConfig()
+        self.assertEqual(cfg.backtest.max_holding_bars, 0)
+
+
+class TrendFilterTests(unittest.TestCase):
+    """Tests for require_close_above_ma filter."""
+
+    def _build_bars(self, breakout_close, base_high=11_470):
+        """Strong uptrend, 10-bar tight base, then breakout at `breakout_close`.
+
+        `breakout_close` must be > base_high to trigger the breakout check.
+        """
+        from datetime import date, timedelta
+        out = []
+        for i in range(30):
+            c = 10_000 + i * 50
+            out.append(PriceBar(
+                time=(date(2024, 1, 1) + timedelta(days=i)).isoformat(),
+                open=c, high=c * 1.001, low=c * 0.999, close=c, volume=100_000,
+            ))
+        # 10-bar tight base
+        for i in range(20, 30):
+            out[i] = PriceBar(
+                time=out[i].time, open=11_450, high=base_high,
+                low=11_440, close=11_450, volume=100_000,
+            )
+        # breakout bar: high = base_high + 30, close > base_high + 5
+        out.append(PriceBar(
+            time=(date(2024, 1, 1) + timedelta(days=30)).isoformat(),
+            open=base_high + 5, high=base_high + 50, low=base_high - 5,
+            close=breakout_close, volume=500_000,
+        ))
+        return out
+
+    def _make_base(self, bars):
+        from darvas_box_strategy.darvas.base_detector import BaseScanner
+        # Scan up to the breakout bar (exclusive) so the base ends before it.
+        return BaseScanner(bars, BaseConfig(min_days=5, max_days=20, max_range_pct=0.05),
+                           ticker="TST").find_base(as_of_idx=len(bars) - 2)
+
+    def test_trend_filter_blocks_signal_below_ma(self):
+        # Close = 11_480, but recent prices mostly 11_450 so MA20 ≈ 11_450
+        # 11_480 > 11_450 should pass. To block, make close < MA20.
+        # Use flat base around 11_000 so MA20 ≈ 11_000; breakout close = 10_900 (below MA)
+        from datetime import date, timedelta
+        bars = []
+        for i in range(30):
+            bars.append(PriceBar(
+                time=(date(2024, 1, 1) + timedelta(days=i)).isoformat(),
+                open=11_000, high=11_010, low=10_990, close=11_000,
+                volume=100_000,
+            ))
+        for i in range(20, 30):
+            bars[i] = PriceBar(
+                time=bars[i].time, open=11_000, high=11_010,
+                low=10_990, close=11_000, volume=100_000,
+            )
+        # breakout: close just above base_high but pull back to MA20
+        bars.append(PriceBar(
+            time=(date(2024, 1, 1) + timedelta(days=30)).isoformat(),
+            open=11_010, high=11_030, low=10_950, close=10_960, volume=500_000,
+        ))
+        base = self._make_base(bars)
+        cfg = StrategyConfig(
+            breakout=BreakoutConfig(volume_mult=1.0, require_ma200=False,
+                                    require_close_above_ma=20),
+        )
+        sig = generate_signal(bars, base, nav=1e9, cfg=cfg, as_of_idx=len(bars) - 1)
+        self.assertIsNone(sig)
+
+    def test_trend_filter_passes_signal_above_ma(self):
+        bars = self._build_bars(breakout_close=11_510)
+        base = self._make_base(bars)
+        cfg = StrategyConfig(
+            breakout=BreakoutConfig(volume_mult=1.0, require_ma200=False,
+                                    require_close_above_ma=20),
+        )
+        sig = generate_signal(bars, base, nav=1e9, cfg=cfg, as_of_idx=len(bars) - 1)
+        self.assertIsNotNone(sig)
+
+
+class RegimeFilterTests(unittest.TestCase):
+    """Tests for the market regime filter."""
+
+    def test_regime_off_when_no_path(self):
+        from datetime import date, timedelta
+        from darvas_box_strategy.darvas.base_detector import BaseScanner
+        from darvas_box_strategy.darvas import (
+            StrategyConfig, BaseConfig, BreakoutConfig,
+        )
+
+        bars = []
+        for i in range(220):
+            c = 10_000 + i * 10
+            bars.append(PriceBar(
+                time=(date(2024, 1, 1) + timedelta(days=i)).isoformat(),
+                open=c, high=c * 1.001, low=c * 0.999, close=c, volume=100_000,
+            ))
+        # 10-bar tight base at the end
+        for i in range(210, 220):
+            bars[i] = PriceBar(
+                time=bars[i].time, open=12_000, high=12_030, low=11_980,
+                close=12_000, volume=100_000,
+            )
+        # breakout bar
+        bars.append(PriceBar(
+            time=(date(2024, 1, 1) + timedelta(days=220)).isoformat(),
+            open=12_050, high=12_200, low=12_040, close=12_180, volume=500_000,
+        ))
+        base = BaseScanner(bars, BaseConfig(), ticker="TST").find_base(as_of_idx=len(bars) - 2)
+        cfg = StrategyConfig(
+            breakout=BreakoutConfig(volume_mult=1.0, require_ma200=False,
+                                    regime_index_path=""),
+        )
+        sig = generate_signal(bars, base, nav=1e9, cfg=cfg, as_of_idx=len(bars) - 1)
+        self.assertIsNotNone(sig)
+
+    def test_regime_blocks_when_index_below_ma(self):
+        from datetime import date, timedelta
+        from darvas_box_strategy.darvas.base_detector import BaseScanner
+        from darvas_box_strategy.darvas import (
+            StrategyConfig, BaseConfig, BreakoutConfig,
+        )
+
+        bars = []
+        for i in range(220):
+            c = 10_000 + i * 10
+            bars.append(PriceBar(
+                time=(date(2024, 1, 1) + timedelta(days=i)).isoformat(),
+                open=c, high=c * 1.001, low=c * 0.999, close=c, volume=100_000,
+            ))
+        for i in range(210, 220):
+            bars[i] = PriceBar(
+                time=bars[i].time, open=12_000, high=12_030, low=11_980,
+                close=12_000, volume=100_000,
+            )
+        bars.append(PriceBar(
+            time=(date(2024, 1, 1) + timedelta(days=220)).isoformat(),
+            open=12_050, high=12_200, low=12_040, close=12_180, volume=500_000,
+        ))
+        base = BaseScanner(bars, BaseConfig(), ticker="TST").find_base(as_of_idx=len(bars) - 2)
+
+        # Market bars: downtrend, last close far below MA50
+        market_bars = []
+        for i in range(100):
+            c = 30_000 - i * 50
+            market_bars.append(PriceBar(
+                time=(date(2024, 1, 1) + timedelta(days=i)).isoformat(),
+                open=c, high=c * 1.001, low=c * 0.999, close=c, volume=100_000,
+            ))
+        cfg = StrategyConfig(
+            breakout=BreakoutConfig(volume_mult=1.0, require_ma200=False,
+                                    regime_index_path="/dummy",
+                                    regime_ma_window=50),
+        )
+        sig = generate_signal(bars, base, nav=1e9, cfg=cfg,
+                              as_of_idx=len(bars) - 1, market_bars=market_bars)
+        self.assertIsNone(sig)
+
+
+class TimeStopTests(unittest.TestCase):
+    """Tests for max_holding_bars time stop."""
+
+    def test_time_stop_closes_when_not_profitable(self):
+        from datetime import date, timedelta
+        from darvas_box_strategy.darvas.signal_generator import Signal, generate_signal
+
+        sig = Signal(
+            ticker="TST", entry_date=date(2024, 1, 1),
+            entry_price=10_000.0, base=None,
+            sl_F=9_500.0, sl_T=9_800.0,
+            tiers=((1.10, 1.0),), conviction="low", size_pct=0.1,
+            shares=1000, max_volume=999999, bars_remaining=30,
+        )
+        cfg = StrategyConfig(
+            backtest=BacktestConfig(start_nav=1e9, cost_bps=0.0,
+                                    max_holding_bars=3),
+            trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.20,
+                                    trail_floor_lock_profit=False,
+                                    activation_tier_idx=999),
+        )
+        # 3 bars where close stays below entry
+        bars = []
+        for i in range(3):
+            bars.append(PriceBar(
+                time=(date(2024, 1, 1) + timedelta(days=i + 1)).isoformat(),
+                open=10_000, high=10_050, low=9_900, close=9_950, volume=100_000,
+            ))
+        result = simulate_trade(sig, bars, cfg)
+        self.assertEqual(result.exit_reason, "TIME_STOP")
+
 
 if __name__ == "__main__":
     unittest.main()

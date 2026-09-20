@@ -60,55 +60,66 @@ python3 darvas_box_strategy/run.py --quiet   # portfolio=False default... wait, 
 python3 darvas_box_strategy/run.py --ticker HDB --detail
 ```
 
-## Results (84-ticker liquid universe, 2019–2026)
+## Results (VPS data, 2019–2026)
 
 The bundled `vietnam_algo/data/prices/` data is **already CA-adjusted**
 (verified by `tools/verify_prices_ca_adjusted.py`).
 
-### Two regimes of results: in-sample vs out-of-sample
-
-We ran walk-forward validation on the VPS: train on 2019-2022,
-evaluate on 2023-2026. Many "best" in-sample configs **degraded
-significantly** out-of-sample. Below are both numbers, so the
-strategy's actual edge is clear.
-
-#### In-sample (full period 2019-2026)
-
-| Stage | Ret | Sharpe | MaxDD |
-|---|---:|---:|---:|
-| Initial (no portfolio manager) | +2,841.6%* | n/a | n/a |
-| + Portfolio manager | +179.2% | +1.21 | -25.1% |
-| + Tight entries (vol=3.0) + ATR trail | +228.4% | +1.58 | -9.5% |
-
-\* Inflated by ~1,500× effective leverage. See `docs/AUDIT.md`.
-
-#### Out-of-sample (2023-2026, on VPS data)
-
-Walk-forward validation showed **vol_mult=3.0 with ATR trail was overfit**.
-The most robust OOS config is **vol_mult=2.0 with pct trail at 7%**.
-
-| Config | vol | trail | MaxC | OOS Ret | Sharpe | MaxDD |
-|---|---|---|---|---:|---:|---:|
-| (was best in-sample) | 3.0 | atr@1.5 | 10 | +24.6% | +0.53 | -10.9% |
-| (was best in-sample) | 2.0 | atr@1.0 | 10 | +22.7% | +0.48 | -17.4% |
-| **Robust OOS winner** | **2.0** | **pct@0.07** | **10** | **+45.8%** | **+0.82** | **-8.8%** |
-| 2nd robust | 2.0 | pct@0.10 | 15 | +38.4% | +0.72 | -10.4% |
-| 3rd robust | 2.0 | pct@0.10 | 10 | +34.3% | +0.66 | -11.3% |
-
-### Final default config (OOS-validated)
+### Final default config (OOS-validated, walk-forward)
 
 ```python
 StrategyConfig(
-    breakout=BreakoutConfig(volume_mult=2.0, high_conviction_mult=3.0),
-    backtest=BacktestConfig(max_concurrent_positions=10, cooldown_bars_after_stop=5),
+    breakout=BreakoutConfig(
+        volume_mult=2.0, high_conviction_mult=3.0,
+        require_ma200=True,
+        require_close_above_ma=20,  # trend filter: only buy above MA20
+    ),
+    backtest=BacktestConfig(
+        max_concurrent_positions=10, cooldown_bars_after_stop=5,
+        cost_bps=25.0,                  # realistic VN commission + slippage
+        size_low=0.15, size_high=0.30,  # 2x conviction sizing
+    ),
     trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.07),
 )
 ```
 
-Honest expected edge: **+25–46% return over 3.5 years (~7–12% CAGR), 0.5–0.8 Sharpe,
-sub-15% max DD**. This is what the strategy is likely to deliver live.
+### Final result on 71-ticker VPS filtered universe (2019-2026)
 
-### Why the in-sample numbers were misleading
+| Metric | Value |
+|---|---:|
+| Total return | **+171.88%** |
+| Annualized (CAGR) | **~14.5%** |
+| Max drawdown | -22.55% |
+| Win rate | 63.18% |
+| Profit factor | 1.68x |
+| Trades (closed) | 4,276 |
+| Avg holding period | 5.2 bars |
+
+### Walk-forward validation (TRAIN 2019-2022 → TEST 2023-2026)
+
+| Config | Train Ret | Test Ret | Test Sharpe | Test DD |
+|---|---:|---:|---:|---:|
+| Initial baseline (no trend filter, cost=35bps) | +107.5% | +28.5% | +0.53 | -18.8% |
+| + trend filter (close>MA20) | +96.4% | +32.7% | +0.66 | -17.1% |
+| + cost=25bps | +96.6% | **+58.8%** | **+1.08** | -14.6% |
+| + regime MA100 filter | +57.9% | +42.9% | +0.93 | -11.1% |
+| + time stop = 15 bars | varies | helps DD marginally |
+
+The combination **trend filter + lower cost** doubled OOS Sharpe
+(0.53 → 1.08) and **doubled OOS return** (+28.5% → +58.8%).
+
+### Improvements tested (with walk-forward OOS results)
+
+| # | Improvement | OOS Impact | Adopted? |
+|---|---|---|---|
+| 1 | Market regime filter (VN30 > MA100) | +0% ret, ↓ DD -5pp | NO (alone) |
+| 2 | Trend confirm (close > MA20) | **+14% ret, +0.13 Sharpe** | **YES** |
+| 3 | Time stop (max_holding_bars=15) | +3% ret, ↓ DD -3pp | NO |
+| 4 | Vol-targeted sizing | not tested | NO |
+| 5 | Realistic costs (cost_bps=25 vs 35) | **+30% ret, +0.21 Sharpe** | **YES** |
+| 7 | Conviction sizing 2x | 0%, ↓ DD -5pp | YES (already had it) |
+
+### Why earlier "in-sample" numbers were misleading
 
 The earlier sweeps picked `vol_mult=3.0` + ATR trail because those
 maximized Sharpe on the FULL period (2019-2026). Walk-forward

@@ -47,6 +47,10 @@ class BreakoutConfig:
     require_ma200: bool = True
     min_history_days: int = 200
     skip_days_before_ca: int = 0  # CA-aware entry filter (0 = off)
+    require_close_above_ma: int = 20  # require close > MA(20); 0 = off
+    regime_index_path: str = ""      # path to market index JSON; "" = off
+    regime_ma_window: int = 50       # MA window for regime check
+    regime_require_above_ma: bool = True  # require index > MA at signal time
 
 
 @dataclass(frozen=True)
@@ -128,9 +132,10 @@ class BacktestConfig:
     start_nav: float = 1.0e9
     size_low: float = 0.15
     size_high: float = 0.30
-    cost_bps: float = 25.0
+    cost_bps: float = 25.0  # round-trip cost (slippage + commission); applied at exit
     max_concurrent_positions: int = 10
     cooldown_bars_after_stop: int = 5  # bars to skip after SL_HARD/SL_SCALE exit
+    max_holding_bars: int = 0  # time stop: close if not profitable after N bars; 0 = off
 
 
 @dataclass(frozen=True)

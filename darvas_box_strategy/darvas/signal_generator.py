@@ -47,6 +47,14 @@ def _avg_volume(bars, idx, window=20):
     return sum(b.volume for b in relevant) / len(relevant)
 
 
+def _ma(bars, idx, window):
+    """Simple moving average of close up to and including idx."""
+    if idx + 1 < window:
+        return None
+    closes = [b.close for b in bars[idx - window + 1: idx + 1]]
+    return sum(closes) / window
+
+
 def _conviction(volume, avg_vol, cfg):
     if avg_vol <= 0:
         return "low"
@@ -55,7 +63,28 @@ def _conviction(volume, avg_vol, cfg):
     return "low"
 
 
-def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None):
+def _regime_ok(breakout_bar, cfg, market_bars):
+    """Check market regime: is the index above its MA at signal time?
+
+    market_bars: list of PriceBar for the index, sorted by date.
+    Returns True if regime filter is disabled or regime allows trading.
+    """
+    if not cfg.breakout.regime_index_path or not market_bars:
+        return True
+    window = cfg.breakout.regime_ma_window
+    target_date = breakout_bar.date
+    # find bars up to and including target_date
+    relevant = [b for b in market_bars if b.date <= target_date]
+    if len(relevant) < window:
+        return True  # not enough data, allow trading
+    closes = [b.close for b in relevant[-window:]]
+    ma = sum(closes) / window
+    above = relevant[-1].close > ma
+    return above if cfg.breakout.regime_require_above_ma else not above
+
+
+def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
+                    market_bars=None):
     breakout_idx = base.end_idx + 1
     if as_of_idx is None:
         as_of_idx = breakout_idx
@@ -78,6 +107,16 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None):
         ma200 = sum(closes[-200:]) / min(len(closes), 200)
         if breakout_bar.close <= ma200:
             return None
+
+    # Trend confirmation: require close > MA(N) at signal time
+    if cfg.breakout.require_close_above_ma > 0:
+        ma_n = _ma(bars, breakout_idx, cfg.breakout.require_close_above_ma)
+        if ma_n is None or breakout_bar.close <= ma_n:
+            return None
+
+    # Market regime filter
+    if not _regime_ok(breakout_bar, cfg, market_bars):
+        return None
 
     if cfg.breakout.skip_days_before_ca > 0 and upcoming_ca:
         for ev in upcoming_ca:

@@ -29,6 +29,7 @@ from .data_loader import (
     DEFAULT_PRICES_DIR,
     PriceBar,
     iter_universe,
+    load_price_bars,
 )
 from .executor import TradeResult, simulate_trade
 from .signal_generator import generate_signal
@@ -63,7 +64,8 @@ class BacktestResult:
         return sum(1 for t in self.trades if t.exit_reason == "EXHAUST")
 
 
-def _scan_ticker(bars, ticker, cfg, *, dividend_per_share=None, upcoming_ca=None):
+def _scan_ticker(bars, ticker, cfg, *, dividend_per_share=None, upcoming_ca=None,
+                  market_bars=None):
     """Yield simulated TradeResults for every signal in the bars."""
     if len(bars) < cfg.breakout.min_history_days:
         return
@@ -74,7 +76,8 @@ def _scan_ticker(bars, ticker, cfg, *, dividend_per_share=None, upcoming_ca=None
         if base is None or base.end_idx >= i:
             continue
         signal = generate_signal(
-            bars, base, nav=nav, cfg=cfg, as_of_idx=i, upcoming_ca=upcoming_ca,
+            bars, base, nav=nav, cfg=cfg, as_of_idx=i,
+            upcoming_ca=upcoming_ca, market_bars=market_bars,
         )
         if signal is None:
             continue
@@ -138,7 +141,6 @@ def _portfolio_layer(cfg, trades, start, end, mtm_mode="close"):
     # We need to read the per-ticker bars from somewhere. We pass them
     # in via the trades themselves (each trade has a ticker; we
     # re-load from the default prices dir).
-    from .data_loader import load_price_bars
     bars_cache: dict[str, list] = {}
 
     def get_bars(ticker: str) -> list:
@@ -233,9 +235,9 @@ def _portfolio_layer(cfg, trades, start, end, mtm_mode="close"):
 
     return daily_nav, [], peak_concurrent, skipped
 
-
 def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
-                 progress=True, ca_events=..., adjust_prices=...,
+                 progress=True, ca_events=...,
+                 adjust_prices=...,
                  ca_path=None, portfolio=False, mtm_mode="close"):
     """Run backtest.
 
@@ -259,12 +261,20 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
         adjust_prices = False
     result.ca_applied = bool(adjust_prices)
 
+    # Load market index bars if regime filter is configured
+    market_bars = None
+    if cfg.breakout.regime_index_path:
+        path = Path(cfg.breakout.regime_index_path)
+        if path.exists():
+            market_bars = load_price_bars(path)
+
+    from .data_loader import load_price_bars as _load_price_bars  # for inner branches
+
     if tickers is not None:
-        from .data_loader import load_price_bars
         universe = []
         for t in tickers:
             path = prices_dir / f"{t.upper()}.json"
-            raw_bars = load_price_bars(path)
+            raw_bars = _load_price_bars(path)
             if not raw_bars:
                 continue
             ticker_events = ca_index.get(t.upper(), [])
@@ -274,7 +284,6 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
                 adj_bars, div = raw_bars, {}
             universe.append((t.upper(), adj_bars, div))
     else:
-        from .data_loader import load_price_bars
         universe = []
         for meta, raw_bars in iter_universe(prices_dir, cfg):
             ticker_events = ca_index.get(meta.ticker, [])
@@ -302,6 +311,7 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
             bars, ticker, cfg,
             dividend_per_share=dividend_per_share,
             upcoming_ca=ticker_events,
+            market_bars=market_bars,
         ):
             result.trades.append(trade)
             result.total_dividend_income += trade.dividend_income

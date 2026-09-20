@@ -71,10 +71,12 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
     sl_T = signal.sl_T
     sl_mid = (sl_F + sl_T) / 2.0
 
+    bars_held = 0
     for bar in bars_after:
         last_bar = bar
         highest_close = max(highest_close, bar.close)
         peak_close = max(peak_close, bar.close)
+        bars_held += 1
 
         if dividend_per_share and bar.date in dividend_per_share and remaining > 0:
             cash_div = dividend_per_share[bar.date]
@@ -87,6 +89,22 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 proceeds=income, fraction_of_pos=0.0,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=income,
             ))
+
+        # Time stop: if held too long and not in profit, close at close.
+        max_hold = getattr(cfg.backtest, "max_holding_bars", 0) or 0
+        if max_hold > 0 and remaining > 0 and bars_held >= max_hold and bar.close < signal.entry_price:
+            proceeds = remaining * bar.close
+            pnl = (bar.close - signal.entry_price) * remaining
+            cost = proceeds * cost_rate * 0.5
+            cumulative_proceeds += proceeds - cost
+            cumulative_pnl += pnl - cost
+            fills.append(FillEvent(
+                date=bar.date, kind="TIME_STOP", level=bar.close, shares=remaining,
+                proceeds=proceeds - cost, fraction_of_pos=1.0,
+                cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
+            ))
+            remaining = 0
+            break
 
         if trailing_active and remaining > 0:
             if atr_trail_distance is not None:
