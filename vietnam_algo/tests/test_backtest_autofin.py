@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, "/home/vst/Documents/Ai-trade/hft-trading-algo")
 
 import vietnam_algo.libs.backtest_autofin as mod
@@ -419,3 +421,84 @@ def test_default_initial_nav_matches_dry_run_state():
     client = FakeClient(deals)
     result = run_autofin_backtest(client=client)  # default initial_nav
     assert isinstance(result["sharpe_time_weighted"], (int, float))
+
+
+def test_backtest_with_sl_caps_losing_trades_at_sl_level():
+    """``user_sl_pct`` (default 10%) mirrors the live bot's
+    ``AUTOFIN_USER_SL_PCT``. A deal whose final close is below
+    the SL level should exit at the SL price, NOT at the
+    below-SL close — preserving capital.
+
+    Pre-2026-09-20 the backtest ignored SL entirely and reported
+    full deep losses, making the live bot look worse than it
+    actually performs. The user feedback was: "i thought previously
+    we have stop-loss 10% already, pls check again".
+    """
+    # Big loser: opens at 100, closes at 70 → -30% raw loss
+    # With 10% SL: exits at 90 → -10% loss instead
+    big_loser = _make_closed_deal(
+        symbol="BIG_LOSER", deal_id="1",
+        p_open=10000, p_close=7000, days=20, n_profit=0, rate=0.15,
+    )
+    # Mild loser: opens at 100, closes at 95 → -5% (above SL)
+    mild_loser = _make_closed_deal(
+        symbol="MILD_LOSER", deal_id="2",
+        p_open=10000, p_close=9500, days=10, n_profit=0, rate=0.15,
+    )
+    # Winner: opens at 100, closes at 130 → +30%
+    winner = _make_closed_deal(
+        symbol="WINNER", deal_id="3",
+        p_open=10000, p_close=13000, days=30, n_profit=3, rate=0.15,
+    )
+
+    # WITHOUT SL: big_loser takes full -30% hit
+    res_no_sl = run_autofin_backtest(
+        initial_nav=1_000_000_000,
+        client=FakeClient([big_loser, mild_loser, winner]),
+        user_sl_pct=0,
+    )
+    # WITH 10% SL: big_loser capped at -10%, mild_loser + winner unchanged
+    res_with_sl = run_autofin_backtest(
+        initial_nav=1_000_000_000,
+        client=FakeClient([big_loser, mild_loser, winner]),
+        user_sl_pct=0.10,
+    )
+
+    # Big_loser should be saved by SL
+    assert res_with_sl["final_nav"] > res_no_sl["final_nav"], (
+        f"SL didn't improve results: no-SL={res_no_sl['final_nav']:.0f} "
+        f"vs SL={res_with_sl['final_nav']:.0f}"
+    )
+    # SL stats are reported
+    assert res_with_sl["user_sl_pct"] == 0.10
+    assert res_with_sl["sl_triggered_count"] == 1, (
+        f"expected 1 SL trip (the BIG_LOSER), got "
+        f"{res_with_sl['sl_triggered_count']}"
+    )
+    # The trade that fired SL has sl_event populated
+    losing_trades = [t for t in res_with_sl["trades"] if t.symbol == "BIG_LOSER"]
+    assert len(losing_trades) == 1
+    assert losing_trades[0].sl_event is not None
+    assert losing_trades[0].sl_event["sl_pct"] == 0.10
+    assert losing_trades[0].sl_event["sl_level"] == pytest.approx(9000)
+    # Mild_loser + winner: no SL trip (close > SL level)
+    for t in res_with_sl["trades"]:
+        if t.symbol in ("MILD_LOSER", "WINNER"):
+            assert t.sl_event is None, (
+                f"{t.symbol} close {t.price_close} should be above "
+                f"SL level {t.price_open * 0.9:.0f}"
+            )
+
+
+def test_backtest_user_sl_pct_default_matches_live_bot():
+    """``user_sl_pct`` default (10%) must mirror the live bot's
+    ``AUTOFIN_USER_SL_PCT`` default. Otherwise the backtest
+    reports a different risk profile than what the bot actually
+    takes. Regression guard for 2026-09-20.
+    """
+    import inspect
+    sig = inspect.signature(run_autofin_backtest)
+    assert sig.parameters["user_sl_pct"].default == 0.10, (
+        f"backtest user_sl_pct default should be 0.10 (matches live "
+        f"bot), got {sig.parameters['user_sl_pct'].default}"
+    )

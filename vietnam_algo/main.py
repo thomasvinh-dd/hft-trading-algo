@@ -228,6 +228,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="slippage per fill as fraction (default 0.001 = 0.1%%; round-trip 0.2%%)",
     )
     autofin_bt.add_argument(
+        "--user-sl-pct",
+        type=float,
+        default=0.10,
+        help="user-defined stop-loss fraction (default 0.10 = 10%%). "
+             "Mirrors AUTOFIN_USER_SL_PCT in the live bot. The backtest "
+             "exits at SL price when the final close is below the SL level. "
+             "Pass 0 to disable (raw 'no SL' baseline).",
+    )
+    autofin_bt.add_argument(
         "--max-pages",
         type=int,
         default=20,
@@ -1173,6 +1182,7 @@ def main(argv: list[str] | None = None) -> int:
             slippage_pct_per_fill=args.slippage_pct_per_fill,
             max_pages=args.max_pages,
             use_full_history=not args.no_full_history,
+            user_sl_pct=args.user_sl_pct,
         )
         json_path, csv_path = write_backtest_outputs(result, args.out_dir)
         report = format_backtest_report(result)
@@ -1183,6 +1193,7 @@ def main(argv: list[str] | None = None) -> int:
                 fee_pct_per_side=args.fee_pct_per_side,
                 slippage_pct_per_fill=args.slippage_pct_per_fill,
                 max_pages=args.max_pages,
+                user_sl_pct=args.user_sl_pct,
             )
             print()
             print("⚠️  HINDSIGHT VARIANTS (DO NOT USE AS LIVE EXPECTATIONS)")

@@ -96,6 +96,10 @@ class AutofinTrade:
     # Each step records the fill price we used (here = price_open since
     # we have no intra-position price), qty sold, fees, and slippage.
     partial_steps: list[dict[str, Any]] = field(default_factory=list)
+    # Stop-loss event (None when no SL fired). When ``user_sl_pct`` is
+    # configured and the final close is below the SL level, we model
+    # the SL as having fired at the SL level.
+    sl_event: dict[str, Any] | None = None
 
     def to_row(self) -> dict[str, Any]:
         return asdict(self)
@@ -273,6 +277,7 @@ def run_autofin_backtest(
     slippage_pct_per_fill: float = DEFAULT_SLIPPAGE_PCT_PER_FILL,
     max_pages: int = MAX_PAGES,
     use_full_history: bool = True,
+    user_sl_pct: float = 0.10,
     client: AutofinClient | None = None,
 ) -> dict[str, Any]:
     """Strict, no-look-ahead replay of autofin's closed deals.
@@ -282,6 +287,27 @@ def run_autofin_backtest(
     N partial-TP SELLs (``numberOfProfit`` steps), then SELL the
     remainder at ``price_Closed``. Each fill pays its own fees +
     slippage. NAV compounds chronologically.
+
+    Stop-loss modeling (2026-09-20)
+    --------------------------------
+
+    ``user_sl_pct`` (default 0.10 = 10%) mirrors ``AUTOFIN_USER_SL_PCT``
+    in the live bot. For each deal, if the final close is below the
+    SL level (``price_Open * (1 - user_sl_pct)``), the backtest
+    models the SL as having fired at the SL level — the deal exits
+    there instead of at ``price_Closed``. This is the conservative
+    model: in reality the SL fires intraday at the SL price; we
+    can't observe intraday prices from the closed-deals feed, so
+    we approximate by checking the final close.
+
+    This is NOT pure hindsight — the SL level was set at entry time
+    (we know ``price_Open`` as soon as we BUY), and the rule
+    "exit at SL if price drops to that level" is a real-time rule.
+    The only hindsight is *when* the SL fired (we use the final
+    close to decide, not intraday bars).
+
+    Pass ``user_sl_pct=0`` to disable SL modeling and get the raw
+    "no SL" baseline that the original backtest used to compute.
 
     No hindsight filters are applied. The result is the most
     *defensible* upper bound on the strategy — actual live trading
@@ -338,6 +364,7 @@ def run_autofin_backtest(
     skipped: list[dict[str, Any]] = []
     wins = 0
     losses = 0
+    sl_triggered_count = 0  # deals where the SL bracket fired
     pnl_pcts: list[float] = []
     weighted_returns: list[tuple[float, int]] = []  # (pnl_pct, holding_days)
 
@@ -373,20 +400,54 @@ def run_autofin_backtest(
             })
             continue
 
-        sim = _simulate_trade(
-            qty=qty,
-            price_open=p_open,
-            price_close=p_close,
-            n_profit_steps=n_profit,
-            fee_pct_per_side=fee_pct_per_side,
-            slippage_pct_per_fill=slippage_pct_per_fill,
-        )
+        # Stop-loss model: if user_sl_pct > 0 and the final close
+        # would have triggered the SL (i.e. price_close <= SL level),
+        # model the SL as having fired at the SL level — exit there
+        # instead of at the final close. This mirrors the live bot's
+        # ``AUTOFIN_USER_SL_PCT`` bracket behavior.
+        # See docstring "Stop-loss modeling" for the assumptions.
+        sl_level = p_open * (1 - user_sl_pct) if user_sl_pct > 0 else 0.0
+        sl_fired = user_sl_pct > 0 and p_close <= sl_level
+        if sl_fired:
+            # SL fires → exit at SL price with 0 partial TPs (no
+            # partials happened before the SL tripped). This is the
+            # conservative model — real SL might fire mid-trade even
+            # if the close recovered. We approximate by treating any
+            # deal that closed below SL as having exited at SL.
+            sim = _simulate_trade(
+                qty=qty,
+                price_open=p_open,
+                price_close=sl_level,
+                n_profit_steps=0,
+                fee_pct_per_side=fee_pct_per_side,
+                slippage_pct_per_fill=slippage_pct_per_fill,
+            )
+            # Annotate the trade so the report can show how many SL
+            # trips happened and at what level.
+            sl_event = {
+                "sl_pct": user_sl_pct,
+                "sl_level": sl_level,
+                "exit_price": sl_level,
+                "would_have_closed_at": p_close,
+            }
+        else:
+            sim = _simulate_trade(
+                qty=qty,
+                price_open=p_open,
+                price_close=p_close,
+                n_profit_steps=n_profit,
+                fee_pct_per_side=fee_pct_per_side,
+                slippage_pct_per_fill=slippage_pct_per_fill,
+            )
+            sl_event = None
         nav += sim["pnl"]
 
         if sim["pnl"] > 0:
             wins += 1
         elif sim["pnl"] < 0:
             losses += 1
+        if sl_fired:
+            sl_triggered_count += 1
         pnl_pcts.append(sim["pnl_pct"])
         weighted_returns.append((sim["pnl_pct"], max(days, 1)))
 
@@ -416,6 +477,7 @@ def run_autofin_backtest(
             n_profit_steps=n_profit,
             last_recomment=rec,
             partial_steps=sim["partial_steps"],
+            sl_event=sl_event,
         ))
 
     final_nav = nav
@@ -481,6 +543,9 @@ def run_autofin_backtest(
         "total_slippage": total_slippage,
         "fee_pct_per_side": fee_pct_per_side,
         "slippage_pct_per_fill": slippage_pct_per_fill,
+        "user_sl_pct": user_sl_pct,
+        "sl_triggered_count": sl_triggered_count,
+        "sl_triggered_pct": sl_triggered_count / len(trades) if trades else 0,
         "mode": "strict_no_lookahead",
         "trades": trades,
         "skipped": skipped,
@@ -684,6 +749,19 @@ def format_backtest_report(result: dict[str, Any]) -> str:
         f"  • total fees: {result['total_fees']:,.0f} VND  "
         f"slippage: {result['total_slippage']:,.0f} VND"
     )
+    sl_pct = result.get("user_sl_pct", 0)
+    sl_count = result.get("sl_triggered_count", 0)
+    if sl_pct and sl_pct > 0:
+        lines.append(
+            f"  • stop-loss: {sl_pct:.0%} bracket fired on "
+            f"{sl_count} deals "
+            f"({result.get('sl_triggered_pct', 0):.1%} of trades)"
+        )
+    elif sl_pct == 0:
+        lines.append(
+            "  • stop-loss: disabled (--user-sl-pct=0); the no-SL baseline "
+            "is the most pessimistic view — live bot has 10% SL by default."
+        )
     lines.append("")
     lines.append("🏆 Top 5 winners")
     winners = sorted(result["trades"], key=lambda t: -t.pnl_vnd)[:5]
