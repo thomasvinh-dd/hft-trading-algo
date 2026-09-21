@@ -1132,9 +1132,29 @@ def run_auto_bot(
                     elif freshness.get("sentinel_exists") is False:
                         parts.append("data_ready_for_eod sentinel missing")
                     if median_age is not None:
-                        parts.append(
-                            f"sample latest-bar median age: {median_age}d (threshold 2d)"
+                        cal_age = freshness.get(
+                            "median_latest_bar_age_calendar_days",
                         )
+                        # Trading-day age is the freshness gate (so a
+                        # Friday close on a Monday morning isn't
+                        # flagged as stale). Calendar-day age is
+                        # shown in the alert text for context — it's
+                        # what most operators intuit. 2026-09-19
+                        # user feedback: "the day before is weekend
+                        # so we can not say that the data is stale,
+                        # we only compare with trading day not
+                        # holiday".
+                        if cal_age is not None and abs(cal_age - median_age) > 0.01:
+                            parts.append(
+                                f"sample latest-bar median age: {median_age} "
+                                f"trading-days ({cal_age} calendar-days, "
+                                f"threshold 2d)"
+                            )
+                        else:
+                            parts.append(
+                                f"sample latest-bar median age: {median_age}d "
+                                f"(threshold 2d)"
+                            )
                         if freshness.get("oldest_sample_symbol"):
                             parts.append(
                                 f"oldest sample: {freshness['oldest_sample_symbol']}"

@@ -364,9 +364,24 @@ def heartbeat_message(
             elif sentinel_mtime is None and not freshness.get("sentinel_exists"):
                 bits.append("sentinel=MISSING")
             if median_age is not None:
+                cal_age = freshness.get(
+                    "median_latest_bar_age_calendar_days",
+                )
+            # Trading-day age is the freshness gate (so a Friday close
+            # on a Monday morning isn't flagged). Calendar-day age is
+            # shown in the alert text for context — that's what most
+            # operators intuit. 2026-09-19 user feedback: "the day
+            # before is weekend so we can not say that the data is
+            # stale, we only compare with trading day not holiday".
+            if cal_age is not None and abs(cal_age - median_age) > 0.01:
+                bits.append(
+                    f"sample-bar-median={median_age}d-trading "
+                    f"({cal_age}d-cal)"
+                )
+            else:
                 bits.append(f"sample-bar-median={median_age}d")
-                if freshness.get("oldest_sample_symbol"):
-                    bits.append(f"oldest={freshness['oldest_sample_symbol']}")
+            if freshness.get("oldest_sample_symbol"):
+                bits.append(f"oldest={freshness['oldest_sample_symbol']}")
             if "error" in freshness:
                 bits.append(f"probe-err={freshness['error'][:40]}")
             lines.append("data: STALE (" + ", ".join(bits) + ")")

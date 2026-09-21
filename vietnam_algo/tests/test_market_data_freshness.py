@@ -69,7 +69,10 @@ class MarketDataFreshnessTests(unittest.TestCase):
         self.assertGreater(out["sentinel_age_hours"], 25.0)
 
     def test_stale_when_sample_bars_old(self) -> None:
-        # Sentinel fresh, but sample bars are 5 days old
+        # Sentinel fresh, but sample bars are 5 calendar days old.
+        # In trading-day terms, 5 calendar days = ~3 trading days
+        # (skipping the weekend), which still exceeds the 2-day
+        # threshold.
         self._write_sentinel(datetime.now(tz=UTC) - timedelta(hours=1))
         old_date = (datetime.now(tz=UTC) - timedelta(days=5)).date().isoformat()
         for sym in ("HPG", "VHM", "FPT", "VIC", "HDB"):
@@ -79,6 +82,84 @@ class MarketDataFreshnessTests(unittest.TestCase):
         self.assertGreater(out["median_latest_bar_age_days"], 2.0)
         # All tied — just verify it picks one of them
         self.assertIn(out["oldest_sample_symbol"], {"HPG", "VHM", "FPT", "VIC", "HDB"})
+
+    def test_freshness_uses_trading_days_not_calendar_days(self) -> None:
+        """User feedback 2026-09-19: "the day before is weekend
+        so we can not say that the data is stale, we only compare
+        with trading day not holiday."
+
+        Vietnamese markets close on weekends and Vietnamese public
+        holidays. Pre-fix the freshness check counted plain
+        calendar days, so a Friday close on a Monday morning
+        looked 3 days old — every Monday the operator got a false
+        STALE alert. Post-fix we count trading days via
+        ``trading_dates_between()`` (excludes weekends + Vietnamese
+        holidays from ``load_market_holidays()``).
+
+        This test simulates a Friday close and walks ``now``
+        forward through the weekend and into the next week,
+        asserting the freshness gate stays at 1 trading day until
+        the next trading session opens.
+        """
+        from datetime import timezone, timedelta
+
+        def _ict_to_utc(d: str, hh: int = 13, mm: int = 0) -> datetime:
+            """Build a UTC datetime from an ICT date string."""
+            y, m, day = (int(x) for x in d.split("-"))
+            return datetime(y, m, day, hh - 7, mm, tzinfo=UTC)
+
+        # Friday Sep 18 close — bar timestamp
+        friday_bar = _ict_to_utc("2026-09-18", 14, 0)
+        self._write_sentinel(friday_bar)
+        for sym in ("HPG", "VHM", "FPT", "VIC", "HDB"):
+            _write_price_file(self.tmp, sym, [{"time": "2026-09-18", "close": 100.0}])
+
+        # Same Friday afternoon (1 trading day from Friday? no,
+        # 0 days since today is the bar date itself).
+        out = get_market_data_freshness(
+            self.tmp, now=_ict_to_utc("2026-09-18", 15, 0)
+        )
+        self.assertEqual(out["median_latest_bar_age_days"], 0,
+                         f"Friday afternoon should be 0 trading-days: {out}")
+
+        # Saturday — still 0 trading days
+        out = get_market_data_freshness(
+            self.tmp, now=_ict_to_utc("2026-09-19", 12, 0)
+        )
+        self.assertEqual(out["median_latest_bar_age_days"], 0,
+                         f"Saturday should be 0 trading-days: {out}")
+
+        # Sunday — still 0 trading days
+        out = get_market_data_freshness(
+            self.tmp, now=_ict_to_utc("2026-09-20", 12, 0)
+        )
+        self.assertEqual(out["median_latest_bar_age_days"], 0,
+                         f"Sunday should be 0 trading-days: {out}")
+
+        # Monday morning — 1 trading day (Fri close → Mon open)
+        out = get_market_data_freshness(
+            self.tmp, now=_ict_to_utc("2026-09-21", 9, 0)
+        )
+        self.assertEqual(out["median_latest_bar_age_days"], 1,
+                         f"Monday should be 1 trading-day: {out}")
+        # Calendar days is 3 (Fri → Sat → Sun → Mon) — operator
+        # mental model says "3 days" but the FRESH gate uses
+        # trading days so we don't false-alarm on Mondays.
+        self.assertGreaterEqual(out["median_latest_bar_age_calendar_days"], 3)
+        self.assertLess(out["median_latest_bar_age_calendar_days"], 4)
+
+        # Tuesday — 2 trading days (still under threshold of 2.0)
+        out = get_market_data_freshness(
+            self.tmp, now=_ict_to_utc("2026-09-22", 13, 0)
+        )
+        self.assertEqual(out["median_latest_bar_age_days"], 2)
+
+        # Wednesday — 3 trading days → STALE (exceeds 2.0 threshold)
+        out = get_market_data_freshness(
+            self.tmp, now=_ict_to_utc("2026-09-23", 13, 0)
+        )
+        self.assertEqual(out["median_latest_bar_age_days"], 3)
+        self.assertFalse(out["fresh"])
 
     def test_missing_sentinel_reports_none_age(self) -> None:
         # No sentinel at all

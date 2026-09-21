@@ -480,6 +480,7 @@ def sync_prices_incremental(
 def get_market_data_freshness(
     data_dir: Path = DEFAULT_DATA_DIR,
     sample_symbols: tuple[str, ...] = ("HPG", "VHM", "FPT", "VIC", "HDB"),
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Return market-data freshness signals for alert/health-check use.
 
@@ -493,18 +494,34 @@ def get_market_data_freshness(
         disk.
       - ``sample_total``: int — total symbols requested.
       - ``median_latest_bar_age_days``: float | None — median of
-        ``today - latest_bar.time`` across sample symbols. None if no
-        sample symbols had any bars.
+        ``trading_days_between(today, last_bar_date)`` across sample
+        symbols. None if no sample symbols had any bars.
+      - ``median_latest_bar_age_calendar_days``: float | None — same as
+        ``median_latest_bar_age_days`` but in plain calendar days
+        (used for the alert text so the operator understands the gap
+        including weekends).
       - ``oldest_sample_symbol``: str | None — symbol with the oldest
         latest bar (None if no sample data).
       - ``fresh``: bool — ``True`` iff sentinel_age_hours <= 25 AND
         median_latest_bar_age_days <= 2.0.
 
+    Bar age is measured in **trading days**, not calendar days.
+    Vietnamese markets close on weekends and Vietnamese public
+    holidays, so a Friday close on a Monday morning is only 1
+    trading day old — not 3. The previous calendar-days count
+    flagged Friday data as "stale" every Monday morning and every
+    day after a Vietnamese public holiday.
+
     The thresholds match the alerts wired into ``common_sync.run()`` and
     the bot heartbeat block (see ``libs/notifier.py`` and
     ``jobs/common_sync.py``).
+
+    ``now`` is injectable for tests; defaults to ``datetime.now(UTC)``.
     """
-    now = datetime.now(UTC)
+    from .market_calendar import load_market_holidays, trading_dates_between
+
+    if now is None:
+        now = datetime.now(UTC)
     result: dict[str, Any] = {
         "sentinel_exists": False,
         "sentinel_age_hours": None,
@@ -512,6 +529,7 @@ def get_market_data_freshness(
         "sample_size": 0,
         "sample_total": len(sample_symbols),
         "median_latest_bar_age_days": None,
+        "median_latest_bar_age_calendar_days": None,
         "oldest_sample_symbol": None,
         "fresh": False,
     }
@@ -522,7 +540,14 @@ def get_market_data_freshness(
         result["sentinel_exists"] = True
         result["sentinel_age_hours"] = round(age_seconds / 3600.0, 2)
         result["sentinel_mtime"] = mtime.isoformat()
-    ages_days: list[tuple[str, float]] = []
+    # Convert "now" to ICT date for trading-day math. Prices are
+    # timestamped in the VN-market session (ICT), so the last bar's
+    # date is already an ICT date string. We compare in ICT.
+    from .schedule import VIETNAM_TZ, local_date
+    today_ict = local_date(now)
+    holidays = load_market_holidays(data_dir)
+    ages_trading_days: list[tuple[str, float]] = []
+    ages_calendar_days: list[tuple[str, float]] = []
     for sym in sample_symbols:
         path = data_dir / "prices" / f"{sym}.json"
         if not path.exists():
@@ -539,13 +564,45 @@ def get_market_data_freshness(
             continue
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=UTC)
-        age_days = (now - last_dt).total_seconds() / 86400.0
-        ages_days.append((sym, age_days))
-    if ages_days:
-        result["sample_size"] = len(ages_days)
-        median_age = statistics.median(a for _, a in ages_days)
+        # Use ICT date for the bar — prices are timestamped in the
+        # VN-market session (ICT). If the bar timestamp is UTC, we
+        # still want to interpret its calendar date as the date the
+        # market saw the close (UTC + 7h ≤ 17:00 ICT → same day).
+        last_ict = last_dt.astimezone(VIETNAM_TZ).date()
+        last_date_str = last_ict.isoformat()
+        # Trading-day age = number of trading days between last bar
+        # date (exclusive) and today (exclusive). 0 = today (would
+        # mean we have today's bar already, which we never do pre-
+        # market-open). 1 = yesterday was a trading day. 2 = two
+        # trading days ago. Friday's close on a Monday morning is
+        # 1 trading day (Sat/Sun skipped).
+        if last_date_str >= today_ict:
+            # Bar is from today (or in the future, which can happen
+            # with UTC-stamped files and an early-ICT "now"). Treat
+            # as fresh.
+            trading_age = 0
+        else:
+            trading_days = trading_dates_between(
+                last_date_str, today_ict, holidays
+            )
+            # trading_dates_between is inclusive on both ends. Subtract
+            # the last bar's date (it counts as 1 itself) and the
+            # today's date (the bar might still be "today" if we
+            # check at 00:01 ICT).
+            trading_age = max(0, len(trading_days) - 1)
+        calendar_age = (now - last_dt).total_seconds() / 86400.0
+        ages_trading_days.append((sym, trading_age))
+        ages_calendar_days.append((sym, calendar_age))
+    if ages_trading_days:
+        result["sample_size"] = len(ages_trading_days)
+        median_age = statistics.median(a for _, a in ages_trading_days)
         result["median_latest_bar_age_days"] = round(median_age, 2)
-        result["oldest_sample_symbol"] = max(ages_days, key=lambda x: x[1])[0]
+        # Keep the calendar-days median around for the alert text so
+        # the operator can see the raw gap ("Friday close on
+        # Monday = 3 calendar days, 1 trading day").
+        cal_median = statistics.median(a for _, a in ages_calendar_days)
+        result["median_latest_bar_age_calendar_days"] = round(cal_median, 2)
+        result["oldest_sample_symbol"] = max(ages_trading_days, key=lambda x: x[1])[0]
     sentinel_fresh = (
         result["sentinel_age_hours"] is not None and result["sentinel_age_hours"] <= 25.0
     )
