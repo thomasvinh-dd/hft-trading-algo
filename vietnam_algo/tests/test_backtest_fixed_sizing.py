@@ -36,6 +36,7 @@ def _make_deal(
     t_close: str,
     rate: float = 0.15,
     rec: str = "Đóng DEAL chạm điểm chặn lãi",
+    last_recomment: str | None = "Khuyến nghị đầu tư",
     days: int = 30,
 ) -> dict:
     """Synthesize a deal. If n_profit > 0, also generates a synthetic
@@ -73,7 +74,7 @@ def _make_deal(
         },
         "numberOfProfit": n_profit,
         "rateForNav": rate,
-        "lastRecomment": rec,
+        "lastRecomment": last_recomment or rec,
         "supply_F": p_open,
         "supply_T": p_open,
         "tP_F": p_close,

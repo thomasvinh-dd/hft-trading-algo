@@ -362,6 +362,82 @@ def _read_token_cache(path: Path) -> dict[str, Any] | None:
         return None
 
 
+# Recomment taxonomy — what the SHORT last_recomment text actually
+# means. autofin emits different prefixes/icons depending on what
+# action the deal is recommending:
+#
+#   "Khuyến nghị đầu tư" / "Khuyến nghị mới" / "Ngày khuyến nghị: ..." →
+#       fresh BUY recommendation (entry signal)
+#   "💰 Chốt lãi lần N mức giá P" → take-profit step N at price P
+#   "🛡️ Chốt lãi X % bảo toàn vốn tại P" → capital-protect exit
+#   "⚠️ Hạ X % tỉ trọng lần N" → reduce position by X%
+#   "Đóng DEAL ..." → full close (stop-loss hit or manual exit)
+#
+# Per user feedback 2026-09-21: pre-fix the bot treated any signal in
+# /signal-static-suggest as a new entry candidate, which fired
+# unwanted BUY orders for deals where autofin was actually publishing a
+# TP/SL/reduce update (e.g. "💰 Chốt lãi lần 1 mức giá 16,600" — TP step
+# on a deal we don't hold). The right behaviour is to classify the
+# text BEFORE deciding whether to plan a BUY.
+RECOMMENT_KIND_ENTRY = "entry"
+RECOMMENT_KIND_TP = "tp"
+RECOMMENT_KIND_CAPITAL_PROTECT = "capital_protect"
+RECOMMENT_KIND_REDUCE = "reduce"
+RECOMMENT_KIND_CLOSE = "close"
+RECOMMENT_KIND_UNKNOWN = "unknown"
+
+
+def classify_recomment(rec_text: str) -> str:
+    """Classify ``last_recomment`` text into one of the recommmend kinds.
+
+    Used by the strategy to decide whether a /signal-static-suggest
+    row is a fresh-entry signal or an in-flight TP / SL / reduce update
+    on a deal we may or may not already hold.
+
+    Returns one of:
+      - ``"entry"`` → "Khuyến nghị đầu tư" / "Ngày khuyến nghị" /
+        "Khuyến nghị mới" — fresh BUY recommendation
+      - ``"tp"`` → "💰 Chốt lãi lần N mức giá P ..." — TP step
+      - ``"capital_protect"`` → "🛡️ Chốt lãi X % bảo toàn vốn..."
+      - ``"reduce"`` → "⚠️ Hạ X % tỉ trọng lần N..."
+      - ``"close"`` → "Đóng DEAL ..." — full close
+      - ``"unknown"`` → anything else (defensive default — caller
+        should treat as "not an entry", i.e. skip)
+
+    Rules (Vietnamese autofin.vn UI text):
+      1. If text contains "Đóng DEAL" → close (CHECK FIRST so the
+         full-close text takes precedence over the embedded TP).
+      2. If text contains "Chốt lãi" AND "bảo toàn vốn" →
+         capital_protect.
+      3. If text contains "Chốt lãi" (with the 💰 icon, even without
+         "bảo toàn vốn") → tp.
+      4. If text contains "Hạ " + "%" + "tỉ trọng" → reduce.
+      5. If text contains "khuyến nghị" (case-insensitive) → entry.
+      6. Otherwise → unknown (be conservative: not an entry).
+    """
+    if not rec_text:
+        return RECOMMENT_KIND_UNKNOWN
+    text = rec_text.lower()
+    # 1. Full close — check before TP because the full-close text
+    # usually embeds the TP price ("Đóng DEAL chạm điểm chặn lãi (Lãi: X %)").
+    if "đóng deal" in text:
+        return RECOMMENT_KIND_CLOSE
+    # 2. Capital protect ("🛡️ Chốt lãi X % bảo toàn vốn tại P")
+    if "chốt lãi" in text and "bảo toàn vốn" in text:
+        return RECOMMENT_KIND_CAPITAL_PROTECT
+    # 3. TP step ("💰 Chốt lãi lần N mức giá P ...")
+    if "chốt lãi" in text or "💰" in rec_text:
+        if "chốt lãi" in text or "💰" in rec_text:
+            return RECOMMENT_KIND_TP
+    # 4. Reduce ("⚠️ Hạ X % tỉ trọng lần N")
+    if "hạ" in text and "tỉ trọng" in text:
+        return RECOMMENT_KIND_REDUCE
+    # 5. Fresh entry ("Khuyến nghị đầu tư" / "Ngày khuyến nghị: ...")
+    if "khuyến nghị" in text:
+        return RECOMMENT_KIND_ENTRY
+    return RECOMMENT_KIND_UNKNOWN
+
+
 def _write_token_cache(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload["_savedAt"] = time.time()

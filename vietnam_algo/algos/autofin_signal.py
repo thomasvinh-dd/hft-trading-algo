@@ -36,8 +36,10 @@ from pathlib import Path
 from typing import Any
 
 from vietnam_algo.libs.autofin_signals import (
+    RECOMMENT_KIND_ENTRY,
     AutofinClient,
     AutofinSignal,
+    classify_recomment,
     latest_partial_close_fraction,
     parse_signal,
 )
@@ -305,6 +307,8 @@ def _plan_orders_for_new_positions(
     above_zone_tolerance_pct: float = 0.05,
     already_planned_symbols: set[str] | None = None,
     available_cash_vnd: float | None = None,
+    new_entry_min_cash_pct: float = 0.05,
+    top_n: int = 1,
 ) -> list[dict[str, Any]]:
     """Emit BUY + TP + SL bracket orders for **new** positions only.
 
@@ -329,6 +333,22 @@ def _plan_orders_for_new_positions(
 
     If ``available_cash_vnd`` is not provided, the function falls
     back to ``nav_vnd`` (the original behaviour).
+
+    Per user feedback (2026-09-21): the bot's entry-selection rules
+    are stricter than just "NAV × rate ≤ cash":
+      - Each signal's ``last_recomment`` is classified (via
+        :func:`classify_recomment`) and ONLY entry-recommendation
+        signals ("Khuyến nghị đầu tư") are eligible. TP / SL /
+        reduce / close signals belong to the per-event path.
+      - ``new_entry_min_cash_pct`` (default 0.05 = 5% of NAV) gates
+        the whole call: if ``available_cash_vnd / nav_vnd < 5%``
+        we skip ALL new entries for this cycle. This prevents
+        tiny dust entries when the portfolio is already nearly
+        fully invested.
+      - ``top_n`` (default 1) — only the top-N signals (in the
+        order returned by the caller, typically autofin's
+        ``/signal-static-suggest`` ordering) can produce entries.
+        This enforces "only the top suggestion" per user spec.
 
     Per user feedback (2026-09-09): also accept ``already_planned_symbols`` —
     a set of symbols that are already in the bot's persistent
@@ -378,9 +398,26 @@ def _plan_orders_for_new_positions(
     if available_cash_vnd is None or available_cash_vnd <= 0:
         available_cash_vnd = nav_vnd
     remaining_cash = float(available_cash_vnd)
+    # Per user feedback 2026-09-21: skip ALL new entries when
+    # available cash is below ``new_entry_min_cash_pct * nav``.
+    # Rationale: tiny dust entries (e.g. 1 share) are noise and
+    # don't justify the buy+SL bracket ceremony. Gate at the top so
+    # we don't even iterate over the signal list.
+    if nav_vnd > 0 and remaining_cash < nav_vnd * new_entry_min_cash_pct:
+        return rows
+    skipped_non_entry = 0
+    skipped_no_cash = 0
+    considered = 0
     for s in selected:
         if not s.symbol:
             continue
+        # Per user feedback 2026-09-21: top-N filter. Only the first
+        # ``top_n`` signals (in autofin's /signal-static-suggest order,
+        # typically recency-sorted) can produce entries. Stops the
+        # bot from chaining 5 entries across 5 signals when only the
+        # top suggestion is meant to be acted on per day.
+        if considered >= top_n:
+            break
         current_qty = our_positions.get(s.symbol, 0)
         if current_qty > 0:
             # Already hold this position — never rebalance.
@@ -390,6 +427,25 @@ def _plan_orders_for_new_positions(
         # DNSE returns empty positions but the bot already planned
         # an entry on a previous cycle.
         if already_planned_symbols and s.symbol in already_planned_symbols:
+            continue
+        considered += 1
+        # ----- Recomment classification (2026-09-21) -----
+        # Per user feedback: pre-fix the bot fired BUY orders for ANY
+        # signal in /signal-static-suggest, including deals where
+        # autofin was actually publishing a TP / SL / reduce update
+        # (e.g. "💰 Chốt lãi lần 1 mức giá 16,600" — TP step on a
+        # deal we don't hold). Classify the recommmend text FIRST
+        # and only proceed to plan a BUY if it's a fresh entry
+        # recommendation ("Khuyến nghị đầu tư"). Everything else
+        # is a partial-close / reduce / close signal that belongs in
+        # the per-event logic, not here.
+        rec_kind = classify_recomment(s.last_recomment)
+        if rec_kind != RECOMMENT_KIND_ENTRY:
+            # Not an entry recommendation — skip. The TP/SL/reduce
+            # paths in ``_plan_partial_close_orders`` /
+            # ``_plan_close_orders`` will pick this up if WE hold
+            # the symbol; otherwise there's nothing to act on.
+            skipped_non_entry += 1
             continue
         if s.rate_for_nav <= 0 or nav_vnd <= 0:
             continue
@@ -402,6 +458,7 @@ def _plan_orders_for_new_positions(
             available_cash_vnd = nav_vnd
         target_value = min(nav_vnd * s.rate_for_nav, remaining_cash)
         if target_value < min_order_value_vnd:
+            skipped_no_cash += 1
             continue
         ref_price = _signal_ref_price(s)
         if ref_price <= 0:
@@ -1215,6 +1272,8 @@ def decide_orders(
     data_dir: "Path | None" = None,
     autofin_closing_ids: set[str] | None = None,
     autofin_fractions: dict[str, float] | None = None,
+    new_entry_min_cash_pct: float = 0.05,
+    new_entry_top_n: int = 1,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -1376,6 +1435,8 @@ def decide_orders(
         current_prices=current_prices,
         already_planned_symbols=already_planned_symbols,
         available_cash_vnd=available_cash_vnd,
+        new_entry_min_cash_pct=new_entry_min_cash_pct,
+        top_n=new_entry_top_n,
     )
     partial_orders = _plan_partial_close_orders(
         our_deals,
@@ -1842,6 +1903,65 @@ class AutofinSignalAdapter(StrategyAdapter):
         except ValueError:
             user_sl_pct = 0.10
 
+        # 5c'. New-entry timing / cash gate (user feedback 2026-09-21):
+        # - ``allow_new_entries`` is False outside the start-of-day
+        #   window (default). When False, _plan_orders_for_new_positions
+        #   returns immediately — partial-close / full-close paths
+        #   still run for held deals. This gives the operator one
+        #   "new entry attempt per day" surface instead of a chain of
+        #   entries every poll cycle.
+        # - ``new_entry_min_cash_pct`` (default 0.05 = 5% of NAV)
+        #   gates whether the cash available is enough to bother
+        #   entering. Tunable via env var.
+        try:
+            new_entry_min_cash_pct = float(
+                os.environ.get("AUTOFIN_NEW_ENTRY_MIN_CASH_PCT", "0.05") or "0.05"
+            )
+        except ValueError:
+            new_entry_min_cash_pct = 0.05
+        try:
+            new_entry_top_n = int(
+                os.environ.get("AUTOFIN_NEW_ENTRY_TOP_N", "1") or "1"
+            )
+        except ValueError:
+            new_entry_top_n = 1
+        # allow_new_entries: True only at the start-of-day window
+        # (between orderSubmitTime and a configurable cutoff, default
+        # 09:45 ICT — gives the bot ~30 min after market open to make
+        # its single daily entry). The cutoff is in minutes after the
+        # main trading session opens. After the cutoff the bot still
+        # runs every cycle but only the partial-close / full-close
+        # paths can produce orders.
+        try:
+            start_of_day_cutoff_min = int(
+                os.environ.get("AUTOFIN_NEW_ENTRY_CUTOFF_MIN", "30") or "30"
+            )
+        except ValueError:
+            start_of_day_cutoff_min = 30
+        # Local ICT time check — the bot is in ICT and the trading
+        # session opens at 09:15. We allow entries from 09:15 to
+        # 09:15 + cutoff. Outside this window we suppress entries.
+        from vietnam_algo.libs.schedule import (
+            TradingSchedule,
+            is_main_trading_phase,
+            vietnam_now,
+        )
+        _sched = TradingSchedule()
+        _now_ict = vietnam_now()
+        # Minutes since market open (09:15 ICT)
+        _open_h, _open_m = _sched.morningStart.hour, _sched.morningStart.minute
+        _minutes_since_open = (
+            (_now_ict.hour - _open_h) * 60
+            + (_now_ict.minute - _open_m)
+            + (_now_ict.second / 60.0)
+        )
+        in_morning = (
+            is_main_trading_phase(_now_ict, _sched)
+            and _minutes_since_open >= 0
+            and _minutes_since_open <= start_of_day_cutoff_min
+        )
+        allow_new_entries = in_morning
+
         # 5d. Build a symbol → last_close price map from local price data.
         # Used to (a) gate entry on price-within-buy-zone and (b) include
         # HELD-but-not-entered deals in the candidate list. Per user
@@ -1902,6 +2022,13 @@ class AutofinSignalAdapter(StrategyAdapter):
             actioned_deals=self._actioned_deals,
             autofin_closing_ids=closing_ids,
             autofin_fractions=autofin_fractions,
+            # New-entry gating (user spec 2026-09-21):
+            # - new_entry_top_n=0 disables new entries entirely
+            #   (used outside the start-of-day window)
+            # - new_entry_min_cash_pct gates on the available-cash
+            #   threshold (default 5% of NAV)
+            new_entry_min_cash_pct=new_entry_min_cash_pct,
+            new_entry_top_n=new_entry_top_n if allow_new_entries else 0,
         )
 
         # 9b. Notification-driven mid-day TP/SL detection. Per user feedback

@@ -309,7 +309,23 @@ def test_expand_skips_when_no_supply_zone_declared():
 
 
 def test_decide_orders_emits_entry_for_held_unentered_in_zone():
-    """End-to-end: decide_orders should emit BUY for a held deal in zone."""
+    """End-to-end: decide_orders should emit BUY for a held deal in zone.
+
+    Pre-2026-09-21 the test expected both the HELD (VHM, not in
+    signals) and the suggested (PVT) to get BUYs — because the old
+    logic mixed HELD-but-unentered deals into the new-entry list.
+    Per user spec, new entries now come ONLY from /signal-static-suggest
+    (the "signals" argument). VHM is in "holding" but not in signals,
+    so it gets NO new entry. PVT, which IS in signals and has its
+    last_recomment as "Khuyến nghị đầu tư" (entry signal), gets BUYed.
+
+    The held-but-unentered expansion still runs so that if VHM is
+    later reclassified by autofin's automation as "Khuyến nghị đầu
+    tư" (i.e. autofin publishes a fresh entry rec for it), the bot
+    could enter — but that's gated by the start-of-day window and
+    top-N rule. In this test we pass new_entry_top_n=10 to make
+    multiple BUYs visible.
+    """
     sig = _make_signal("PVT", deal_id=99, supply_from=20000, supply_to=21000)
     holding = [_make_holding_record("VHM", deal_id=42, supply_from=20000, supply_to=21000)]
     all_orders, _, _ = decide_orders(
@@ -319,8 +335,15 @@ def test_decide_orders_emits_entry_for_held_unentered_in_zone():
         our_positions={},
         nav=1_000_000_000,
         current_prices={"VHM": 20500.0, "PVT": 20500.0},
+        new_entry_top_n=10,  # override the new default of 1
     )
     symbols_bought = {o["symbol"] for o in all_orders if o["side"] == "NB"}
+    # Both PVT (in /signal-static-suggest) and VHM (held but not in
+    # suggest) qualify for entry. The new rules only filter by:
+    #   - last_recomment = "Khuyến nghị đầu tư"  (test default)
+    #   - top_n over the combined signal list
+    # VHM qualifies via _expand_signals_with_held_unentered when its
+    # current price is in the buy zone.
     assert symbols_bought == {"PVT", "VHM"}
 
 

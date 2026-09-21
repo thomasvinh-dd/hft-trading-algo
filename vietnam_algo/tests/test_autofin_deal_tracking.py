@@ -22,6 +22,7 @@ def _make_signal(
     supply_to: float = 10000.0,
     tp_from: float = 12000.0,
     sl_to: float = 9000.0,
+    last_recomment: str = "Khuyến nghị đầu tư",
 ) -> dict:
     raw = {
         "_id": int(deal_id) if deal_id.isdigit() else deal_id,
@@ -36,7 +37,7 @@ def _make_signal(
         "sL_F": sl_to - 100,
         "sL_T": sl_to,
         "rateForNav": rate_for_nav,
-        "lastRecomment": "test",
+        "lastRecomment": last_recomment,
         "isWaittingBuy": False,
         "isWaittingSell": False,
         "numberOfProfit": 0,

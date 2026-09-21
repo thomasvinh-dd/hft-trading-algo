@@ -29,6 +29,7 @@ def _make_signal(
     sl_to: float | None = None,
     rating: float = 0.0,
     win_rate: float = 0.0,
+    last_recomment: str = "Khuyến nghị đầu tư",
 ) -> object:
     sl_to = sl_to if sl_to is not None else supply_to - 100
     raw = {
@@ -42,7 +43,7 @@ def _make_signal(
         "sL_F": sl_to - 100,
         "sL_T": sl_to,
         "rateForNav": rate_for_nav,
-        "lastRecomment": "test",
+        "lastRecomment": last_recomment,
         "isWaittingBuy": is_waiting_buy,
         "isWaittingSell": is_waiting_sell,
         "numberOfProfit": 0,
@@ -1371,6 +1372,7 @@ def test_plan_new_positions_remaining_cash_shared_across_signals():
         nav_vnd=100_000_000,
         our_positions={},
         available_cash_vnd=20_000_000,
+        top_n=10,
     )
     buys = [r for r in rows if r["side"] == "NB"]
     buys_by_sym = {b["symbol"]: b for b in buys}
