@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -456,7 +458,7 @@ class AutofinClient:
         signals_url: str = DEFAULT_SIGNALS_URL,
         notifications_url: str = DEFAULT_NOTIFICATIONS_URL,
         token_cache_path: Path = DEFAULT_TOKEN_CACHE_PATH,
-        request_timeout: float = 15.0,
+        request_timeout: float = 30.0,
     ) -> None:
         self.email = email
         self.password = password
@@ -590,36 +592,98 @@ class AutofinClient:
         needed: the server can revoke a token that we still consider
         fresh (e.g. password change, manual logout).
 
+        Also retries transient NETWORK errors with exponential backoff:
+        SSL handshake timeouts (\"<urlopen error _ssl.c:983...>\"),
+        socket timeouts, connection resets, DNS failures, etc.
+        autofin's API occasionally times out at the TCP/SSL layer
+        (the operator saw this on 2026-09-19 — every cycle got
+        "<urlopen error _ssl.c:983: The handshake operation timed
+        out>" for ~30 minutes). One-shot failure dropped entire
+        closing-signals / holding / signal-static-suggest polls,
+        which meant the bot missed full-close triggers for those
+        deals until the next cycle. Now we retry up to
+        ``max_network_retries`` times with backoff 0.5s, 1s, 2s.
+
         Returns the parsed JSON payload (dict or list). Raises the
-        last HTTP error if both attempts fail.
+        last error if all retries (network + token) are exhausted.
         """
         effective_timeout = timeout if timeout is not None else self.request_timeout
+        max_network_retries = int(os.environ.get(
+            "AUTOFIN_NETWORK_RETRIES", "3",
+        ))
         last_exc: Exception | None = None
-        for attempt in range(2):
-            if attempt == 0:
-                # Fast path: use the (proactively-refreshed) in-memory
-                # or cached token.
-                token = self.get_token()
-            else:
-                # Reactive refresh path: skip the cache (which may
-                # still appear valid locally) and force a fresh login.
-                self._token = None
-                self._token_exp = None
-                self._token_saved_at = None
-                token = self._ensure_token(force_refresh=True)
-            req = urllib.request.Request(url, method="GET", headers=dict(headers))
-            req.add_header("Cookie", f"token={token}")
-            try:
-                with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-                    return json.loads(raw) if raw else {}
-            except urllib.error.HTTPError as exc:
-                last_exc = exc
-                # Only refresh on 401, and only once (attempt==0).
-                if exc.code == 401 and attempt == 0:
-                    continue
-                raise
-        # Defensive: loop should always raise on second attempt failure.
+        # Outer loop: token-refresh attempts (0..1).
+        # Each iteration may consume several network retries
+        # before giving up. We track the total retry count so the
+        # caller can log "after N retries" if it fails.
+        network_attempts_used = 0
+        for attempt in range(2):  # token-refresh attempts
+            # Inner loop: network retries. Each iteration tries
+            # one network request; on transient error, sleep and
+            # retry up to ``max_network_retries`` times.
+            for net_attempt in range(max_network_retries):
+                network_attempts_used += 1
+                if attempt == 0 and net_attempt == 0:
+                    # Fast path on the very first try of the first
+                    # token attempt: use the (proactively-refreshed)
+                    # in-memory or cached token.
+                    token = self.get_token()
+                elif net_attempt == 0:
+                    # Second token attempt: skip the cache and
+                    # force a fresh login (server revoked our token).
+                    self._token = None
+                    self._token_exp = None
+                    self._token_saved_at = None
+                    token = self._ensure_token(force_refresh=True)
+                req = urllib.request.Request(url, method="GET", headers=dict(headers))
+                req.add_header("Cookie", f"token={token}")
+                try:
+                    with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
+                        return json.loads(raw) if raw else {}
+                except urllib.error.HTTPError as exc:
+                    last_exc = exc
+                    # Only refresh on 401, and only once. Other HTTP
+                    # errors propagate immediately.
+                    if exc.code == 401 and attempt == 0 and net_attempt == 0:
+                        break  # break inner loop, refresh token
+                    # 5xx (server errors) → transient, retry
+                    if exc.code in (502, 503, 504) and net_attempt < max_network_retries - 1:
+                        time.sleep(0.5 * (2 ** net_attempt))
+                        continue
+                    raise
+                except (
+                    urllib.error.URLError,
+                    TimeoutError,
+                    ConnectionError,
+                    socket.timeout,
+                    socket.gaierror,
+                    ssl.SSLError,
+                    OSError,
+                ) as exc:
+                    last_exc = exc
+                    if net_attempt < max_network_retries - 1:
+                        time.sleep(0.5 * (2 ** net_attempt))
+                        continue
+                    # All network retries exhausted. Wrap the
+                    # exception so the caller's alert
+                    # ("⚠️ autofin fetch_X failed: ...") makes it
+                    # clear we tried multiple times. We use a
+                    # urllib.error.URLError with a string reason
+                    # (instead of mutating the original args) because
+                    # Python's URLError.__str__ ignores
+                    # ``args[1:]`` and always wraps in
+                    # "<urlopen error ...>" — see CPython source.
+                    reason_str = (
+                        f"{exc} (after {network_attempts_used} attempts)"
+                    )
+                    raise urllib.error.URLError(reason_str)
+            # End of inner (network retry) loop. If we got here, the
+            # break was taken — token was 401, refresh it and retry
+            # with the new token. Otherwise, this iteration also raised.
+        # Defensive: if both token attempts fail without a clear
+        # raise (shouldn't happen given the raise statements above),
+        # surface the last exception.
         raise last_exc if last_exc else RuntimeError(f"Autofin request failed: {url}")
 
     def fetch_signals(

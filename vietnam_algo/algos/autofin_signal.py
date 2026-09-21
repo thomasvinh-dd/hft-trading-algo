@@ -1746,6 +1746,13 @@ class AutofinSignalAdapter(StrategyAdapter):
         try:
             closing = client.fetch_closing(page_size=50)
         except Exception as exc:
+            # _request_with_token_refresh already retries transient
+            # network errors (SSL handshake timeout, connection
+            # refused, etc.) up to AUTOFIN_NETWORK_RETRIES times with
+            # exponential backoff before propagating. If we still
+            # see this alert, it means every retry failed — likely
+            # autofin's API is genuinely down, not just slow. See
+            # libs/autofin_signals.py:_request_with_token_refresh.
             notify(f"⚠️ autofin fetch_closing failed: {exc}")
             closing = []
         # Build the closing_ids set: deal_id = _id + ":" + symbol.

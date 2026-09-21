@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 import sys
 import time
 import unittest
@@ -217,6 +219,115 @@ class AutofinTokenRefreshTests(unittest.TestCase):
         # The retry triggered exactly one refresh (the second 401
         # is not eligible for a third attempt).
         self.assertEqual(login.call_count, 1)
+
+    def test_request_helper_retries_transient_ssl_errors(self) -> None:
+        """SSL handshake timeouts (the error that flooded the operator's
+        Telegram on 2026-09-19) MUST be retried with exponential
+        backoff. Without this, every cycle of autofin API slowness
+        dropped the entire closing-signals poll, missing full-close
+        triggers until the next 60s cycle.
+
+        We simulate the SSL handshake timeout via ``ssl.SSLError``
+        raised through ``urllib.error.URLError`` — same shape the
+        real Python ``urllib`` produces for "handshake operation
+        timed out".
+        """
+        good_payload = self._login_payload()
+        with patch.object(AutofinClient, "_post_login") as login:
+            client = AutofinClient(
+                email="u@example.com",
+                password="p",
+                token_cache_path=self.cache_path,
+            )
+            client._save_tokens(good_payload)
+            login.return_value = good_payload
+
+            # First two attempts raise SSL handshake timeout;
+            # third attempt succeeds.
+            import socket
+            import ssl as _ssl
+            responses = [
+                urllib.error.URLError(
+                    _ssl.SSLError("The handshake operation timed out")
+                ),
+                socket.timeout("read timed out"),
+                {"data": [{"_id": 42, "symbol": "HPG"}]},
+            ]
+
+            def fake_urlopen(req, timeout=None):
+                resp = responses.pop(0)
+                if isinstance(resp, Exception):
+                    raise resp
+                m = MagicMock()
+                m.read.return_value = json.dumps(resp).encode()
+                m.__enter__ = lambda s: m
+                m.__exit__ = lambda s, *a: None
+                return m
+
+            with patch(
+                "vietnam_algo.libs.autofin_signals.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ):
+                with patch(
+                    "vietnam_algo.libs.autofin_signals.time.sleep"
+                ) as sleep:
+                    out = client._request_with_token_refresh(
+                        "http://x/api",
+                        headers={"accept": "*/*"},
+                    )
+        self.assertEqual(out, {"data": [{"_id": 42, "symbol": "HPG"}]})
+        # Backoff was applied between retries: 1s, 2s
+        sleep.assert_any_call(0.5)  # net_attempt=1 → 0.5 * 2^0 = 0.5
+        sleep.assert_any_call(1.0)  # net_attempt=2 → 0.5 * 2^1 = 1.0
+        # No token refresh was needed (we got success on third attempt).
+        login.assert_not_called()
+
+    def test_request_helper_gives_up_after_max_network_retries(self) -> None:
+        """If every network attempt fails, the helper raises with
+        the original SSL error message augmented with the retry
+        count so the caller's alert ("⚠️ autofin fetch_X failed")
+        makes it clear we tried multiple times.
+        """
+        good_payload = self._login_payload()
+        with patch.object(AutofinClient, "_post_login") as login:
+            client = AutofinClient(
+                email="u@example.com",
+                password="p",
+                token_cache_path=self.cache_path,
+            )
+            client._save_tokens(good_payload)
+            login.return_value = good_payload
+
+            import ssl as _ssl
+            responses = [
+                urllib.error.URLError(
+                    _ssl.SSLError("The handshake operation timed out")
+                )
+                for _ in range(5)  # more than max retries
+            ]
+
+            def fake_urlopen(req, timeout=None):
+                raise responses.pop(0)
+
+            with patch(
+                "vietnam_algo.libs.autofin_signals.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ):
+                with patch(
+                    "vietnam_algo.libs.autofin_signals.time.sleep"
+                ):
+                    with self.assertRaises(urllib.error.URLError) as ctx:
+                        client._request_with_token_refresh(
+                            "http://x/api",
+                            headers={"accept": "*/*"},
+                        )
+        # The exception message now reports how many attempts we made.
+        msg = str(ctx.exception)
+        self.assertIn("after", msg)
+        self.assertIn("attempts", msg)
+        # Default AUTOFIN_NETWORK_RETRIES=3 → 3 attempts in the
+        # first token pass before raising.
+        self.assertIn("3 attempts", msg)
 
 
 
