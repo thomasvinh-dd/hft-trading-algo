@@ -120,9 +120,17 @@ pytest suite. 398 tests across 36 files. Tests import via
 ```
 
 The bots are launched as long-lived processes (see
-`scripts/launch_autofin2.sh` and `scripts/launch_momentum.sh`) and
+`scripts/launch_autofin.sh` and `scripts/launch_momentum.sh`) and
 loop on a 60-sec sleep. They read the `data_ready_for_eod` sentinel
 the common-sync job stamps and wait for it before doing EOD work.
+
+Each launcher sources a per-bot Telegram env file
+(`vietnam_algo/env/.env.telegram` for momentum,
+`vietnam_algo/env/.env.telegram-autofin` for autofin) so the two
+strategies post to distinct chats. The shared DNSE creds come
+from `vietnam_algo/env/.env.dnse-secrets`. See
+`vietnam_algo/tests/test_per_bot_telegram_env.py` for the
+regression guards.
 
 ## Adding a new algorithm
 

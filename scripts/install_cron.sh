@@ -47,19 +47,25 @@ _env_sources='set -a && . '"$PROJECT_DIR"'/vietnam_algo/env/.env.dnse-secrets &&
 
 # Bot watchdog: every 5 minutes, check if the autofin and momentum
 # trading bots are alive. If a bot's PID is gone, relaunch it via
-# the standard launcher scripts. This catches silent crashes that
-# don't write a traceback (e.g. OOM kill, parent reaping) and was
-# the root cause of the 2026-09-22 "no SOD / no EOD" report —
-# the old momentum bot had been dead for ~24 hours before anyone
-# noticed, because the cron was restarting the autofin side but
-# nobody owned the momentum side.
+# the canonical launcher scripts under ``scripts/``. This catches
+# silent crashes that don't write a traceback (e.g. OOM kill,
+# parent reaping) and was the root cause of the 2026-09-22
+# "no SOD / no EOD" report — the old momentum bot had been dead
+# for ~24 hours before anyone noticed, because the cron was
+# restarting the autofin side but nobody owned the momentum side.
 #
 # Detection: ``pgrep -f 'auto-trading-bot.*--strategy <name>'`` —
 # returns 0 if at least one matching process exists.
-# Action:     if not, ``bash $PROJECT_DIR/launch_<name>.sh`` —
-# these scripts already pkill stale instances, so the watchdog
+# Action:     if not, ``bash $PROJECT_DIR/scripts/launch_<name>.sh``
+# — these scripts already pkill stale instances, source the per-bot
+# Telegram env files, and pass through DNSE creds, so the watchdog
 # can safely run them on every tick without leaking processes.
-_watchdog='pgrep -f "auto-trading-bot.*--strategy autofin_signal" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: autofin bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/launch_autofin.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1); pgrep -f "auto-trading-bot.*--strategy momentum" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: momentum bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/launch_momentum.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1)'
+#
+# Why ``scripts/launch_*``: the operator also keeps a legacy copy
+# at ``/root/launch_*.sh`` for ad-hoc manual restarts. The watchdog
+# only ever invokes the canonical git-tracked version so any
+# future tweak to launcher behaviour is picked up automatically.
+_watchdog='pgrep -f "auto-trading-bot.*--strategy autofin_signal" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: autofin bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/scripts/launch_autofin.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1); pgrep -f "auto-trading-bot.*--strategy momentum" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: momentum bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/scripts/launch_momentum.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1)'
 
 case "${1:-}" in
     --print)
