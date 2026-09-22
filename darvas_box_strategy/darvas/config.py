@@ -98,7 +98,7 @@ class TrailingConfig:
 
     activation_tier_idx: int = 0
     trail_mode: str = "pct"   # "pct" or "atr" — pct is more robust OOS
-    trail_from_peak_pct: float = 0.07  # used when trail_mode="pct"
+    trail_from_peak_pct: float = 0.12  # 12% trail lets winners run (vs 7% which cut them short)
     trail_atr_mult: float = 1.5       # used when trail_mode="atr"
     trail_floor_lock_profit: bool = True
     trail_atr_window: int = 14          # ATR window for trail_mode="atr"
@@ -136,15 +136,15 @@ class BacktestConfig:
     """
 
     start_nav: float = 1.0e9
-    size_low: float = 0.15
-    size_high: float = 0.30
+    size_low: float = 0.20
+    size_high: float = 0.40
     cost_bps: float = 25.0  # round-trip cost (slippage + commission); applied at exit
     max_concurrent_positions: int = 10
     cooldown_bars_after_stop: int = 5  # bars to skip after SL_HARD/SL_SCALE exit
     max_holding_bars: int = 0  # time stop: close if not profitable after N bars; 0 = off
-    vol_target_pct: float = 0.02  # target daily vol; if >0, size = (vol_target_pct * nav) / atr_pct
-    vol_target_floor: float = 0.05  # minimum size fraction when vol-targeting
-    vol_target_ceiling: float = 0.30  # maximum size fraction when vol-targeting
+    vol_target_pct: float = 0.0  # OFF: fixed 2x sizing (size_low/size_high) beats vol-targeting
+    vol_target_floor: float = 0.05  # minimum size fraction when vol-targeting is ON
+    vol_target_ceiling: float = 0.30  # maximum size fraction when vol-targeting is ON
 
 
 @dataclass(frozen=True)

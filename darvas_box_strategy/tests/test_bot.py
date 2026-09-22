@@ -116,9 +116,11 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(cfg.backtest.cost_bps, 25.0)
         self.assertEqual(cfg.backtest.max_concurrent_positions, 10)
         self.assertEqual(cfg.backtest.cooldown_bars_after_stop, 5)
-        self.assertEqual(cfg.backtest.vol_target_pct, 0.02)
+        self.assertEqual(cfg.backtest.vol_target_pct, 0.0)  # OFF: fixed sizing wins
+        self.assertEqual(cfg.backtest.size_low, 0.20)
+        self.assertEqual(cfg.backtest.size_high, 0.40)
         self.assertEqual(cfg.trailing.trail_mode, "pct")
-        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.07)
+        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.12)  # let winners run
 
 
 class ReportFormatTests(unittest.TestCase):

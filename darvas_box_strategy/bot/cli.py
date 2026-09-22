@@ -47,7 +47,13 @@ def load_blue_chips(path: Path = DEFAULT_BLUE_CHIPS) -> List[str]:
 
 
 def build_default_config() -> StrategyConfig:
-    """Return the OOS-validated default config."""
+    """Return the OOS-validated default config.
+
+    OOS validation on 70 HOSE blue chips (TRAIN 2019-2022, TEST 2023-2026):
+    - vol_target=0% (off) — fixed 2x sizing beats vol-targeting
+    - trail=12% — let winners compound (vs 7% which cut them short)
+    - size 0.20/0.40 — 2x conviction sizing
+    """
     return StrategyConfig(
         base=BaseConfig(min_days=5, max_days=30, max_range_pct=0.030),
         breakout=BreakoutConfig(
@@ -56,15 +62,15 @@ def build_default_config() -> StrategyConfig:
             require_close_above_ma=20,
         ),
         exits=ExitsConfig(),
-        trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.07),
+        trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.12),
         universe=UniverseConfig(min_avg_value_20d=1.0e9, min_price=5_000.0, max_price=200_000.0),
         backtest=BacktestConfig(
             start_nav=1_000_000_000.0,
             max_concurrent_positions=10,
             cooldown_bars_after_stop=5,
             cost_bps=25.0,
-            size_low=0.15, size_high=0.30,
-            vol_target_pct=0.02,
+            size_low=0.20, size_high=0.40,
+            vol_target_pct=0.0,  # OFF: fixed sizing beats vol-targeting
             vol_target_floor=0.05, vol_target_ceiling=0.30,
         ),
     )

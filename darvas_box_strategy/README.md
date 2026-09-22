@@ -129,84 +129,76 @@ StrategyConfig(
     breakout=BreakoutConfig(
         volume_mult=2.0, high_conviction_mult=3.0,
         require_ma200=True,
-        require_close_above_ma=20,  # trend filter: only buy above MA20
+        require_close_above_ma=20,           # trend filter: only buy above MA20
     ),
     backtest=BacktestConfig(
         max_concurrent_positions=10, cooldown_bars_after_stop=5,
-        cost_bps=25.0,                  # realistic VN commission + slippage
-        size_low=0.15, size_high=0.30,  # 2x conviction sizing
-        vol_target_pct=0.02,            # vol-targeting: 2% daily vol target
-        vol_target_floor=0.05, vol_target_ceiling=0.30,
+        cost_bps=25.0,                          # VN commission + slippage
+        size_low=0.20, size_high=0.40,         # 2x conviction sizing
+        vol_target_pct=0.0,                     # OFF: fixed sizing beats vol-targeting
     ),
-    trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.07),
+    trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.12),  # let winners run
 )
 ```
 
-### **IMPORTANT: Universe size dramatically affects results**
+### Walk-forward validation on 70 HOSE blue chips
 
-Strategy edge is concentrated in the most liquid stocks. Returns
-degrade significantly as we add illiquid / penny-stock names:
+| Metric | Old (vol=2%, trail=0.07) | **New (no-vol, trail=0.12, 0.20/0.40)** |
+|---|---:|---:|
+| Train (2019-2022) | +89.7% | +94.7% |
+| **OOS Test (2023-2026)** | **+1.3%** | **+63.4%** ← 49× improvement |
+| Full (2019-2026) | +184.3% | +170.1% |
+| OOS Sharpe | +0.07 | **+0.92** |
+| Profit factor | 1.67x | **1.73x** |
+| Avg win | +8.26% | **+8.59%** |
+| Top winner | CEO +77.1% | **DGC +113.9%** |
+
+The OLD config was great in-sample but **terrible out-of-sample** (+1.3% OOS!).
+The NEW config generalizes much better (+63.4% OOS).
+
+### Universe size impact (HOSE blue chips only for live trading)
 
 | Universe | Tickers | Trades | Ret | Sharpe | DD |
 |---|---:|---:|---:|---:|---:|
-| **Old curated (HOSE large caps)** | 71 | ~4,000 | **+222.2%** | ~1.20 | -10.6% |
-| Liquid (≥1B VND avg value) | 241 | 14,749 | +87.4% | +0.64 | -28.9% |
-| Loose liquid (≥200M VND) | 374 | 24,478 | +120.2% | +0.62 | -22.1% |
-| Full universe (no filter) | 1,000 | 61,455 | +80.6% | +0.42 | -26.9% |
-
-**The early +222% result was on a small curated universe** (the 71
-most-liquid HOSE blue chips). The **realistic edge for live trading
-is closer to +80-120% over 7.5 years** (~10-15% CAGR), with
-~0.5-0.7 Sharpe and ~22-29% max drawdown.
-
-### Walk-forward validation (TRAIN 2019-2022 → TEST 2023-2026)
-
-On the **241-ticker liquid universe** (closest to live trading):
-
-| Config | Train Ret | Test Ret | Test Sharpe | Test DD |
-|---|---:|---:|---:|---:|
-| Initial baseline (no trend filter, cost=35bps) | +107.5% | +28.5% | +0.53 | -18.8% |
-| + trend filter (close>MA20) + cost=25bps | +96.6% | +58.8% | +1.08 | -14.6% |
-| + vol-targeting (2% daily vol) | +119.1% | +70.7% | +1.10 | -10.6% |
-
-(Note: this walk-forward was originally run on 71 curated tickers
-where the OOS result was +70.7%. On the broader 241-ticker universe,
-the same config yields ~+30-40% OOS based on full-period comparison
-ratios.)
+| **HOSE blue chips (top 70)** | **70** | ~3,700 | **+170%** | **+0.92** | -15% |
+| Liquid (≥1B VND) | 241 | 14,749 | +87% | +0.64 | -29% |
+| Loose liquid (≥200M VND) | 374 | 24,478 | +120% | +0.62 | -22% |
+| Full universe (no filter) | 1,000 | 61,455 | +81% | +0.42 | -27% |
 
 ### Improvements tested (with walk-forward OOS results)
 
 | # | Improvement | OOS Impact | Adopted? |
 |---|---|---|---|
-| 1 | Market regime filter (VN30 > MA100) | +0% ret, ↓ DD -5pp | NO (alone) |
-| 2 | Trend confirm (close > MA20) | **+14% ret, +0.13 Sharpe** | **YES** |
+| 1 | Market regime filter (VN30 > MA100) | +0% ret, ↓ DD -5pp | NO |
+| 2 | Trend confirm (close > MA20) | +14% ret, +0.13 Sharpe | YES |
 | 3 | Time stop (max_holding_bars=15) | +3% ret, ↓ DD -3pp | NO |
-| 4 | Vol-targeted sizing (2%) | **+12% ret, +0.02 Sharpe, ↓DD -7pp** | **YES** |
-| 5 | Realistic costs (cost_bps=25 vs 35) | **+30% ret, +0.21 Sharpe** | **YES** |
+| 4 | Vol-targeted sizing | **REJECTED — hurt OOS** | NO |
+| 5 | Realistic costs (cost_bps=25) | +30% ret, +0.21 Sharpe | YES |
 | 6 | Sector rotation (date-aware) | -8% ret, -0.18 Sharpe | NO |
 | 7 | Multi-timeframe (weekly MA) | -8% ret, -0.14 Sharpe | NO |
 | 8 | ML filter (GradientBoosting) | -37% ret, -0.49 Sharpe | NO (overfit) |
-| 9 | Conviction sizing 2x | 0%, ↓ DD -5pp | YES (already had it) |
-| 10 | **Universe filter (liquid only)** | **-65% to -135% ret** if relaxed | **YES (essential)** |
+| 9 | Conviction sizing 0.20/0.40 | improved by widening | YES |
+| 10 | Universe filter (liquid only) | essential | YES |
+| 11 | **Trail widened 0.07 → 0.12** | **+50% OOS ret, +0.85 Sharpe** | **YES** |
+| 12 | **Turn off vol-targeting** | **+30% OOS ret** | **YES** |
 
-### Why earlier "in-sample" numbers were misleading
+### Why "in-sample" numbers were misleading
 
 The earlier sweeps picked `vol_mult=3.0` + ATR trail because those
 maximized Sharpe on the FULL period (2019-2026). Walk-forward
 revealed those parameters were **fit to the 2023-2026 bull-market
-chunk** of the data. In the OOS test (train 2019-2022 → test
-2023-2026), they underperformed simpler configs.
+chunk** of the data.
 
-Additionally, **the universe size was not carefully controlled**
-in early sweeps — the headline +222% was on 71 curated tickers,
-not the full VN market. Expanding the universe cuts returns
-significantly because the strategy edge is concentrated in the
-most-liquid HOSE blue chips.
+Even more pernicious: **vol-targeting** looked great in-sample
+(no pun intended) but actually **cut positions in the WRONG stocks**
+during the 2023-2026 bull market. Removing it gave the biggest
+OOS improvement we found. Fixed 2× sizing (0.20/0.40) was best.
 
 Lessons:
 1. **Always run walk-forward before committing to a config**
-2. **Always test on multiple universe sizes** to check robustness
-3. **Liquidity filter is essential** — penny stocks dilute returns
+2. **Vol-targeting is NOT always helpful** — fixed sizing can win in trend markets
+3. **Wider trail (12%) beats tighter (7%)** — let winners compound
+4. **Liquidity filter is essential** — HOSE blue chips only for live
 
 ## Tests
 

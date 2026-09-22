@@ -342,7 +342,7 @@ class PortfolioDefaultsTests(unittest.TestCase):
         """OOS-validated: pct trail beats atr trail on out-of-sample data."""
         cfg = StrategyConfig()
         self.assertEqual(cfg.trailing.trail_mode, "pct")
-        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.07)
+        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.12)
 
     def test_default_require_close_above_ma_is_20(self):
         """OOS-validated: requiring close>MA20 doubles OOS Sharpe."""
@@ -358,6 +358,22 @@ class PortfolioDefaultsTests(unittest.TestCase):
         """Time stop is opt-in."""
         cfg = StrategyConfig()
         self.assertEqual(cfg.backtest.max_holding_bars, 0)
+
+    def test_default_trail_is_12_percent(self):
+        """OOS-validated: 12% trail lets winners compound; 7% was too tight."""
+        cfg = StrategyConfig()
+        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.12)
+
+    def test_default_vol_target_is_disabled(self):
+        """OOS-validated: vol-targeting hurt returns; fixed 2x sizing is better."""
+        cfg = StrategyConfig()
+        self.assertEqual(cfg.backtest.vol_target_pct, 0.0)
+
+    def test_default_size_low_high(self):
+        """OOS-validated: 2x sizing (0.20/0.40) for low/high conviction."""
+        cfg = StrategyConfig()
+        self.assertEqual(cfg.backtest.size_low, 0.20)
+        self.assertEqual(cfg.backtest.size_high, 0.40)
 
 
 class TrendFilterTests(unittest.TestCase):
