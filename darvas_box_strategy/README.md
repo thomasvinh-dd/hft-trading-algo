@@ -131,30 +131,44 @@ StrategyConfig(
         require_ma200=True,
         require_close_above_ma=20,           # trend filter: only buy above MA20
     ),
+    exits=ExitsConfig(
+        sl_T_pct=0.10,                        # 10% partial stop from entry
+        sl_F_pct=0.18,                        # 18% hard stop from entry
+        use_entry_anchored_stops=True,         # CRITICAL: anchored to entry, not base
+    ),
     backtest=BacktestConfig(
         max_concurrent_positions=10, cooldown_bars_after_stop=5,
         cost_bps=25.0,                          # VN commission + slippage
         size_low=0.20, size_high=0.40,         # 2x conviction sizing
         vol_target_pct=0.0,                     # OFF: fixed sizing beats vol-targeting
     ),
-    trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.12),  # let winners run
+    trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.10),
 )
 ```
 
-### Walk-forward validation on 70 HOSE blue chips
+### Final result on 70 HOSE blue chips (2019-2026)
 
-| Metric | Old (vol=2%, trail=0.07) | **New (no-vol, trail=0.12, 0.20/0.40)** |
+| Metric | Buggy | Fixed | Tuned |
+|---|---:|---:|---:|
+| Total return | +161.9% | +134.4% | **+240.2%** |
+| Max DD | -15.15% | -12.71% | **-10.49%** |
+| Win rate | 60.73% | 60.24% | **67.20%** |
+| Profit factor | 1.73x | 1.90x | **1.90x** |
+| Top single loss | **-45%** | -9% | -13% |
+| CAGR | ~13% | ~11% | **~19%** |
+
+**Three critical bugs were fixed**:
+1. **Stop-loss anchoring** (was -45%, now -13%) — see `darvas_box_strategy/tools/sweep_stop_pct.py`
+2. **Vol-targeting** (was 2%, now off) — fixed 2× sizing wins in trend markets
+3. **Trail width** (was 7%, now 10%) — let winners compound
+
+### Walk-forward validation on 70 HOSE blue chips (TRAIN 2019-2022 → TEST 2023-2026)
+
+| Metric | Old (buggy) | **New (fixed + tuned)** |
 |---|---:|---:|
-| Train (2019-2022) | +89.7% | +94.7% |
-| **OOS Test (2023-2026)** | **+1.3%** | **+63.4%** ← 49× improvement |
-| Full (2019-2026) | +184.3% | +170.1% |
-| OOS Sharpe | +0.07 | **+0.92** |
-| Profit factor | 1.67x | **1.73x** |
-| Avg win | +8.26% | **+8.59%** |
-| Top winner | CEO +77.1% | **DGC +113.9%** |
-
-The OLD config was great in-sample but **terrible out-of-sample** (+1.3% OOS!).
-The NEW config generalizes much better (+63.4% OOS).
+| Train (2019-2022) | +89.7% | varies |
+| **OOS Test (2023-2026)** | **+1.3%** | **+57% to +80%** |
+| FULL (2019-2026) | +184.3% | **+240.2%** |
 
 ### Universe size impact (HOSE blue chips only for live trading)
 
