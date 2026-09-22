@@ -774,6 +774,7 @@ def run_auto_bot(
             print(f"[{now.isoformat()}] Sending start-of-day briefing")
             try:
                 from vietnam_algo.libs.notifier import start_of_day_message
+                _items: list[dict[str, object]] = []
                 # For backtest-driven strategies (momentum), the dry-run
                 # apply (rescale + walk full backtest CSV) only runs in
                 # _apply_dry_run_fills via the EOD path. If the start-
