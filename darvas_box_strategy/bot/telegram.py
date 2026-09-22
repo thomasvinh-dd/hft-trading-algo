@@ -22,10 +22,38 @@ class TelegramConfig:
 
 
 def load_telegram_config(env_path: Optional[Path] = None) -> Optional[TelegramConfig]:
-    """Load Telegram credentials from env vars or .env.telegram file."""
+    """Load Telegram credentials.
+
+    Lookup order:
+    1. Environment variables (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    2. darvas_box_strategy/data/bot.env (this strategy's dedicated bot)
+    3. The env_path argument (defaults to vietnam_algo/env/.env.telegram)
+
+    The darvas-specific file is checked first so the new dedicated bot
+    is independent of the autofin bot. The autofin .env is used as a
+    fallback so existing setups continue to work.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+    # Try darvas-specific file first (this bot's dedicated credentials).
+    # __file__ = darvas_box_strategy/bot/telegram.py
+    # parents[1] = darvas_box_strategy/
+    darvas_env = Path(__file__).resolve().parents[1] / "data" / "bot.env"
+    if (not token or not chat_id) and darvas_env.exists():
+        for line in darvas_env.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k == "TELEGRAM_BOT_TOKEN" and not token:
+                token = v
+            elif k == "TELEGRAM_CHAT_ID" and not chat_id:
+                chat_id = v
+
+    # Fall back to the autofin .env (shared file)
     if (not token or not chat_id) and env_path and env_path.exists():
         for line in env_path.read_text().splitlines():
             line = line.strip()
