@@ -973,63 +973,64 @@ def run_auto_bot(
             # Fall back to the legacy generate_live_orders() for momentum /
             # hybrid strategies.
             #
-            # For backtest-style strategies (momentum), the EOD should
-            # always pick the latest trades in the backtest CSV (or
-            # ``today`` if those happen to align). Forcing
-            # ``trade_date=today`` produces an empty plan when the
-            # backtest hasn't been refreshed to the calendar's current
-            # trading day — see the 2026-09-11 incident where the
-            # latest_orders file ended up empty and the briefing then
-            # read a stale Sept 7 fallback. Letting adapters decide
-            # (most pass None → falls back to the latest CSV row) is
-            # safer for dry-run/replay bots.
+            # Pass ``trade_date=today`` so the momentum backtest's
+            # ``export_orders_for_date`` filters the historical CSV to
+            # TODAY's date. Without it, the bot silently picks the
+            # latest CSV row (often days stale — e.g. 2026-09-16
+            # when today is 2026-09-22) and reports that as
+            # "tradeDate", which the operator flagged as confusing.
+            # When the backtest has no signals for today, count=0
+            # and the briefing reports "No orders today" — which is
+            # the truthful answer for a backtest-driven strategy.
+            #
+            # In dry-run mode the bot's order sizes should match
+            # the operator's configured NAV scale (DRY_RUN_INITIAL_NAV
+            # / MOCK_NAV), not the 1B-VND default. Otherwise the
+            # backtest emits 6200-share BUYs that get scaled to
+            # 620 shares (6.2 lots — invalid Vietnamese board lot)
+            # during the dry-run fill replay, leaving the
+            # order file's quantity out of sync with the
+            # resulting position. Run the backtest directly at
+            # the dry-run NAV so lots come out native.
+            # Pre-2026-09-19 the runner did this via a
+            # post-hoc qty_scale in _apply_dry_run_fills, which
+            # broke the board-lot rounding and produced the
+            # mismatch the operator flagged in the
+            # BSR 6200/620 incident.
+            strat_cfg = strategy_config
+            if not live_submit:
+                try:
+                    from vietnam_algo.libs.dry_run_state import (
+                        init_dry_run_state,
+                    )
+                    _dry = init_dry_run_state(
+                        engine_config.dataDir,
+                        strategy_name=strategy_name,
+                    )
+                    if (
+                        _dry.initial_nav > 0
+                        and _dry.initial_nav
+                        < float(strat_cfg.initialCash) * 0.99
+                    ):
+                        from dataclasses import replace as _dc_replace
+                        strat_cfg = _dc_replace(
+                            strat_cfg,
+                            initialCash=float(_dry.initial_nav),
+                        )
+                        print(
+                            f"[eod] dry-run: backtest initialCash "
+                            f"overridden to {strat_cfg.initialCash:,.0f}"
+                        )
+                except Exception as exc:
+                    print(f"[eod] dry-run initialCash override failed: {exc}")
             if strategy_adapter is not None:
                 result = strategy_adapter.generate_orders(
-                    engine_config, strategy_config,
+                    engine_config, strat_cfg, trade_date=today,
                 )
             else:
-                # In dry-run mode the bot's order sizes should match
-                # the operator's configured NAV scale (DRY_RUN_INITIAL_NAV
-                # / MOCK_NAV), not the 1B-VND default. Otherwise the
-                # backtest emits 6200-share BUYs that get scaled to
-                # 620 shares (6.2 lots — invalid Vietnamese board lot)
-                # during the dry-run fill replay, leaving the
-                # order file's quantity out of sync with the
-                # resulting position. Run the backtest directly at
-                # the dry-run NAV so lots come out native.
-                # Pre-2026-09-19 the runner did this via a
-                # post-hoc qty_scale in _apply_dry_run_fills, which
-                # broke the board-lot rounding and produced the
-                # mismatch the operator flagged in the
-                # BSR 6200/620 incident.
-                strat_cfg = strategy_config
-                if not live_submit:
-                    try:
-                        from vietnam_algo.libs.dry_run_state import (
-                            init_dry_run_state,
-                        )
-                        _dry = init_dry_run_state(
-                            engine_config.dataDir,
-                            strategy_name=strategy_name,
-                        )
-                        if (
-                            _dry.initial_nav > 0
-                            and _dry.initial_nav
-                            < float(strat_cfg.initialCash) * 0.99
-                        ):
-                            from dataclasses import replace as _dc_replace
-                            strat_cfg = _dc_replace(
-                                strat_cfg,
-                                initialCash=float(_dry.initial_nav),
-                            )
-                            print(
-                                f"[eod] dry-run: backtest initialCash "
-                                f"overridden to {strat_cfg.initialCash:,.0f}"
-                            )
-                    except Exception as exc:
-                        print(f"[eod] dry-run initialCash override failed: {exc}")
                 result = generate_live_orders(
-                    engine_config, strat_cfg, strategy_name=strategy_name,
+                    engine_config, strat_cfg, trade_date=today,
+                    strategy_name=strategy_name,
                     notify_telegram=False,
                 )
             print(result)
