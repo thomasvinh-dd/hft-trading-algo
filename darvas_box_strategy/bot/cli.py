@@ -51,8 +51,9 @@ def build_default_config() -> StrategyConfig:
 
     OOS validation on 70 HOSE blue chips (TRAIN 2019-2022, TEST 2023-2026):
     - vol_target=0% (off) — fixed 2x sizing beats vol-targeting
-    - trail=12% — let winners compound (vs 7% which cut them short)
+    - trail=10% — let winners compound after partial cut
     - size 0.20/0.40 — 2x conviction sizing
+    - sl_T=10%, sl_F=18% — entry-anchored stops (was base-anchored, buggy)
     """
     return StrategyConfig(
         base=BaseConfig(min_days=5, max_days=30, max_range_pct=0.030),
@@ -61,8 +62,12 @@ def build_default_config() -> StrategyConfig:
             require_ma200=True, min_history_days=200,
             require_close_above_ma=20,
         ),
-        exits=ExitsConfig(),
-        trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.12),
+        exits=ExitsConfig(
+            sl_T_pct=0.10,        # 10% partial stop from entry
+            sl_F_pct=0.18,        # 18% hard stop from entry
+            use_entry_anchored_stops=True,  # CRITICAL: not the ancient base
+        ),
+        trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.10),
         universe=UniverseConfig(min_avg_value_20d=1.0e9, min_price=5_000.0, max_price=200_000.0),
         backtest=BacktestConfig(
             start_nav=1_000_000_000.0,

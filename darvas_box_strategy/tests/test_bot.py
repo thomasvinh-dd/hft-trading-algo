@@ -120,7 +120,10 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(cfg.backtest.size_low, 0.20)
         self.assertEqual(cfg.backtest.size_high, 0.40)
         self.assertEqual(cfg.trailing.trail_mode, "pct")
-        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.12)  # let winners run
+        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.10)  # trail after partial cut
+        self.assertTrue(cfg.exits.use_entry_anchored_stops)
+        self.assertEqual(cfg.exits.sl_T_pct, 0.10)
+        self.assertEqual(cfg.exits.sl_F_pct, 0.18)
 
 
 class ReportFormatTests(unittest.TestCase):

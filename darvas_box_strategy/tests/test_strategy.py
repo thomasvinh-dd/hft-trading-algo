@@ -342,7 +342,7 @@ class PortfolioDefaultsTests(unittest.TestCase):
         """OOS-validated: pct trail beats atr trail on out-of-sample data."""
         cfg = StrategyConfig()
         self.assertEqual(cfg.trailing.trail_mode, "pct")
-        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.12)
+        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.10)
 
     def test_default_require_close_above_ma_is_20(self):
         """OOS-validated: requiring close>MA20 doubles OOS Sharpe."""
@@ -359,15 +359,22 @@ class PortfolioDefaultsTests(unittest.TestCase):
         cfg = StrategyConfig()
         self.assertEqual(cfg.backtest.max_holding_bars, 0)
 
-    def test_default_trail_is_12_percent(self):
-        """OOS-validated: 12% trail lets winners compound; 7% was too tight."""
+    def test_default_trail_is_10_percent(self):
+        """OOS-validated: 10% trail (with 10% partial cut) balances winners and losers."""
         cfg = StrategyConfig()
-        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.12)
+        self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.10)
 
     def test_default_vol_target_is_disabled(self):
         """OOS-validated: vol-targeting hurt returns; fixed 2x sizing is better."""
         cfg = StrategyConfig()
         self.assertEqual(cfg.backtest.vol_target_pct, 0.0)
+
+    def test_default_stops_are_entry_anchored(self):
+        """Stops must be anchored to entry, not ancient base."""
+        cfg = StrategyConfig()
+        self.assertTrue(cfg.exits.use_entry_anchored_stops)
+        self.assertEqual(cfg.exits.sl_T_pct, 0.10)
+        self.assertEqual(cfg.exits.sl_F_pct, 0.18)
 
     def test_default_size_low_high(self):
         """OOS-validated: 2x sizing (0.20/0.40) for low/high conviction."""
@@ -590,17 +597,17 @@ class StopLossAnchoringTests(unittest.TestCase):
         )
 
     def test_entry_anchored_stops_far_run(self):
-        """If entry is 10x base, stops must still be -7%/-12% from entry."""
+        """If entry is 10x base, stops must still be -10%/-18% from entry."""
         # Bug scenario: base at 1,200, entry at 12,000 (10x run-up)
         # With entry-anchored stops:
         cfg = StrategyConfig()
-        expected_sl_T = 12000 * (1 - cfg.exits.sl_T_pct)  # 11,160
-        expected_sl_F = 12000 * (1 - cfg.exits.sl_F_pct)  # 10,560
+        expected_sl_T = 12000 * (1 - cfg.exits.sl_T_pct)  # 12000 * 0.90 = 10,800
+        expected_sl_F = 12000 * (1 - cfg.exits.sl_F_pct)  # 12000 * 0.82 = 9,840
 
-        # sl_T should be 7% below entry, NOT 45% below
-        self.assertAlmostEqual(expected_sl_T, 11160)
-        self.assertGreater(expected_sl_T, 12000 * 0.90)  # > 90% of entry (max -10%)
-        self.assertGreater(expected_sl_F, 12000 * 0.85)  # > 85% of entry (max -15%)
+        # sl_T should be 10% below entry, NOT 45% below
+        self.assertAlmostEqual(expected_sl_T, 10800)
+        self.assertGreater(expected_sl_T, 12000 * 0.85)  # > 85% of entry (max -15%)
+        self.assertGreater(expected_sl_F, 12000 * 0.78)  # > 78% of entry (max -22%)
 
     def test_legacy_stops_would_be_dangerous(self):
         """Document the bug: legacy stops at (base_low + entry)/2 would be -45%."""

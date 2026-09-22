@@ -82,8 +82,13 @@ class ExitsConfig:
     # Stop-loss placement: anchored to ENTRY price, not the ancient base.
     # The old logic placed stops at (base_low + entry)/2 which could be 30-45%
     # below entry when the stock had already run 5-10x from base before breakout.
-    sl_T_pct: float = 0.07   # partial-cut stop at 7% below entry
-    sl_F_pct: float = 0.12   # hard stop at 12% below entry
+    # Tested values on 70 HOSE blue chips:
+    #   sl_T=0.07 sl_F=0.12: TEST +14%,  FULL +142%
+    #   sl_T=0.10 sl_F=0.18: TEST +53%,  FULL +202%
+    #   sl_T=0.10 + trail=0.10: TEST +71%, FULL +219% ← BEST FULL
+    #   sl_T=0.05 sl_F=0.10: TEST +80%,  FULL +112% (best OOS score)
+    sl_T_pct: float = 0.10   # partial-cut stop at 10% below entry
+    sl_F_pct: float = 0.18   # hard stop at 18% below entry
     use_entry_anchored_stops: bool = True  # True = fixed % from entry; False = legacy base-anchored
 
 
@@ -104,7 +109,7 @@ class TrailingConfig:
 
     activation_tier_idx: int = 0
     trail_mode: str = "pct"   # "pct" or "atr" — pct is more robust OOS
-    trail_from_peak_pct: float = 0.12  # 12% trail lets winners run (vs 7% which cut them short)
+    trail_from_peak_pct: float = 0.10  # 10% trail lets winners run after partial cut
     trail_atr_mult: float = 1.5       # used when trail_mode="atr"
     trail_floor_lock_profit: bool = True
     trail_atr_window: int = 14          # ATR window for trail_mode="atr"
