@@ -244,8 +244,18 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
         shares = max_volume
 
     sl_buffer = 1.0 - cfg.exits.sl_buffer_pct
-    sl_F = base.base_low * sl_buffer
-    sl_T = (base.base_low + breakout_bar.close) / 2.0
+    if cfg.exits.use_entry_anchored_stops:
+        # Anchor stops to ENTRY price (entry-anchored). Avoids the bug where
+        # stops placed at ancient base_low result in -45% "stop-losses" when
+        # the stock has already moved 5-10x from base before the breakout.
+        sl_F = breakout_bar.close * (1.0 - cfg.exits.sl_F_pct)
+        sl_T = breakout_bar.close * (1.0 - cfg.exits.sl_T_pct)
+    else:
+        # Legacy: base-anchored stops. Can be -30% to -45% from entry if the
+        # stock has run far from the base. Kept for backward compatibility
+        # but NOT recommended.
+        sl_F = base.base_low * sl_buffer
+        sl_T = (base.base_low + breakout_bar.close) / 2.0
 
     return Signal(
         ticker=base.ticker,

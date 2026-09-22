@@ -79,6 +79,12 @@ class ExitsConfig:
     scale_out_pct_at_sl_T: float = 0.5
     scale_out_pct_at_midpoint: float = 0.5
     sl_buffer_pct: float = 0.01
+    # Stop-loss placement: anchored to ENTRY price, not the ancient base.
+    # The old logic placed stops at (base_low + entry)/2 which could be 30-45%
+    # below entry when the stock had already run 5-10x from base before breakout.
+    sl_T_pct: float = 0.07   # partial-cut stop at 7% below entry
+    sl_F_pct: float = 0.12   # hard stop at 12% below entry
+    use_entry_anchored_stops: bool = True  # True = fixed % from entry; False = legacy base-anchored
 
 
 @dataclass(frozen=True)

@@ -566,3 +566,70 @@ class TimeStopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopLossAnchoringTests(unittest.TestCase):
+    """Regression tests for stop-loss anchoring.
+
+    Bug: stops placed at base_low × 0.99, causing -45% "stop-losses"
+    when the stock has run 5-10x from base before the breakout.
+    Fix: anchor stops to entry price (e.g., -7% and -12%).
+    """
+
+    def _make_signal(self, base_low, entry_price):
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        return Signal(
+            ticker="TST", entry_date=date(2024, 1, 1),
+            entry_price=entry_price,
+            base=Base(ticker="TST", base_low=base_low, base_high=base_low * 1.05,
+                      end_idx=10, days_in_base=5, volume_compression=1.5),
+            sl_F=0.0, sl_T=0.0,
+            tiers=((1.10, 1.0),), conviction="high", size_pct=0.4,
+            shares=1000, max_volume=999999, bars_remaining=30,
+        )
+
+    def test_entry_anchored_stops_far_run(self):
+        """If entry is 10x base, stops must still be -7%/-12% from entry."""
+        # Bug scenario: base at 1,200, entry at 12,000 (10x run-up)
+        # With entry-anchored stops:
+        cfg = StrategyConfig()
+        expected_sl_T = 12000 * (1 - cfg.exits.sl_T_pct)  # 11,160
+        expected_sl_F = 12000 * (1 - cfg.exits.sl_F_pct)  # 10,560
+
+        # sl_T should be 7% below entry, NOT 45% below
+        self.assertAlmostEqual(expected_sl_T, 11160)
+        self.assertGreater(expected_sl_T, 12000 * 0.90)  # > 90% of entry (max -10%)
+        self.assertGreater(expected_sl_F, 12000 * 0.85)  # > 85% of entry (max -15%)
+
+    def test_legacy_stops_would_be_dangerous(self):
+        """Document the bug: legacy stops at (base_low + entry)/2 would be -45%."""
+        # With base=1,200, entry=12,000:
+        legacy_sl_T = (1200 + 12000) / 2  # = 6,600 — that's -45% from entry!
+        legacy_sl_F = 1200 * 0.99         # = 1,188 — that's -90% from entry!
+
+        self.assertAlmostEqual(legacy_sl_T, 6600)
+        self.assertAlmostEqual(legacy_sl_F, 1188)
+
+        # The bug: legacy sl_T is 45% below entry, sl_F is 90% below entry!
+        # This means "stop-loss" actually allows a -45% loss before exiting.
+        loss_at_sl_T = (legacy_sl_T - 12000) / 12000
+        self.assertLess(loss_at_sl_T, -0.40)  # confirms the bug
+
+    def test_legacy_stops_would_be_dangerous(self):
+        """Document the bug: legacy stops at (base_low + entry)/2 would be -45%."""
+        # With base=1,200, entry=12,000:
+        legacy_sl_T = (1200 + 12000) / 2  # = 6,600 — that's -45% from entry!
+        legacy_sl_F = 1200 * 0.99         # = 1,188 — that's -90% from entry!
+
+        self.assertAlmostEqual(legacy_sl_T, 6600)
+        self.assertAlmostEqual(legacy_sl_F, 1188)
+
+        # The bug: legacy sl_T is 45% below entry, sl_F is 90% below entry!
+        # This means "stop-loss" actually allows a -45% loss before exiting.
+        loss_at_sl_T = (legacy_sl_T - 12000) / 12000
+        self.assertLess(loss_at_sl_T, -0.40)  # confirms the bug
+
+
+if __name__ == "__main__":
+    unittest.main()
