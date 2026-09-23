@@ -847,9 +847,43 @@ def _plan_partial_close_orders(
         #       actions for the same nP. Without (b), a bot that
         #       tracked an nP but never had valid qty (so couldn't
         #       act) would silently never re-fire on the same step.
+        #   (c) — 2026-09-22 ASP incident: autofin publishes the
+        #       ``lastRecomment`` BEFORE updating the /signal-deals
+        #       history with the matching "Tỷ trọng X %" line. The
+        #       first poll after the suggestion therefore sees
+        #       recomment text but a STALE fraction (the previous
+        #       step's %), undersells the deal. On a later cycle
+        #       autofin catches up the history, but the recomment
+        #       is now unchanged so (a) and (b) don't fire. Force
+        #       a re-fire when the recomment matches a previously-
+        #       seen step but the latest fraction differs from the
+        #       one we last sold at.
         nP_changed = cur_nP > last_nP
         recomment_changed = bool(rec) and rec != last_rec
-        if not (nP_changed or recomment_changed):
+        fraction_changed = False
+        if (
+            not (nP_changed or recomment_changed)
+            and last_nP >= 0
+            and action.action in ("take_profit_lap", "reduce_lap")
+            and autofin_fractions is not None
+        ):
+            last_partial_fraction = sig.get("_last_partial_fraction")
+            if last_partial_fraction is not None:
+                cur_fraction = autofin_fractions.get(did)
+                if (
+                    cur_fraction is not None
+                    and abs(cur_fraction - float(last_partial_fraction)) > 1e-6
+                ):
+                    fraction_changed = True
+                    print(
+                        f"[autofin_signal] {sig.get('symbol','?')}: "
+                        f"recomment + nP match but fraction changed "
+                        f"{last_partial_fraction:.2%} → "
+                        f"{cur_fraction:.2%} (autofin published step "
+                        f"before updating history) — re-firing partial "
+                        f"close"
+                    )
+        if not (nP_changed or recomment_changed or fraction_changed):
             continue
 
         # Use the live position qty, NOT the stale _our_qty. This is
@@ -892,6 +926,9 @@ def _plan_partial_close_orders(
         elif action.action == "capital_protect":
             # action.percent is in % (e.g. 28.57) → convert to fraction
             delta = int(our_qty * action.percent / 100)
+            # Mirror the tp/reduce branch's fraction tracking so the
+            # fraction-change detection covers capital_protect too.
+            fraction = float(action.percent) / 100.0
         else:
             continue
 
@@ -928,6 +965,11 @@ def _plan_partial_close_orders(
         sig["_last_numberOfProfit"] = cur_nP
         sig["_last_recomment"] = rec
         sig["_our_qty"] = max(0, our_qty - delta)
+        # Track the fraction we sold at so the next cycle can detect
+        # an autofin-side lag where the recomment text was published
+        # before the /signal-deals history was updated. See the
+        # 2026-09-22 ASP incident.
+        sig["_last_partial_fraction"] = fraction
 
     return rows
 

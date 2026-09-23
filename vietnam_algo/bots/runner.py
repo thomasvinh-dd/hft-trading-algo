@@ -550,7 +550,19 @@ def run_auto_bot(
                          "loan_package_id": loan_package_id},
                 local_date=local_date(bot_start_time),
                 occurred_at=bot_start_time)
+    # Sleep at the TOP of the loop so any ``continue`` statements below
+    # still respect the cadence. The previous layout put time.sleep at
+    # the bottom, which meant the SOD/EOD data-ready gates'
+    # ``if not data_ready: continue`` jumped back to the top and spun
+    # without ever sleeping — the 2026-09-23 incident that filled the
+    # log to 6 GB before common_sync re-stamped the sentinel. First
+    # iteration is skipped so ``--once`` mode still terminates
+    # immediately without a phantom pre-cycle sleep.
+    first_iter = True
     while True:
+        if not first_iter:
+            time.sleep(sleep_seconds)
+        first_iter = False
         now = vietnam_now()
         today = local_date(now)
         state = load_state(engine_config.dataDir, strategy_name=strategy_name)
@@ -740,28 +752,22 @@ def run_auto_bot(
             # hasn't run yet today. We re-use the data_ready_for_eod
             # sentinel that's stamped after the owner's sync.
             #
-            # IMPORTANT: set ``data_ready = False`` and ``continue``
-            # AFTER the whole block, not from inside the wait print
-            # (see 2026-09-17 incident: a direct ``continue`` here
-            # bypassed the ``time.sleep(sleep_seconds)`` at the bottom
-            # of the while-loop, hammering the log at ~16k prints/sec
-            # until the disk filled). The same flag-then-continue-at-end
-            # pattern is used for the EOD wait block below.
+            # 2026-09-23 review: the previous age threshold
+            # ``> 60 * 18`` (18 hours) was always breached on the
+            # first SOD after the cron run, because common_sync fires
+            # at 13:15 ICT and SOD fires at 09:00 ICT — ~19h 45min
+            # apart. The bot then tight-looped waiting on the sentinel
+            # (the ``continue`` bypassed the bottom-of-loop sleep; that
+            # sleep now lives at the top of the loop, but the age
+            # threshold was still wrong by design). Now we only gate
+            # on sentinel existence — common_sync refuses to stamp on
+            # bad sync days, so a stale sentinel means genuine data
+            # trouble, and waiting until the next 13:15 cron is OK.
             data_ready = True
             if not engine_config.syncData:
                 try:
-                    from datetime import datetime as _dt_sod, timezone as _tz_sod
-                    def _utc_now_sod() -> _dt_sod:
-                        return _dt_sod.now(tz=_tz_sod.utc)
                     _ready = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
-                    if not _ready.exists() or (
-                        _ready.exists()
-                        and (
-                            _utc_now_sod().timestamp() - _ready.stat().st_mtime
-                        )
-                        / 60
-                        > 60 * 18
-                    ):
+                    if not _ready.exists():
                         print(
                             f"[{now.isoformat()}] waiting for data-sync owner "
                             f"to refresh prices before start-of-day briefing"
@@ -909,6 +915,27 @@ def run_auto_bot(
                     # close, new entry, full close) — see
                     # AutofinSignalAdapter._notify_new_orders.
                     print(f"[{now.isoformat()}] poll result: {poll_result.get('count', 0)} orders planned")
+                    # Mid-day polls also need to apply the planned orders
+                    # to the dry-run state immediately. Without this,
+                    # the JSON is overwritten with [] on the next poll
+                    # (which plans nothing new) and the partial close
+                    # is never applied to the simulated portfolio —
+                    # so the EOD's positions section keeps showing the
+                    # pre-close qty and the operator can't see what was
+                    # actually sold during the day. See the 2026-09-22
+                    # ASP partial-close incident where the Telegram
+                    # alert said "SELL 100 ASP" but the EOD showed
+                    # ASP qty unchanged.
+                    if not live_submit and isinstance(poll_result, dict):
+                        try:
+                            _apply_dry_run_fills(
+                                poll_result, engine_config, account_no,
+                                strategy_config, strategy_name=strategy_name,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[{now.isoformat()}] mid-day dry-run apply failed: {exc}"
+                            )
                 except Exception as exc:
                     notify(
                         "\n".join(
@@ -1202,4 +1229,6 @@ def run_auto_bot(
 
         if once:
             return
-        time.sleep(sleep_seconds)
+        # NB: time.sleep lives at the TOP of the while-loop now (see
+        # the comment block above the loop). This makes any
+        # ``continue`` in the gates above still respect the cadence.
