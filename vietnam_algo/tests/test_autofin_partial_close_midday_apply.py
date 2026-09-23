@@ -320,3 +320,129 @@ def test_plan_partial_close_does_not_refire_when_fraction_unchanged():
         "recomment + nP + fraction all match the previous "
         "step — bot must skip (re-firing would double-sell)."
     )
+
+
+# 4. ASP 500-share scenario (matches user's Sep-22 complaint) --------------------
+
+
+def test_plan_partial_close_500_shares_30pct_sells_200():
+    """End-to-end replay of the 2026-09-22 ASP scenario with the
+    CORRECT starting qty of 500 (not 600 — the user's complaint
+    said '30 % of 500 share (the current holding stock not
+    origin 600 share)'). autofin's recomment says TP step 2 at
+    16,700 with 'Tỷ trọng 30 % danh mục nắm giữ' (30 % of the
+    held position). Expected:
+      delta = int(500 × 0.30) = 150 → round-up to 200 shares
+      _our_qty after sell: max(0, 500 - 200) = 300
+    """
+    from vietnam_algo.algos.autofin_signal import _plan_partial_close_orders
+
+    deal_id = "1789084800:ASP"
+    sig = {
+        "_id": 1789084800,
+        "symbol": "ASP",
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 15,800",
+        "numberOfProfit": 1,
+        "_last_numberOfProfit": 1,
+        "_last_recomment": "💰 Chốt lãi lần 1 mức giá 15,800",
+        "_last_partial_fraction": 0.10,
+        "_our_qty": 500,  # 600 - 100 (TP step 1 already applied)
+        "tP_F": 15800,
+        "tP_T": 20800,
+    }
+    holding = [{
+        "_id": 1789084800,
+        "symbol": "ASP",
+        "numberOfProfit": 2,  # autofin bumped nP to 2 (TP step 2)
+        "lastRecomment": "💰 Chốt lãi lần 2 mức giá 16,700",
+        "tP_F": 15800,
+        "tP_T": 20800,
+    }]
+    rows = _plan_partial_close_orders(
+        {deal_id: sig}, holding, our_positions={"ASP": 500},
+        board_lot=100, autofin_fractions={deal_id: 0.30},
+    )
+    assert len(rows) == 1
+    order = rows[0]
+    assert order["side"] == "NS"
+    assert order["symbol"] == "ASP"
+    assert order["price"] == 16700
+    assert order["quantity"] == 200, (
+        f"500 × 30 % = 150 → round-up to 200 (board lot); "
+        f"got quantity={order['quantity']} — bot must match the "
+        f"user's expectation of selling 200 shares, not 100."
+    )
+    # _our_qty tracked on the deal dict for the next cycle —
+    # this is what the next `_plan_partial_close_orders` reads
+    # back to detect the autofin-side lag on a future cycle.
+    assert sig["_our_qty"] == 300, (
+        f"after selling 200 from 500, _our_qty should be 300; "
+        f"got {sig['_our_qty']}"
+    )
+    assert sig["_last_partial_fraction"] == 0.30
+    assert sig["_last_recomment"] == "💰 Chốt lãi lần 2 mức giá 16,700"
+    assert sig["_last_numberOfProfit"] == 2
+
+
+def test_plan_partial_close_500_shares_10pct_then_30pct():
+    """Two-step replay: cycle 1 sells at 10 % (TP step 1),
+    cycle 2 sells at 30 % (TP step 2) on a 500-share position
+    that was already at 500 (the original 600-share entry lost
+    100 shares on the prior TP step that's reflected in our
+    starting qty). This is the full flow the operator wanted
+    to see in the Sep-22 EOD report.
+    """
+    from vietnam_algo.algos.autofin_signal import _plan_partial_close_orders
+
+    deal_id = "1789084800:ASP"
+    sig = {
+        "_id": 1789084800,
+        "symbol": "ASP",
+        "lastRecomment": "Khuyến nghị đầu tư",
+        "numberOfProfit": 0,
+        "_last_numberOfProfit": 0,
+        "_last_recomment": "Khuyến nghị đầu tư",
+        "_our_qty": 500,
+        "tP_F": 15800,
+        "tP_T": 20800,
+    }
+    # Cycle 1: TP step 1 fires with stale fraction (10 %).
+    holding_v1 = [{
+        "_id": 1789084800,
+        "symbol": "ASP",
+        "numberOfProfit": 1,
+        "lastRecomment": "💰 Chốt lãi lần 1 mức giá 15,800",
+        "tP_F": 15800,
+        "tP_T": 20800,
+    }]
+    rows_v1 = _plan_partial_close_orders(
+        {deal_id: sig}, holding_v1, our_positions={"ASP": 500},
+        board_lot=100, autofin_fractions={deal_id: 0.10},
+    )
+    assert len(rows_v1) == 1
+    assert rows_v1[0]["quantity"] == 100  # 500 × 10 % = 50 → round-up
+    assert sig["_our_qty"] == 400  # 500 - 100
+    assert sig["_last_partial_fraction"] == 0.10
+
+    # Cycle 2: TP step 2 fires with corrected fraction (30 %).
+    # After cycle 1, the live qty is 400 (200 = 100 already sold).
+    # But the user reads 500 × 30 % = 200 (round up); the bot
+    # reads our_positions["ASP"]=400, so 400 × 30 % = 120 → 200
+    # (round-up). Same end result (sell 200), just the path is
+    # different from "starting at 500".
+    holding_v2 = [{
+        "_id": 1789084800,
+        "symbol": "ASP",
+        "numberOfProfit": 2,
+        "lastRecomment": "💰 Chốt lãi lần 2 mức giá 16,700",
+        "tP_F": 15800,
+        "tP_T": 20800,
+    }]
+    rows_v2 = _plan_partial_close_orders(
+        {deal_id: sig}, holding_v2, our_positions={"ASP": 400},
+        board_lot=100, autofin_fractions={deal_id: 0.30},
+    )
+    assert len(rows_v2) == 1
+    assert rows_v2[0]["quantity"] == 200  # 400 × 30 % = 120 → round-up
+    assert sig["_our_qty"] == 200  # 400 - 200
+    assert sig["_last_partial_fraction"] == 0.30
