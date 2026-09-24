@@ -337,8 +337,12 @@ def latest_partial_close_fraction(raw_deal: dict[str, Any]) -> tuple[float, str]
             # as fallback when "Tỷ trọng" is missing — but we want
             # to distinguish "autofin said 1/3" from "autofin said
             # nothing". Heuristic: re-check the raw text.
+            # autofin uses BOTH "Tỷ trọng" (capital, in TP-step
+            # history) and "tỉ trọng" / "tỷ trọng" (lowercase, in
+            # reduce-event history). The old capital-only check
+            # missed HNM-style reduce events, falling back to 1/3.
             raw_text = ev.get("raw", "")
-            if "Tỷ trọng" in raw_text:
+            if "Tỷ trọng" in raw_text or "tỷ trọng" in raw_text or "tỉ trọng" in raw_text:
                 return ev["fraction"], raw_text
             # No explicit "Tỷ trọng" → library fell back to 1/3.
             # Trust autofin's UI default (1/3).

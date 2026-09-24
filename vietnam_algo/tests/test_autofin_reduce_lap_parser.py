@@ -161,6 +161,41 @@ def test_plan_reduce_lap_sells_50pct_of_position():
     )
 
 
+def test_latest_partial_close_fraction_case_insensitive_for_reduce():
+    """2026-09-24 HNM incident: ``latest_partial_close_fraction``
+    returned 1/3 (the default) for HNM's reduce event because
+    it checked ``"Tỷ trọng" in raw_text`` (capital T) but autofin
+    emits lowercase "tỉ trọng" (U+1EC9 with hook) in reduce events.
+    The reduce event parser DID extract fraction=0.50 from the
+    regex, but the case-sensitive ``in`` check rejected it as
+    "no explicit Tỷ trọng → fall back to 1/3".
+
+    Fix: the helper now accepts "Tỷ trọng", "tỷ trọng", AND
+    "tỉ trọng" so reduce events get their real fraction.
+    """
+    from vietnam_algo.libs.autofin_signals import latest_partial_close_fraction
+
+    raw_deal = {
+        "hisRecomment": [
+            "<div><p>Ngày khuyến nghị: 14/09/2026 🟢 Vùng mua: 8,900 - 9,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 1 "
+            "Giá: 8,100 - Nắm giữ: 4 ngày Lỗ: -10.99 %</p></div>",
+        ],
+        "statusDeal": {"price_Open": 9000, "price_Closed": 0},
+    }
+    result = latest_partial_close_fraction(raw_deal)
+    assert result is not None, (
+        "reduce event should yield a fraction, not None"
+    )
+    fraction, raw_text = result
+    assert fraction == 0.50, (
+        f"reduce event 'Hạ 50 %' must yield 0.50; got {fraction} "
+        f"(autofin's explicit 50 % was being discarded by a "
+        f"case-sensitive 'Tỷ trọng' in-raw check)."
+    )
+    assert "tỉ trọng" in raw_text
+
+
 # Helper shim — we don't import pytest at the top so this file
 # stays import-clean for ad-hoc `python -m pytest` runs.
 def pytest_approx(v):
