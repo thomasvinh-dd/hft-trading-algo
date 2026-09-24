@@ -123,7 +123,19 @@ def _extract_partial_fraction(
     """
     import re as _re
     if recomment_text:
-        m = _re.search(r"T\u1ef7\s*tr\u1ecdng\s*([\d\.,]+)\s*%", recomment_text)
+        # autofin uses both "Tỷ trọng" (capital, in TP-step text) and
+        # "tỷ trọng" / "tỉ trọng" (lowercase + U+1EC9 vs U+1EF7, in
+        # the reduce-event body). The OLD regex used a capital T and a
+        # y-with-dot, so it missed "tỷ trọng" entirely. The new one is
+        # case-insensitive and accepts both y-with-dot (U+1EF7) and
+        # i-with-dot (U+1EC9). The whitespace between the
+        # consonant and "trọng" is optional because autofin emits
+        # both "tỷtrọng" and "tỷ trọng" / "tỉ trọng".
+        m = _re.search(
+            r"t[ỷỉy]\s*trọng\s*([\d\.,]+)\s*%",
+            recomment_text,
+            _re.IGNORECASE,
+        )
         if m:
             try:
                 pct = float(m.group(1).replace(",", ""))
@@ -682,7 +694,20 @@ _PARTIAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.IGNORECASE,
     ), "stop_loss_close"),
     (re.compile(r"Chốt lãi lần\s*(\d+)(?:\s*mức giá\s*([\d,\.]+))?", re.IGNORECASE), "take_profit_lap"),
-    (re.compile(r"Hạ tỷ trọng lần\s*(\d+)", re.IGNORECASE), "reduce_lap"),
+    # Reduce event: autofin's format is "[HNM] ⚠️ Hạ 50 % tỉ trọng lần 1"
+    # — the % sits BETWEEN "Hạ" and "tỉ/tỷ trọng", with the lap number
+    # at the end. Older builds' regex `Hạ tỷ trọng lần\s*(\d+)` missed
+    # this format (no `%` between "Hạ" and "tỷ trọng") and the action
+    # was silently classified as ``unknown``, so the bot never issued
+    # the reduce. autofin's UI uses two spellings:
+    #   * "tỷ trọng" (y-with-dot + trọng, often no space)
+    #   * "tỉ trọng" (i-with-dot + space + trọng — `tỉ` is one char,
+    #     U+1EC9, NOT in the y-with-dot U+1EF7 family)
+    # We accept both. Group 1 = %, group 2 = lap.
+    (re.compile(
+        r"Hạ\s+([\d,\.]+)\s*%\s*t[ỷỉy]?\s*trọng\s+lần\s*(\d+)",
+        re.IGNORECASE,
+    ), "reduce_lap"),
     (re.compile(r"Chốt lãi\s*([\d,\.]+)\s*%\s*bảo toàn vốn", re.IGNORECASE), "capital_protect"),
     (re.compile(r"Đóng DEAL", re.IGNORECASE), "full_close"),
 )
@@ -738,9 +763,15 @@ def _parse_partial_close(recomment: str) -> PartialCloseAction:
         if action == "reduce_lap":
             # Reduce events often include a price on the next line as
             # "Giá: X - Nắm giữ: Y ngày". Try to extract it.
+            # The regex now captures (percent, lap): group 1 is the
+            # "X %" sell fraction, group 2 is the lap number.
             price_m = re.search(r"Giá\s*:\s*([\d,\.]+)", rec)
             price = _parse_vnd(price_m.group(1)) if price_m else 0.0
-            return PartialCloseAction(action=action, lap=int(m.group(1)), price=price)
+            pct = _parse_percent(m.group(1))
+            return PartialCloseAction(
+                action=action, lap=int(m.group(2)), price=price,
+                percent=pct,
+            )
         if action == "capital_protect":
             pct = _parse_percent(m.group(1))
             # capital_protect also includes a price: "tại P"
@@ -1047,8 +1078,19 @@ def _event_to_partial_orders(
     if our_qty <= 0:
         return []
 
-    if action.action in ("take_profit_lap", "reduce_lap"):
+    if action.action == "take_profit_lap":
+        # TP-step text never includes "Tỷ trọng X %" — autofin only
+        # publishes the price on the TP step ("Chốt lãi lần N mức giá P").
+        # Use the historical 1/3 default.
         delta = our_qty // 3
+    elif action.action == "reduce_lap":
+        # Reduce-event text always includes "Hạ X % tỉ/tỷ trọng" — use
+        # that percent directly. Fall back to 1/3 when the regex missed
+        # (shouldn't happen now that the regex covers both spellings).
+        if action.percent > 0:
+            delta = int(our_qty * action.percent / 100)
+        else:
+            delta = our_qty // 3
     elif action.action == "capital_protect":
         delta = int(our_qty * action.percent / 100)
     else:

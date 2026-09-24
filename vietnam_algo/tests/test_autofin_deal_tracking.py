@@ -139,9 +139,17 @@ def test_parse_partial_close_take_profit_lap_no_price():
 
 
 def test_parse_partial_close_reduce_lap():
-    a = _parse_partial_close("⚠️ Hạ tỷ trọng lần 2")
+    # autofin's actual format embeds the percent between "Hạ"
+    # and "tỷ/tỉ trọng": "[HNM] ⚠️ Hạ 50 % tỉ trọng lần 1".
+    # The OLD regex `Hạ tỷ trọng lần\s*(\d+)` matched the synthetic
+    # form (no %) but never real autofin output — that was the
+    # 2026-09-24 HNM-missed-signal incident. The new regex
+    # requires the percent and accepts both "tỷ trọng" and
+    # "tỉ trọng" spellings.
+    a = _parse_partial_close("⚠️ Hạ 30 % tỷ trọng lần 2")
     assert a.action == "reduce_lap"
     assert a.lap == 2
+    assert a.percent == 30.0
     assert a.price == 0.0
 
 
@@ -199,7 +207,7 @@ def test_partial_close_emits_sell_on_numberOfProfit_bump():
 
 
 def test_partial_close_uses_tpF_when_no_price_in_recomment():
-    """'Hạ tỷ trọng' has no price → fall back to tP_F from autofin.
+    """'Hạ X % tỷ trọng' has no price → fall back to tP_F from autofin.
 
     Holding endpoint returns raw VND; suggest endpoint returns thousands.
     Both should produce the same VND price.
@@ -209,7 +217,7 @@ def test_partial_close_uses_tpF_when_no_price_in_recomment():
     }
     autofin_holding = [{
         "_id": 222, "symbol": "POW", "numberOfProfit": 1,
-        "lastRecomment": "⚠️ Hạ tỷ trọng lần 2",
+        "lastRecomment": "⚠️ Hạ 30 % tỷ trọng lần 2",
         "tP_F": 15100, "sL_F": 12700,  # raw VND (holding endpoint)
     }]
     rows = _plan_partial_close_orders(our_deals, autofin_holding)
@@ -225,7 +233,7 @@ def test_partial_close_uses_tpF_in_thousands_when_small():
     }
     autofin_holding = [{
         "_id": 222, "symbol": "POW", "numberOfProfit": 1,
-        "lastRecomment": "⚠️ Hạ tỷ trọng lần 2",
+        "lastRecomment": "⚠️ Hạ 30 % tỷ trọng lần 2",
         "tP_F": 15.1, "sL_F": 12.7,  # thousands (suggest endpoint)
     }]
     rows = _plan_partial_close_orders(our_deals, autofin_holding)

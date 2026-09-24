@@ -95,15 +95,18 @@ class EventToPartialOrdersTests(unittest.TestCase):
         self.assertEqual(sell["quantity"], 400)
 
     def test_reduce_event(self):
-        """⚠️ Hạ 50 % → SELL 1/3 of position (default reduce delta)."""
-        # Use the exact autofin wording — "Hạ tỷ trọng" (y + ơ).
-        body = "[HII] ⚠️ Hạ tỷ trọng lần 1\nGiá: 9,500 - Nắm giữ: 6 ngày"
+        """⚠️ Hạ 50 % → SELL 50% of position (round-up to board lot)."""
+        # Use autofin's actual wording — the OLD regex required
+        # "Hạ tỷ trọng lần 1" (no %), which never matched real
+        # autofin output. autofin always emits the percent BETWEEN
+        # "Hạ" and "tỷ/tỉ trọng". See the 2026-09-24 HNM incident.
+        body = "[HII] ⚠️ Hạ 50 % tỷ trọng lần 1\nGiá: 9,500 - Nắm giữ: 6 ngày"
         ev = _event(body=body, tags=("SIGNAL", "TAK", "TRAILINGSTOP"))
         our = _our_deal("HII", qty=1600)
         orders = _event_to_partial_orders(ev.title, ev.body, our)
         self.assertEqual(len(orders), 1)
-        # Reduce: delta = qty // 3 = 533.
-        self.assertEqual(orders[0]["quantity"], 500)
+        # Reduce: 50 % × 1600 = 800, round-up to 100-lots = 800.
+        self.assertEqual(orders[0]["quantity"], 800)
 
     def test_no_symbol_in_body(self):
         """Body without [SYM] → no match → empty."""
