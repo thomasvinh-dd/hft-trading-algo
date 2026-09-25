@@ -8,6 +8,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -131,6 +132,125 @@ class CommonSyncAlertingTests(unittest.TestCase):
             errors = [(s, "ConnectionError: timeout") for s in symbols[:5]]  # 2.5%
             notify_mock = self._run_with_mocks(tmp, symbols, errors)
         self.assertFalse(notify_mock.called)
+
+
+class CommonSyncSentinelStampTests(unittest.TestCase):
+    """Sentinel stamp must be gated on the success rate of the
+    DNSE-accepted universe (total symbols minus the denylist).
+
+    Background (2026-09-23): the previous design stamped the sentinel
+    unconditionally at the end of the price sync — but the price sync
+    could finish with 0 successful fetches and still stamp the
+    sentinel, fooling downstream bots into thinking data was fresh.
+    Fix: only stamp when success rate (excluding denylisted symbols)
+    is >= the threshold (default 50%).
+    """
+
+    def _run_sentinel_test(
+        self,
+        tmp: Path,
+        symbols: list[str],
+        errors: list[tuple[str, str]],
+        denylist: set[str] | None = None,
+    ) -> tuple[bool, unittest.mock.Mock]:
+        (tmp / "prices").mkdir(parents=True, exist_ok=True)
+        for sym in symbols[:5]:
+            (tmp / "prices" / f"{sym}.json").write_text(
+                json.dumps({"source": "test", "symbol": sym, "count": 0, "items": []})
+            )
+        if denylist:
+            from vietnam_algo.libs.data import save_invalid_symbol_denylist
+            save_invalid_symbol_denylist(tmp, set(denylist))
+        fake_helpers = unittest.mock.MagicMock(run_ca_incremental=lambda **kw: [])
+        notify_mock = unittest.mock.MagicMock()
+        with unittest.mock.patch.object(common_sync, "DATA_DIR", tmp), \
+             unittest.mock.patch.object(common_sync, "TRADE_STATE", tmp / "live" / "common_sync_state.json"), \
+             unittest.mock.patch.object(common_sync, "SENTINEL_PATH", tmp / "live" / "data_ready_for_eod"), \
+             unittest.mock.patch.object(common_sync, "sync_symbols"), \
+             unittest.mock.patch.object(common_sync, "load_saved_symbols", return_value=symbols), \
+             unittest.mock.patch.object(common_sync, "is_trading_day", return_value=True), \
+             unittest.mock.patch.object(common_sync, "sync_prices_incremental", return_value=([], errors)), \
+             unittest.mock.patch("vietnam_algo.jobs.common_sync.notify", notify_mock), \
+             unittest.mock.patch.dict(sys.modules, {"vietnam_algo.jobs._helpers": fake_helpers}):
+            common_sync.run()
+        stamped = (tmp / "live" / "data_ready_for_eod").exists()
+        return stamped, notify_mock
+
+    def test_high_success_rate_stamps_sentinel(self) -> None:
+        with _TmpDataDir() as tmp:
+            symbols = [f"SYM{i:03d}" for i in range(100)]
+            errors = [(s, "ConnectionError: timeout") for s in symbols[:10]]  # 90% success
+            stamped, notify_mock = self._run_sentinel_test(tmp, symbols, errors)
+        self.assertTrue(stamped, "sentinel should be stamped at 90% success rate")
+        # Success path → no "sentinel NOT stamped" alert
+        warn_texts = [c.args[0] for c in notify_mock.call_args_list
+                      if c.args and "sentinel NOT stamped" in c.args[0]]
+        self.assertEqual(warn_texts, [])
+
+    def test_low_success_rate_skips_sentinel(self) -> None:
+        with _TmpDataDir() as tmp:
+            symbols = [f"SYM{i:03d}" for i in range(100)]
+            errors = [(s, "ConnectionError: timeout") for s in symbols[:80]]  # 20% success
+            stamped, notify_mock = self._run_sentinel_test(tmp, symbols, errors)
+        self.assertFalse(stamped, "sentinel must NOT be stamped below 50% success")
+        # Operator gets one warning per run
+        warn_texts = [c.args[0] for c in notify_mock.call_args_list
+                      if c.args and "sentinel NOT stamped" in c.args[0]]
+        self.assertEqual(len(warn_texts), 1)
+
+    def test_denylisted_symbols_excluded_from_denominator(self) -> None:
+        """If 80 of 100 symbols are on the denylist, we only sync 20;
+        if 5 of those 20 fail (75% success on the DNSE-accepted
+        universe), the sentinel MUST be stamped — even though 85/100
+        of the raw symbols 'failed'."""
+        with _TmpDataDir() as tmp:
+            symbols = [f"SYM{i:03d}" for i in range(100)]
+            # Pretend 80 symbols are denylisted (DNSE never carries them)
+            denylist = {f"SYM{i:03d}" for i in range(80)}
+            # Of the remaining 20, 5 fail with a real (non-400) error
+            errors = [(f"SYM{i:03d}", "ConnectionError: timeout") for i in range(85, 90)]
+            stamped, _ = self._run_sentinel_test(tmp, symbols, errors, denylist=denylist)
+        self.assertTrue(
+            stamped,
+            "sentinel should be stamped when 75% of the DNSE-accepted "
+            "universe succeeds, even though 85% of the raw universe "
+            "appears to have failed",
+        )
+
+    def test_denylisted_symbols_with_400s_dont_count_as_failures(self) -> None:
+        """400 'invalid symbol' errors are a denylist concern, not a
+        sync failure. The success-rate denominator excludes them via
+        the denylist filter; the numerator counts everything else as
+        success."""
+        with _TmpDataDir() as tmp:
+            symbols = [f"SYM{i:03d}" for i in range(100)]
+            # 50 symbols return 400 'invalid symbol' — these should be
+            # added to the denylist and NOT count against success rate.
+            invalid_err = (
+                'RuntimeError: DNSE GET /price/ohlc -> HTTP 400 '
+                '{"status":400,"code":"BAD_REQUEST","message":"invalid symbol"}'
+            )
+            errors = [(f"SYM{i:03d}", invalid_err) for i in range(50)]
+            stamped, _ = self._run_sentinel_test(tmp, symbols, errors)
+        self.assertTrue(
+            stamped,
+            "all 400 invalid symbol errors should be treated as "
+            "denylist additions, leaving 100% effective success rate",
+        )
+
+    def test_existing_threshold_env_override(self) -> None:
+        """``COMMON_SYNC_SENTINEL_MIN_SUCCESS_PCT`` overrides the default 50%."""
+        with _TmpDataDir() as tmp:
+            symbols = [f"SYM{i:03d}" for i in range(100)]
+            errors = [(s, "ConnectionError: timeout") for s in symbols[:60]]  # 40% success
+            # Default threshold: 50% → would NOT stamp
+            stamped_default, _ = self._run_sentinel_test(tmp, symbols, errors)
+            self.assertFalse(stamped_default)
+            # Loosened threshold: 25% → WOULD stamp
+            with unittest.mock.patch.dict(os.environ,
+                                          {"COMMON_SYNC_SENTINEL_MIN_SUCCESS_PCT": "25.0"}):
+                stamped_loose, _ = self._run_sentinel_test(tmp, symbols, errors)
+            self.assertTrue(stamped_loose)
 
 
 class LoadSharedTokenTests(unittest.TestCase):

@@ -11,9 +11,15 @@ in the trade-state file matches today, the job short-circuits and
 returns 0 immediately. The sentinel is re-stamped with the current
 mtime either way so stale sentinel lookups are robust.
 
-Run on cron:
-  - 08:30 ICT  : pre-market refresh (futures *shouldn't* yet be open)
-  - 15:15 ICT  : post-close refresh (CA events publish at 17:00)
+Run on cron (VPS-local CEST; see scripts/install_cron.sh):
+  - 08:15 CEST ≈ 13:15 ICT : pre-market refresh (futures *shouldn't* yet be open)
+  - 15:15 CEST ≈ 20:15 ICT : post-close refresh (CA events publish at 17:00 ICT)
+
+Sentinel stamp is now gated on sync success (>=50% of DNSE-accepted
+universe must have been fetched). When the stamp is skipped, the
+shared ``data_ready_for_eod`` is left untouched and a Telegram
+warning is sent — the momentum bot will then keep waiting on the
+previous (older) sentinel rather than acting on stale prices.
 
 Why this is its own job
 -----------------------
@@ -35,7 +41,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vietnam_algo.libs.corporate_actions import sync_corporate_actions_incremental
-from vietnam_algo.libs.data import DEFAULT_DATA_DIR, DEFAULT_PRICE_LIMIT, load_saved_symbols, sync_prices, sync_prices_incremental, sync_symbols
+from vietnam_algo.libs.data import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_PRICE_LIMIT,
+    is_invalid_symbol_error,
+    load_invalid_symbol_denylist,
+    load_saved_symbols,
+    save_invalid_symbol_denylist,
+    sync_prices,
+    sync_prices_incremental,
+    sync_symbols,
+)
 from vietnam_algo.libs.notifier import notify
 from vietnam_algo.libs.schedule import is_trading_day, local_date, vietnam_now
 
@@ -137,6 +153,14 @@ def run() -> CommonSyncResult:
     if not symbols:
         raise RuntimeError("sync_symbols returned 0 symbols — aborting")
 
+    # Surface the denylist size for log observability — when DNSE stops
+    # carrying a symbol it lands here and is skipped on future syncs.
+    denylist = load_invalid_symbol_denylist(DATA_DIR)
+    print(
+        f"[common_sync] denylist: {len(denylist)} symbol(s) "
+        f"previously rejected by DNSE as 'invalid symbol'"
+    )
+
     sleep_seconds = float(os.environ.get("COMMON_SYNC_SLEEP_SECONDS", "0.2"))
     incremental_limit = int(os.environ.get("COMMON_SYNC_INCREMENTAL_LIMIT", "10"))
     paths, fetch_errors = sync_prices_incremental(
@@ -146,24 +170,55 @@ def run() -> CommonSyncResult:
         sleep_seconds=sleep_seconds,
         incremental_limit=incremental_limit,
     )
+    # ``sync_prices_incremental`` extends the on-disk denylist itself
+    # when it sees new 400 'invalid symbol' errors. Reload so we have
+    # the up-to-date set for the success-rate calc below.
+    denylist_after = load_invalid_symbol_denylist(DATA_DIR)
+    new_invalid = denylist_after - denylist
+    if new_invalid:
+        print(
+            f"[common_sync] added {len(new_invalid)} new symbol(s) "
+            f"to the invalid-symbol denylist"
+        )
     print(f"[common_sync] prices refreshed: {len(paths)} (incremental)")
     if fetch_errors:
-        # Surface the failure so an operator notices upstream regressions
-        # even when the cron job itself succeeds. Threshold: >5% of the
-        # universe failing (per the user's 2026-09-18 alert policy).
-        failure_pct = (len(fetch_errors) / max(len(symbols), 1)) * 100.0
-        sample = ", ".join(f"{sym}({err[:40]})" for sym, err in fetch_errors[:5])
-        msg = (
-            f"⚠️ Vietnam Algo: market-data price fetch errors\n"
-            f"date: {today}\n"
-            f"failed: {len(fetch_errors)}/{len(symbols)} symbols ({failure_pct:.1f}%)\n"
-            f"first failures: {sample}"
-        )
-        if failure_pct > 5.0:
-            print(f"[common_sync] {msg}", file=sys.stderr)
-            notify(msg)
+        # Separate 'invalid symbol' rejections (permanent — DNSE will
+        # never carry these tickers) from real failures (network, 5xx,
+        # timeouts — these matter for operator alerting). The denylist
+        # handles invalid symbols silently; only the real failures
+        # contribute to the success-rate threshold below.
+        real_errors = [
+            (sym, err) for sym, err in fetch_errors
+            if sym not in denylist_after or not is_invalid_symbol_error(err)
+        ]
+        # Effective universe size = total symbols minus the denylist.
+        # (DNSE-accepted universe, i.e. what success rate should be
+        # measured against.)
+        effective_universe = max(len(symbols) - len(denylist_after), 1)
+        if real_errors:
+            failure_pct = (len(real_errors) / effective_universe) * 100.0
+            sample = ", ".join(f"{sym}({err[:40]})" for sym, err in real_errors[:5])
+            msg = (
+                f"⚠️ Vietnam Algo: market-data price fetch errors\n"
+                f"date: {today}\n"
+                f"failed: {len(real_errors)}/{effective_universe} symbols ({failure_pct:.1f}%)"
+                f" — excluding {len(denylist_after)} denylisted\n"
+                f"first failures: {sample}"
+            )
+            if failure_pct > 5.0:
+                print(f"[common_sync] {msg}", file=sys.stderr)
+                notify(msg)
+            else:
+                print(
+                    f"[common_sync] price fetch errors (below 5% threshold): "
+                    f"{len(real_errors)}"
+                )
         else:
-            print(f"[common_sync] price fetch errors (below 5% threshold): {len(fetch_errors)}")
+            print(
+                f"[common_sync] {len(fetch_errors)} error(s) were all "
+                f"DNSE 'invalid symbol' rejections — already on the "
+                f"denylist; ignoring."
+            )
 
     # CA: ``sync_corporate_actions_incremental`` is itself idempotent —
     # it tracks a ``fromDate`` cursor in process memory; we wrap a
@@ -174,17 +229,56 @@ def run() -> CommonSyncResult:
                                              # creating a separate module
     ca_events = run_ca_incremental(index_path=CA_DIR, existing=index)
 
-    # Stamp the sentinel file with the current UTC instant.
-    SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SENTINEL_PATH.write_text(datetime.now(tz=timezone.utc).isoformat())
-    print(f"[common_sync] sentinel: {SENTINEL_PATH}")
+    # Sentinel stamp — only mark data as "fresh" if the sync was
+    # materially successful. The downstream momentum bot gates its
+    # start-of-day and EOD briefings on this sentinel; if we stamp
+    # on a broken sync, the bot will show stale prices as if they
+    # were today's. Threshold: >=50% of the DNSE-accepted universe
+    # (total - denylist) must have been fetched without errors.
+    # Below that we skip the stamp and alert — the bot will then
+    # wait on the sentinel and re-check next cron tick.
+    effective_universe = max(len(symbols) - len(denylist_after), 1)
+    success_count = effective_universe - len(
+        [e for e in fetch_errors if e[0] not in denylist_after or not is_invalid_symbol_error(e[1])]
+    )
+    success_rate = (success_count / effective_universe) * 100.0
+    SENTINEL_MIN_SUCCESS_PCT = float(
+        os.environ.get("COMMON_SYNC_SENTINEL_MIN_SUCCESS_PCT", "50.0")
+    )
+    if success_rate >= SENTINEL_MIN_SUCCESS_PCT:
+        SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SENTINEL_PATH.write_text(datetime.now(tz=timezone.utc).isoformat())
+        print(
+            f"[common_sync] sentinel: {SENTINEL_PATH} "
+            f"(success {success_count}/{effective_universe} = {success_rate:.1f}%)"
+        )
+    else:
+        # Stale data — don't pretend it's fresh. Bot will keep waiting
+        # on the (older) previous sentinel and an operator gets a
+        # single Telegram warning per cron run.
+        warn = (
+            f"⚠️ Vietnam Algo: sentinel NOT stamped — sync success "
+            f"{success_rate:.1f}% below {SENTINEL_MIN_SUCCESS_PCT}% threshold\n"
+            f"date: {today}\n"
+            f"failed: {effective_universe - success_count}/{effective_universe} "
+            f"symbols (excluding {len(denylist_after)} denylisted)\n"
+            f"bot will continue to use the previous sentinel"
+        )
+        print(f"[common_sync] {warn}", file=sys.stderr)
+        notify(warn)
 
     # Persist a small state file so we don't re-run heavy work twice.
     summary = {
         "date": today,
         "ran_at": datetime.now(tz=timezone.utc).isoformat(),
         "symbols_updated": len(symbols),
+        "denylisted": len(denylist_after),
         "prices_refreshed": len(paths),
+        "fetch_errors": len(fetch_errors),
+        "success_count": success_count,
+        "effective_universe": effective_universe,
+        "success_rate_pct": round(success_rate, 2),
+        "sentinel_stamped": success_rate >= SENTINEL_MIN_SUCCESS_PCT,
         "ca_events": len(ca_events),
     }
     TRADE_STATE.parent.mkdir(parents=True, exist_ok=True)

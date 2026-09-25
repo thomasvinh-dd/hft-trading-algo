@@ -318,6 +318,69 @@ def load_saved_symbols(data_dir: Path = DEFAULT_DATA_DIR) -> list[str]:
     return [str(item["ticker"]).upper() for item in payload.get("items", []) if item.get("ticker")]
 
 
+# DNSE rejects a fixed set of tickers (bonds, warrants, delisted names,
+# etc.) with ``HTTP 400 {"code":"BAD_REQUEST","message":"invalid symbol"}``
+# on every fetch. We maintain a per-data-dir denylist so:
+#   * the daily price sync skips them (saves ~50% of the per-cycle
+#     API quota when the universe is the broad HOSE/UPCoM list — see
+#     the 2026-09-23 incident where 1148/2186 symbols failed);
+#   * common_sync computes its success-rate using ``(total - denylist)``
+#     as the denominator so the sentinel age reflects how many
+#     symbols DNSE ACTUALLY carries, not how many it returns 400 for.
+INVALID_SYMBOL_DENYLIST_FILENAME = "dnse_invalid_symbols.json"
+
+
+def _invalid_symbol_denylist_path(data_dir: Path) -> Path:
+    return data_dir / "live" / INVALID_SYMBOL_DENYLIST_FILENAME
+
+
+def load_invalid_symbol_denylist(data_dir: Path = DEFAULT_DATA_DIR) -> set[str]:
+    """Read the set of tickers DNSE has rejected as ``invalid symbol``.
+
+    Returns an empty set if the file is missing or unreadable — callers
+    can treat absence as "no denylist yet" and let the first sync run
+    populate it.
+    """
+    path = _invalid_symbol_denylist_path(data_dir)
+    if not path.exists():
+        return set()
+    try:
+        payload = read_json(path)
+        items = payload.get("symbols", []) if isinstance(payload, dict) else []
+        return {str(s).strip().upper() for s in items if s}
+    except Exception:
+        return set()
+
+
+def save_invalid_symbol_denylist(
+    data_dir: Path,
+    symbols: set[str],
+) -> Path:
+    """Persist the denylist (sorted for readability). Idempotent."""
+    path = _invalid_symbol_denylist_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(
+        path,
+        {
+            "source": "dnse-openapi",
+            "fetchedAt": utc_now(),
+            "count": len(symbols),
+            "symbols": sorted(symbols),
+        },
+    )
+    return path
+
+
+def is_invalid_symbol_error(err: str) -> bool:
+    """True when ``err`` is a DNSE 'invalid symbol' (HTTP 400 BAD_REQUEST).
+
+    Matches the exact pattern the DNSE client raises in
+    ``DnseClient.request`` for 400 responses — see common_sync.py
+    failure samples like ``HTTP 400 {"...","message":"invalid symbol"}``.
+    """
+    return "HTTP 400" in err and "invalid symbol" in err
+
+
 def sync_symbols(data_dir: Path = DEFAULT_DATA_DIR, limit: int = 50, timeout: float = 30.0) -> Path:
     symbols = fetch_all_symbols(limit=limit, timeout=timeout)
     return save_symbols(symbols, data_dir)
@@ -389,16 +452,48 @@ def sync_prices_incremental(
         per-symbol fetch that raised. The function never raises on
         per-symbol fetch failures — callers can decide whether to alert
         based on ``len(errors) / total``.
+
+    DNSE 'invalid symbol' handling
+    ------------------------------
+
+    DNSE returns ``HTTP 400 {"code":"BAD_REQUEST","message":"invalid
+    symbol"}`` for tickers it doesn't carry (bonds, warrants, delisted
+    names, etc. — the broad HOSE/UPCoM universe has ~1100 of these as
+    of 2026-09-23). We maintain a per-data-dir denylist at
+    ``data/live/dnse_invalid_symbols.json`` so:
+
+      * Symbols already on the denylist are skipped at the top of the
+        loop (no API call, no log line, no error tuple).
+      * New 400s are appended to the denylist on the fly and persisted
+        at the end of the call, so the next sync run skips them too.
+
+    The callers (common_sync, daily_engine.update_dataset) don't need
+    to know about the denylist — it's an implementation detail of the
+    sync layer. They can compute success rates using
+    ``len(errors) / len(symbols_filtered_to_denylist_excluded)``.
     """
     data_dir = ensure_data_dir(data_dir)
     paths: list[Path] = []
     errors: list[tuple[str, str]] = []
-    total = len(symbols)
+    denylist = load_invalid_symbol_denylist(data_dir)
+    denylist_grew = False
     new_bars_added = 0
     today = datetime.now(tz=UTC).date()
     bootstrap_days = 90  # used when a symbol has no existing file
     overlap_days = 7  # safety overlap so we catch upstream revisions
-    for index, symbol in enumerate(symbols, start=1):
+    # Filter out already-denylisted symbols BEFORE the loop so they
+    # don't count toward ``total`` (which feeds the per-N progress
+    # prints and the post-summary). Callers that want the raw universe
+    # size should consult the saved denylist file.
+    candidates = [s for s in symbols if s.strip().upper() not in denylist]
+    skipped_denylisted = len(symbols) - len(candidates)
+    if skipped_denylisted:
+        print(
+            f"[sync_prices_incremental] skipping {skipped_denylisted} "
+            f"symbol(s) on the DNSE invalid-symbol denylist"
+        )
+    total = len(candidates)
+    for index, symbol in enumerate(candidates, start=1):
         ticker = symbol.strip().upper()
         path = data_dir / "prices" / f"{ticker}.json"
         existing_rows = load_saved_price_bars(path)
@@ -426,6 +521,12 @@ def sync_prices_incremental(
             err = f"{type(exc).__name__}: {exc}"
             print(f"[{index}/{total}] fetch {ticker} FAILED: {exc}")
             errors.append((ticker, err))
+            # 400 'invalid symbol' is a permanent upstream rejection —
+            # add to the denylist so future runs skip the API call
+            # entirely (saves quota and runtime).
+            if ticker not in denylist and is_invalid_symbol_error(err):
+                denylist.add(ticker)
+                denylist_grew = True
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
             continue
@@ -469,10 +570,20 @@ def sync_prices_incremental(
             )
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
+    if denylist_grew:
+        try:
+            save_invalid_symbol_denylist(data_dir, denylist)
+            print(
+                f"[sync_prices_incremental] denylist now has {len(denylist)}"
+                f" symbol(s); saved to {_invalid_symbol_denylist_path(data_dir)}"
+            )
+        except Exception as exc:
+            print(f"[sync_prices_incremental] WARNING: failed to save denylist: {exc}")
     print(
         f"sync_prices_incremental done: {len(paths)} files updated,"
         f" {new_bars_added} new bars appended across {total} symbols,"
-        f" {len(errors)} fetch errors."
+        f" {len(errors)} fetch errors,"
+        f" {skipped_denylisted} skipped (denylisted)."
     )
     return paths, errors
 

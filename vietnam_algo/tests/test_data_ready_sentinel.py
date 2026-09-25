@@ -73,22 +73,34 @@ if __name__ == "__main__":
 
 
 class DataReadyGateRegressionTests(unittest.TestCase):
-    """Regression test for 2026-09-17 runaway loop.
+    """Regression test for 2026-09-17 + 2026-09-23 runaway loops.
 
     Background: the momentum bot's start-of-day block used to call
     ``continue`` *from inside* the data-ready wait print. Because
     ``continue`` jumps back to the top of the while-loop, it skipped
     the ``time.sleep(sleep_seconds)`` at the bottom — the bot spun
     at CPU speed, printing the wait message ~16k times/sec until
-    the log filled the disk (33 GB in 22 hours).
+    the log filled the disk (33 GB on 2026-09-17, 6.2 GB on
+    2026-09-23).
 
-    Fix: the data-ready gate now follows the same flag-then-continue
-    pattern as the EOD wait block — set ``data_ready = False``
-    inside the wait print, then check ``if not data_ready: continue``
-    AFTER the inner block so the time.sleep is reached.
+    Two layered fixes:
+
+    1. ``data_ready = False`` is set inside the wait block, then the
+       ``if not data_ready: continue`` happens AFTER the block (not
+       from inside the print). This was already in place by 2026-09-17
+       but was insufficient because the ``continue`` STILL bypassed
+       the bottom-of-loop sleep.
+
+    2. (2026-09-23) ``time.sleep(sleep_seconds)`` moved to the TOP of
+       the while-loop, so any ``continue`` in a gate is still bounded
+       by the sleep on the next iteration. The age-based
+       ``> 60 * 18`` threshold was also dropped — it was wrong by
+       design (SOD at 09:00 ICT is always ~19h 45min after the
+       13:15 ICT cron), and the only sensible gate now is sentinel
+       existence.
 
     This test exercises the runner's main loop end-to-end with a
-    stale sentinel and asserts the loop:
+    missing sentinel and asserts the loop:
       1. Prints the wait message at most ONCE per main-loop pass
          (i.e. the function returns to the time.sleep within one
          iteration, NOT loops within the iteration).
@@ -118,18 +130,23 @@ class DataReadyGateRegressionTests(unittest.TestCase):
     def test_start_of_day_wait_does_not_skip_sleep(self) -> None:
         """The data-ready wait print must not bypass the main-loop sleep.
 
-        We invoke ``run_auto_bot`` with a stale sentinel and
+        We invoke ``run_auto_bot`` with NO sentinel at all (the only
+        case where the SOD wait fires after the 2026-09-23 fix —
+        stale-but-existing sentinels now proceed immediately).
         ``sleep_seconds=1`` and a TradingSchedule that forces
         start-of-day to fire on every iteration. After one pass,
         the bot must (a) have printed the wait message at most once,
         and (b) the elapsed wall-clock must be >= sleep_seconds — the
-        time.sleep at the end of the loop must have run.
+        time.sleep at the TOP of the loop must have run.
         """
         import os
         import time
 
-        # Set up a stale sentinel (24h old → well past the 18h gate).
-        self._make_stale_sentinel(age_min=24 * 60)
+        # Ensure no sentinel exists — this is the only case that
+        # triggers the SOD wait post-2026-09-23.
+        sentinel = self.tmp / "live" / "data_ready_for_eod"
+        if sentinel.exists():
+            sentinel.unlink()
 
         # Build the env needed for run_auto_bot (DNSE creds are
         # checked in main.py before run_auto_bot is called, so we
