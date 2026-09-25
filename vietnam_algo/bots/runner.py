@@ -872,7 +872,15 @@ def run_auto_bot(
                     _db, strategy_name or engine_config.strategy or "?",
                     "start_of_day",
                     payload={"date": today, "items": len(_items)},
-                    message=msg[:500],
+                    # ``cycle_events.message`` is TEXT (unbounded — see
+                    # libs/schema_sql.py:147), so pass the full message.
+                    # The Telegram alert above (operator-visible) is the
+                    # authoritative copy and is also unbounded; storing
+                    # a truncated copy here would silently corrupt the
+                    # audit trail because the message can be re-fetched
+                    # later from the table by dashboards / log viewers.
+                    # See 2026-09-25 review issue #4.
+                    message=msg,
                     local_date=today,
                 )
                 if isinstance(portfolio_snap, dict):
@@ -1163,7 +1171,18 @@ def run_auto_bot(
                     _db, strategy_name or engine_config.strategy or "?",
                     "eod",
                     payload={"date": today, "count": result.get("count", 0)},
-                    message=eod_msg[:500],
+                    # ``cycle_events.message`` is TEXT (unbounded — see
+                    # libs/schema_sql.py:147), so pass the full EOD
+                    # summary. Pre-2026-09-25 this was truncated to
+                    # ``eod_msg[:500]`` — silently lossy when the
+                    # operator-visible Telegram alert was longer (which
+                    # it almost always was for the momentum strategy
+                    # where the backtest metrics + orders table easily
+                    # exceeds 500 chars). The full text is also mirrored
+                    # to ``daily_reports.raw_message`` so the audit
+                    # trail is consistent across both tables. See
+                    # 2026-09-25 review issue #4.
+                    message=eod_msg,
                     local_date=today,
                 )
                 if isinstance(portfolio_snap, dict):
