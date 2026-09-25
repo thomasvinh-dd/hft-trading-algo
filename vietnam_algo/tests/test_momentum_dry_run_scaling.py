@@ -68,12 +68,23 @@ def test_apply_dry_run_fills_rounds_scaled_qty_to_board_lot(tmp_path: Path) -> N
         "tradeDate": "2026-09-19",
         "items": [],  # not used; loader reads from latestOrdersJson
     }
+    # Compute qty_scale from the result payload via the helper
+    # (matches what the production EOD path does now). The
+    # backtest was 1B VND, the dry-run NAV is 100M → 0.1.
+    from vietnam_algo.bots.runner import _compute_dry_run_qty_scale
+    from vietnam_algo.libs.dry_run_state import load_dry_run_state as _load_dry
+    _state_for_scale = _load_dry(tmp_path, strategy_name="test")
+    assert _state_for_scale is not None
+    qty_scale = _compute_dry_run_qty_scale(
+        result_payload["result"], _state_for_scale,
+    )
     _apply_dry_run_fills(
-        result_payload,
+        orders_path,
         engine_config,
         account_no="0003937868",
         strategy_config=strategy_config,
         strategy_name="test",
+        qty_scale=qty_scale,
     )
     # The in-memory scaled quantities get applied to the dry-run
     # state. The on-disk latest_orders.json keeps the raw
@@ -141,9 +152,10 @@ def test_apply_marker_dedup_reapplies_when_orders_change(tmp_path: Path) -> None
         ],
     }))
     _apply_dry_run_fills(
-        {"latestOrdersJson": str(orders_path), "tradeDate": "2026-09-15"},
+        orders_path,
         engine_config, account_no="0000000001",
         strategy_config=strategy_config, strategy_name="test",
+        qty_scale=1.0,
     )
 
     # Sanity check: first apply worked.
@@ -168,9 +180,10 @@ def test_apply_marker_dedup_reapplies_when_orders_change(tmp_path: Path) -> None
         ],
     }))
     _apply_dry_run_fills(
-        {"latestOrdersJson": str(orders_path), "tradeDate": "2026-09-15"},
+        orders_path,
         engine_config, account_no="0000000001",
         strategy_config=strategy_config, strategy_name="test",
+        qty_scale=1.0,
     )
 
     state = load_dry_run_state(tmp_path, strategy_name="test")

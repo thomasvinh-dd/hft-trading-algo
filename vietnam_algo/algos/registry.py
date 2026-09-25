@@ -42,7 +42,7 @@ STRATEGY_REGISTRY: dict[str, StrategyAdapter] = {
 class _EmptyStrategy(StrategyAdapter):
     """Minimal concrete subclass used internally for tests; not in the registry."""
 
-    def generate_orders(self, config, strategy_config, trade_date=None):  # pragma: no cover
+    def generate_orders(self, config, strategy_config, trade_date=None, *, skip_backtest=False):  # pragma: no cover
         return {}
 
 

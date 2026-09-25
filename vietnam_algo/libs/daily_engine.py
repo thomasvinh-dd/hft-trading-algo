@@ -231,12 +231,85 @@ def _maybe_mirror_prices_to_db(
     print(f"[update_dataset] mirrored {touched}/{len(symbols)} price files to Postgres")
 
 
+def _run_strategy_backtest(
+    config: EngineConfig,
+    strategy_config: StrategyConfig,
+    strategy_name: str,
+) -> tuple[BacktestResult, Path, Path]:
+    """Run the strategy's full backtest and persist its artefacts.
+
+    Returns ``(result, result_path, orders_path)`` where:
+
+      * ``result`` — the ``BacktestResult`` returned by
+        ``strategy_runner(strategy)``. The caller can read
+        ``result.metrics`` for the Telegram summary.
+      * ``result_path`` — the saved backtest JSON file under
+        ``data/backtests/`` (named via
+        ``adapter.backtest_result_filename``).
+      * ``orders_path`` — the full backtest orders CSV under
+        ``data/backtests/`` (named via
+        ``adapter.backtest_orders_filename``). The CSV is what
+        ``export_orders_for_date`` filters when building the
+        per-date latest-orders file.
+
+    This is the slow path (~3 min for the momentum ~6-year
+    backtest). The 09:16 submit cycle calls it; the EOD cycle
+    skips it (see ``generate_live_orders(skip_backtest=True)``).
+    """
+    from vietnam_algo.algos.registry import get_strategy
+    save_liquid_universe(build_liquid_universe(config.dataDir), config.dataDir)
+    adapter = get_strategy(config.strategy) if strategy_name else None
+    result = strategy_runner(config.strategy)(config.dataDir, "liquid_stocks", strategy_config)
+    result_path = save_backtest_result(result, config.dataDir)
+    orders_path = save_order_list(result, config.dataDir)
+    return result, result_path, orders_path
+
+
+def _build_orders_payload(
+    config: EngineConfig,
+    strategy_name: str,
+    trade_date: str | None,
+    orders_path: Path,
+    result_path: Path | None,
+    result: BacktestResult | None,
+    selected_date: str | None,
+    count: int,
+    csv_path: Path,
+    json_path: Path,
+) -> dict[str, object]:
+    """Assemble the result payload returned by ``generate_live_orders``.
+
+    ``result`` / ``result_path`` may be ``None`` when the caller
+    skipped the backtest (EOD reuses the cached artefacts from
+    09:16). In that case ``metrics`` is empty and ``"result"`` is
+    absent from the payload — both are only consumed in the EOD
+    Telegram summary for non-dry-run mode, where the backtest
+    numbers wouldn't be displayed anyway.
+    """
+    payload: dict[str, object] = {
+        "orders": str(orders_path),
+        "latestOrdersCsv": str(csv_path),
+        "latestOrdersJson": str(json_path),
+        "tradeDate": selected_date,
+        "count": count,
+        "strategy": config.strategy,
+        "orders_file": str(csv_path),
+    }
+    if result is not None:
+        payload["metrics"] = result.metrics
+    if result_path is not None:
+        payload["result"] = str(result_path)
+    return payload
+
+
 def generate_live_orders(
     config: EngineConfig,
     strategy_config: StrategyConfig,
     trade_date: str | None = None,
     strategy_name: str = "",
     notify_telegram: bool = False,
+    *,
+    skip_backtest: bool = False,
 ) -> dict[str, object]:
     """Run the strategy's full backtest and write per-strategy order files.
 
@@ -252,16 +325,46 @@ def generate_live_orders(
     ``daily_generation_message()`` or ``format_cycle_summary()`` to
     decide what (if anything) to send to Telegram, rather than always
     sending a generic "orders generated" message on every call.
+
+    ``skip_backtest=True`` reuses the cached orders CSV written by
+    an earlier ``generate_live_orders`` call today (typically the
+    09:16 submit cycle). The full backtest is skipped — only the
+    cheap ``export_orders_for_date`` step runs. This saves the
+    ~3-min the full ~6-year momentum backtest takes when the
+    auto-trading-bot's EOD cycle runs at 15:15 ICT.
+
+    The skip is best-effort: if the cached orders CSV is missing,
+    falls back to running the full backtest (so a freshly-cleaned
+    VPS still produces a plan).
     """
     from vietnam_algo.algos.registry import get_strategy
-    save_liquid_universe(build_liquid_universe(config.dataDir), config.dataDir)
     adapter = get_strategy(config.strategy) if strategy_name else None
-    result = strategy_runner(config.strategy)(config.dataDir, "liquid_stocks", strategy_config)
-    result_path = save_backtest_result(result, config.dataDir)
-    orders_path = save_order_list(result, config.dataDir)
 
     csv_name = (adapter.orders_csv_filename if adapter else "latest_orders.csv")
     json_name = (adapter.orders_json_filename if adapter else "latest_orders.json")
+    orders_filename = (
+        adapter.backtest_orders_filename if adapter else "backtest_orders.csv"
+    )
+    cached_orders_path = config.dataDir / "backtests" / orders_filename
+
+    result: BacktestResult | None = None
+    result_path: Path | None = None
+    orders_path: Path
+
+    if skip_backtest and cached_orders_path.exists():
+        # EOD path: reuse today's backtest artefacts. We don't
+        # have the BacktestResult in memory (it lives in the saved
+        # JSON), so ``result`` and ``result_path`` stay None.
+        # The payload assembler omits them from the dict.
+        orders_path = cached_orders_path
+    else:
+        # Submit cycle or no cached artefacts: run the heavy
+        # backtest (or fall back to it if skip_backtest=True was
+        # requested but the cache is cold).
+        result, result_path, orders_path = _run_strategy_backtest(
+            config, strategy_config, strategy_name,
+        )
+
     csv_path, json_path, selected_date, count = export_orders_for_date(
         orders_path,
         config.dataDir / config.liveDirName,
@@ -270,17 +373,18 @@ def generate_live_orders(
         json_filename=json_name,
         strategy_name=strategy_name,
     )
-    result_payload = {
-        "result": str(result_path),
-        "orders": str(orders_path),
-        "latestOrdersCsv": str(csv_path),
-        "latestOrdersJson": str(json_path),
-        "tradeDate": selected_date,
-        "count": count,
-        "metrics": result.metrics,
-        "strategy": config.strategy,
-        "orders_file": str(csv_path),
-    }
+    result_payload = _build_orders_payload(
+        config=config,
+        strategy_name=strategy_name,
+        trade_date=trade_date,
+        orders_path=orders_path,
+        result_path=result_path,
+        result=result,
+        selected_date=selected_date,
+        count=count,
+        csv_path=csv_path,
+        json_path=json_path,
+    )
     if notify_telegram:
         notify(daily_generation_message(result_payload))
     return result_payload

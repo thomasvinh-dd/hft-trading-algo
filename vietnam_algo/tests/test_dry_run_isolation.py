@@ -113,8 +113,9 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
             "tradeDate": "2026-09-10",
         }
         _apply_dry_run_fills(
-            result, engine_config, "0003937868", strategy_config,
+            orders_path, engine_config, "0003937868", strategy_config,
             strategy_name="autofin_signal",
+            qty_scale=1.0,
         )
         # Now read the autofin state — KLB should be a HOLDING
         # (entry applied, SL bracket NOT applied as immediate fill).
@@ -168,8 +169,9 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
             "tradeDate": "2026-09-10",
         }
         _apply_dry_run_fills(
-            result, engine_config, "0003937868", strategy_config,
+            orders_path, engine_config, "0003937868", strategy_config,
             strategy_name="autofin_signal",
+            qty_scale=1.0,
         )
         state = load_dry_run_state(self.tmp, strategy_name="autofin_signal")
         assert state is not None
@@ -241,8 +243,10 @@ class PerStrategyStateIsolationTests(unittest.TestCase):
             "count": 0,
         }
         _apply_dry_run_fills(
-            result, engine_config, "0003937868", strategy_config,
+            live_dir / "latest_orders.json",
+            engine_config, "0003937868", strategy_config,
             strategy_name="momentum",
+            qty_scale=1.0,
         )
         state = load_dry_run_state(self.tmp, strategy_name="momentum")
         assert state is not None

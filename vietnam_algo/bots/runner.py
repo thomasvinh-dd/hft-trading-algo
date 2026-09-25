@@ -145,12 +145,67 @@ def _hydrate_shared_token_into_state(state, data_dir) -> bool:
     return True
 
 
+def _compute_dry_run_qty_scale(
+    backtest_result_path: "Path | str | None",
+    state: "DryRunState",
+) -> float:
+    """Return the quantity scale factor for a dry-run apply.
+
+    For strategies whose full backtest runs at 1B VND (``initialCash``
+    on the backtest side) but whose dry-run state starts at 100M VND
+    (the user's chosen ``DRY_RUN_INITIAL_NAV``), the planned orders
+    are sized for the larger scale and would mostly be clipped as
+    ``insufficient_cash`` / ``below_board_lot`` on apply. The fix is
+    to scale every BUY/SELL qty by
+    ``state.initial_nav / backtest_initial_cash`` before applying.
+
+    The function reads ``equityCurve[0].cash`` from the saved
+    backtest JSON to learn the source scale. Returns 1.0 when:
+      * the backtest result path is missing,
+      * the file can't be parsed,
+      * the backtest initial cash isn't materially larger than the
+        dry-run NAV (the "1.5x" guard matches the historical
+        threshold below which scaling doesn't help),
+      * the dry-run ``state.initial_nav`` is unset.
+
+    This used to live inside ``_apply_dry_run_fills`` and was the
+    reason the function took a full ``result`` dict (it pulled
+    ``result["result"]`` to get the backtest path). Splitting it out
+    lets callers pass ``qty_scale`` directly and eliminates the
+    ``_fake_result`` synthesis the SOD path used to build just to
+    satisfy the ``result.get("result")`` lookup.
+    """
+    if not backtest_result_path:
+        return 1.0
+    try:
+        from vietnam_algo.libs.backtest import _initial_cash_from_result
+        backtest_initial_cash = _initial_cash_from_result(Path(str(backtest_result_path)))
+    except Exception:
+        return 1.0
+    if (
+        backtest_initial_cash
+        and backtest_initial_cash > 0
+        and state.initial_nav > 0
+        and backtest_initial_cash > state.initial_nav * 1.5
+    ):
+        scale = float(state.initial_nav) / float(backtest_initial_cash)
+        print(
+            f"[dry-run] scaling order quantities by {scale:.4f} "
+            f"(dry-run NAV={state.initial_nav:,.0f} vs "
+            f"backtest initial={backtest_initial_cash:,.0f})"
+        )
+        return scale
+    return 1.0
+
+
 def _apply_dry_run_fills(
-    result: dict,
+    orders_json_path: "Path | str",
     engine_config: "EngineConfig",
     account_no: str,
     strategy_config: "StrategyConfig | None" = None,
     strategy_name: str = "",
+    *,
+    qty_scale: float = 1.0,
 ) -> None:
     """Apply today's ``latest_orders.json`` orders to the dry-run state.
 
@@ -235,35 +290,36 @@ def _apply_dry_run_fills(
                     )
             except Exception as exc:
                 print(f"[dry-run] legacy-state migration failed: {exc}")
-    # The momentum adapter exposes the full backtest orders CSV in
-    # ``result["orders"]`` and the per-date filtered JSON in
-    # ``result["latestOrdersJson"]``. The dry-run replays the
-    # per-date filtered JSON only — i.e. orders the bot ACTUALLY
-    # generated TODAY (or the date the bot's submit cycle produced).
-    # Replaying the full backtest CSV (6+ years of trades, all 740
-    # rows) was the original intent for an offline replay, but it
-    # inflated the dry-run state with the full backtest's cumulative
-    # P&L, which doesn't match what a user starting the bot today
-    # with ``DRY_RUN_INITIAL_NAV=100M`` expects. See the 2026-09-15
-    # incident where realized_pnl was 102M while cash only went up
-    # 21M from initial.
-    #
-    # Autofin already follows this convention (its ``orders`` field
-    # points at the latest-orders file). Momentum now does too —
-    # dry-run state accumulates the bot's own orders, not the
-    # backtest's full history.
+    # The dry-run replays the per-date filtered JSON only — i.e.
+    # orders the bot ACTUALLY generated TODAY (or the date the bot's
+    # submit cycle produced). Replaying the full backtest CSV (6+
+    # years of trades, all 740 rows) was the original intent for an
+    # offline replay, but it inflated the dry-run state with the full
+    # backtest's cumulative P&L, which doesn't match what a user
+    # starting the bot today with ``DRY_RUN_INITIAL_NAV=100M``
+    # expects. See the 2026-09-15 incident where realized_pnl was
+    # 102M while cash only went up 21M from initial.
     #
     # The dry-run respects the user-configured DRY_RUN_INITIAL_NAV /
-    # MOCK_NAV env var. Quantities are SCALED by
-    # ``state.initial_nav / backtest_initial_cash`` so a 1B-VND-scale
-    # backtest output fits a 100M-VND dry-run budget without clipping
-    # most BUYs as insufficient_cash / below_board_lot.
-    json_path = result.get("latestOrdersJson")
+    # MOCK_NAV env var. Quantities are SCALED by the caller-supplied
+    # ``qty_scale`` (computed in ``_compute_dry_run_qty_scale``) so
+    # a 1B-VND-scale backtest output fits a 100M-VND dry-run budget
+    # without clipping most BUYs as insufficient_cash /
+    # below_board_lot.
+    #
+    # Before this fix the function took a full ``result`` dict and
+    # pulled ``result["result"]`` (the backtest JSON path) here to
+    # compute the scale. That forced the start-of-day path to
+    # synthesise a ``_fake_result`` dict just to satisfy this lookup,
+    # even though the SOD path doesn't run a backtest. Splitting the
+    # scale computation into ``_compute_dry_run_qty_scale`` lets
+    # callers pass the scale directly.
+    json_path = Path(str(orders_json_path))
     payload: dict[str, Any] = {}
     items: list[dict[str, Any]] = []
-    if json_path and Path(str(json_path)).exists():
+    if json_path.exists():
         try:
-            payload = _json.loads(Path(str(json_path)).read_text(encoding="utf-8"))
+            payload = _json.loads(json_path.read_text(encoding="utf-8"))
             items = list(payload.get("items") or [])
         except Exception as exc:
             print(f"[dry-run] failed to read latest orders json {json_path}: {exc}")
@@ -272,29 +328,6 @@ def _apply_dry_run_fills(
         return
     if not isinstance(items, list) or not items:
         return
-    # Scale order quantities to match the dry-run's initial NAV.
-    # Pull the backtest's initial cash from the saved backtest result
-    # (if available) so we know the source scale.
-    qty_scale: float = 1.0
-    try:
-        result_path = result.get("result") if isinstance(result, dict) else None
-        if result_path:
-            from vietnam_algo.libs.backtest import _initial_cash_from_result
-            backtest_initial_cash = _initial_cash_from_result(Path(str(result_path)))
-            if (
-                backtest_initial_cash
-                and backtest_initial_cash > 0
-                and state.initial_nav > 0
-                and backtest_initial_cash > state.initial_nav * 1.5
-            ):
-                qty_scale = float(state.initial_nav) / float(backtest_initial_cash)
-                print(
-                    f"[dry-run] scaling order quantities by {qty_scale:.4f} "
-                    f"(dry-run NAV={state.initial_nav:,.0f} vs "
-                    f"backtest initial={backtest_initial_cash:,.0f})"
-                )
-    except Exception as exc:
-        print(f"[dry-run] qty-scale detection failed: {exc}")
     if qty_scale < 1.0:
         # Round scaled quantities DOWN to the board lot so the
         # resulting fill matches a valid Vietnamese lot size.
@@ -354,7 +387,6 @@ def _apply_dry_run_fills(
         return
     trade_date = (
         payload.get("tradeDate")
-        or result.get("tradeDate")
         or ""
     )
     marker_key = f"_applied:{trade_date}"
@@ -801,25 +833,19 @@ def run_auto_bot(
                             _payload = _json.loads(_json_path.read_text(encoding="utf-8"))
                             _items = list(_payload.get("items") or [])
                             if _items:
-                                _fake_result = {
-                                    "orders": str(
-                                        engine_config.dataDir
-                                        / "backtests"
-                                        / "liquid_momentum_rotation_orders.csv"
-                                    ),
-                                    "latestOrdersJson": str(_json_path),
-                                    "latestOrdersCsv": str(_json_path).replace(".json", ".csv"),
-                                    "result": str(
-                                        engine_config.dataDir
-                                        / "backtests"
-                                        / "liquid_momentum_rotation.json"
-                                    ),
-                                    "tradeDate": today,
-                                    "count": len(_items),
-                                }
+                                # SOD replays the orders JSON the previous
+                                # EOD already wrote. The qty_scale has
+                                # already been baked into those qtys by the
+                                # EOD run (which had access to the backtest
+                                # initial cash via the result dict), so
+                                # pass 1.0 here. No ``_fake_result``
+                                # synthesis needed — the function takes the
+                                # orders JSON path directly. See issue #3
+                                # in the 2026-09-25 review.
                                 _apply_dry_run_fills(
-                                    _fake_result, engine_config, account_no,
+                                    _json_path, engine_config, account_no,
                                     strategy_config, strategy_name=strategy_name,
+                                    qty_scale=1.0,
                                 )
                     except Exception as _exc:
                         print(f"[{now.isoformat()}] start-of-day dry-run apply failed: {_exc}")
@@ -928,10 +954,22 @@ def run_auto_bot(
                     # ASP qty unchanged.
                     if not live_submit and isinstance(poll_result, dict):
                         try:
-                            _apply_dry_run_fills(
-                                poll_result, engine_config, account_no,
-                                strategy_config, strategy_name=strategy_name,
+                            # Autofin's poll_result has ``latestOrdersJson``
+                            # pointing at the JSON it just wrote; the
+                            # orders there are sized for the current NAV
+                            # scale (autofin doesn't run a backtest that
+                            # needs rescaling). qty_scale=1.0 is correct.
+                            poll_orders_json = (
+                                poll_result.get("latestOrdersJson")
+                                if isinstance(poll_result, dict)
+                                else None
                             )
+                            if poll_orders_json:
+                                _apply_dry_run_fills(
+                                    poll_orders_json, engine_config, account_no,
+                                    strategy_config, strategy_name=strategy_name,
+                                    qty_scale=1.0,
+                                )
                         except Exception as exc:
                             print(
                                 f"[{now.isoformat()}] mid-day dry-run apply failed: {exc}"
@@ -1053,12 +1091,20 @@ def run_auto_bot(
             if strategy_adapter is not None:
                 result = strategy_adapter.generate_orders(
                     engine_config, strat_cfg, trade_date=today,
+                    # EOD reuses the orders CSV the 09:16 submit
+                    # cycle wrote. The full ~3-min backtest has
+                    # already run; running it again at 15:15 would
+                    # be wasted compute AND could drift if any
+                    # underlying data shifted. See 2026-09-25
+                    # review issue #1.
+                    skip_backtest=True,
                 )
             else:
                 result = generate_live_orders(
                     engine_config, strat_cfg, trade_date=today,
                     strategy_name=strategy_name,
                     notify_telegram=False,
+                    skip_backtest=True,
                 )
             print(result)
             # In dry-run mode, REPLAY today's planned orders against the
@@ -1067,10 +1113,23 @@ def run_auto_bot(
             # bot would have entered if it were live).
             if not live_submit and isinstance(result, dict):
                 try:
-                    _apply_dry_run_fills(
-                        result, engine_config, account_no, strategy_config,
-                        strategy_name=strategy_name,
-                    )
+                    orders_json_path = result.get("latestOrdersJson")
+                    if orders_json_path:
+                        # Compute the qty scale outside the function so
+                        # ``_apply_dry_run_fills`` no longer needs the
+                        # ``result`` dict (and the SOD path can stop
+                        # building a ``_fake_result`` to satisfy the
+                        # function's previous ``result.get("result")``
+                        # lookup). See 2026-09-25 review issue #3.
+                        backtest_result_path = result.get("result")
+                        qty_scale = _compute_dry_run_qty_scale(
+                            backtest_result_path, _dry,
+                        )
+                        _apply_dry_run_fills(
+                            orders_json_path, engine_config, account_no,
+                            strategy_config, strategy_name=strategy_name,
+                            qty_scale=qty_scale,
+                        )
                 except Exception as exc:
                     print(f"[{now.isoformat()}] dry-run fill replay failed: {exc}")
             # Fetch live portfolio snapshot once so the EOD summary can

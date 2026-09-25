@@ -1871,7 +1871,15 @@ class AutofinSignalAdapter(StrategyAdapter):
         config: EngineConfig,
         strategy_config: StrategyConfig,
         trade_date: str | None = None,
+        *,
+        skip_backtest: bool = False,
     ) -> dict[str, Any]:
+        # ``skip_backtest`` is a no-op for autofin — the adapter runs
+        # its own decision pipeline (autofin API → signal classifier
+        # → dry-run apply) rather than a backtest, so there is nothing
+        # to cache. Accepted for signature compatibility with the
+        # base ``StrategyAdapter.generate_orders`` abstract method.
+        del skip_backtest
         client = self._client_lazy()
         self._load_state(config.dataDir)
 
