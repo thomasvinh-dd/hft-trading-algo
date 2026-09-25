@@ -54,8 +54,22 @@ _env_sources='set -a && . '"$PROJECT_DIR"'/vietnam_algo/env/.env.dnse-secrets &&
 # for ~24 hours before anyone noticed, because the cron was
 # restarting the autofin side but nobody owned the momentum side.
 #
-# Detection: ``pgrep -f 'auto-trading-bot.*--strategy <name>'`` —
+# Detection: ``pgrep -f '[a]uto-trading-bot.*--strategy <name>'`` —
 # returns 0 if at least one matching process exists.
+#
+# IMPORTANT — the ``[a]`` trick. pgrep -f searches the FULL command
+# line (including argv[0]) of every process. A naive pattern like
+# ``auto-trading-bot.*--strategy autofin_signal`` matches the
+# watchdog's own ``sh -c`` invocation because the pattern string
+# appears verbatim in the watchdog's argv. That false-positive
+# made the watchdog think the bot was always alive and NEVER
+# relaunched after 2026-09-24's manual pkill, leaving the autofin
+# bot dead for ~21 hours (no SOD on 2026-09-25). The ``[a]uto``
+# bracket class matches ``auto`` in real argv but the literal
+# ``[a]uto-trading-bot`` in the cron entry does NOT contain the
+# substring ``auto-trading-bot``, so the watchdog's own command
+# line no longer self-matches.
+#
 # Action:     if not, ``bash $PROJECT_DIR/scripts/launch_<name>.sh``
 # — these scripts already pkill stale instances, source the per-bot
 # Telegram env files, and pass through DNSE creds, so the watchdog
@@ -65,7 +79,7 @@ _env_sources='set -a && . '"$PROJECT_DIR"'/vietnam_algo/env/.env.dnse-secrets &&
 # at ``/root/launch_*.sh`` for ad-hoc manual restarts. The watchdog
 # only ever invokes the canonical git-tracked version so any
 # future tweak to launcher behaviour is picked up automatically.
-_watchdog='pgrep -f "auto-trading-bot.*--strategy autofin_signal" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: autofin bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/scripts/launch_autofin.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1); pgrep -f "auto-trading-bot.*--strategy momentum" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: momentum bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/scripts/launch_momentum.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1)'
+_watchdog='pgrep -f "[a]uto-trading-bot.*--strategy autofin_signal" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: autofin bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/scripts/launch_autofin.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1); pgrep -f "[a]uto-trading-bot.*--strategy momentum" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: momentum bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/scripts/launch_momentum.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1)'
 
 case "${1:-}" in
     --print)
