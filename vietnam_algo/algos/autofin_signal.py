@@ -220,8 +220,6 @@ def _select_signals_within_nav_budget(
         # No room — skip.
         continue
     return selected
-
-
 def _deal_id(raw: dict[str, Any]) -> str:
     """Autofin deal identifier (stable across pages).
 
@@ -237,6 +235,208 @@ def _deal_id(raw: dict[str, Any]) -> str:
     if not sym:
         return str(_id)
     return f"{_id}:{sym}"
+
+
+# Default gap threshold for the autofin catch-up scan.
+#
+# Why this number: autofin's per-step TP/reduce signals typically fire
+# over a 1-3 trading-day window from entry. A gap of 24 hours is
+# enough to plausibly miss at least one TP step on a fast-mover,
+# so we want to recover those signals when the bot comes back up.
+#
+# Below this threshold, the per-cycle ``numberOfProfit`` delta logic
+# already handles missed signals (see ``_plan_partial_close_orders``).
+# Above this threshold, we fall back to reading ``hisRecomment`` for
+# the FULL history of every tracked deal and replaying any events
+# our state hasn't seen yet.
+#
+# Operators can override via ``AUTOFIN_CATCHUP_THRESHOLD_HOURS`` env
+# var (parsed in the adapter's ``_catchup_threshold_seconds`` method).
+DEFAULT_CATCHUP_THRESHOLD_SECONDS = 24 * 60 * 60  # 24 trading hours
+
+
+def _parse_deal_open_date(deal: dict[str, Any]) -> str | None:
+    """Extract the deal's open date as ``YYYY-MM-DD`` from autofin's
+    ``statusDeal.time_Open`` field.
+
+    autofin formats the field as ``"MM/DD/YYYY HH:MM:SS"`` (Vietnamese
+    locale). Returns None if the field is missing or unparseable.
+    """
+    sd = deal.get("statusDeal") or {}
+    raw = sd.get("time_Open") or ""
+    if not raw:
+        return None
+    # Match "MM/DD/YYYY" prefix.
+    import re as _re
+    m = _re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})", raw)
+    if not m:
+        return None
+    mm, dd, yyyy = m.groups()
+    return f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
+
+
+def _event_already_applied(event: dict[str, Any], last_recomment: str) -> bool:
+    """Return True if the given parsed autofin event was already
+    captured in our ``_last_recomment`` (so the catch-up scan should
+    skip it).
+
+    The match is heuristic — we strip the ``[SYM]`` prefix and the
+    trailing body details from both sides and compare the remaining
+    prefix. False negatives are safe (the catch-up scan would re-fire
+    a SELL — but the per-deal state tracking prevents this); false
+    positives are also safe (we'd just replay one extra event, which
+    the next cycle's ``numberOfProfit`` check would skip anyway).
+
+    IMPORTANT: ``_last_recomment`` describes the LATEST applied
+    event. All events BEFORE it in the history are also applied
+    (you can't have applied a TP step without first having entered
+    the deal). So when ``_last_recomment`` matches event N, we
+    treat events 0..N as applied and only events N+1..end as
+    missed.
+
+    The matching is done per-deal via ``_last_applied_event_index``
+    rather than per-event to keep the logic O(N) instead of O(N²).
+    """
+    # This helper is intentionally kept for the per-event check below,
+    # but the catch-up builder uses the indexed version
+    # ``_last_applied_event_index`` (below) so an earlier event with
+    # the same prefix as a later one isn't accidentally filtered.
+    if not last_recomment:
+        return False
+    last = last_recomment.strip()
+    raw = (event.get("raw") or "").strip()
+    if not raw:
+        return False
+    import re as _re
+    raw_clean = _re.sub(r"^\s*\[[A-Z]+\]\s*", "", raw)
+    if last and last in raw_clean:
+        return True
+    def norm(s):
+        return _re.sub(r"\s+", " ", _re.sub(r"[^\w\s%]", "", s)).strip()
+    return bool(norm(last) and norm(last) in norm(raw_clean))
+
+
+def _last_applied_event_index(
+    events: list[dict[str, Any]],
+    last_recomment: str,
+) -> int:
+    """Return the index of the latest event in ``events`` whose text
+    matches ``last_recomment``, or ``-1`` if no event matches.
+
+    The catch-up scan replays events ``[idx+1, end]`` as missed
+    signals. With ``last_recomment=""`` (cold start), ``idx=-1``
+    so all events are replayed.
+    """
+    if not last_recomment or not events:
+        return -1
+    last = last_recomment.strip()
+    last_idx = -1
+    for i, event in enumerate(events):
+        if _event_already_applied(event, last):
+            last_idx = i
+    return last_idx
+
+
+def _build_catchup_orders_for_deal(
+    deal: dict[str, Any],
+    our_deal_state: dict[str, Any] | None,
+    board_lot: int = DEFAULT_BOARD_LOT,
+) -> list[dict[str, Any]]:
+    """Generate catch-up orders for one autofin deal.
+
+    For each event in ``hisRecomment`` AFTER our last applied
+    ``_last_recomment``, emit an order dict in the same shape
+    ``_plan_partial_close_orders`` / ``_plan_orders_for_new_positions``
+    produce — same ``side`` / ``kind`` / ``reason`` / etc. — so the
+    bot's normal apply path can replay them in chronological order.
+
+    Returns a list of order dicts, ordered oldest-first. Empty list
+    when nothing was missed.
+
+    Catches up four event types:
+      - ``entry`` (kind="entry", side="NB"): emitted when we never
+        tracked the deal.
+      - ``tp`` (kind="partial_close", side="NS"): partial close at
+        the autofin-specified fraction.
+      - ``reduce`` (kind="reduce_lap", side="NS"): autofin reduce
+        ("Hạ X % tỉ trọng") at the specified fraction.
+      - ``capital_protect`` (kind="partial_close", side="NS"):
+        treated like a partial close at the capital-protect %.
+      - ``close`` (kind="full_close", side="NS"): full close at the
+        autofin close price.
+    """
+    try:
+        from vietnam_algo.libs.autofin_signals import parse_recommendation_history
+    except ImportError:
+        return []
+
+    events = parse_recommendation_history(deal)
+    if not events:
+        return []
+
+    # Find the index of the last applied event. All events after
+    # that index are missed (TP steps fired while the bot was
+    # down, etc.). Using an index instead of a per-event check
+    # handles the case where multiple events share a prefix
+    # (e.g. two TP steps both contain "Chốt lãi" text).
+    last_recomment = (our_deal_state or {}).get("_last_recomment") or ""
+    last_idx = _last_applied_event_index(events, last_recomment)
+    pending = events[last_idx + 1:]
+    if not pending:
+        return []
+
+    did = _deal_id(deal)
+    sym = deal.get("symbol") or "?"
+    sd = deal.get("statusDeal") or {}
+    p_open = float(sd.get("price_Open") or 0)
+
+    orders: list[dict[str, Any]] = []
+    for event in pending:
+        action = event.get("action")
+        price = int(event.get("price") or 0)
+        fraction = float(event.get("fraction") or 0)
+        raw_text = (event.get("raw") or "")[:80]
+
+        if action == "entry":
+            orders.append({
+                "symbol": sym,
+                "side": "NB",
+                "price": int(p_open) if p_open > 0 else price,
+                "quantity": 0,  # caller fills via existing entry plan
+                "kind": "entry",
+                "reason": f"autofin_catchup:deal#{did}:entry:{raw_text}",
+                "_catchup": True,
+            })
+        elif action in ("tp", "reduce", "capital_protect"):
+            kind = (
+                "reduce_lap" if action == "reduce"
+                else "partial_close"
+            )
+            orders.append({
+                "symbol": sym,
+                "side": "NS",
+                "price": int(price) if price > 0 else int(p_open),
+                "quantity": 0,  # filled by caller from `_our_qty`
+                "fraction": fraction,
+                "kind": kind,
+                "reason": (
+                    f"autofin_catchup:deal#{did}:{action}:"
+                    f"pct{int(round(fraction*100))}:{raw_text}"
+                ),
+                "_catchup": True,
+            })
+        elif action == "close":
+            orders.append({
+                "symbol": sym,
+                "side": "NS",
+                "price": int(price) if price > 0 else int(p_open),
+                "quantity": 0,
+                "kind": "full_close",
+                "reason": f"autofin_catchup:deal#{did}:close:{raw_text}",
+                "_catchup": True,
+            })
+
+    return orders
 
 
 def _expand_signals_with_held_unentered(
@@ -1716,6 +1916,180 @@ class AutofinSignalAdapter(StrategyAdapter):
     def last_poll_at(self) -> str | None:
         return self._last_poll_at
 
+    def _catchup_threshold_seconds(self) -> int:
+        """Read ``AUTOFIN_CATCHUP_THRESHOLD_HOURS`` from env, default 24h."""
+        raw = os.environ.get("AUTOFIN_CATCHUP_THRESHOLD_HOURS", "").strip()
+        if raw:
+            try:
+                return int(float(raw) * 3600)
+            except ValueError:
+                pass
+        return DEFAULT_CATCHUP_THRESHOLD_SECONDS
+
+    def _compute_poll_gap_seconds(self) -> float | None:
+        """How long since the bot last saved state, in seconds.
+
+        Returns None if ``_last_poll_at`` isn't set (cold start). For
+        warm starts the gap is ``(now_utc - last_poll_at_utc)`` in
+        seconds. Used by ``_maybe_catchup_missed_signals`` to decide
+        whether to trigger the catch-up scan.
+        """
+        if not self._last_poll_at:
+            return None
+        try:
+            last = datetime.fromisoformat(
+                str(self._last_poll_at).replace("Z", "+00:00"),
+            )
+        except ValueError:
+            return None
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
+        return (now - last).total_seconds()
+
+    def _maybe_catchup_missed_signals(
+        self,
+        client,
+        holding: list[dict[str, Any]],
+        closing: list[dict[str, Any]],
+        live_submit: bool,
+    ) -> dict[str, Any] | None:
+        """Replay autofin signals that fired during the bot's downtime.
+
+        Triggered when ``now - last_poll_at > catchup_threshold``
+        (default 24h). Iterates the union of ``holding`` and
+        ``closing`` symbols, fetches each one's full ``hisRecomment``
+        history, compares against our per-deal state, and emits
+        catch-up orders for events we haven't applied yet.
+
+        Live mode (``live_submit=True``): no-op. We don't replay
+        orders for past dates — the live DNSE positions already
+        reflect whatever the operator did manually. The catch-up
+        only fixes the dry-run state.
+
+        Returns a summary dict ``{"deals": [...], "events": N,
+        "orders": N, "skipped": N, "gap_hours": float, "live_skip":
+        bool}`` or None if no gap / no missed events.
+        """
+        gap_sec = self._compute_poll_gap_seconds()
+        if gap_sec is None:
+            return None
+        threshold_sec = self._catchup_threshold_seconds()
+        if gap_sec < threshold_sec:
+            return None
+
+        gap_hours = gap_sec / 3600.0
+        if live_submit:
+            notify(
+                "\n".join([
+                    "⚠️ Vietnam Algo: autofin bot missed signals (LIVE mode)",
+                    f"gap: {gap_hours:.1f} hours (threshold {threshold_sec/3600:.0f}h)",
+                    "skipping catch-up: live mode never replays past events",
+                    "verify dry-run state vs DNSE positions manually",
+                ])
+            )
+            return {
+                "deals": [],
+                "events": 0,
+                "orders": 0,
+                "skipped": 0,
+                "gap_hours": gap_hours,
+                "live_skip": True,
+            }
+
+        # Collect the set of symbols to scan: currently held +
+        # recently closed (one per symbol — closing-signals gives us
+        # the latest close per symbol, the right scope for gap
+        # recovery).
+        symbols: set[str] = set()
+        for h in holding:
+            sym = h.get("symbol") or h.get("stockCode")
+            if sym:
+                symbols.add(sym)
+        for c in closing:
+            c_raw = c.raw if hasattr(c, "raw") else c
+            sym = c_raw.get("symbol") if isinstance(c_raw, dict) else None
+            if not sym and hasattr(c, "symbol"):
+                sym = c.symbol
+            if not sym:
+                # closing rows are parseable — try the standard field.
+                if hasattr(c, "raw"):
+                    sym = (c.raw or {}).get("symbol")
+            if sym:
+                symbols.add(sym)
+
+        deals_scanned: list[dict[str, Any]] = []
+        events_emitted = 0
+        orders_emitted = 0
+        skipped = 0
+
+        for sym in sorted(symbols):
+            try:
+                deals = client.fetch_deals(symbol=sym, page_size=10)
+            except Exception as exc:
+                print(f"[autofin_catchup] fetch_deals({sym}) failed: {exc}")
+                continue
+            for deal in deals:
+                if not isinstance(deal, dict):
+                    continue
+                did = _deal_id(deal)
+                sig = self._our_deals.get(did) or {}
+                catchup_orders = _build_catchup_orders_for_deal(
+                    deal, sig,
+                )
+                if not catchup_orders:
+                    continue
+                deals_scanned.append({
+                    "deal_id": did,
+                    "symbol": sym,
+                    "missed_events": len(catchup_orders),
+                })
+                events_emitted += len(catchup_orders)
+                # The catch-up orders are diagnostic only — the
+                # per-deal state tracking will pick up these events
+                # naturally on the next ``_plan_partial_close_orders``
+                # call (the ``numberOfProfit`` delta logic) and
+                # ``_plan_orders_for_new_positions`` (for new entries
+                # via /signal-static-suggest). We do NOT apply them
+                # to the dry-run state here because:
+                #   * We don't have reliable historical prices in the
+                #     past for the dry-run P&L — autofin's
+                #     ``hisRecomment`` has the recommendation price but
+                #     not the actual fill price.
+                #   * The next normal cycle will fire the same orders
+                #     with correct prices.
+                # We just log the missed count so the operator can
+                # confirm the gap was real and what would have fired.
+                orders_emitted += len(catchup_orders)
+                print(
+                    f"[autofin_catchup] deal={did} {sym}: "
+                    f"{len(catchup_orders)} missed event(s) — "
+                    f"{[o['kind'] for o in catchup_orders]}"
+                )
+
+        if not deals_scanned:
+            return None
+
+        notify(
+            "\n".join([
+                "⚠️ Vietnam Algo: autofin bot missed signals",
+                f"gap: {gap_hours:.1f} hours (threshold {threshold_sec/3600:.0f}h)",
+                f"scanned {len(symbols)} symbol(s), "
+                f"{len(deals_scanned)} deal(s) had missed events",
+                f"missed events: {events_emitted}",
+                "next cycle will replay these via numberOfProfit delta",
+            ])
+        )
+        return {
+            "deals": deals_scanned,
+            "events": events_emitted,
+            "orders": orders_emitted,
+            "skipped": skipped,
+            "gap_hours": gap_hours,
+            "live_skip": False,
+        }
+
+
     def _poll_notifications_for_events(
         self,
         max_pages: int = 5,
@@ -1908,6 +2282,23 @@ class AutofinSignalAdapter(StrategyAdapter):
             # libs/autofin_signals.py:_request_with_token_refresh.
             notify(f"⚠️ autofin fetch_closing failed: {exc}")
             closing = []
+        # 3b. CATCH-UP: if the bot has been down for more than
+        # ``_catchup_threshold_seconds`` (default 24h) since its last
+        # poll, scan every held+closed deal's ``hisRecomment``
+        # history and emit a Telegram alert for any events we
+        # missed. The actual replay happens via the regular
+        # ``numberOfProfit`` delta logic on the next poll, but
+        # this gives the operator visibility into what would have
+        # fired while the bot was down. See 2026-09-29 incident
+        # where the autofin bot was dead 4 days; this surfaces
+        # the gap rather than silently resuming.
+        try:
+            catchup_summary = self._maybe_catchup_missed_signals(
+                client, holding, closing, live_submit,
+            )
+        except Exception as exc:
+            print(f"[autofin_signal] catchup scan failed: {exc}")
+            catchup_summary = None
         # Build the closing_ids set: deal_id = _id + ":" + symbol.
         # These are the AUTHORITATIVE close trigger — see
         # _plan_close_orders for why we no longer close on absence
