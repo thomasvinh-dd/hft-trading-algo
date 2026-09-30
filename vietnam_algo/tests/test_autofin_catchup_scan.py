@@ -500,3 +500,79 @@ def test_maybe_catchup_includes_symbols_from_our_deals(monkeypatch):
         "pre-fix the scan would skip HNM entirely (0 missed). "
         "Got %d." % hnm_deal[0]["missed_events"]
     )
+
+
+def test_maybe_catchup_includes_symbols_from_dry_run_state(
+    monkeypatch, tmp_path
+):
+    """Even more invasive case: HNM is NOT in autofin's holding,
+    NOT in autofin's closing, NOT in ``_positions``, and NOT in
+    ``_our_deals`` — but IS in the dry-run state file. This is the
+    most extreme orphan-position scenario the catchup scan must
+    handle. Pre-fix the scan would skip HNM entirely.
+
+    The catchup must read the dry-run state file directly as a
+    last-resort fallback. ``config`` is the standard
+    ``EngineConfig`` instance the runner passes in; we point its
+    ``dataDir`` at a temp dir where we control the state file.
+    """
+    from pathlib import Path
+    monkeypatch.setenv("AUTOFIN_CATCHUP_THRESHOLD_HOURS", "24")
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+    a = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    a._last_poll_at = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=48)
+    ).isoformat()
+    a._our_deals = {}  # nothing tracked by the adapter
+    a._positions = None  # nothing in live portfolio snapshot
+
+    # Write a dry-run state file with HNM 100 shares
+    state_path = tmp_path / "live" / "dry_run_state.autofin_signal.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "initial_nav": 100_000_000,
+        "cash": 50_000_000,
+        "positions": {
+            "HNM": {
+                "symbol": "HNM",
+                "quantity": 100,
+                "avg_price": 8600.0,
+                "last_price": 8600.0,
+                "cost_basis": 860000.0,
+            },
+        },
+        "applied_keys": [],
+        "closed_trades": [],
+        "realized_pnl": 0.0,
+    }))
+
+    class _Cfg:
+        pass
+    cfg = _Cfg()
+    cfg.dataDir = tmp_path
+
+    deal = {
+        "_id": 1789344000,
+        "symbol": "HNM",
+        "statusDeal": {"price_Open": 9100},
+        "hisRecomment": [
+            "<div><p>Ngày khuyến nghị: 14/09/2026 🟢 Vùng mua: 8,900 - 9,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 1 Giá: 8,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 7,800</p></div>",
+        ],
+    }
+    client = _FakeClient({"HNM": [deal]})
+
+    result = a._maybe_catchup_missed_signals(
+        client, [], [], live_submit=False, config=cfg,
+    )
+    assert result is not None
+    hnm_deal = [d for d in result["deals"] if d["symbol"] == "HNM"]
+    assert len(hnm_deal) == 1, (
+        "HNM must be detected via the dry-run state fallback. "
+        "Pre-fix the scan would skip HNM entirely (0 missed)."
+    )
+    assert hnm_deal[0]["missed_events"] == 3, (
+        "expected 3 missed events (entry + 2 REDUCE lần 1 + lần 2); "
+        "got %d" % hnm_deal[0]["missed_events"]
+    )

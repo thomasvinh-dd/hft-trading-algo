@@ -1953,6 +1953,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         holding: list[dict[str, Any]],
         closing: list[dict[str, Any]],
         live_submit: bool,
+        config: "EngineConfig | None" = None,
     ) -> dict[str, Any] | None:
         """Replay autofin signals that fired during the bot's downtime.
 
@@ -1961,6 +1962,14 @@ class AutofinSignalAdapter(StrategyAdapter):
         ``closing`` symbols, fetches each one's full ``hisRecomment``
         history, compares against our per-deal state, and emits
         catch-up orders for events we haven't applied yet.
+
+        ``config`` (EngineConfig) is needed to read the dry-run state
+        file (autofin's ``dry_run_state.autofin_signal.json``). The
+        file lists positions the dry-run state still holds but the
+        autofin adapter doesn't track in ``_positions`` /
+        ``_our_deals`` (orphan positions from a previous bot
+        configuration that survived a state-file migration).
+        Without ``config`` the dry-run state fallback is skipped.
 
         Live mode (``live_submit=True``): no-op. We don't replay
         orders for past dates — the live DNSE positions already
@@ -2040,6 +2049,37 @@ class AutofinSignalAdapter(StrategyAdapter):
             sym = (sig or {}).get("symbol")
             if sym:
                 symbols.add(sym)
+        # Finally, read the dry-run state file directly. The autofin
+        # adapter never reads this file itself — ``_apply_dry_run_fills``
+        # in runner.py mutates it externally — so ``_positions`` and
+        # ``_our_deals`` (which the adapter DOES read) can both be
+        # empty for a symbol that we still hold in dry-run state. This
+        # happens when the bot was previously wired to a different
+        # autofin-account and the dry-run state accumulated positions
+        # that no longer match the current ``our_deals`` tracking
+        # state. Without this fallback HNM (and other "orphan"
+        # positions) would be invisible to the catchup scan — exactly
+        # the 2026-09-30 incident.
+        try:
+            from vietnam_algo.libs.dry_run_state import (
+                load_dry_run_state,
+            )
+            from pathlib import Path as _P
+            _data_dir = None
+            if config is not None and hasattr(config, "dataDir"):
+                _data_dir = config.dataDir
+            else:
+                _data_dir = _P("vietnam_algo/data")
+            _dry = load_dry_run_state(_P(_data_dir), strategy_name="autofin_signal")
+            if _dry is not None and _dry.positions:
+                for sym in _dry.positions:
+                    if sym:
+                        symbols.add(sym)
+        except Exception as exc:
+            print(
+                f"[autofin_catchup] dry-run state load failed "
+                f"(non-fatal): {exc}"
+            )
 
         deals_scanned: list[dict[str, Any]] = []
         events_emitted = 0
@@ -2318,7 +2358,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         # the gap rather than silently resuming.
         try:
             catchup_summary = self._maybe_catchup_missed_signals(
-                client, holding, closing, live_submit,
+                client, holding, closing, live_submit, config,
             )
         except Exception as exc:
             print(f"[autofin_signal] catchup scan failed: {exc}")
