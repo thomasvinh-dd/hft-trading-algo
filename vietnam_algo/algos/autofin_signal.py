@@ -1997,10 +1997,20 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "live_skip": True,
             }
 
-        # Collect the set of symbols to scan: currently held +
-        # recently closed (one per symbol — closing-signals gives us
-        # the latest close per symbol, the right scope for gap
-        # recovery).
+        # Collect the set of symbols to scan: currently held + recently
+        # closed (one per symbol — closing-signals gives us the latest
+        # close per symbol, the right scope for gap recovery) PLUS the
+        # symbols we ourselves hold in dry-run state. The latter is
+        # critical: autofin's ``/signal-static-holding`` does NOT return
+        # positions whose deals have an active ``isClosed=False`` flag
+        # in ``/signal-deals`` (likely positions the operator manually
+        # closed in the autofin UI but autofin's deal record wasn't
+        # updated). For those symbols the catchup scan would otherwise
+        # skip them entirely — leaving reduce events unsurfaced. See
+        # 2026-09-30 HNM incident where the dry-run state held 100
+        # HNM shares but autofin's holding list returned nothing, so
+        # the catchup scan never visited HNM and the REDUCE 50% lần 1
+        # + lần 2 events stayed unapplied.
         symbols: set[str] = set()
         for h in holding:
             sym = h.get("symbol") or h.get("stockCode")
@@ -2015,6 +2025,19 @@ class AutofinSignalAdapter(StrategyAdapter):
                 # closing rows are parseable — try the standard field.
                 if hasattr(c, "raw"):
                     sym = (c.raw or {}).get("symbol")
+            if sym:
+                symbols.add(sym)
+        # Also include every symbol we hold in the dry-run state.
+        # ``self._positions`` is the live portfolio snapshot (DNSE in
+        # live mode, local in dry-run); ``self._our_deals`` is the
+        # per-deal state file. Together they cover every position we
+        # might still have a stake in.
+        if getattr(self, "_positions", None):
+            for p in self._positions:
+                if p:
+                    symbols.add(p)
+        for sig in self._our_deals.values():
+            sym = (sig or {}).get("symbol")
             if sym:
                 symbols.add(sym)
 
@@ -2247,6 +2270,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         trade_date: str | None = None,
         *,
         skip_backtest: bool = False,
+        live_submit: bool = False,
     ) -> dict[str, Any]:
         # ``skip_backtest`` is a no-op for autofin — the adapter runs
         # its own decision pipeline (autofin API → signal classifier

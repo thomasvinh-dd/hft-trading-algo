@@ -938,6 +938,7 @@ def run_auto_bot(
                         poll_result = strategy_adapter.generate_orders(
                             engine_config, strategy_config,
                             trade_date=today,
+                            live_submit=live_submit,
                         )
                     else:
                         poll_result = generate_live_orders(
@@ -1106,6 +1107,7 @@ def run_auto_bot(
                     # underlying data shifted. See 2026-09-25
                     # review issue #1.
                     skip_backtest=True,
+                    live_submit=live_submit,
                 )
             else:
                 result = generate_live_orders(

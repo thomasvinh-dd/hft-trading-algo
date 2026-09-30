@@ -76,7 +76,14 @@ class MomentumRotationAdapter(StrategyAdapter):
         trade_date: str | None = None,
         *,
         skip_backtest: bool = False,
+        live_submit: bool = False,
     ) -> dict[str, Any]:
+        # ``live_submit`` is a no-op for momentum — the legacy
+        # ``generate_live_orders`` path reads ``live_submit`` from
+        # ``engine_config.liveSubmit`` directly, so passing it through
+        # here would just shadow the engine config. Accepted for
+        # signature compatibility with the base ``StrategyAdapter``.
+        del live_submit
         # Use the legacy generate_live_orders path which writes to backtests/.
         # Pass ``strategy_name=self.name`` so the per-strategy latest_orders
         # files (data/live/latest_orders.momentum.csv/.json) get the same

@@ -443,3 +443,60 @@ def test_maybe_catchup_no_missed_events_returns_none(monkeypatch):
     assert result is None, (
         f"All events already applied; expected no catch-up. Got {result}"
     )
+
+
+def test_maybe_catchup_includes_symbols_from_our_deals(monkeypatch):
+    """2026-09-30 HNM incident: HNM was held in our dry-run state but
+    autofin's ``/signal-static-holding`` no longer returned it (likely
+    because the operator manually closed it in the autofin UI). The
+    catchup scan only iterated ``holding + closing``, so HNM was
+    skipped entirely — even though ``/signal-deals?symbol=HNM`` had
+    two missed REDUCE 50% events.
+
+    Fix: also iterate over symbols from ``self._positions`` (live
+    portfolio) and ``self._our_deals`` (per-deal state). Both are
+    populated from local state files which always have the symbols
+    the bot actually still has a stake in.
+    """
+    monkeypatch.setenv("AUTOFIN_CATCHUP_THRESHOLD_HOURS", "24")
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+    a = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    a._last_poll_at = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=48)
+    ).isoformat()
+    # HNM is in OUR state but NOT in autofin's holding or closing.
+    # This is the exact scenario the bug exposed.
+    a._our_deals = {
+        "1789344000:HNM": {"_last_recomment": ""},  # no events applied yet
+    }
+    a._positions = ["HNM"]
+    deal = {
+        "_id": 1789344000,
+        "symbol": "HNM",
+        "statusDeal": {"price_Open": 9100},
+        "hisRecomment": [
+            "<div><p>Ngày khuyến nghị: 14/09/2026 🟢 Vùng mua: 8,900 - 9,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 1 Giá: 8,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 7,800</p></div>",
+        ],
+    }
+    client = _FakeClient({"HNM": [deal]})
+
+    # Empty holding + closing (HNM not in autofin's lists) — but
+    # catchup must still visit HNM because we hold it ourselves.
+    result = a._maybe_catchup_missed_signals(
+        client, [], [], live_submit=False,
+    )
+    assert result is not None, (
+        "catchup scan must visit symbols from our state even when "
+        "they're absent from autofin's holding+closing lists"
+    )
+    hnm_deal = [d for d in result["deals"] if d["symbol"] == "HNM"]
+    assert len(hnm_deal) == 1
+    # 3 missed events: the entry (no applied_keys for HNM in state)
+    # + 2 REDUCE events. Pre-fix the scan would skip HNM entirely.
+    assert hnm_deal[0]["missed_events"] == 3, (
+        "expected 3 missed events (entry + 2 REDUCE lần 1 + lần 2); "
+        "pre-fix the scan would skip HNM entirely (0 missed). "
+        "Got %d." % hnm_deal[0]["missed_events"]
+    )

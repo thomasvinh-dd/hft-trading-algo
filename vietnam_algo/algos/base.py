@@ -30,6 +30,7 @@ class StrategyAdapter(ABC):
         trade_date: str | None = None,
         *,
         skip_backtest: bool = False,
+        live_submit: bool = False,
     ) -> dict[str, Any]:
         """Run the strategy and return the same payload as generate_live_orders.
 
@@ -40,6 +41,13 @@ class StrategyAdapter(ABC):
         ``generate_live_orders`` can forward the flag through.
         Adapters that run their own decision logic (e.g. autofin)
         can ignore it.
+
+        ``live_submit=True`` tells the adapter the caller intends to
+        submit real DNSE orders; ``False`` is dry-run mode. Adapters
+        that have any side-effect-with-real-money decisions (e.g. an
+        autofin catch-up scan that might re-emit past orders) should
+        no-op in live mode. Default ``False`` keeps the signature
+        backward compatible with callers that pre-date this flag.
         """
         ...
 
