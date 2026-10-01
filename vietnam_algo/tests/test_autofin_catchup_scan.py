@@ -576,3 +576,320 @@ def test_maybe_catchup_includes_symbols_from_dry_run_state(
         "expected 3 missed events (entry + 2 REDUCE lần 1 + lần 2); "
         "got %d" % hnm_deal[0]["missed_events"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Apply-to-state (2026-09-30 catch-up actually fills the dry-run state)
+# ---------------------------------------------------------------------------
+
+
+def test_catchup_applies_reduce_to_dry_run_state(monkeypatch, tmp_path):
+    """2026-09-30 HNM incident: the catchup scan reported the missed
+    events but didn't apply them. The 100 HNM shares stayed in dry-run
+    state forever because HNM had been removed from autofin's
+    /signal-static-holding list. This test verifies the fix: the
+    catchup scan now applies the missed events to the dry-run state
+    directly, so HNM ends up with 25 shares (100 × 0.5 × 0.5).
+
+    Two missed REDUCE 50% events on HNM during the 4-day gap:
+      lần 1 @ 8100  →  100 → 50
+      lần 2 @ 7800  →   50 → 25
+    After the catchup scan, dry_run_state should have:
+      HNM qty=25, cash increased by 50*8100 + 25*7800 = 600,000 VND
+      realized_pnl = (8100-8600)*50 + (7800-8600)*25 = -25000 - 20000 = -45000
+    """
+    monkeypatch.setenv("AUTOFIN_CATCHUP_THRESHOLD_HOURS", "24")
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+    from vietnam_algo.libs.dry_run_state import (
+        DryRunState,
+        DryRunPosition,
+        load_dry_run_state,
+    )
+
+    # Pre-existing dry-run state: HNM 100 @ 8600
+    state = DryRunState(
+        initial_nav=100_000_000,
+        cash=50_000_000,
+        positions={"HNM": DryRunPosition(
+            symbol="HNM",
+            quantity=100,
+            avg_price=8600.0,
+            last_price=8600.0,
+            cost_basis=860000.0,
+        )},
+        realized_pnl=0.0,
+        applied_keys=set(),
+    )
+    state_path = tmp_path / "live" / "dry_run_state.autofin_signal.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    from vietnam_algo.libs.dry_run_state import save_dry_run_state
+    save_dry_run_state(state, tmp_path, strategy_name="autofin_signal")
+
+    a = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    a._last_poll_at = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=48)
+    ).isoformat()
+    a._our_deals = {}
+    a._positions = None
+
+    deal = {
+        "_id": 1789344000,
+        "symbol": "HNM",
+        "statusDeal": {"price_Open": 9100},
+        "hisRecomment": [
+            "<div><p>Ngày khuyến nghị: 14/09/2026 🟢 Vùng mua: 8,900 - 9,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 1 Giá: 8,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 7,800</p></div>",
+        ],
+    }
+    client = _FakeClient({"HNM": [deal]})
+
+    class _Cfg:
+        pass
+    cfg = _Cfg()
+    cfg.dataDir = tmp_path
+
+    result = a._maybe_catchup_missed_signals(
+        client, [], [], live_submit=False, config=cfg,
+    )
+    assert result is not None
+    assert result["applied"] == 2, (
+        "expected 2 REDUCE orders applied to dry-run state. "
+        "Pre-fix applied=0 (catchup was diagnostic only). Got %d."
+        % result["applied"]
+    )
+
+    # Verify dry-run state was actually mutated
+    new_state = load_dry_run_state(tmp_path, strategy_name="autofin_signal")
+    assert new_state is not None
+    hnm = new_state.positions.get("HNM")
+    assert hnm is not None
+    assert hnm.quantity == 25, (
+        "HNM should be 25 shares after 2 REDUCE 50% steps "
+        "(100 → 50 → 25). Got %d." % hnm.quantity
+    )
+    # 50 shares sold @ 8100 = 405000 cash in
+    # 25 shares sold @ 7800 = 195000 cash in
+    # Total cash added: 600000
+    assert new_state.cash == 50_000_000 + 600_000, (
+        "cash should be 50M + 600K = 50.6M. Got %.0f." % new_state.cash
+    )
+    # Realized P&L = (8100-8600)*50 + (7800-8600)*25 = -25000 + -20000 = -45000
+    assert abs(new_state.realized_pnl - (-45000)) < 1, (
+        "realized_pnl should be -45000. Got %.0f." % new_state.realized_pnl
+    )
+
+
+def test_catchup_applies_full_close_to_dry_run_state(monkeypatch, tmp_path):
+    """Catchup scan should also apply full_close events to dry-run state."""
+    monkeypatch.setenv("AUTOFIN_CATCHUP_THRESHOLD_HOURS", "24")
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+    from vietnam_algo.libs.dry_run_state import (
+        DryRunState,
+        DryRunPosition,
+        load_dry_run_state,
+        save_dry_run_state,
+    )
+
+    state = DryRunState(
+        initial_nav=100_000_000,
+        cash=50_000_000,
+        positions={"MZG": DryRunPosition(
+            symbol="MZG",
+            quantity=500,
+            avg_price=30000.0,
+            last_price=30000.0,
+            cost_basis=15_000_000.0,
+        )},
+        realized_pnl=0.0,
+        applied_keys=set(),
+    )
+    state_path = tmp_path / "live" / "dry_run_state.autofin_signal.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    save_dry_run_state(state, tmp_path, strategy_name="autofin_signal")
+
+    a = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    a._last_poll_at = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=48)
+    ).isoformat()
+    a._our_deals = {}
+    a._positions = None
+
+    deal = {
+        "_id": 1785888000,
+        "symbol": "MZG",
+        "statusDeal": {"price_Open": 30000},
+        "hisRecomment": [
+            "<div><p>Ngày khuyến nghị: 12/09/2026 🟢 Vùng mua: 29,500 - 30,500</p></div>",
+            "<div><p>[MZG] 💰 Chốt lãi lần 1 mức giá 32,000 Tỷ trọng 30 %</p></div>",
+            "<div><p>Đóng DEAL [MZG] Lãi: 8.00 %</p></div>",
+        ],
+    }
+    client = _FakeClient({"MZG": [deal]})
+
+    class _Cfg:
+        pass
+    cfg = _Cfg()
+    cfg.dataDir = tmp_path
+
+    result = a._maybe_catchup_missed_signals(
+        client, [], [], live_submit=False, config=cfg,
+    )
+    assert result is not None
+    # 1 partial_close (TP 30%) + 1 full_close
+    assert result["applied"] == 2
+
+    new_state = load_dry_run_state(tmp_path, strategy_name="autofin_signal")
+    mzg = new_state.positions.get("MZG")
+    # 500 → 350 (after 30% partial_close) → 0 (after full_close)
+    assert mzg.quantity == 0, (
+        "MZG should be closed after the full_close event. Got %d." % mzg.quantity
+    )
+
+
+def test_catchup_no_apply_when_dry_run_state_missing(
+    monkeypatch, tmp_path
+):
+    """Cold start with no dry-run state file → catchup still surfaces
+    the missed events (we passed HNM via _positions) but doesn't
+    apply anything (no state to mutate)."""
+    monkeypatch.setenv("AUTOFIN_CATCHUP_THRESHOLD_HOURS", "24")
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    a = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    a._last_poll_at = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=48)
+    ).isoformat()
+    a._our_deals = {}
+    # _positions has HNM, so the scan visits the symbol
+    a._positions = ["HNM"]
+
+    deal = {
+        "_id": 1789344000,
+        "symbol": "HNM",
+        "statusDeal": {"price_Open": 9100},
+        "hisRecomment": [
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 1 Giá: 8,100</p></div>",
+        ],
+    }
+    client = _FakeClient({"HNM": [deal]})
+
+    class _Cfg:
+        pass
+    cfg = _Cfg()
+    # Use a tmp_path with NO dry-run state file
+    subdir = tmp_path / "no_state_here"
+    subdir.mkdir()
+    cfg.dataDir = subdir
+
+    result = a._maybe_catchup_missed_signals(
+        client, [], [], live_submit=False, config=cfg,
+    )
+    assert result is not None
+    assert result["applied"] == 0, (
+        "no dry-run state file → no apply. Got %d." % result["applied"]
+    )
+    # The missed events were still surfaced (informational only)
+    assert result["events"] == 1
+
+
+def test_catchup_does_not_reapply_on_subsequent_runs(
+    monkeypatch, tmp_path
+):
+    """Run the catchup twice with the same 50h gap, but on the
+    SECOND run load the per-deal state file first (simulating a
+    bot restart that reloaded its tracking dict from the persisted
+    autofin_signal_state.json). The first run applied 2 REDUCE
+    events and saved its _last_recomment. The second run should
+    recognise the deals are now up-to-date and skip the re-fire.
+
+    Pre-fix the second run would re-apply the same REDUCE events
+    (HNM 25 → 12 → 6). Post-fix the second run detects 0 missed
+    events because _last_recomment is set in the loaded our_deals.
+    """
+    monkeypatch.setenv("AUTOFIN_CATCHUP_THRESHOLD_HOURS", "24")
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+    from vietnam_algo.libs.dry_run_state import (
+        DryRunState,
+        DryRunPosition,
+        save_dry_run_state,
+    )
+
+    # Seed dry-run state
+    state = DryRunState(
+        initial_nav=100_000_000,
+        cash=50_000_000,
+        positions={"HNM": DryRunPosition(
+            symbol="HNM",
+            quantity=100,
+            avg_price=8600.0,
+            last_price=8600.0,
+            cost_basis=860000.0,
+        )},
+        realized_pnl=0.0,
+        applied_keys=set(),
+    )
+    state_path = tmp_path / "live" / "dry_run_state.autofin_signal.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    save_dry_run_state(state, tmp_path, strategy_name="autofin_signal")
+
+    deal = {
+        "_id": 1789344000,
+        "symbol": "HNM",
+        "statusDeal": {"price_Open": 9100},
+        "hisRecomment": [
+            "<div><p>Ngày khuyến nghị: 14/09/2026 🟢 Vùng mua: 8,900 - 9,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 1 Giá: 8,100</p></div>",
+            "<div><p>[HNM] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 7,800</p></div>",
+        ],
+    }
+    client = _FakeClient({"HNM": [deal]})
+
+    class _Cfg:
+        pass
+    cfg = _Cfg()
+    cfg.dataDir = tmp_path
+
+    # First run — fresh adapter, _our_deals empty
+    a1 = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    a1._last_poll_at = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=48)
+    ).isoformat()
+    a1._our_deals = {}
+    a1._positions = None
+    r1 = a1._maybe_catchup_missed_signals(
+        client, [], [], live_submit=False, config=cfg,
+    )
+    assert r1 is not None
+    assert r1["applied"] == 2
+    # a1._our_deals was updated with the orphan symbol
+    assert "orphan:HNM" in a1._our_deals or any(
+        v.get("symbol") == "HNM" for v in a1._our_deals.values()
+    ), "first run should track HNM in our_deals"
+
+    # Second run — simulate bot reload of state. The adapter instance
+    # is fresh, but its _our_deals is restored from the first run's
+    # in-memory state. This is exactly what the bot does between
+    # cycles: ``_save_state`` writes our_deals to disk, ``_load_state``
+    # reads it back on the next cycle. Without the reload, the
+    # test would fail because the in-memory state would be lost.
+    a2 = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    a2._last_poll_at = (
+        datetime.now(tz=timezone.utc) - timedelta(hours=48)
+    ).isoformat()
+    # Restore from first run's updates
+    a2._our_deals = dict(a1._our_deals)
+    a2._positions = None
+
+    r2 = a2._maybe_catchup_missed_signals(
+        client, [], [], live_submit=False, config=cfg,
+    )
+    # r2 might be None (no missed events after dedup) or a summary
+    # with applied=0 — either way, HNM should NOT be reduced
+    # below the 25 shares we landed on after the first run.
+    from vietnam_algo.libs.dry_run_state import load_dry_run_state
+    s2 = load_dry_run_state(tmp_path, strategy_name="autofin_signal")
+    assert s2.positions["HNM"].quantity == 25, (
+        "second catchup run with restored _our_deals must not "
+        "re-apply reduces. Got HNM qty = %.2f." % s2.positions["HNM"].quantity
+    )

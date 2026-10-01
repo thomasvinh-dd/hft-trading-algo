@@ -255,6 +255,193 @@ def _deal_id(raw: dict[str, Any]) -> str:
 DEFAULT_CATCHUP_THRESHOLD_SECONDS = 24 * 60 * 60  # 24 trading hours
 
 
+def _apply_catchup_orders_to_dry_run_state(
+    catchup_orders_by_symbol: dict[str, list[dict[str, Any]]],
+    dry_state: Any,
+    our_deals: dict[str, dict[str, Any]],
+    board_lot: int = DEFAULT_BOARD_LOT,
+) -> tuple[int, int, int]:
+    """Apply the catchup's missed-event orders to ``dry_state`` directly.
+
+    The catchup scan reports events autofin fired while the bot was
+    down — for symbols that are no longer in autofin's
+    ``/signal-static-holding`` list, the next cycle's
+    ``_plan_partial_close_orders`` won't visit them (line 1053:
+    ``if did not in autofin_by_id: continue``). The catchup scan must
+    therefore apply the missed events itself, otherwise the dry-run
+    state stays out of sync with autofin forever (2026-09-30 HNM
+    incident: 100 HNM shares held in dry-run, autofin issued 2 REDUCE
+    50% steps during the bot's 4-day downtime, but neither step was
+    applied because HNM had been manually closed in the autofin UI
+    and dropped from autofin's holding list).
+
+    Args:
+      ``catchup_orders_by_symbol``: ``symbol → list[order]`` from
+        ``_build_catchup_orders_for_deal``. Each order dict has
+        ``side``, ``kind``, ``fraction``, ``price``, ``reason``
+        and is sorted oldest-first.
+      ``dry_state``: ``DryRunState`` instance (mutated in place).
+      ``our_deals``: per-deal tracking dict (mutated in place to
+        record the latest applied recomment + ``_last_numberOfProfit``
+        + ``_last_partial_fraction`` baseline).
+      ``board_lot``: for ``_emit_redmitt`` qty rounding.
+
+    Returns:
+      ``(applied_count, skipped_count, closed_count)`` — telemetry
+      for the operator notification.
+    """
+    applied = 0
+    skipped = 0
+    closed = 0
+    for sym, orders in catchup_orders_by_symbol.items():
+        # Idempotency guard via ``applied_keys``. The catchup orders
+        # use a synthetic date prefix (``catchup:<reason>``) so they
+        # never collide with the EOD's per-date dedup keys. If a
+        # previous catchup cycle already applied an order with the
+        # same synthetic key, skip — prevents the HNM 100 → 50 → 25
+        # → 12 → 6 chain when the bot runs the catchup multiple
+        # times against the same deal (e.g. two ``last_poll_at``
+        # resets in a row, or a bot restart that reloaded an
+        # empty ``_our_deals`` from disk).
+        applied_keys = set(dry_state.applied_keys or [])
+        pos = dry_state.positions.get(sym)
+        if pos is None and orders and orders[0].get("kind") != "entry":
+            # Catchup orders for a symbol we don't hold in dry-run.
+            # Without an entry event, we can't reconstruct the
+            # initial BUY. Skip the partial closes — operator must
+            # add the position to dry-run state manually if needed.
+            for o in orders:
+                skipped += 1
+            continue
+        for order in orders:
+            kind = order.get("kind")
+            side = order.get("side")
+            price = int(order.get("price") or 0)
+            fraction = float(order.get("fraction") or 0)
+            if kind == "entry":
+                # The autofin adapter's ``_plan_orders_for_new_positions``
+                # will create the BUY the next time the deal becomes
+                # active. Catchup skips entry replay because we don't
+                # have the historical fill qty / cash-on-hand.
+                skipped += 1
+                continue
+            if side != "NS":
+                # BUY from catchup — same caveat as entry above.
+                skipped += 1
+                continue
+            if pos is None or pos.quantity <= 0:
+                skipped += 1
+                continue
+            if kind == "full_close":
+                # Idempotency: skip if this exact catchup order was
+                # applied in a previous cycle.
+                dedup = f"catchup:{sym}:{side}:full:{price}"
+                if dedup in applied_keys:
+                    skipped += 1
+                    continue
+                sell_qty = pos.quantity
+                sell_price = price or pos.last_price or pos.avg_price
+                realized = (sell_price - pos.avg_price) * sell_qty if pos.avg_price > 0 else 0.0
+                pos.quantity = 0
+                pos.cost_basis = 0
+                pos.avg_price = 0
+                dry_state.cash += sell_qty * sell_price
+                dry_state.realized_pnl += realized
+                dry_state.closed_trades.append({
+                    "symbol": sym,
+                    "avg_cost": pos.avg_price,
+                    "sell_price": sell_price,
+                    "qty": sell_qty,
+                    "realized_pnl": realized,
+                })
+                applied_keys.add(dedup)
+                closed += 1
+                applied += 1
+                continue
+            if kind in ("partial_close", "reduce_lap"):
+                # Idempotency: skip if this exact catchup order was
+                # applied in a previous cycle. The dedup key uses
+                # ``sym + side + price + fraction`` (NOT qty) — qty
+                # is derived from the current position size which
+                # changes between runs (100 → 25). The fraction
+                # uniquely identifies the autofin event: lần 1 vs
+                # lần 2 both have fraction=0.5 but different prices,
+                # and the price is part of the recomment text.
+                dedup = (
+                    f"catchup:{sym}:{side}:"
+                    f"{price}:{int(round(fraction * 100))}"
+                )
+                if dedup in applied_keys:
+                    skipped += 1
+                    continue
+                # SELLs do NOT round to a board lot — they're
+                # reductions of an existing lot position, so a
+                # sub-lot sale (e.g. 50 shares of a 100-share lot
+                # after a 50% reduce) is valid. The existing
+                # ``_apply_dry_run_fills`` follows the same rule
+                # (line 400: ``sell_qty = min(qty, pos.quantity)``).
+                if fraction > 0:
+                    sell_qty = int(pos.quantity * fraction)
+                else:
+                    sell_qty = pos.quantity // 2  # fallback if fraction is 0
+                if sell_qty <= 0:
+                    skipped += 1
+                    continue
+                # Don't oversell. The next iteration of the outer
+                # loop will re-read pos.quantity for the next reduce.
+                sell_qty = min(sell_qty, pos.quantity)
+                sell_price = price or pos.last_price or pos.avg_price
+                realized = (sell_price - pos.avg_price) * sell_qty if pos.avg_price > 0 else 0.0
+                pos.quantity -= sell_qty
+                pos.cost_basis = pos.quantity * pos.avg_price if pos.avg_price > 0 else 0.0
+                dry_state.cash += sell_qty * sell_price
+                dry_state.realized_pnl += realized
+                applied_keys.add(dedup)
+                applied += 1
+                continue
+            skipped += 1
+        # Update tracking state for the next cycle so the regular
+        # ``_plan_partial_close_orders`` won't re-fire on these
+        # events. Without this we'd risk double-applying on the
+        # next cycle's numberOfProfit delta logic.
+        did_key = next(
+            (k for k, v in our_deals.items() if v.get("symbol") == sym),
+            None,
+        )
+        # If the deal isn't tracked in our_deals (orphan symbol that
+        # autofin's /signal-static-holding dropped), add a minimal
+        # entry so future catchup runs can find it via did_key above.
+        # The deal_id used here is just a placeholder — the real
+        # deal_id (autofin's `time_Open`-derived) isn't available
+        # without an autofin fetch, but the symbol-based lookup is
+        # enough to deduplicate catchup re-runs.
+        if did_key is None and orders and applied > 0:
+            did_key = "orphan:{sym}".format(sym=sym)
+            our_deals[did_key] = {"symbol": sym, "_our_qty": 0}
+        if did_key and orders:
+            last_event = orders[-1]
+            our_deals[did_key]["_last_recomment"] = (
+                (last_event.get("reason") or "").split(":")[-1]
+            )
+            our_deals[did_key]["_last_partial_fraction"] = (
+                float(last_event.get("fraction") or 0) or None
+            )
+            # numberOfProfit is unknown from the catchup (we don't
+            # have autofin's per-deal numberOfProfit for orphan deals).
+            # Set a sentinel — the next cycle's bootstrap (last_nP < 0)
+            # would re-anchor on whatever autofin reports then.
+            if "_last_numberOfProfit" not in our_deals[did_key]:
+                our_deals[did_key]["_last_numberOfProfit"] = -1
+        # Persist the catchup dedup keys back to the state. This is
+        # what prevents the re-fire: a future catchup cycle reads
+        # the same ``applied_keys`` set from disk and skips orders
+        # whose synthetic key is already present. The ``:orphan:HNM``
+        # key would also work but applied_keys is more reliable
+        # because it's an unbounded set rather than a per-deal dict.
+        dry_state.applied_keys = applied_keys
+    return applied, skipped, closed
+
+
 def _parse_deal_open_date(deal: dict[str, Any]) -> str | None:
     """Extract the deal's open date as ``YYYY-MM-DD`` from autofin's
     ``statusDeal.time_Open`` field.
@@ -2085,6 +2272,12 @@ class AutofinSignalAdapter(StrategyAdapter):
         events_emitted = 0
         orders_emitted = 0
         skipped = 0
+        # Per-symbol list of catchup orders, oldest-first. Collected
+        # during the scan and applied once at the end so multiple
+        # events on the same symbol (e.g. lần 1 then lần 2 reduce)
+        # compose correctly: the second reduce operates on the
+        # post-first-reduce position qty.
+        catchup_orders_by_symbol: dict[str, list[dict[str, Any]]] = {}
 
         for sym in sorted(symbols):
             try:
@@ -2108,22 +2301,10 @@ class AutofinSignalAdapter(StrategyAdapter):
                     "missed_events": len(catchup_orders),
                 })
                 events_emitted += len(catchup_orders)
-                # The catch-up orders are diagnostic only — the
-                # per-deal state tracking will pick up these events
-                # naturally on the next ``_plan_partial_close_orders``
-                # call (the ``numberOfProfit`` delta logic) and
-                # ``_plan_orders_for_new_positions`` (for new entries
-                # via /signal-static-suggest). We do NOT apply them
-                # to the dry-run state here because:
-                #   * We don't have reliable historical prices in the
-                #     past for the dry-run P&L — autofin's
-                #     ``hisRecomment`` has the recommendation price but
-                #     not the actual fill price.
-                #   * The next normal cycle will fire the same orders
-                #     with correct prices.
-                # We just log the missed count so the operator can
-                # confirm the gap was real and what would have fired.
                 orders_emitted += len(catchup_orders)
+                catchup_orders_by_symbol.setdefault(sym, []).extend(
+                    catchup_orders
+                )
                 print(
                     f"[autofin_catchup] deal={did} {sym}: "
                     f"{len(catchup_orders)} missed event(s) — "
@@ -2133,6 +2314,56 @@ class AutofinSignalAdapter(StrategyAdapter):
         if not deals_scanned:
             return None
 
+        # Apply the catchup orders to dry-run state. We do this
+        # before the notification so the operator sees the post-fill
+        # state in the next cycle's Telegram. Live mode is gated
+        # above (returns a "live_skip" summary instead) — this block
+        # only runs in dry-run.
+        try:
+            from vietnam_algo.libs.dry_run_state import (
+                load_dry_run_state,
+                save_dry_run_state,
+            )
+            from pathlib import Path as _P
+            _data_dir = (
+                config.dataDir
+                if config is not None and hasattr(config, "dataDir")
+                else _P("vietnam_algo/data")
+            )
+            _dry = load_dry_run_state(_P(_data_dir), strategy_name="autofin_signal")
+            if _dry is None:
+                # No state yet — bot is cold-starting. Skip apply;
+                # the next cycle's ``_plan_orders_for_new_positions``
+                # will pick up new entries, and any held positions
+                # would have already been tracked via the next cycle's
+                # ``fetch_holding`` reconcile.
+                applied_count = 0
+                skipped_count = 0
+                closed_count = 0
+            else:
+                applied_count, skipped_count, closed_count = (
+                    _apply_catchup_orders_to_dry_run_state(
+                        catchup_orders_by_symbol,
+                        _dry,
+                        self._our_deals,
+                        board_lot=DEFAULT_BOARD_LOT,
+                    )
+                )
+                save_dry_run_state(
+                    _dry, _P(_data_dir), strategy_name="autofin_signal",
+                )
+                print(
+                    f"[autofin_catchup] dry-run applied={applied_count} "
+                    f"skipped={skipped_count} closed={closed_count}"
+                )
+        except Exception as exc:
+            print(
+                f"[autofin_catchup] dry-run apply failed (non-fatal): {exc}"
+            )
+            applied_count = 0
+            skipped_count = 0
+            closed_count = 0
+
         notify(
             "\n".join([
                 "⚠️ Vietnam Algo: autofin bot missed signals",
@@ -2140,14 +2371,17 @@ class AutofinSignalAdapter(StrategyAdapter):
                 f"scanned {len(symbols)} symbol(s), "
                 f"{len(deals_scanned)} deal(s) had missed events",
                 f"missed events: {events_emitted}",
-                "next cycle will replay these via numberOfProfit delta",
+                f"applied to dry-run: {applied_count} SELL "
+                f"({closed_count} deals closed)",
             ])
         )
         return {
             "deals": deals_scanned,
             "events": events_emitted,
             "orders": orders_emitted,
-            "skipped": skipped,
+            "applied": applied_count,
+            "closed": closed_count,
+            "skipped": skipped_count,
             "gap_hours": gap_hours,
             "live_skip": False,
         }
