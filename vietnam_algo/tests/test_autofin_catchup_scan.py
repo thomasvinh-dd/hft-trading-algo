@@ -589,14 +589,16 @@ def test_catchup_applies_reduce_to_dry_run_state(monkeypatch, tmp_path):
     state forever because HNM had been removed from autofin's
     /signal-static-holding list. This test verifies the fix: the
     catchup scan now applies the missed events to the dry-run state
-    directly, so HNM ends up with 25 shares (100 × 0.5 × 0.5).
+    directly.
 
-    Two missed REDUCE 50% events on HNM during the 4-day gap:
-      lần 1 @ 8100  →  100 → 50
-      lần 2 @ 7800  →   50 → 25
-    After the catchup scan, dry_run_state should have:
-      HNM qty=25, cash increased by 50*8100 + 25*7800 = 600,000 VND
-      realized_pnl = (8100-8600)*50 + (7800-8600)*25 = -25000 - 20000 = -45000
+    2026-10-01 fix: SELL qty rounds UP to the nearest board lot (100).
+    For a 100-share position, a 50% reduce rounds to 100 (full close).
+    So HNM goes from 100 → 0 (full close at lần 1) — the lần 2
+    reduce has nothing to apply to and is skipped.
+
+    After the catchup scan:
+      HNM qty=0, cash increased by 100*8100 = 810,000 VND
+      realized_pnl = (8100-8600)*100 = -50,000 VND
     """
     monkeypatch.setenv("AUTOFIN_CATCHUP_THRESHOLD_HOURS", "24")
     from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
@@ -653,30 +655,34 @@ def test_catchup_applies_reduce_to_dry_run_state(monkeypatch, tmp_path):
         client, [], [], live_submit=False, config=cfg,
     )
     assert result is not None
-    assert result["applied"] == 2, (
-        "expected 2 REDUCE orders applied to dry-run state. "
-        "Pre-fix applied=0 (catchup was diagnostic only). Got %d."
-        % result["applied"]
+    # Only lần 1 applies (50% of 100 = 50, rounds up to 100, full
+    # close). lần 2 is skipped because pos.quantity is 0 by then.
+    assert result["applied"] == 1, (
+        "expected 1 REDUCE order applied (lần 1 closes the deal "
+        "via 50% rounding up to 100). lần 2 has nothing to reduce. "
+        "Got applied=%d." % result["applied"]
+    )
+    assert result["closed"] == 1, (
+        "expected 1 deal closed (HNM). Got %d." % result["closed"]
     )
 
     # Verify dry-run state was actually mutated
     new_state = load_dry_run_state(tmp_path, strategy_name="autofin_signal")
     assert new_state is not None
     hnm = new_state.positions.get("HNM")
-    assert hnm is not None
-    assert hnm.quantity == 25, (
-        "HNM should be 25 shares after 2 REDUCE 50% steps "
-        "(100 → 50 → 25). Got %d." % hnm.quantity
+    assert hnm is None, (
+        "HNM should be removed from positions after the catchup "
+        "applies lần 1 (50% of 100 rounds up to 100, full close). "
+        "Still has %r." % hnm
     )
-    # 50 shares sold @ 8100 = 405000 cash in
-    # 25 shares sold @ 7800 = 195000 cash in
-    # Total cash added: 600000
-    assert new_state.cash == 50_000_000 + 600_000, (
-        "cash should be 50M + 600K = 50.6M. Got %.0f." % new_state.cash
+    # 100 shares sold @ 8100 = 810,000 cash in
+    assert new_state.cash == 50_000_000 + 810_000, (
+        "cash should be 50M + 810K = 50.81M. Got %.0f." % new_state.cash
     )
-    # Realized P&L = (8100-8600)*50 + (7800-8600)*25 = -25000 + -20000 = -45000
-    assert abs(new_state.realized_pnl - (-45000)) < 1, (
-        "realized_pnl should be -45000. Got %.0f." % new_state.realized_pnl
+    # Realized P&L = (8100-8600)*100 = -50,000 VND
+    assert abs(new_state.realized_pnl - (-50_000)) < 1, (
+        "realized_pnl should be -50000 (full position closed at a "
+        "loss vs avg cost 8600). Got %.0f." % new_state.realized_pnl
     )
 
 
@@ -861,11 +867,10 @@ def test_catchup_does_not_reapply_on_subsequent_runs(
         client, [], [], live_submit=False, config=cfg,
     )
     assert r1 is not None
-    assert r1["applied"] == 2
-    # a1._our_deals was updated with the orphan symbol
-    assert "orphan:HNM" in a1._our_deals or any(
-        v.get("symbol") == "HNM" for v in a1._our_deals.values()
-    ), "first run should track HNM in our_deals"
+    # HNM 100 × 0.5 = 50 → rounds up to 100 → full close on lần 1.
+    # lần 2 has nothing to reduce. Result: applied=1, closed=1.
+    assert r1["applied"] == 1
+    assert r1["closed"] == 1
 
     # Second run — simulate bot reload of state. The adapter instance
     # is fresh, but its _our_deals is restored from the first run's
@@ -881,15 +886,16 @@ def test_catchup_does_not_reapply_on_subsequent_runs(
     a2._our_deals = dict(a1._our_deals)
     a2._positions = None
 
-    r2 = a2._maybe_catchup_missed_signals(
+    a2._maybe_catchup_missed_signals(
         client, [], [], live_submit=False, config=cfg,
     )
-    # r2 might be None (no missed events after dedup) or a summary
-    # with applied=0 — either way, HNM should NOT be reduced
-    # below the 25 shares we landed on after the first run.
+    # Second run should not re-fire — the synthetic dedup keys
+    # written by the first run (catchup:HNM:NS:8100:50 and
+    # catchup:HNM:NS:7800:50) are now in dry_state.applied_keys.
     from vietnam_algo.libs.dry_run_state import load_dry_run_state
     s2 = load_dry_run_state(tmp_path, strategy_name="autofin_signal")
-    assert s2.positions["HNM"].quantity == 25, (
-        "second catchup run with restored _our_deals must not "
-        "re-apply reduces. Got HNM qty = %.2f." % s2.positions["HNM"].quantity
+    # HNM was fully closed in the first run (no HNM position remains).
+    assert "HNM" not in s2.positions, (
+        "second run must not re-open a closed position. "
+        "Got HNM back in positions: %r." % s2.positions.get("HNM")
     )

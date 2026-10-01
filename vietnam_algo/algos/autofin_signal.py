@@ -374,26 +374,59 @@ def _apply_catchup_orders_to_dry_run_state(
                 if dedup in applied_keys:
                     skipped += 1
                     continue
-                # SELLs do NOT round to a board lot — they're
-                # reductions of an existing lot position, so a
-                # sub-lot sale (e.g. 50 shares of a 100-share lot
-                # after a 50% reduce) is valid. The existing
-                # ``_apply_dry_run_fills`` follows the same rule
-                # (line 400: ``sell_qty = min(qty, pos.quantity)``).
+                # Vietnamese stocks trade in board lots of 100 —
+                # you can't sell a sub-lot quantity. Compute the
+                # raw reduce amount and round UP to the nearest
+                # board lot. If the rounded-up amount exceeds the
+                # current position (e.g. a 50% reduce on a 100-share
+                # lot rounds up to 100, which is the entire
+                # position), do a full close instead. This is the
+                # 2026-10-01 fix: the previous code rounded DOWN,
+                # leaving HNM at 2 shares after multiple reduce
+                # 50% events on a 100-share entry. The user feedback
+                # was explicit: "for ex if origin is 100 share,
+                # 50% will be 50 share round to 100 is 100 share,
+                # so we will have no shares left and need to close
+                # the deal out of our porfolio".
                 if fraction > 0:
-                    sell_qty = int(pos.quantity * fraction)
+                    raw_reduce = int(pos.quantity * fraction)
                 else:
-                    sell_qty = pos.quantity // 2  # fallback if fraction is 0
-                if sell_qty <= 0:
+                    raw_reduce = pos.quantity // 2  # fallback if fraction is 0
+                if raw_reduce <= 0:
                     skipped += 1
                     continue
-                # Don't oversell. The next iteration of the outer
-                # loop will re-read pos.quantity for the next reduce.
+                if board_lot > 1:
+                    sell_qty = ((raw_reduce + board_lot - 1) // board_lot) * board_lot
+                else:
+                    sell_qty = raw_reduce
+                # Don't oversell — if the rounded-up amount exceeds
+                # the position, do a full close instead. This is
+                # the small-position case the user described.
                 sell_qty = min(sell_qty, pos.quantity)
                 sell_price = price or pos.last_price or pos.avg_price
                 realized = (sell_price - pos.avg_price) * sell_qty if pos.avg_price > 0 else 0.0
+                # If the reduce fully closes the position, also
+                # emit a closed_trades record so the operator's
+                # EOD summary reflects the exit.
+                closed_this = sell_qty >= pos.quantity
                 pos.quantity -= sell_qty
                 pos.cost_basis = pos.quantity * pos.avg_price if pos.avg_price > 0 else 0.0
+                if closed_this:
+                    pos.avg_price = 0
+                    pos.last_price = sell_price
+                    dry_state.closed_trades.append({
+                        "symbol": sym,
+                        "avg_cost": 0,  # cleared above
+                        "sell_price": sell_price,
+                        "qty": sell_qty,
+                        "realized_pnl": realized,
+                    })
+                    # Remove the closed position so the EOD summary
+                    # doesn't list it as a 0-share holding. Use
+                    # pop with default to avoid KeyError if the
+                    # position was already removed (defensive).
+                    dry_state.positions.pop(sym, None)
+                    closed += 1
                 dry_state.cash += sell_qty * sell_price
                 dry_state.realized_pnl += realized
                 applied_keys.add(dedup)
