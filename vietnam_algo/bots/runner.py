@@ -496,6 +496,7 @@ def _build_portfolio_snapshot(
             build_dry_run_snapshot,
             init_dry_run_state,
             mark_to_market,
+            save_dry_run_state,
         )
         state = init_dry_run_state(engine_config.dataDir, strategy_name=strategy_name)
         # Mark-to-market any open positions against the most recent close
@@ -511,6 +512,21 @@ def _build_portfolio_snapshot(
                     if last_close > 0:
                         prices[sym] = float(last_close)
             mark_to_market(state, prices)
+            # 2026-10-01 fix: persist the mark-to-market updates back to
+            # the dry-run state file so subsequent cycles don't see an
+            # outdated ``last_price``. Previously the in-memory
+            # ``mark_to_market`` updated the snapshot's ``marketPrice``
+            # correctly (so the Telegram message showed fresh prices)
+            # but the on-disk ``last_price`` stayed at the last BUY/SELL
+            # price forever. The user noticed ABB and BSR showing
+            # stale prices: ABB last_price=17,317 (the Sep 15 BUY
+            # price, never updated since) and BSR last_price=31,518
+            # (the Sep 22 SELL price, never updated since). The fix is
+            # to save the state right after mark_to_market so the
+            # on-disk and in-memory values stay in sync.
+            save_dry_run_state(
+                state, engine_config.dataDir, strategy_name=strategy_name,
+            )
         except Exception:
             pass
         return build_dry_run_snapshot(state, account_no=account_no)
