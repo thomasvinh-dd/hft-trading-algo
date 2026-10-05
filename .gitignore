@@ -1,23 +1,29 @@
-# Local env files (DNS, IMAP, Telegram credentials)
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Secrets / env files
+vietnam_algo/env/
 .env
 .env.*
-*.env.local
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
+# Data — never commit (large + may contain PII)
+vietnam_algo/data/
+data/
 
-# Editor / OS
-.vscode/
-.idea/
-.DS_Store
+# Logs
+logs/
+*.log
 
-# Backtest artefacts (large regenerable data)
-/vietnam_algo/data/backtests/_*.json
+# Backups / runtime artifacts
+backups/
+*.pyc.bak
 
-# Live state (sensitive)
-/vietnam_algo/data/live/*.json
-
-# Session state for opencode
-/.opencode/
+# Secrets left at project root — DO NOT COMMIT
+dnse.txt
