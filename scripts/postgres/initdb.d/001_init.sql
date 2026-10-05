@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS market_holidays (
 CREATE TABLE IF NOT EXISTS sync_state (
     source      TEXT NOT NULL,    -- 'dnse', 'fiin', 'vietstock', 'market_holiday'
     kind        TEXT NOT NULL,    -- 'symbols', 'prices', 'corporate_actions', ...
-    symbol      TEXT NOT NULL DEFAULT '',  -- empty string for global syncs
+    symbol      TEXT,             -- nullable; symbols sync is global
     last_synced TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (source, kind, symbol)
+    PRIMARY KEY (source, kind, COALESCE(symbol, ''))
 );
