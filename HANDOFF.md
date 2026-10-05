@@ -205,21 +205,7 @@ the tunnel used a non-standard port.
 | DNSE live trading | end-to-end verified | via reverse SSH tunnel |
 | Reverse SSH tunnel setup | done | cron watchdog on workstation |
 | Auto-bot dry-run on VPS | works | 1384 trades / 222.39% (matches local) |
-| DNSE daily price sync | 1407/1417 = 99.29% | 11 tickers DNSE doesn't carry — see below |
-
-**DNSE price coverage (snapshot 2026-08-31 17:43):**
-- Master list: 1417 tickers (from `data/symbols.json`, FiinTrade)
-- DNSE prices_dnse files: 1411, of which **1407 have bars**, 4 are empty
-- Newest bar in 872 tickers: **2026-08-28** (others lag by a few days — typical
-  for thinly-traded UPCoM names)
-- Total bars: 2,781,579
-- Full manifest at `vietnam_algo/data/prices_dnse/SYNC_REPORT.json`
-- **Unfillable from DNSE (11 tickers, all delisted or not in DNSE's book):**
-  - `HTTP 400 invalid symbol`: BCG, BCR, FUCTVGF3, RDP, TAN, VE2, VTS
-  - `HTTP 200 with items=[]`: CNA, EGL, TBW, UTT
-- 1 extra in prices_dnse not in master: **VND** (DNSE carries it, FiinTrade master doesn't)
-- To re-run: `python -m vietnam_algo.main dnse-sync-prices --from-date 2015-01-01` (skips existing by default; ~20s)
-- To force-refresh everything: add `--no-skip-existing` (takes ~30h for 1417 tickers at 0.3s sleep)
+| 7 missing tickers | 6 of 7 are delisted/non-stock | BCG, BCR, FUCTVGF3, RDP, TAN, VE2, VTS — not blockers |
 
 ## 9. Open items the fresh agent should keep working on
 
