@@ -110,27 +110,21 @@ def test_runner_passes_today_to_strategy_adapter():
     import re
 
     src = _runner_source()
-    # The call may span multiple lines; match ``trade_date=today``
-    # anywhere within a ``(...`` argument block. Use a
-    # balanced-bracket-free pattern: search for the keyword
-    # ``trade_date=today`` within 200 chars after each function-call
-    # site we care about.
-    adapter_call = src.find("strategy_adapter.generate_orders(")
-    assert adapter_call > 0, "strategy_adapter.generate_orders call missing"
-    adapter_tail = src[adapter_call:adapter_call + 400]
-    assert "trade_date=today" in adapter_tail, (
+    # Both call sites must pass trade_date=today. Whitespace-tolerant.
+    adapter_pattern = re.compile(
+        r"strategy_adapter\.generate_orders\s*\([^)]*trade_date\s*=\s*today",
+        re.DOTALL,
+    )
+    legacy_pattern = re.compile(
+        r"generate_live_orders\s*\([^)]*trade_date\s*=\s*today",
+        re.DOTALL,
+    )
+    assert adapter_pattern.search(src), (
         "strategy_adapter.generate_orders must receive trade_date=today — "
         "without it the momentum backtest silently picks the latest CSV "
         "row (often days stale) and reports that as today's tradeDate."
     )
-
-    legacy_call = src.find("generate_live_orders(\n                    engine_config, strat_cfg,")
-    if legacy_call < 0:
-        # Try without the indented form
-        legacy_call = src.find("generate_live_orders(\n                engine_config, strat_cfg,")
-    assert legacy_call > 0, "generate_live_orders call missing in EOD path"
-    legacy_tail = src[legacy_call:legacy_call + 400]
-    assert "trade_date=today" in legacy_tail, (
+    assert legacy_pattern.search(src), (
         "generate_live_orders must also receive trade_date=today for the "
         "hybrid strategy fallback path."
     )

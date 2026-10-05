@@ -825,6 +825,31 @@ def _plan_orders_for_new_positions(
         at ``supply_to`` (high end of buy zone).
     """
     rows: list[dict[str, Any]] = []
+    # 2026-10-02 fix: pre-strip signals whose symbols are in
+    # ``already_planned_symbols`` (i.e. we've already issued an order
+    # for them) BEFORE the top-N loop. The previous logic ran the
+    # top-N check at the start of every iteration (line ~854:
+    # ``if considered >= top_n: break``), so when autofin's
+    # /signal-static-suggest returned an already-actioned deal at
+    # position 0, the single ``top_n=1`` slot was consumed by that
+    # deal — the loop exited and any real new suggestions lower
+    # in the list were never evaluated. The result: cash > 5% NAV
+    # gate passed, but zero orders triggered because the top
+    # suggestion was an old, actioned deal. Stripping actioned
+    # symbols up-front means ``top_n`` now measures "top N
+    # candidates we haven't already traded", which is what the
+    # user actually wants.
+    if already_planned_symbols:
+        _before = len(selected)
+        selected = [
+            s for s in selected if s.symbol not in already_planned_symbols
+        ]
+        _filtered = _before - len(selected)
+        if _filtered > 0:
+            print(
+                f"[autofin_signal] filtered {_filtered} already-actioned "
+                f"signal(s) before top-N selection"
+            )
     # Cash budget shared across the whole selected list. Defaults to
     # nav_vnd if no explicit budget was passed (legacy behaviour).
     if available_cash_vnd is None or available_cash_vnd <= 0:
@@ -2373,7 +2398,15 @@ class AutofinSignalAdapter(StrategyAdapter):
                 applied_count = 0
                 skipped_count = 0
                 closed_count = 0
+                _new_closes: list[dict[str, Any]] = []
             else:
+                # Snapshot the closed_trades length BEFORE apply so we
+                # can attribute any new closes to this catchup run in
+                # the Telegram alert (operator feedback 2026-10-05:
+                # the summary-only alert didn't show which symbols got
+                # closed in dry-run, making the close invisible until
+                # the next cycle's SOD/cycle snapshot).
+                _closed_before = len(_dry.closed_trades)
                 applied_count, skipped_count, closed_count = (
                     _apply_catchup_orders_to_dry_run_state(
                         catchup_orders_by_symbol,
@@ -2389,6 +2422,8 @@ class AutofinSignalAdapter(StrategyAdapter):
                     f"[autofin_catchup] dry-run applied={applied_count} "
                     f"skipped={skipped_count} closed={closed_count}"
                 )
+                # Slice any new entries appended during this apply.
+                _new_closes = list(_dry.closed_trades[_closed_before:])
         except Exception as exc:
             print(
                 f"[autofin_catchup] dry-run apply failed (non-fatal): {exc}"
@@ -2396,18 +2431,64 @@ class AutofinSignalAdapter(StrategyAdapter):
             applied_count = 0
             skipped_count = 0
             closed_count = 0
+            _new_closes = []
 
-        notify(
-            "\n".join([
-                "⚠️ Vietnam Algo: autofin bot missed signals",
-                f"gap: {gap_hours:.1f} hours (threshold {threshold_sec/3600:.0f}h)",
-                f"scanned {len(symbols)} symbol(s), "
-                f"{len(deals_scanned)} deal(s) had missed events",
-                f"missed events: {events_emitted}",
-                f"applied to dry-run: {applied_count} SELL "
-                f"({closed_count} deals closed)",
-            ])
-        )
+        # Build the alert body. When the apply closed any positions
+        # this run, append a per-deal breakdown so the operator sees
+        # *which* symbols were closed (not just the aggregate count).
+        # Per user feedback 2026-10-05: STB's weekend catchup close
+        # was silent because the previous notify() body only carried
+        # the rolled-up "applied=N closed=M" line.
+        _notify_lines: list[str] = [
+            "⚠️ Vietnam Algo: autofin bot missed signals",
+            f"gap: {gap_hours:.1f} hours (threshold {threshold_sec/3600:.0f}h)",
+            f"scanned {len(symbols)} symbol(s), "
+            f"{len(deals_scanned)} deal(s) had missed events",
+            f"missed events: {events_emitted}",
+            f"applied to dry-run: {applied_count} SELL "
+            f"({closed_count} deals closed)",
+        ]
+        if _new_closes:
+            _notify_lines.append("")
+            _notify_lines.append(
+                f"📊 *DRY-RUN CLOSES THIS RUN* ({len(_new_closes)} deal"
+                f"{'s' if len(_new_closes) != 1 else ''}):"
+            )
+            # Cap the per-deal list at 10 to keep the alert readable;
+            # the cycle/SOD snapshot still has the full portfolio.
+            for _close in _new_closes[:10]:
+                _sym = _close.get("symbol", "?")
+                _qty = _close.get("qty", 0)
+                _avg = _close.get("avg_cost", 0)
+                _px = _close.get("sell_price", 0)
+                _pnl = _close.get("realized_pnl", 0)
+                _note = _close.get("note") or ""
+                # Express P&L as % of cost basis for quick scanning.
+                _cost_total = (_avg or 0) * (_qty or 0)
+                if _cost_total > 0:
+                    _pct = (_pnl / _cost_total) * 100.0
+                    _pct_str = f"{_pct:+.2f}%"
+                else:
+                    _pct_str = "n/a"
+                _pnl_str = (
+                    f"+{_pnl:,.0f}" if _pnl > 0
+                    else f"{_pnl:,.0f}"
+                )
+                _line = (
+                    f"  • *{_sym}*: {_qty:,} shares, "
+                    f"cost {_avg:,.0f} → sold @ {_px:,.0f} "
+                    f"({_pct_str}, {_pnl_str} VND)"
+                )
+                if _note:
+                    _line += f"\n    note: {_note}"
+                _notify_lines.append(_line)
+            if len(_new_closes) > 10:
+                _notify_lines.append(
+                    f"  …and {len(_new_closes) - 10} more (see dry-run "
+                    f"state for full list)"
+                )
+
+        notify("\n".join(_notify_lines))
         return {
             "deals": deals_scanned,
             "events": events_emitted,
