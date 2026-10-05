@@ -156,6 +156,61 @@ def test_select_within_nav_budget_uses_rating_and_winrate():
     assert [s.symbol for s in selected] == ["B", "A"]
 
 
+def test_select_within_nav_budget_excludes_reduce_and_tp_signals():
+    """2026-10-05 incident: today's autofin suggestions were 3 entry
+    signals (ABB, HDB, ABW) plus 3 reduce signals (DXP, GMD, TLG)
+    with wide TP zones. Risk-reward scoring gave the reduce signals
+    higher rr than the entry signals, so the NAV budget filled with
+    reduce signals, pushing ABB/ABW out. ``_plan_orders_for_new_positions``
+    then skipped all 5 (non-entry) and emitted 0 orders despite cash
+    being > 50 % of NAV.
+
+    Fix: the selector must pre-filter to entry-only signals before
+    risk-reward scoring so non-entry signals can't crowd out real
+    candidates.
+    """
+    # Entry signals (real candidates).
+    abb = _make_signal("ABB", 0.30, last_index=200, supply_to=17400,
+                       tp_from=18400, sl_to=15900,
+                       last_recomment="Khuyến nghị đầu tư")
+    abw = _make_signal("ABW", 0.15, last_index=100, supply_to=14100,
+                       tp_from=15200, sl_to=12900,
+                       last_recomment="Khuyến nghị đầu tư")
+    # Reduce signals with very wide TP zones (tp_to far above tp_from).
+    # Scoring sees target = (tp_from + tp_to) / 2 = (15600 + 19000) / 2 = 17300
+    # → rr ≈ 2.81, higher than ABB's rr ≈ 0.67. So without filtering, the
+    # reduce signals consume the NAV budget and ABB/ABW are pushed out.
+    dxp = _make_signal("DXP", 0.15, last_index=180, supply_to=14600,
+                       tp_from=15600, sl_to=13300,
+                       last_recomment="⚠️ Hạ tỷ trọng lần 2")
+    gmd = _make_signal("GMD", 0.30, last_index=160, supply_to=78700,
+                       tp_from=83300, sl_to=74400,
+                       last_recomment="⚠️ Hạ tỷ trọng lần 1")
+    tlg = _make_signal("TLG", 0.15, last_index=140, supply_to=53500,
+                       tp_from=57200, sl_to=49550,
+                       last_recomment="⚠️ Hạ tỷ trọng lần 1")
+    # Plus a TP-step signal with a mid-zone TP that scores even higher.
+    msb = _make_signal("MSB", 0.30, last_index=120, supply_to=13450,
+                       tp_from=14350, sl_to=12000,
+                       last_recomment="💰 Chốt lãi lần 1 mức giá 14,350")
+    selected = mod._select_signals_within_nav_budget(
+        [abb, abw, dxp, gmd, tlg, msb], nav_budget_pct=1.0,
+    )
+    selected_syms = [s.symbol for s in selected]
+    # The two entry signals (ABW + ABB) must be in the selection;
+    # non-entry signals must not consume it.
+    assert "ABB" in selected_syms, (
+        f"ABB (entry) must be selected; got {selected_syms}"
+    )
+    assert "ABW" in selected_syms, (
+        f"ABW (entry) must be selected; got {selected_syms}"
+    )
+    assert "DXP" not in selected_syms, "reduce signal must not consume NAV budget"
+    assert "GMD" not in selected_syms, "reduce signal must not consume NAV budget"
+    assert "TLG" not in selected_syms, "reduce signal must not consume NAV budget"
+    assert "MSB" not in selected_syms, "TP-step signal must not consume NAV budget"
+
+
 def test_plan_new_positions_emits_buy_sl_bracket():
     """BUY + SL bracket only — TP is per-event (autofin publishes
     partial closes via ``numberOfProfit`` / ``lastRecomment``), not

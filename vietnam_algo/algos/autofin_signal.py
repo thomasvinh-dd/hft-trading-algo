@@ -180,7 +180,22 @@ def _select_signals_within_nav_budget(
         Deals A,B,C at 30% → 0.90 cumulative
         Deal D wants 0.30, leftover 0.10 → enter D at 0.10 NAV
         Deal E wants 0.30, leftover 0 → skip (no room)
+
+    Entry-only filter (2026-10-05 fix):
+      Only signals whose ``lastRecomment`` classifies as a fresh entry
+      ("Khuyến nghị đầu tư") are eligible for new-entry budget allocation.
+      Without this filter, ongoing TP/reduce signals with multi-lap
+      ``tp_to`` zones (e.g. DXP tp_to=19000 while the deal is only on
+      TP-lap 2) earn artificially high risk-reward scores and crowd out
+      the real entry candidates, leaving the bot with cash > 5% NAV
+      but 0 new orders (2026-10-05 HDB/ABB incident). The TP/reduce
+      paths in ``_plan_partial_close_orders`` handle exits for any
+      position we already hold, so excluding them here is safe.
     """
+    entry_signals = [
+        s for s in signals
+        if classify_recomment(s.last_recomment) == RECOMMENT_KIND_ENTRY
+    ]
     def _score(s: AutofinSignal) -> tuple[float, float, float]:
         entry = (s.supply_from + s.supply_to) / 2 if (s.supply_from and s.supply_to) else 0
         target = (s.tp_from + s.tp_to) / 2 if (s.tp_from and s.tp_to) else 0
@@ -193,7 +208,7 @@ def _select_signals_within_nav_budget(
             rr = (target - entry) / (entry - stop)
         return (-rr, -rating, -win_rate)
 
-    sorted_signals = sorted(signals, key=_score)
+    sorted_signals = sorted(entry_signals, key=_score)
     selected: list[AutofinSignal] = []
     cumulative = 0.0
     for s in sorted_signals:
