@@ -468,6 +468,141 @@ def _apply_dry_run_fills(
     save_dry_run_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
 
+def _submit_autofin_deals_to_dnse(
+    deals_actioned: list[dict],
+    *,
+    account_no: str,
+    loan_package_id: int,
+    trading_token: str,
+    client: "DnseClient",
+    data_dir: "Path",
+    trade_date: str,
+    loan_package_id_by_symbol: dict[str, int] | None = None,
+) -> dict:
+    """Convert autofin adapter's ``deals_actioned`` into ``DnseOrder``
+    records and submit them to DNSE via ``execute_orders_with_ledger``.
+
+    Autofin adapter produces ``dnse_orders`` dicts of shape::
+
+        {"symbol", "side", "price", "quantity", "kind", "reason"}
+
+    but ``execute_orders_with_ledger`` consumes ``DnseOrder`` (frozen
+    dataclass) with required ``loanPackageId``, ``orderType``,
+    ``sourceOrderId``, ``sourceDate``. This helper bridges the two.
+
+    ``sourceOrderId`` is a stable hash of
+    ``(deal_id, side, price, kind)`` so the same logical order has the
+    same ID across cycles — the ledger's dedup key
+    ``(run_id, sourceOrderId, symbol, side)`` then prevents duplicate
+    submissions if the bot restarts mid-cycle.
+
+    Parameters
+    ----------
+    deals_actioned:
+        From ``strategy_adapter.generate_orders(...)["deals_actioned"]``.
+    loan_package_id:
+        The DNSE loan package id (1775 for HDB margin).
+    loan_package_id_by_symbol:
+        Optional per-symbol override for stocks whose loan package
+        differs from the default. Falls back to ``loan_package_id``.
+    trade_date:
+        ISO date used as ``sourceDate`` on every order in this batch.
+
+    Returns
+    -------
+    A dict with ``submitted`` (list of dnseOrderId strings),
+    ``skipped_existing`` (count), ``unknown`` (count of orders that
+    failed with unknown status), and ``total`` (count of orders in
+    input). Empty ``deals_actioned`` returns
+    ``{"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}``.
+    """
+    from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
+    from vietnam_algo.libs.trading_engine import DnseOrder
+
+    if not deals_actioned:
+        return {"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}
+
+    # Build a stable sourceOrderId for each (deal, side, price, kind) tuple
+    # so the ledger dedup works across bot restarts.
+    def _stable_id(deal: dict, o: dict) -> int:
+        import hashlib
+        key = "|".join([
+            str(deal.get("deal_id", "")),
+            str(o.get("side", "")),
+            str(o.get("price", "")),
+            str(o.get("kind", "")),
+        ])
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+        # Convert the first 12 hex chars to an int (48-bit fits in 8 bytes
+        # and gives ~2.8e14 unique IDs — enough for the daily batch).
+        return int(digest, 16)
+
+    orders: list[DnseOrder] = []
+    for deal in deals_actioned:
+        for o in deal.get("dnse_orders", []) or []:
+            sym = str(o.get("symbol") or "").upper().strip()
+            side = str(o.get("side") or "").upper().strip()
+            if not sym or side not in ("NB", "NS"):
+                continue
+            try:
+                price = int(o.get("price") or 0)
+                quantity = int(o.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+            if price <= 0 or quantity <= 0:
+                continue
+            lp = (loan_package_id_by_symbol or {}).get(sym, loan_package_id)
+            orders.append(DnseOrder(
+                symbol=sym,
+                side=side,
+                quantity=quantity,
+                price=price,
+                loanPackageId=lp,
+                orderType=str(o.get("orderType") or "LO"),
+                sourceOrderId=_stable_id(deal, o),
+                sourceDate=trade_date,
+                reason=str(o.get("reason") or f"autofin:{deal.get('action', '?')}"),
+            ))
+
+    if not orders:
+        return {"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}
+
+    results, _reconciliation, _submit_complete = execute_orders_with_ledger(
+        client=client,
+        account_no=account_no,
+        trading_token=trading_token,
+        orders=orders,
+        data_dir=data_dir,
+        run_id=trade_date,
+    )
+
+    submitted_ids: list[str] = []
+    skipped_existing = 0
+    unknown = 0
+    for r in results:
+        status = str(r.get("status", ""))
+        if status == "submitted":
+            dnse_id = r.get("detail", {}).get("id") if isinstance(r.get("detail"), dict) else None
+            if not dnse_id:
+                # Some endpoints return the id at top level
+                resp = r.get("response")
+                if isinstance(resp, dict):
+                    dnse_id = resp.get("id") or resp.get("orderId")
+            if dnse_id:
+                submitted_ids.append(str(dnse_id))
+        elif status == "skipped_existing_ledger":
+            skipped_existing += 1
+        elif status in ("unknown",):
+            unknown += 1
+
+    return {
+        "submitted": submitted_ids,
+        "skipped_existing": skipped_existing,
+        "unknown": unknown,
+        "total": len(orders),
+    }
+
+
 def _build_portfolio_snapshot(
     client: "DnseClient | None",
     account_no: str,
@@ -966,6 +1101,56 @@ def run_auto_bot(
                     # close, new entry, full close) — see
                     # AutofinSignalAdapter._notify_new_orders.
                     print(f"[{now.isoformat()}] poll result: {poll_result.get('count', 0)} orders planned")
+                    # Live mode: actually submit the planned orders to
+                    # DNSE via execute_orders_with_ledger. We do this
+                    # BEFORE the dry-run apply so the dry-run state
+                    # stays untouched (the orders are real, not simulated).
+                    # Skip if no trading_token — that means
+                    # ensure_fresh_trading_token hasn't run yet for
+                    # this cycle (e.g. token refresh failed).
+                    if (
+                        live_submit
+                        and isinstance(poll_result, dict)
+                        and poll_result.get("deals_actioned")
+                        and token
+                    ):
+                        try:
+                            submit_result = _submit_autofin_deals_to_dnse(
+                                poll_result.get("deals_actioned") or [],
+                                account_no=account_no,
+                                loan_package_id=loan_package_id,
+                                trading_token=token,
+                                client=client,
+                                data_dir=engine_config.dataDir,
+                                trade_date=today,
+                            )
+                            print(
+                                f"[{now.isoformat()}] mid-day submit: "
+                                f"{len(submit_result['submitted'])} submitted, "
+                                f"{submit_result['skipped_existing']} skipped-existing, "
+                                f"{submit_result['unknown']} unknown "
+                                f"(of {submit_result['total']} planned)"
+                            )
+                            if submit_result["submitted"]:
+                                notify(
+                                    "Vietnam Algo: autofin mid-day SUBMITTED to DNSE\n"
+                                    f"date: {today}\n"
+                                    f"count: {len(submit_result['submitted'])}\n"
+                                    f"dnseOrderIds: {','.join(submit_result['submitted'][:10])}"
+                                    + (
+                                        f" + {len(submit_result['submitted']) - 10} more"
+                                        if len(submit_result["submitted"]) > 10 else ""
+                                    )
+                                )
+                        except Exception as exc:
+                            notify(
+                                "\n".join([
+                                    "🚨 Vietnam Algo: autofin mid-day SUBMIT FAILED",
+                                    f"date: {today}",
+                                    f"err: {str(exc)[:400]}",
+                                ])
+                            )
+                            print(f"[{now.isoformat()}] mid-day submit failed: {exc}")
                     # Mid-day polls also need to apply the planned orders
                     # to the dry-run state immediately. Without this,
                     # the JSON is overwritten with [] on the next poll
@@ -1133,6 +1318,54 @@ def run_auto_bot(
                     skip_backtest=True,
                 )
             print(result)
+            # Live mode: actually submit the planned orders to DNSE.
+            # Mirrors the mid-day-poll logic above: the ledger dedups
+            # by (run_id, sourceOrderId, symbol, side) so the same
+            # logical order can't be double-submitted if the bot
+            # restarts mid-day and the EOD replans it.
+            if (
+                live_submit
+                and isinstance(result, dict)
+                and result.get("deals_actioned")
+                and token
+            ):
+                try:
+                    submit_result = _submit_autofin_deals_to_dnse(
+                        result.get("deals_actioned") or [],
+                        account_no=account_no,
+                        loan_package_id=loan_package_id,
+                        trading_token=token,
+                        client=client,
+                        data_dir=engine_config.dataDir,
+                        trade_date=today,
+                    )
+                    print(
+                        f"[{now.isoformat()}] eod submit: "
+                        f"{len(submit_result['submitted'])} submitted, "
+                        f"{submit_result['skipped_existing']} skipped-existing, "
+                        f"{submit_result['unknown']} unknown "
+                        f"(of {submit_result['total']} planned)"
+                    )
+                    if submit_result["submitted"]:
+                        notify(
+                            "Vietnam Algo: autofin EOD SUBMITTED to DNSE\n"
+                            f"date: {today}\n"
+                            f"count: {len(submit_result['submitted'])}\n"
+                            f"dnseOrderIds: {','.join(submit_result['submitted'][:10])}"
+                            + (
+                                f" + {len(submit_result['submitted']) - 10} more"
+                                if len(submit_result["submitted"]) > 10 else ""
+                            )
+                        )
+                except Exception as exc:
+                    notify(
+                        "\n".join([
+                            "🚨 Vietnam Algo: autofin EOD SUBMIT FAILED",
+                            f"date: {today}",
+                            f"err: {str(exc)[:400]}",
+                        ])
+                    )
+                    print(f"[{now.isoformat()}] eod submit failed: {exc}")
             # In dry-run mode, REPLAY today's planned orders against the
             # simulated state BEFORE building the snapshot, so the EOD
             # summary shows cash + positions post-fill (matching what the
