@@ -14,6 +14,25 @@
 # the momentum bot's chat (Thomas Biin's personal channel) instead of
 # the dedicated Auto Fin Bot channel.
 #
+# LIVE-SUBMIT MODE (2026-10-06+):
+#   This launcher runs the bot with --live-submit, meaning autofin's
+#   planned BUYs and SELLs are actually placed on DNSE (not just
+#   simulated locally). NAV for sizing is pulled from the live DNSE
+#   account balance via the autofin adapter's build_portfolio_snapshot,
+#   so the 10M VND test account will size ~10x smaller than the
+#   100M dry-run reference.
+#
+#   Reverting to dry-run: remove ``--live-submit`` from the python3
+#   invocation below and restart the bot.
+#
+#   Order flow: ``strategy_adapter.generate_orders(live_submit=True)``
+#   returns ``deals_actioned``; the runner funnels the resulting
+#   ``dnse_orders`` through ``_submit_autofin_deals_to_dnse`` which
+#   builds ``DnseOrder`` records (stable sourceOrderId for ledger
+#   dedup) and calls ``execute_orders_with_ledger``. Telegram
+#   notifications include the dnseOrderIds returned by DNSE so the
+#   operator can verify on the web/app.
+#
 # Run: bash scripts/launch_autofin.sh
 # Logs: /root/logs/autofin.log (stdout+stderr)
 # Watchdog: scripts/install_cron.sh installs a */5 cron entry that
@@ -50,6 +69,7 @@ nohup env DNSE_API_KEY="$DNSE_API_KEY" \
     python3 -u -m vietnam_algo.main auto-trading-bot \
         --account-no 0003937868 --loan-package-id 1775 \
         --sleep-seconds 60 --update-symbols --update-prices --strategy autofin_signal \
+        --live-submit \
     > "$LOG_DIR/autofin.log" 2>&1 &
 disown
 sleep 8
