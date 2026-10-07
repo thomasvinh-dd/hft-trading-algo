@@ -158,7 +158,16 @@ def ensure_fresh_trading_token(
 
     # Need to refresh.
     if refresh_func is None:
-        from .daily_engine import trading_token_from_email
+        # 2026-10-07: absolute import. ``auth.py`` lives in
+        # ``vietnam_algo.libs.dnse`` but ``trading_token_from_email``
+        # is defined in the parent package ``vietnam_algo.libs.daily_engine``,
+        # so the previous relative import ``from .daily_engine`` only
+        # worked when ``daily_engine.py`` happened to be co-located in
+        # this sub-package. That module does not exist here, so the
+        # live-mode submit cycle crashed with ``No module named
+        # 'vietnam_algo.libs.dnse.daily_engine'`` the first time a
+        # bot needed a token refresh.
+        from vietnam_algo.libs.daily_engine import trading_token_from_email
         refresh_func = lambda: trading_token_from_email(client)
 
     if notify_fn is not None:
