@@ -33,6 +33,16 @@
 #   notifications include the dnseOrderIds returned by DNSE so the
 #   operator can verify on the web/app.
 #
+# LIVE-QUOTE GATE (2026-10-07+):
+#   The submit helper now fetches a LIVE DNSE quote via
+#   ``client.get_latest_quote`` for each new-entry candidate, and
+#   re-checks the buy-zone gate against the LIVE best-ask. The
+#   planning step uses the local cached close (hours stale by
+#   mid-day) so a real-time quote catches a price that has since
+#   moved out of the zone. Default: enabled (``AUTOFIN_LIVE_QUOTE_GATE=1``).
+#   To disable (e.g. for diagnosing a flapping connection), set
+#   ``AUTOFIN_LIVE_QUOTE_GATE=0`` in the environment below.
+#
 # Run: bash scripts/launch_autofin.sh
 # Logs: /root/logs/autofin.log (stdout+stderr)
 # Watchdog: scripts/install_cron.sh installs a */5 cron entry that
@@ -66,6 +76,7 @@ nohup env DNSE_API_KEY="$DNSE_API_KEY" \
     AUTOFIN_EMAIL="$AUTOFIN_EMAIL" \
     AUTOFIN_PASSWORD="$AUTOFIN_PASSWORD" \
     AUTOFIN_USER_SL_PCT="$AUTOFIN_USER_SL_PCT" \
+    AUTOFIN_LIVE_QUOTE_GATE="${AUTOFIN_LIVE_QUOTE_GATE:-1}" \
     python3 -u -m vietnam_algo.main auto-trading-bot \
         --account-no 0003937868 --loan-package-id 1775 \
         --sleep-seconds 60 --update-symbols --update-prices --strategy autofin_signal \

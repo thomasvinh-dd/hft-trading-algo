@@ -1661,6 +1661,15 @@ def _build_deals_actioned(
             "lastRecomment": rec,
             "rateForNav": rate,
             "numberOfProfit": nP,
+            # 2026-10-07: include the autofin supply zone so the live-
+            # submit path can fetch a DNSE quote and re-check the gate
+            # against the LIVE best-ask price at submit time. The
+            # planning step uses the local cached close as `cur`, which
+            # can be stale by minutes (last sync was hours ago for mid-
+            # day polls). A real DNSE quote lets us catch a price that
+            # has since moved out of the zone since planning.
+            "supply_F": float(h.get("supply_F") or 0) if h else 0,
+            "supply_T": float(h.get("supply_T") or 0) if h else 0,
             "dnse_orders": orders,
         })
 
@@ -1798,6 +1807,15 @@ def _format_per_action_message(deal: dict[str, Any], ts: str) -> str:
             "lastRecomment": rec,
             "rateForNav": rate,
             "numberOfProfit": nP,
+            # 2026-10-07: include the autofin supply zone so the live-
+            # submit path can fetch a DNSE quote and re-check the gate
+            # against the LIVE best-ask price at submit time. The
+            # planning step uses the local cached close as `cur`, which
+            # can be stale by minutes (last sync was hours ago for mid-
+            # day polls). A real DNSE quote lets us catch a price that
+            # has since moved out of the zone since planning.
+            "supply_F": float(h.get("supply_F") or 0) if h else 0,
+            "supply_T": float(h.get("supply_T") or 0) if h else 0,
             "dnse_orders": orders,
         })
 

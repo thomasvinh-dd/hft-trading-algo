@@ -468,6 +468,63 @@ def _apply_dry_run_fills(
     save_dry_run_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
 
+def _extract_best_ask_in_vnd(quote: object) -> int | None:
+    """Extract the best-ask price (in absolute VND) from a DNSE
+    ``/price/{sym}/quotes/latest`` response.
+
+    DNSE returns the quote in this shape::
+
+        {"quotes": [
+            {"symbol": "ABW", "boardId": "G1",
+             "bid":   [{"price": 14.4, "quantity": ...}, ...],
+             "offer": [{"price": 14.5, "quantity": ...}, ...],  ← best ask
+             ...
+            },
+            ...  # may have G1 + G4 boards
+        ]}
+
+    Prices inside ``bid``/``offer`` are in *thousands of VND*
+    (e.g. ``14.5`` = 14,500 VND). The order_monitor helper
+    ``quote_match_price`` rounds these with ``int(round(...))`` which
+    silently drops the unit factor — we must multiply by 1000 here so
+    the value is comparable to the autofin ``supply_F/supply_T`` zone
+    (which is in absolute VND, e.g. 13,800 = 13,800 VND).
+    """
+    if not isinstance(quote, dict):
+        return None
+    boards = quote.get("quotes")
+    if not isinstance(boards, list) or not boards:
+        return None
+    # Prefer the G1 board (HSX main). If unavailable fall back to the
+    # first board returned.
+    target = None
+    for b in boards:
+        if isinstance(b, dict) and b.get("boardId") == "G1":
+            target = b
+            break
+    if target is None:
+        for b in boards:
+            if isinstance(b, dict) and isinstance(b.get("offer"), list) and b["offer"]:
+                target = b
+                break
+    if target is None:
+        return None
+    offer_levels = target.get("offer")
+    if not isinstance(offer_levels, list) or not offer_levels:
+        return None
+    first = offer_levels[0]
+    if not isinstance(first, dict):
+        return None
+    try:
+        v = float(first.get("price") or 0)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    # DNSE returns kVND; multiply by 1000 → absolute VND.
+    return int(round(v * 1000.0))
+
+
 def _submit_autofin_deals_to_dnse(
     deals_actioned: list[dict],
     *,
@@ -478,6 +535,7 @@ def _submit_autofin_deals_to_dnse(
     data_dir: "Path",
     trade_date: str,
     loan_package_id_by_symbol: dict[str, int] | None = None,
+    live_quote_tolerance_pct: float = 0.05,
 ) -> dict:
     """Convert autofin adapter's ``deals_actioned`` into ``DnseOrder``
     records and submit them to DNSE via ``execute_orders_with_ledger``.
@@ -496,6 +554,24 @@ def _submit_autofin_deals_to_dnse(
     ``(run_id, sourceOrderId, symbol, side)`` then prevents duplicate
     submissions if the bot restarts mid-cycle.
 
+    2026-10-07: for new-entry deals (``deal["action"] == "new_entry"``),
+    this function now fetches a LIVE DNSE quote via ``client.get_latest_quote``
+    immediately before submitting, and re-checks the buy-zone gate against
+    the BEST-ASK price (what we'd actually pay to fill). The planning
+    step uses the local cached close, which can be hours stale by mid-day
+    — a real-time quote catches the case where the price has since moved
+    out of the zone since planning. If the live best-ask is outside
+    ``[supply_F * (1 - tol), supply_T * (1 + tol)]``, the entire new-entry
+    deal is dropped with a Telegram notification. The local-file price
+    is treated as authoritative only when the DNSE API fails (graceful
+    degradation — log + proceed, not a hard block).
+
+    Partial-close and full-close actions are NOT gated by this check —
+    we always want to SELL regardless of where the live ask is, because
+    (a) the partial-close TP is by definition a "we're up" signal, and
+    (b) if price has dropped to the SL zone, the order should still
+    execute.
+
     Parameters
     ----------
     deals_actioned:
@@ -507,6 +583,10 @@ def _submit_autofin_deals_to_dnse(
         differs from the default. Falls back to ``loan_package_id``.
     trade_date:
         ISO date used as ``sourceDate`` on every order in this batch.
+    live_quote_tolerance_pct:
+        Per-side tolerance (default 5 %) for the live-quote gate.
+        ``supply_T * (1 + tol)`` and ``supply_F * (1 - tol)`` form the
+        upper / lower edges the live best-ask must stay within.
 
     Returns
     -------
@@ -521,6 +601,78 @@ def _submit_autofin_deals_to_dnse(
 
     if not deals_actioned:
         return {"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}
+
+    # 2026-10-07: filter new_entry deals whose LIVE best-ask has moved
+    # out of the supply zone since planning. ``out_of_zone`` collects
+    # deals we drop here so the caller can notify.
+    out_of_zone: list[dict] = []
+    if os.environ.get("AUTOFIN_LIVE_QUOTE_GATE", "1") != "0":
+        try:
+            for deal in deals_actioned:
+                if deal.get("action") != "new_entry":
+                    continue
+                sym = str(deal.get("symbol") or "").upper().strip()
+                s_lo = float(deal.get("supply_F") or 0)
+                s_hi = float(deal.get("supply_T") or 0)
+                if not sym or s_lo <= 0 or s_hi <= 0:
+                    continue  # no zone declared → don't gate
+                try:
+                    quote = client.get_latest_quote(sym)
+                except Exception as exc:
+                    # Graceful degradation: API failure → trust the
+                    # local-file price the planning step already used.
+                    print(
+                        f"[autofin_live_gate] {sym}: get_latest_quote "
+                        f"failed ({type(exc).__name__}: {str(exc)[:200]}); "
+                        f"proceeding with local-cache price"
+                    )
+                    continue
+                ask = _extract_best_ask_in_vnd(quote)
+                if ask is None or ask <= 0:
+                    print(
+                        f"[autofin_live_gate] {sym}: no best-ask in quote; "
+                        f"proceeding with local-cache price"
+                    )
+                    continue
+                lo_edge = s_lo * (1.0 - live_quote_tolerance_pct)
+                hi_edge = s_hi * (1.0 + live_quote_tolerance_pct)
+                if ask < lo_edge or ask > hi_edge:
+                    out_of_zone.append({
+                        "deal": deal,
+                        "live_ask": ask,
+                        "lo_edge": lo_edge,
+                        "hi_edge": hi_edge,
+                    })
+                    print(
+                        f"[autofin_live_gate] {sym}: live ask {ask:.0f} "
+                        f"VND is outside [{lo_edge:.0f}, {hi_edge:.0f}] → "
+                        f"dropping new-entry deal "
+                        f"(zone [{s_lo:.0f}, {s_hi:.0f}], tol "
+                        f"{live_quote_tolerance_pct*100:.1f}%)"
+                    )
+        except Exception as exc:
+            # Defensive: any failure in the gate itself must not block
+            # the submit. Log and proceed.
+            print(f"[autofin_live_gate] unexpected error: {exc}")
+
+    if out_of_zone:
+        out_of_zone_symbols = {d["deal"].get("symbol", "?") for d in out_of_zone}
+        # Filter the deals_actioned in-place so the rest of the submit
+        # flow only sees the survivors.
+        deals_actioned = [
+            d for d in deals_actioned
+            if d.get("symbol") not in out_of_zone_symbols
+        ]
+        if not deals_actioned:
+            # All deals dropped — return zero result. Caller is expected
+            # to send a Telegram summary combining submit + out_of_zone.
+            return {
+                "submitted": [],
+                "skipped_existing": 0,
+                "unknown": 0,
+                "total": 0,
+                "out_of_zone": out_of_zone,
+            }
 
     # Build a stable sourceOrderId for each (deal, side, price, kind) tuple
     # so the ledger dedup works across bot restarts.
@@ -565,7 +717,15 @@ def _submit_autofin_deals_to_dnse(
             ))
 
     if not orders:
-        return {"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}
+        result = {
+            "submitted": [],
+            "skipped_existing": 0,
+            "unknown": 0,
+            "total": 0,
+        }
+        if out_of_zone:
+            result["out_of_zone"] = out_of_zone
+        return result
 
     results, _reconciliation, _submit_complete = execute_orders_with_ledger(
         client=client,
@@ -600,6 +760,7 @@ def _submit_autofin_deals_to_dnse(
         "skipped_existing": skipped_existing,
         "unknown": unknown,
         "total": len(orders),
+        "out_of_zone": out_of_zone,
     }
 
 
@@ -1139,9 +1300,31 @@ def run_auto_bot(
                                     f"dnseOrderIds: {','.join(submit_result['submitted'][:10])}"
                                     + (
                                         f" + {len(submit_result['submitted']) - 10} more"
-                                        if len(submit_result["submitted"]) > 10 else ""
+                                        if len(submit_result["submitted"]) > 10
+                                        else ""
                                     )
                                 )
+                            # 2026-10-07: notify when the live-quote
+                            # gate dropped a new-entry deal because the
+                            # live best-ask had moved out of the
+                            # supply zone since planning.
+                            out_of_zone = submit_result.get("out_of_zone") or []
+                            if out_of_zone:
+                                lines = [
+                                    "⚠️ Vietnam Algo: autofin LIVE-QUOTE gate dropped new entries",
+                                    f"date: {today}",
+                                    f"reason: live best-ask outside [supply_F*0.95, supply_T*1.05]",
+                                ]
+                                for o in out_of_zone[:10]:
+                                    d = o.get("deal", {})
+                                    lines.append(
+                                        f"  {d.get('symbol', '?')}: "
+                                        f"live ask {o.get('live_ask', 0):,.0f} VND "
+                                        f"(zone {d.get('supply_F', 0):,.0f}–{d.get('supply_T', 0):,.0f})"
+                                    )
+                                if len(out_of_zone) > 10:
+                                    lines.append(f"  + {len(out_of_zone) - 10} more")
+                                notify("\n".join(lines))
                         except Exception as exc:
                             notify(
                                 "\n".join([
@@ -1357,6 +1540,23 @@ def run_auto_bot(
                                 if len(submit_result["submitted"]) > 10 else ""
                             )
                         )
+                    out_of_zone = submit_result.get("out_of_zone") or []
+                    if out_of_zone:
+                        lines = [
+                            "⚠️ Vietnam Algo: autofin LIVE-QUOTE gate dropped new entries (EOD)",
+                            f"date: {today}",
+                            f"reason: live best-ask outside [supply_F*0.95, supply_T*1.05]",
+                        ]
+                        for o in out_of_zone[:10]:
+                            d = o.get("deal", {})
+                            lines.append(
+                                f"  {d.get('symbol', '?')}: "
+                                f"live ask {o.get('live_ask', 0):,.0f} VND "
+                                f"(zone {d.get('supply_F', 0):,.0f}–{d.get('supply_T', 0):,.0f})"
+                            )
+                        if len(out_of_zone) > 10:
+                            lines.append(f"  + {len(out_of_zone) - 10} more")
+                        notify("\n".join(lines))
                 except Exception as exc:
                     notify(
                         "\n".join([
