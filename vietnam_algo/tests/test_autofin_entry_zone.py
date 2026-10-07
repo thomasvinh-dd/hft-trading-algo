@@ -148,17 +148,92 @@ def test_plan_enters_at_supply_to_when_price_equals_supply_to():
 
 
 def test_plan_enters_at_min_when_price_below_supply_to():
-    """Price below supply_T → enter at min(price, supply_T)."""
+    """Price below supply_T but within 5% of supply_F → enter at min.
+
+    2026-10-07 fix: the lower-bound check uses a 5% tolerance band
+    below ``supply_F`` (matching the upper-bound 5% above ``supply_T``).
+    5800 is 3.3% below ``supply_F=6000`` so it's still inside the
+    acceptable range, and we enter at min(5800, 6100) = 5800.
+    """
     sig = _make_signal("APH", supply_from=6000, supply_to=6100)
     rows = _plan_orders_for_new_positions(
         selected=[sig],
         nav_vnd=1_000_000_000,
         our_positions={},
-        current_prices={"APH": 5800.0},  # below supply_F (slight overshoot)
+        current_prices={"APH": 5800.0},  # 3.3% below supply_F=6000 → inside tolerance
     )
     buy = next(r for r in rows if r["side"] == "NB")
-    # We're 5800, supply_T is 6100 → entry at min(5800, 6100) = 5800.
-    assert buy["price"] == 5800
+    assert buy["price"] == 5800  # entry at min(5800, 6100) = 5800
+
+
+def test_plan_enters_at_min_when_price_at_supply_from():
+    """Price exactly at supply_F → enter at supply_F (lower boundary)."""
+    sig = _make_signal("APH", supply_from=6000, supply_to=6100)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=1_000_000_000,
+        our_positions={},
+        current_prices={"APH": 6000.0},  # exactly at supply_F
+    )
+    buy = next(r for r in rows if r["side"] == "NB")
+    assert buy["price"] == 6000  # entry at supply_F
+
+
+def test_plan_skips_when_price_below_buy_zone_by_more_than_tolerance():
+    """2026-10-07 fix: price materially below supply_F → skip the entry.
+    Autofin's analysis assumed price in [6000, 6100]; if current price
+    has fallen 8% below the floor (cur=5500 < supply_F * 0.95 = 5700),
+    the deal is in a different regime. Skip rather than catching a
+    falling knife.
+    """
+    sig = _make_signal("APH", supply_from=6000, supply_to=6100)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=1_000_000_000,
+        our_positions={},
+        current_prices={"APH": 5500.0},  # 8.3% below supply_F=6000 → skip
+    )
+    assert rows == [], "should skip when price is materially below buy zone"
+
+
+def test_plan_skips_at_lower_tolerance_boundary():
+    """Boundary: cur = supply_F * (1 - 5%) is the inclusive limit. Below
+    that, skip. Above (including equal), enter.
+    """
+    sig = _make_signal("APH", supply_from=6000, supply_to=6100)
+    # At the exact tolerance boundary → still enter (cur=5700).
+    rows = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=1_000_000_000,
+        our_positions={},
+        current_prices={"APH": 5700.0},  # supply_F * 0.95 = 5700 → enter
+    )
+    buy = next(r for r in rows if r["side"] == "NB")
+    assert buy["price"] == 5700
+    # One tick below the boundary → skip (cur=5699 < 5700).
+    rows2 = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=1_000_000_000,
+        our_positions={},
+        current_prices={"APH": 5699.0},
+    )
+    assert rows2 == [], "should skip just below tolerance"
+
+
+def test_plan_skips_lower_bound_when_supply_F_undeclared():
+    """When supply_F=0, the lower-bound is unknown → don't apply the gate
+    (the upper-bound check has the same behavior when supply_T=0).
+    """
+    sig = _make_signal("APH", supply_from=0, supply_to=6100)
+    rows = _plan_orders_for_new_positions(
+        selected=[sig],
+        nav_vnd=1_000_000_000,
+        our_positions={},
+        current_prices={"APH": 100.0},  # way below — but supply_F=0, so no lower check
+    )
+    # entry_price = min(100, 6100) = 100 (still passes the upper-bound check).
+    buy = next(r for r in rows if r["side"] == "NB")
+    assert buy["price"] == 100
 
 
 def test_plan_enters_at_above_zone_up_to_tolerance():
@@ -278,7 +353,13 @@ def test_expand_skips_when_no_current_price():
 
 
 def test_expand_skips_when_deal_overshoots_supply_F():
-    """Price way below supply_F (likely invalid zone) → skip."""
+    """Price way below supply_F (likely invalid zone) → skip.
+
+    2026-10-07: the expansion lower-bound check now uses the same 5%
+    tolerance as the upper-bound (was 30% before). ``VHM @ 4000`` is
+    33% below ``supply_F=6000`` so it's well outside both the old
+    30% and the new 5% bounds — skip either way.
+    """
     holding = [_make_holding_record("VHM", deal_id=42, supply_from=6000, supply_to=6100)]
     out = _expand_signals_with_held_unentered(
         signals=[],
@@ -287,6 +368,36 @@ def test_expand_skips_when_deal_overshoots_supply_F():
         current_prices={"VHM": 4000.0},  # 33% below supply_F → too far, skip
     )
     assert out == []
+
+
+def test_expand_skips_when_price_just_below_supply_F():
+    """2026-10-07: with the new 5% lower-bound tolerance, prices 6%+
+    below ``supply_F`` are now rejected by ``_expand_signals_with_held_unentered``
+    too. ``VHM @ 5600`` is 6.7% below ``supply_F=6000`` → skip.
+    """
+    holding = [_make_holding_record("VHM", deal_id=42, supply_from=6000, supply_to=6100)]
+    out = _expand_signals_with_held_unentered(
+        signals=[],
+        holding=holding,
+        our_deals={},
+        current_prices={"VHM": 5600.0},  # 6.7% below supply_F → skip
+    )
+    assert out == []
+
+
+def test_expand_includes_held_at_lower_tolerance_boundary():
+    """At the exact 5% lower-bound (``supply_F * 0.95``), still included.
+    ``VHM @ 5700`` is exactly at the tolerance edge → include.
+    """
+    holding = [_make_holding_record("VHM", deal_id=42, supply_from=6000, supply_to=6100)]
+    out = _expand_signals_with_held_unentered(
+        signals=[],
+        holding=holding,
+        our_deals={},
+        current_prices={"VHM": 5700.0},  # supply_F * 0.95 = 5700 → enter
+    )
+    assert len(out) == 1
+    assert out[0].symbol == "VHM"
 
 
 def test_expand_skips_when_no_supply_zone_declared():

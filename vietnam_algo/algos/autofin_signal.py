@@ -696,9 +696,12 @@ def _expand_signals_with_held_unentered(
     currently-open deals) and converts any deal we have NOT yet
     entered (``our_deals[deal_id]._our_qty == 0`` or missing) into
     a synthetic AutofinSignal, but ONLY if its current market price
-    is within (or up to ``above_zone_tolerance_pct`` above) the
-    declared supply zone. De-duplicated against existing ``signals``
-    by deal_id so fresh signals win.
+    is within (or within ``above_zone_tolerance_pct`` of either edge
+    of) the declared supply zone ``[supply_from, supply_to]``. The
+    same ``above_zone_tolerance_pct`` is used symmetrically for both
+    the upper and lower bounds — i.e. a price more than 5 % below
+    ``supply_from`` is also rejected as out-of-zone. De-duplicated
+    against existing ``signals`` by deal_id so fresh signals win.
     """
     seen_ids: set[str] = {_deal_id(s.raw) for s in signals if s.symbol}
     out: list[AutofinSignal] = list(signals)
@@ -733,10 +736,17 @@ def _expand_signals_with_held_unentered(
         if cur > s_hi * (1.0 + above_zone_tolerance_pct):
             # Way above the buy zone — wait for pullback.
             continue
-        # Also enforce a reasonable lower bound: if current price is
-        # more than 30% below the buy zone, the deal is likely
-        # already invalid (autofin's zone has moved past). Skip.
-        if s_lo > 0 and cur < s_lo * 0.7:
+        # 2026-10-07: also enforce a lower bound (5 % below ``supply_F``,
+        # matching the upper-bound tolerance above and the buy-zone
+        # gate in ``_plan_orders_for_new_positions``). Previously this
+        # used a 30 % tolerance — too permissive, it let in deals
+        # whose current price was materially below autofin's intended
+        # zone. The plan function would then drop them again on the
+        # tighter gate, so the asymmetry was harmless but wasteful.
+        # Aligning both stages to 5 % keeps the held-deal candidate
+        # list in sync with what the plan function will actually
+        # accept.
+        if s_lo > 0 and cur < s_lo * (1.0 - above_zone_tolerance_pct):
             continue
         out.append(sig)
         seen_ids.add(did)
@@ -752,6 +762,7 @@ def _plan_orders_for_new_positions(
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
     above_zone_tolerance_pct: float = 0.05,
+    below_zone_tolerance_pct: float = 0.05,
     already_planned_symbols: set[str] | None = None,
     available_cash_vnd: float | None = None,
     new_entry_min_cash_pct: float = 0.05,
@@ -826,15 +837,19 @@ def _plan_orders_for_new_positions(
         of autofin's declared sL_F and the user's `user_sl_pct`
         below entry (default 0 = use autofin's SL only).
 
-    Entry price selection (user feedback 2026-09-08):
+    Entry price selection (user feedback 2026-09-08, refined 2026-10-07):
       - If ``current_prices[symbol]`` is provided AND the price is
-        within (or up to ``above_zone_tolerance_pct`` above) the
-        buy zone ``[supply_from, supply_to]``, enter.
+        within (or within ``above_zone_tolerance_pct`` above /
+        ``below_zone_tolerance_pct`` below) the buy zone
+        ``[supply_from, supply_to]``, enter.
       - Entry price = ``min(current_price, supply_to)`` — buys at
         the better of the two, so we never overpay vs the buy zone
         ceiling.
       - If current price is way above the buy zone (above tolerance),
         SKIP — wait for a pullback to the zone.
+      - If current price is way below the buy zone (below tolerance,
+        2026-10-07), SKIP — the deal's analysis no longer applies
+        in this price regime; avoid catching a falling knife.
       - If no current price is available for this symbol (price data
         not yet synced), fall back to the legacy behaviour of entering
         at ``supply_to`` (high end of buy zone).
@@ -943,7 +958,21 @@ def _plan_orders_for_new_positions(
             # Way above the buy zone → skip and wait for pullback.
             if s_hi > 0 and cur > s_hi * (1.0 + above_zone_tolerance_pct):
                 continue
-            # Below or at the top of zone → enter at the better price.
+            # 2026-10-07 fix: also enforce a lower bound. Autofin's
+            # ``supply_F..supply_T`` is the recommended buy zone; if
+            # the current price has fallen materially below the floor
+            # (default 5 % below ``supply_F``) the deal's analysis
+            # no longer applies — the price is in a different regime
+            # than what autofin was tracking. Previously the bot
+            # would happily BUY at any price below the zone ceiling
+            # (e.g. ``Vùng mua: 13,800 - 14,100`` → BUY @ 13,000 when
+            # price had dropped 8 %), exposing us to catching a
+            # falling knife. Skip and wait for price to climb back
+            # into the zone (or for autofin to republish).
+            if s_lo > 0 and cur < s_lo * (1.0 - below_zone_tolerance_pct):
+                continue
+            # Inside the zone (or just outside either tolerance) →
+            # enter at the better price (capped at the zone ceiling).
             entry_price = int(round(min(cur, s_hi))) if s_hi > 0 else int(round(cur))
         else:
             # No live price → legacy fallback.
