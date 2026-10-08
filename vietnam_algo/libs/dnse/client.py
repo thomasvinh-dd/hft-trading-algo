@@ -354,6 +354,7 @@ class DnseClient:
         body: dict[str, object] | None = None,
         extra_headers: dict[str, str] | None = None,
         version: str | None = None,
+        max_retries: int | None = None,
     ) -> dict[str, Any] | list[Any]:
         # NOTE: query string is included in the URL but NOT inside the signing string (DNSE spec)
         url = self.base_url + path
@@ -368,8 +369,18 @@ class DnseClient:
             headers.update(extra_headers)
         data = json.dumps(body).encode("utf-8") if body is not None else None
 
+        # Caller can override the instance-level ``max_retries`` for a
+        # specific request. Default behaviour: read-only endpoints retry
+        # 5 times (the instance default); write endpoints (place/replace/
+        # cancel order) should pass max_retries=0 because a successful
+        # request whose response was lost in transit would create a
+        # duplicate order on retry — DNSE does not have an idempotency
+        # key. Callers that genuinely want retries on writes must guard
+        # them with their own dedup (the order ledger, in our case).
+        retries = self.max_retries if max_retries is None else max(0, max_retries)
+
         last_exc: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(retries + 1):
             request = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
@@ -591,6 +602,170 @@ class DnseClient:
         if not isinstance(response, dict) or "tradingToken" not in response:
             raise RuntimeError(f"Missing tradingToken in response: {response}")
         return str(response["tradingToken"])
+
+    # =========================================================================
+    # Trading endpoints (place / replace / cancel order, order detail)
+    #
+    # All 4 endpoints require the ``trading-token`` HTTP HEADER (set
+    # by ``/registration/trading-token`` then renewed per session by the
+    # `get_otp` cron). The body / path is independent of the token.
+    #
+    # All 4 endpoints have ``max_retries=0`` on the underlying
+    # ``request()`` call. The default ``DnseClient.max_retries=5`` is
+    # fine for read-only endpoints where the worst-case of a successful
+    # response being lost is a redundant GET, but on writes a lost
+    # response is invisible to us and a retry can place a duplicate
+    # order. DNSE does not implement an idempotency key, so the bot's
+    # own ``order_ledger`` is what prevents double-submission across
+    # cycles (via ``sourceOrderId`` dedup).
+    #
+    # The 2026-10-08 incident: the bot's Telegram preview said
+    # "→ DNSE: BUY 1700 ABB @ 17,400 VND" but the call site in
+    # ``daily_engine.execute_orders_with_ledger`` was calling
+    # ``client.place_stock_order(...)`` and Python raised
+    # ``AttributeError`` — silently swallowed by the surrounding
+    # try/except. The methods below were missing entirely; they are
+    # the real implementation that wires the bot to DNSE for real.
+    # See ``vietnam_algo/docs/dnse-api/README.md`` for the spec.
+    # =========================================================================
+
+    def place_stock_order(
+        self,
+        account_no: str,
+        trading_token: str,
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: int | float,
+        loan_package_id: int,
+        order_type: str = "LO",
+        market_type: str = "STOCK",
+        order_category: str = "NORMAL",
+    ) -> dict[str, Any] | list[Any]:
+        """POST /accounts/{accountNo}/orders — place a NORMAL stock order.
+
+        ``trading_token`` is the UUID from ``/registration/trading-token``
+        (or ``create_trading_token``). It is sent as the ``trading-token``
+        HTTP HEADER, NOT in the body.
+
+        Parameters mirror ``DnseOrder`` so the call sites in
+        ``daily_engine.py:483``, ``trading_engine.py:821``, and
+        ``order_monitor.py:171`` can pass them as-is.
+
+        ``side`` must be ``NB`` (mua/buy) or ``NS`` (bán/sell) — the
+        call sites already use this convention.
+
+        ``order_type`` must be a value accepted by the relevant sàn:
+        HOSE: ``ATO``, ``ATC``, ``LO``, ``MTL``. HNX: ``ATC``, ``LO``,
+        ``MAK``, ``MOK``, ``MTL``, ``PLO``. UPCOM: ``LO``. The bot only
+        places ``LO``.
+
+        ``price`` is in VND (full đồng, not kVND). For non-``LO`` order
+        types DNSE expects ``price=0``; the call sites only place ``LO``
+        so this isn't a concern in the current bot.
+
+        Returns the parsed JSON response. The new order's id is at
+        ``response["id"]`` or ``response["orderId"]`` (the helper
+        ``order_ledger.dnse_order_id`` checks both). The response is
+        NOT retried — a 5xx/429 error propagates as ``RuntimeError`` so
+        the ledger records the failure honestly.
+        """
+        body = {
+            "symbol": str(symbol).upper(),
+            "side": str(side).upper(),
+            "orderType": str(order_type).upper(),
+            "price": int(price) if order_type.upper() != "MP" else 0,
+            "quantity": int(quantity),
+            "loanPackageId": int(loan_package_id),
+        }
+        return self.request(
+            "POST",
+            f"/accounts/{account_no}/orders",
+            query={"marketType": market_type, "orderCategory": order_category},
+            body=body,
+            extra_headers={"trading-token": str(trading_token)},
+            max_retries=0,
+        )
+
+    def order_detail(
+        self,
+        account_no: str,
+        order_id: str | int,
+        trading_token: str | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        """GET /accounts/{accountNo}/orders/{orderId} — fetch a single order.
+
+        ``trading_token`` is OPTIONAL on the read path (DNSE accepts
+        order-detail GETs without it on some sessions, but to be safe
+        we forward it whenever the caller has it). The order-detail
+        response carries the order's current state under
+        ``orderStatus`` (one of: pending, pendingNew, new, partiallyFilled,
+        filled, pendingReplace, pendingCancel, canceled, rejected, expired,
+        doneForDay) and the matched quantity under ``filledQuantity``
+        (the bot's ``order_monitor.filled_quantity`` already accepts
+        multiple field-name variants).
+        """
+        extra_headers: dict[str, str] | None = None
+        if trading_token:
+            extra_headers = {"trading-token": str(trading_token)}
+        return self.request(
+            "GET",
+            f"/accounts/{account_no}/orders/{order_id}",
+            extra_headers=extra_headers,
+            max_retries=0,
+        )
+
+    def replace_order(
+        self,
+        account_no: str,
+        trading_token: str,
+        order_id: str | int,
+        price: int | float,
+        quantity: int,
+        order_type: str = "LO",
+        market_type: str = "STOCK",
+        order_category: str = "NORMAL",
+    ) -> dict[str, Any] | list[Any]:
+        """PUT /accounts/{accountNo}/orders/{orderId} — replace an order.
+
+        Only allowed when the order is in ``new`` or ``partiallyFilled``
+        state (per DNSE spec). On success DNSE cancels the old order
+        and places a new one with the supplied price/quantity.
+
+        Body is just ``{price, quantity}`` — ``symbol``, ``side``,
+        ``loanPackageId`` cannot be changed on a replace.
+        """
+        body = {
+            "price": int(price),
+            "quantity": int(quantity),
+        }
+        return self.request(
+            "PUT",
+            f"/accounts/{account_no}/orders/{order_id}",
+            query={"marketType": market_type, "orderCategory": order_category},
+            body=body,
+            extra_headers={"trading-token": str(trading_token)},
+            max_retries=0,
+        )
+
+    def cancel_order(
+        self,
+        account_no: str,
+        trading_token: str,
+        order_id: str | int,
+    ) -> dict[str, Any] | list[Any]:
+        """DELETE /accounts/{accountNo}/orders/{orderId} — cancel an order.
+
+        Per DNSE spec, allowed when the order is in:
+        - NORMAL: ``pendingNew``, ``new``, ``partiallyFilled``
+        - STOP/OCO: ``new`` (waiting to be triggered)
+        """
+        return self.request(
+            "DELETE",
+            f"/accounts/{account_no}/orders/{order_id}",
+            extra_headers={"trading-token": str(trading_token)},
+            max_retries=0,
+        )
 
     def trading_token(self, otp_type: str, passcode: str) -> str:
         """Backward-compatible alias used by ``daily_engine`` and the ``dnse-trading-token`` CLI."""

@@ -187,7 +187,7 @@ def submit_and_monitor_order(
     current_order = order
     for _ in range(max_checks):
         time.sleep(check_interval_seconds)
-        detail = client.order_detail(account_no, order_id)
+        detail = client.order_detail(account_no, order_id, trading_token=trading_token)
         quote = client.latest_quote(order.symbol)
         decision = decide_reprice(current_order, detail, quote, signal_price=signal_price, max_drift_percent=max_drift_percent)
         events.append({"event": "checked", "orderId": order_id, "detail": detail, "decision": asdict(decision)})
@@ -213,7 +213,7 @@ def submit_and_monitor_order(
                 reason=current_order.reason,
             )
             events.append({"event": "replaced", "orderId": order_id, "newPrice": decision.price, "newQuantity": remaining_quantity, "response": response})
-    detail = client.order_detail(account_no, order_id)
+    detail = client.order_detail(account_no, order_id, trading_token=trading_token)
     status = order_status(detail)
     if status not in DONE_ORDER_STATUSES:
         events.append({"event": "monitor_exhausted_unfilled", "orderId": order_id, "detail": detail, "status": status or "UNKNOWN"})

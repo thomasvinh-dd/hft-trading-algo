@@ -1617,6 +1617,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "auto-trading-bot":
         if not args.live_submit:
             print("Running in dry-run mode. Add --live-submit only when ready for real DNSE orders.")
+        else:
+            # 2026-10-08 guard: refuse --live-submit unless DnseClient
+            # has the 4 order-management methods wired up. On 2026-10-08
+            # the bot was started with --live-submit but the methods
+            # were missing entirely; the call sites raised AttributeError,
+            # the surrounding try/except silently swallowed the error,
+            # and the Telegram preview claimed orders were placed when
+            # they were not. This guard turns that class of bug into a
+            # fail-fast startup error with an actionable message.
+            from vietnam_algo.libs.dnse.client import DnseClient
+            missing = [
+                name for name in ("place_stock_order", "order_detail", "replace_order", "cancel_order")
+                if not callable(getattr(DnseClient, name, None))
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Refusing --live-submit: DnseClient is missing "
+                    f"{', '.join(missing)}. These methods are required to place, "
+                    "monitor, replace, and cancel orders on DNSE. "
+                    "See vietnam_algo/docs/dnse-api/README.md (2026-10-08 incident)."
+                )
         schedule = TradingSchedule()
         if getattr(args, "heartbeat_time", None):
             from datetime import datetime as _dt

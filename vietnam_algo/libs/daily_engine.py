@@ -408,14 +408,14 @@ def trading_token_from_email(client: DnseClient, otp_type: str = "email_otp") ->
     return client.trading_token(otp_type, otp)
 
 
-def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[str, LedgerOrder]) -> tuple[dict[str, LedgerOrder], list[dict[str, object]]]:
+def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[str, LedgerOrder], trading_token: str | None = None) -> tuple[dict[str, LedgerOrder], list[dict[str, object]]]:
     updates: list[dict[str, object]] = []
     now = utc_now()
     for key, item in list(ledger.items()):
         if not item.dnseOrderId or item.status not in {"submitted", "open", "partial", "unknown", "submitting"}:
             continue
         try:
-            detail = client.order_detail(account_no, item.dnseOrderId)
+            detail = client.order_detail(account_no, item.dnseOrderId, trading_token=trading_token)
             status = normalize_ledger_status(order_status_from_detail(detail))
             ledger[key] = LedgerOrder(
                 runId=item.runId,
@@ -451,7 +451,7 @@ def execute_orders_with_ledger(
     from dataclasses import asdict
 
     ledger = load_ledger(data_dir)
-    ledger, reconciliation = reconcile_ledger_orders(client, account_no, ledger)
+    ledger, reconciliation = reconcile_ledger_orders(client, account_no, ledger, trading_token=trading_token)
     unsafe = unsafe_existing_orders(ledger, run_id)
     if unsafe:
         save_ledger(ledger, data_dir)
@@ -491,7 +491,7 @@ def execute_orders_with_ledger(
                 order_type=str(payload["orderType"]),
             )
             order_id = dnse_order_id(response)
-            detail = client.order_detail(account_no, order_id) if order_id else response
+            detail = client.order_detail(account_no, order_id, trading_token=trading_token) if order_id else response
             status = normalize_ledger_status(order_status_from_detail(detail)) if order_id else "unknown"
             ledger[key] = LedgerOrder(**{**ledger[key].__dict__, "status": status, "dnseOrderId": order_id, "updatedAt": utc_now(), "lastDetail": detail})
             results.append({"status": "submitted", "order": payload, "response": response, "detail": detail})

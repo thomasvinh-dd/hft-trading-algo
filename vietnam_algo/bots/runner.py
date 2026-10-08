@@ -1304,6 +1304,30 @@ def run_auto_bot(
                                         else ""
                                     )
                                 )
+                            # 2026-10-08 fix: surface the silent failure
+                            # path. Before this, if ``place_stock_order``
+                            # raised (e.g. AttributeError because the
+                            # method was never implemented, or a 5xx
+                            # from DNSE that the bot's try/except
+                            # swallowed), ``unknown`` would be > 0 and
+                            # the cycle would end with no Telegram
+                            # notification. The user would see the
+                            # per-order "→ DNSE: BUY ..." preview
+                            # (which fires BEFORE the submit) and
+                            # assume the order went through. Pin the
+                            # failure-notify here so a future
+                            # regression cannot silently swallow
+                            # submission errors again.
+                            if submit_result.get("unknown", 0) > 0:
+                                notify(
+                                    "\n".join([
+                                        "🚨 Vietnam Algo: autofin mid-day SUBMIT UNKNOWN STATUS",
+                                        f"date: {today}",
+                                        f"unknown: {submit_result['unknown']} of {submit_result['total']}",
+                                        "orders did not get a confirmed submit/reject from DNSE.",
+                                        "Check data/live/order_ledger.json for the per-order error.",
+                                    ])
+                                )
                             # 2026-10-07: notify when the live-quote
                             # gate dropped a new-entry deal because the
                             # live best-ask had moved out of the
@@ -1584,6 +1608,19 @@ def run_auto_bot(
                                 f" + {len(submit_result['submitted']) - 10} more"
                                 if len(submit_result["submitted"]) > 10 else ""
                             )
+                        )
+                    # 2026-10-08 fix: surface the silent failure path on
+                    # the EOD submit too. See mid-day equivalent above
+                    # for the 2026-10-08 04:30 incident backstory.
+                    if submit_result.get("unknown", 0) > 0:
+                        notify(
+                            "\n".join([
+                                "🚨 Vietnam Algo: autofin EOD SUBMIT UNKNOWN STATUS",
+                                f"date: {today}",
+                                f"unknown: {submit_result['unknown']} of {submit_result['total']}",
+                                "orders did not get a confirmed submit/reject from DNSE.",
+                                "Check data/live/order_ledger.json for the per-order error.",
+                            ])
                         )
                     out_of_zone = submit_result.get("out_of_zone") or []
                     if out_of_zone:
