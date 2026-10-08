@@ -1383,8 +1383,19 @@ def run_auto_bot(
             # When this bot doesn't own data sync, wait for the data-
             # sync owner (autofin) to finish refreshing prices + CA
             # before we proceed. We poll for a sentinel file
-            # ``data_ready_for_eod`` written by the owner; if it's
-            # absent or stale, skip this cycle and try again next.
+            # ``data_ready_for_eod`` written by the owner.
+            #
+            # 2026-10-08 fix: the previous code only SKIPPED on
+            # ABSENT sentinel; for a STALE sentinel it just printed a
+            # warning and proceeded with EOD using yesterday's prices
+            # (the 2026-10-08 incident: BSR reported 31,750 instead
+            # of 32,000). The autofin sync takes ~26 min; the sentinel
+            # can be hours stale before the sync completes. Now we
+            # treat a stale sentinel the same as an absent one and
+            # ``continue`` to retry on the next 60s cycle. The first
+            # ``should_run_eod`` check (above) still re-fires each
+            # cycle because state.eodDate is unchanged until EOD
+            # actually completes.
             data_ready = True
             if not engine_config.syncData:
                 try:
@@ -1403,8 +1414,11 @@ def run_auto_bot(
                         if age_min > 60:
                             print(
                                 f"[{now.isoformat()}] data_ready_for_eod is "
-                                f"{age_min:.0f} min old — owner may be stuck"
+                                f"{age_min:.0f} min old — owner may be stuck, "
+                                f"skipping EOD to avoid stale prices; will retry "
+                                f"next cycle (60s)"
                             )
+                            data_ready = False
                 except Exception as exc:
                     print(f"[{now.isoformat()}] data-ready probe failed: {exc}")
                 if not data_ready:
@@ -1418,13 +1432,44 @@ def run_auto_bot(
                 update_dataset(engine_config)
                 # Stamp the data-ready sentinel so peer bots (e.g.
                 # momentum reading from disk) can resume their EOD.
-                try:
-                    from datetime import datetime as _dt2, timezone as _tz2
-                    _stamp = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
-                    _stamp.parent.mkdir(parents=True, exist_ok=True)
-                    _stamp.write_text(_dt2.now(tz=_tz2).isoformat())
-                except Exception:
-                    pass
+                # 2026-10-08: the previous ``except Exception: pass``
+                # silently swallowed disk-full / permission errors and
+                # left momentum running EOD against yesterday's close
+                # (the 2026-10-08 incident). Log the error and retry
+                # once before giving up — if the disk write still
+                # fails, raise so the bot crashes and the watchdog
+                # relaunches it under a healthy state.
+                _stamp = (
+                    engine_config.dataDir
+                    / engine_config.liveDirName
+                    / "data_ready_for_eod"
+                )
+                _stamp.parent.mkdir(parents=True, exist_ok=True)
+                from datetime import datetime as _dt2, timezone as _tz2
+                _stamp_payload = _dt2.now(tz=_tz2).isoformat()
+                _stamp_err: Exception | None = None
+                for _stamp_attempt in range(2):
+                    try:
+                        _stamp.write_text(_stamp_payload)
+                        _stamp_err = None
+                        break
+                    except Exception as _exc:
+                        _stamp_err = _exc
+                        print(
+                            f"[{now.isoformat()}] data_ready_for_eod "
+                            f"stamp attempt {_stamp_attempt + 1}/2 failed: "
+                            f"{type(_exc).__name__}: {_exc}"
+                        )
+                if _stamp_err is not None:
+                    notify(
+                        "\n".join([
+                            "🚨 Vietnam Algo: data_ready_for_eod stamp FAILED",
+                            f"strategy: {engine_config.strategy}",
+                            f"err: {str(_stamp_err)[:300]}",
+                            "consequence: peer bots (momentum) will use stale prices",
+                        ])
+                    )
+                    raise _stamp_err
             # Use the strategy adapter's generate_orders() when available.
             # This is the right path for strategies like autofin_signal
             # which don't go through run_daily_once → run_momentum_rotation.

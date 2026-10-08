@@ -8,6 +8,7 @@ ensures momentum never reads stale prices.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from vietnam_algo.libs.daily_engine import EngineConfig
+from vietnam_algo.libs.schedule import TradingSchedule, should_run_eod
 
 
 class DataReadySentinelTests(unittest.TestCase):
@@ -66,6 +68,175 @@ class DataReadySentinelTests(unittest.TestCase):
         sentinel = self.tmp / "live" / "data_ready_for_eod"
         age_sec = time.time() - sentinel.stat().st_mtime
         self.assertGreater(age_sec, 60 * 60)  # owner stuck
+
+
+class EodScheduleTimeTests(unittest.TestCase):
+    """Regression for 2026-10-08: momentum EOD fired at 15:15 ICT, but the
+    autofin sync (sync_prices_incremental across 1500+ symbols × 1s
+    sleep) was still in progress. Momentum's mark-to-market therefore
+    read yesterday's close (BSR reported 31,750 instead of 32,000).
+
+    Fix: push the EOD time to 15:45 ICT so the autofin sync has time
+    to finish before either bot reads prices. Pin the schedule
+    default here so any future revert gets caught.
+    """
+
+    def test_default_eod_time_is_15_45(self) -> None:
+        """TradingSchedule default eodUpdateTime must be 15:45 (ICT).
+
+        Pushed back from 15:15 because the autofin sync is ~26 min
+        long. With EOD at 15:15, the momentum bot read stale prices;
+        15:45 gives the autofin sync enough slack to land first.
+        """
+        sched = TradingSchedule()
+        self.assertEqual(sched.eodUpdateTime, _dt.time(15, 45))
+
+    def test_should_run_eod_at_15_44(self) -> None:
+        """At 15:44 ICT on a fresh day → EOD has NOT fired yet."""
+        # Use a weekday so is_trading_day returns True.
+        today = "2026-10-08"  # a Thursday in 2026
+        moment = datetime.fromisoformat(f"{today}T15:44:00+07:00")
+        self.assertFalse(
+            should_run_eod(moment, done_for_date=None, holidays=set()),
+            "EOD should not fire at 15:44 with the new schedule",
+        )
+
+    def test_should_run_eod_at_15_45(self) -> None:
+        """At 15:45 ICT on a fresh day → EOD fires (15:45 ≥ 15:45)."""
+        today = "2026-10-08"
+        moment = datetime.fromisoformat(f"{today}T15:45:00+07:00")
+        self.assertTrue(
+            should_run_eod(moment, done_for_date=None, holidays=set()),
+            "EOD should fire at 15:45 with the new schedule",
+        )
+
+    def test_should_run_eod_at_15_50(self) -> None:
+        """At 15:50 ICT on a fresh day → EOD still fires (idempotent
+        within the same day, gated by state.eodDate)."""
+        today = "2026-10-08"
+        moment = datetime.fromisoformat(f"{today}T15:50:00+07:00")
+        self.assertTrue(
+            should_run_eod(moment, done_for_date=None, holidays=set()),
+        )
+
+
+class StaleSentinelGateTests(unittest.TestCase):
+    """Regression for 2026-10-08 incident: the EOD gate printed a
+    warning for stale sentinels but DID NOT actually skip the EOD.
+    Momentum proceeded with yesterday's close.
+
+    Fix: a stale sentinel (age > 60 min) now sets ``data_ready=False``
+    and ``continue`` to the next cycle. Pin the new behavior here.
+    """
+
+    def setUp(self) -> None:
+        import shutil
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="stale_sentinel_test_"))
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_sentinel(self, age_min: float) -> None:
+        import os
+        import time
+        path = self.tmp / "live" / "data_ready_for_eod"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(datetime.now(timezone.utc).isoformat())
+        old = time.time() - age_min * 60
+        os.utime(path, (old, old))
+
+    def test_runner_docstring_pins_stale_skip_behavior(self) -> None:
+        """The runner's EOD gate comment must say "absent OR stale"
+        so a future reader knows both conditions skip the EOD.
+        """
+        from vietnam_algo.bots import runner
+        src = Path(runner.__file__).read_text()
+        # The fix's comment uses the phrases "absent" and "stale" to
+        # document the gate; the previous wording was just "absent".
+        # We assert the stale-skip is documented.
+        self.assertIn(
+            "treat a stale sentinel the same as an absent one",
+            src,
+            "runner.py EOD-gate comment must document the stale-skip "
+            "behavior (2026-10-08 fix — the missing skip caused "
+            "stale prices in the momentum EOD report).",
+        )
+
+    def test_runner_stale_branch_sets_data_ready_false(self) -> None:
+        """The runner's stale branch must set ``data_ready = False``
+        so the ``if not data_ready: continue`` actually fires. The
+        2026-10-08 incident was caused by a missing
+        ``data_ready = False`` inside the age > 60 block.
+        """
+        from vietnam_algo.bots import runner
+        src = Path(runner.__file__).read_text()
+        # Locate the stale-branch block.
+        marker = "if age_min > 60:"
+        idx = src.find(marker)
+        self.assertGreater(idx, 0, "runner.py must contain the age>60 check")
+        # Read the next ~600 chars (the branch body) and check the
+        # assignment to data_ready happens within it.
+        branch = src[idx: idx + 600]
+        self.assertIn(
+            "data_ready = False",
+            branch,
+            "stale sentinel branch must set data_ready = False "
+            "(2026-10-08 fix — without this, momentum proceeds with "
+            "yesterday's prices).",
+        )
+
+
+class SentinelStampReliabilityTests(unittest.TestCase):
+    """Regression for 2026-10-08 incident: the autofin EOD's
+    ``data_ready_for_eod`` stamp was wrapped in a bare
+    ``except Exception: pass`` that silently swallowed disk-write
+    errors. The sentinel never updated, so the momentum bot kept
+    seeing a 14+ hour-old sentinel and used stale prices.
+
+    Fix: the stamp path now retries once, logs the failure, and
+    raises if both attempts fail. Pin the behavior here.
+    """
+
+    def test_runner_stamp_block_does_not_swallow_exception(self) -> None:
+        """The sentinel-stamp try/except must NOT use ``pass`` — it
+        must at least log and ideally retry. The 2026-10-08 incident
+        was caused by a silent ``except Exception: pass``.
+        """
+        from vietnam_algo.bots import runner
+        src = Path(runner.__file__).read_text()
+        # The fix replaces the original silent block with a retry loop.
+        # We assert the fix's wording is present (proves the silent
+        # version is gone) and the old wording is absent.
+        self.assertNotIn(
+            "except Exception:\n                    pass",
+            src,
+            "runner.py must not have a silent 'except Exception: pass' "
+            "around the sentinel stamp (2026-10-08 fix).",
+        )
+        self.assertIn(
+            "stamp attempt",
+            src,
+            "runner.py sentinel stamp must log retry attempts "
+            "(2026-10-08 fix).",
+        )
+
+    def test_runner_stamp_block_raises_on_persistent_failure(self) -> None:
+        """If both stamp attempts fail, runner.py must raise (so the
+        bot crashes and the watchdog relaunches it under a healthy
+        state) — not silently swallow the error.
+        """
+        from vietnam_algo.bots import runner
+        src = Path(runner.__file__).read_text()
+        # Look for the post-retry block that re-raises.
+        self.assertIn(
+            "raise _stamp_err",
+            src,
+            "runner.py sentinel stamp must re-raise on persistent failure "
+            "(2026-10-08 fix — silent failure left momentum bot with "
+            "stale prices).",
+        )
 
 
 if __name__ == "__main__":

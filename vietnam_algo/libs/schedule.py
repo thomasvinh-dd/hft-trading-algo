@@ -13,7 +13,17 @@ class TradingSchedule:
     tokenTime: time = time(8, 30)
     startOfDayTime: time = time(9, 0)
     orderSubmitTime: time = time(9, 16)
-    eodUpdateTime: time = time(15, 15)
+    # 2026-10-08 fix: eodUpdateTime was 15:15, but the data-sync owner
+    # (autofin bot) takes ~26 minutes for ``sync_prices_incremental``
+    # across 1500+ symbols. At 15:15 the autofin sync was still in
+    # progress when the momentum bot fired its EOD, so the momentum
+    # mark-to-market read yesterday's close (file last written by the
+    # 08:30 common_sync). Pushed the EOD trigger to 15:45 — by that time
+    # autofin's sync has finished and the daily prices are on disk. The
+    # momentum bot also gained a stale-sentinel check in
+    # ``bots/runner.py`` (see commit msg), so even at 15:45 it waits
+    # for ``data_ready_for_eod`` to be fresh before using prices.
+    eodUpdateTime: time = time(15, 45)
     corporateActionSyncTime: time = time(15, 10)
     heartbeatTime: time = time(10, 30)
     morningStart: time = time(9, 15)
