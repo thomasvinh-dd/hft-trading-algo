@@ -692,6 +692,8 @@ class DnseClient:
         account_no: str,
         order_id: str | int,
         trading_token: str | None = None,
+        market_type: str = "STOCK",
+        order_category: str = "NORMAL",
     ) -> dict[str, Any] | list[Any]:
         """GET /accounts/{accountNo}/orders/{orderId} — fetch a single order.
 
@@ -704,6 +706,11 @@ class DnseClient:
         doneForDay) and the matched quantity under ``filledQuantity``
         (the bot's ``order_monitor.filled_quantity`` already accepts
         multiple field-name variants).
+
+        NOTE: DNSE requires ``marketType`` and ``orderCategory`` as
+        query parameters (the spec page lists no query params but the
+        server returns HTTP 400 ``INVALID_MARKET_TYPE`` without them).
+        Defaults to ``STOCK`` + ``NORMAL`` which is what the bot places.
         """
         extra_headers: dict[str, str] | None = None
         if trading_token:
@@ -711,6 +718,7 @@ class DnseClient:
         return self.request(
             "GET",
             f"/accounts/{account_no}/orders/{order_id}",
+            query={"marketType": market_type, "orderCategory": order_category},
             extra_headers=extra_headers,
             max_retries=0,
         )
@@ -753,16 +761,24 @@ class DnseClient:
         account_no: str,
         trading_token: str,
         order_id: str | int,
+        market_type: str = "STOCK",
+        order_category: str = "NORMAL",
     ) -> dict[str, Any] | list[Any]:
         """DELETE /accounts/{accountNo}/orders/{orderId} — cancel an order.
 
         Per DNSE spec, allowed when the order is in:
         - NORMAL: ``pendingNew``, ``new``, ``partiallyFilled``
         - STOP/OCO: ``new`` (waiting to be triggered)
+
+        NOTE: DNSE requires ``marketType`` and ``orderCategory`` as
+        query parameters (the spec page lists no query params but the
+        server returns HTTP 400 ``INVALID_MARKET_TYPE`` without them).
+        Defaults to ``STOCK`` + ``NORMAL`` which is what the bot places.
         """
         return self.request(
             "DELETE",
             f"/accounts/{account_no}/orders/{order_id}",
+            query={"marketType": market_type, "orderCategory": order_category},
             extra_headers={"trading-token": str(trading_token)},
             max_retries=0,
         )

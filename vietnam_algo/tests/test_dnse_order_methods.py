@@ -253,7 +253,11 @@ def test_order_detail_uses_get_with_order_id_in_path(monkeypatch: pytest.MonkeyP
     assert detail["orderStatus"] == "filled"
     req = captured["req"]
     assert req.method == "GET"
-    assert req.full_url == "https://openapi.dnse.com.vn/accounts/0003937868/orders/999"
+    assert req.full_url.startswith("https://openapi.dnse.com.vn/accounts/0003937868/orders/999")
+    # marketType + orderCategory required by DNSE (server returns
+    # 400 INVALID_MARKET_TYPE without them — verified on 2026-10-08)
+    assert "marketType=STOCK" in req.full_url
+    assert "orderCategory=NORMAL" in req.full_url
 
 
 def test_order_detail_sends_trading_token_header_when_provided(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -294,6 +298,8 @@ def test_replace_order_uses_put_with_correct_body(monkeypatch: pytest.MonkeyPatc
     req = captured["req"]
     assert req.method == "PUT"
     assert req.full_url.startswith("https://openapi.dnse.com.vn/accounts/0003937868/orders/999")
+    assert "marketType=STOCK" in req.full_url
+    assert "orderCategory=NORMAL" in req.full_url
     body = json.loads(req.data)
     assert body == {"price": 26000, "quantity": 200}
 
@@ -311,7 +317,7 @@ def test_replace_order_does_not_retry(monkeypatch: pytest.MonkeyPatch) -> None:
 # -----------------------------------------------------------------------------
 
 
-def test_cancel_order_uses_delete_with_no_body(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cancel_order_uses_delete_with_query_params_and_no_body(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture_request(monkeypatch, {"id": 999, "orderStatus": "canceled"})
     client = _client()
     response = client.cancel_order(
@@ -322,7 +328,11 @@ def test_cancel_order_uses_delete_with_no_body(monkeypatch: pytest.MonkeyPatch) 
     assert response["orderStatus"] == "canceled"
     req = captured["req"]
     assert req.method == "DELETE"
-    assert req.full_url == "https://openapi.dnse.com.vn/accounts/0003937868/orders/999"
+    assert req.full_url.startswith("https://openapi.dnse.com.vn/accounts/0003937868/orders/999")
+    # marketType + orderCategory required by DNSE (server returns
+    # 400 INVALID_MARKET_TYPE without them — verified on 2026-10-08)
+    assert "marketType=STOCK" in req.full_url
+    assert "orderCategory=NORMAL" in req.full_url
     # Cancel has no body
     assert req.data is None
 
