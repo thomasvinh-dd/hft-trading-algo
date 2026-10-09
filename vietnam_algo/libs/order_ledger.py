@@ -115,30 +115,71 @@ def _maybe_mirror_to_db(rows: list[LedgerOrder]) -> None:
 
 
 def order_status_from_detail(detail: dict[str, Any] | list[Any]) -> str:
+    """Extract the order's status string from a DNSE order-detail payload.
+
+    Returns the status in the **normalized** form expected by
+    ``normalize_ledger_status``: camelCase split on the lowercase→uppercase
+    boundary, then upper-cased. Examples:
+
+      - ``"partiallyFilled"``  → ``"PARTIALLY_FILLED"``
+      - ``"pendingNew"``       → ``"PENDING_NEW"``
+      - ``"pendingCancel"``    → ``"PENDING_CANCEL"``
+      - ``"cancelledByRightsEvent"`` → ``"CANCELLED_BY_RIGHTS_EVENT"``
+
+    The 2026-10-08 monitoring fix added this normalization because the
+    raw DNSE wire format is camelCase and the old "just upper-case
+    it" path produced ``"PARTIALLYFILLED"`` which ``normalize_ledger_status``
+    couldn't map. Without the fix, every partial fill was reported as
+    ``"unknown"`` to the operator.
+    """
+    import re as _re
+    raw = ""
     if isinstance(detail, dict):
         for key in ("status", "orderStatus", "state"):
             if key in detail and detail[key] not in (None, ""):
-                return str(detail[key]).upper()
-        for value in detail.values():
-            if isinstance(value, (dict, list)):
-                status = order_status_from_detail(value)
-                if status:
-                    return status
+                raw = str(detail[key])
+                break
+        if not raw:
+            for value in detail.values():
+                if isinstance(value, (dict, list)):
+                    raw = order_status_from_detail(value)
+                    if raw:
+                        break
     elif isinstance(detail, list):
         for item in detail:
-            status = order_status_from_detail(item)
-            if status:
-                return status
-    return ""
+            raw = order_status_from_detail(item)
+            if raw:
+                break
+    if not raw:
+        return ""
+    # camelCase → snake_case → UPPER
+    snake = _re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw)
+    return snake.upper()
 
 
 def normalize_ledger_status(status: str) -> str:
-    clean = status.upper()
+    # DNSE returns the order status under ``orderStatus`` and the wire
+    # format is camelCase (e.g. ``partiallyFilled``, ``pendingCancel``).
+    # The 2026-10-08 monitoring fix added the camelCase → UPPER_SNAKE
+    # conversion so ``normalize_ledger_status("partiallyFilled")``
+    # returns ``"partial"``. Without this conversion, a partial fill
+    # would be mapped to ``"unknown"`` and the operator would lose
+    # visibility on the fill.
+    raw = (status or "").strip()
+    if not raw:
+        return "unknown"
+    # camelCase → snake_case: insert "_" before each uppercase letter
+    # that follows a lowercase letter, then uppercase the whole string.
+    # Examples: "partiallyFilled" → "partially_filled", "pendingNew" →
+    # "pending_new", "cancelledByRightsEvent" → "cancelled_by_rights_event".
+    import re as _re
+    snake = _re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw)
+    clean = snake.upper()
     if clean in {"FILLED", "MATCHED"}:
         return "filled"
-    if clean in {"PARTIALLY_FILLED", "PARTIAL_FILLED"}:
+    if clean in {"PARTIALLY_FILLED", "PARTIAL_FILLED", "PARTIALLY_MATCHED"}:
         return "partial"
-    if clean in {"CANCELLED", "CANCELED"}:
+    if clean in {"CANCELLED", "CANCELED", "CANCELLED_BY_RIGHTS_EVENT"}:
         return "cancelled"
     if clean == "REJECTED":
         return "rejected"
@@ -146,9 +187,11 @@ def normalize_ledger_status(status: str) -> str:
         return "expired"
     if clean == "CLOSED":
         return "closed"
+    if clean == "DONE_FOR_DAY":
+        return "closed"
     if clean in {"NEW", "OPEN", "PENDING", "PENDING_NEW", "WAITING", "QUEUED"}:
         return "open"
-    return "unknown" if clean else "unknown"
+    return "unknown"
 
 
 def dnse_order_id(response: dict[str, Any] | list[Any] | None) -> str:

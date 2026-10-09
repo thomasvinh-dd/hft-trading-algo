@@ -36,6 +36,14 @@ from vietnam_algo.libs.notifier import (
     eod_summary_message,
     heartbeat_message,
 )
+from vietnam_algo.libs.order_ledger import (
+    LedgerOrder,
+    TERMINAL_LEDGER_STATUSES,
+    load_ledger,
+    save_ledger,
+    normalize_ledger_status,
+    order_status_from_detail,
+)
 from vietnam_algo.libs.schedule import (
     TradingSchedule,
     TradingSession,
@@ -914,6 +922,194 @@ def _read_strategy_last_poll(data_dir: Path, strategy_name: str) -> str | None:
         return None
 
 
+# In-memory throttle cache: maps ledger key → last-polled-at epoch (seconds).
+# Lives for the duration of the bot process; reset on bot restart (which
+# is the right behaviour — we want to re-poll everything after a restart
+# in case status changed while the bot was down).
+_ORDER_POLL_THROTTLE: dict[str, float] = {}
+
+
+def _format_status_change_message(
+    item: LedgerOrder,
+    previous: str,
+    current: str,
+    detail: dict | list | None,
+) -> str:
+    """Build a Telegram message for an order status change.
+
+    The message is human-friendly: a short header line, the previous →
+    current transition, and the key order fields (symbol, side, qty,
+    price, dnseOrderId). If the detail carries a useful explanation
+    (rejectReason, cancelReason, filledQuantity, averagePrice) we
+    include that too — operators want to know WHY an order rejected
+    without opening the DNSE web UI.
+    """
+    side_label = "BUY" if item.side == "NB" else "SELL"
+    header_icon = {
+        "filled": "✅",
+        "cancelled": "🚫",
+        "rejected": "❌",
+        "expired": "⏰",
+        "partial": "🟡",
+        "open": "📋",
+        "unknown": "❓",
+    }.get(current, "🔄")
+
+    lines = [
+        f"{header_icon} Vietnam Algo: order {item.symbol} → {current.upper()}",
+        f"orderId: {item.dnseOrderId or '?'}",
+        f"transition: {previous.upper()} → {current.upper()}",
+        f"intent: {side_label} {item.quantity:,} {item.symbol} @ {item.price:,} VND",
+    ]
+    if isinstance(detail, dict):
+        # Show extras that operators care about.
+        for key in (
+            "filledQuantity", "fillQuantity", "matchedQuantity",
+            "averagePrice", "fillPrice", "lastPrice",
+            "canceledQuantity", "leaveQuantity",
+            "rejectReason", "cancelReason", "rejectedReason", "errorReason",
+        ):
+            value = detail.get(key)
+            if value is not None and value != "":
+                pretty = key.replace("Quantity", " qty").replace("Price", " (VND)")
+                lines.append(f"  {key}: {value}")
+        # also surface the raw exchange reason if DNSE attached one
+        if "metadata" in detail and isinstance(detail["metadata"], str):
+            meta = detail["metadata"]
+            if "rejected" in meta.lower() or "reject" in meta.lower():
+                lines.append(f"  metadata: {meta[:200]}")
+    return "\n".join(lines)
+
+
+def _monitor_order_statuses(
+    client: "DnseClient | None",
+    account_no: str,
+    trading_token: str | None,
+    data_dir: Path,
+    *,
+    throttle_seconds: int = 60,
+) -> dict[str, Any]:
+    """Poll DNSE for status updates on every non-terminal order in the ledger.
+
+    Sends a Telegram notification on every status change
+    (``pendingNew`` → ``new`` → ``partiallyFilled`` → ``filled``, or
+    transitions to ``cancelled`` / ``rejected`` / ``expired``). Also
+    sends a follow-up notification on the first ``filled`` for partial
+    fills so the operator can react.
+
+    Per-order throttle (default 60 s) prevents hammering DNSE. The
+    throttle is in-memory only — bot restart resets it, which is the
+    right behaviour: after a restart we want to re-poll every order
+    because status may have changed while we were down.
+
+    Returns a summary dict for the cycle log:
+
+        {
+            "polled": int,        # number of orders polled this cycle
+            "skipped_throttle": int,
+            "changes": [{"key": ..., "previous": ..., "current": ...}],
+            "errors": [{"key": ..., "err": ...}],
+            "terminal_transitions": int,  # # of orders that just hit a terminal state
+        }
+    """
+    summary: dict[str, Any] = {
+        "polled": 0,
+        "skipped_throttle": 0,
+        "changes": [],
+        "errors": [],
+        "terminal_transitions": 0,
+    }
+    if client is None:
+        return summary
+    try:
+        ledger = load_ledger(data_dir)
+    except Exception as exc:
+        summary["errors"].append({"key": "<load_ledger>", "err": str(exc)[:200]})
+        return summary
+
+    if not ledger:
+        return summary
+
+    now_epoch = time.time()
+    dirty = False  # ledger changed → save at the end
+
+    for key, item in list(ledger.items()):
+        # Only poll orders that DNSE knows about AND that haven't reached
+        # a terminal state. Terminal-state orders are "done" — polling
+        # them would just confirm what we already know.
+        if not item.dnseOrderId:
+            continue
+        if item.status in TERMINAL_LEDGER_STATUSES:
+            continue
+
+        # Per-order throttle. Skip if we polled this order recently.
+        last_polled = _ORDER_POLL_THROTTLE.get(key, 0.0)
+        if now_epoch - last_polled < throttle_seconds:
+            summary["skipped_throttle"] += 1
+            continue
+
+        try:
+            detail = client.order_detail(
+                account_no, item.dnseOrderId, trading_token=trading_token,
+            )
+        except Exception as exc:
+            # Network blip or DNSE down. Don't spam Telegram on transient
+            # errors — just record the error on the ledger so the cycle
+            # log surfaces it. The next cycle will retry.
+            err = f"{type(exc).__name__}: {str(exc)[:200]}"
+            summary["errors"].append({"key": key, "err": err})
+            ledger[key] = LedgerOrder(**{**item.__dict__, "error": err, "updatedAt": _utc_iso()})
+            dirty = True
+            continue
+
+        _ORDER_POLL_THROTTLE[key] = now_epoch
+        summary["polled"] += 1
+
+        # DNSE returns the order status under `orderStatus` (or `status`
+        # on some endpoints). `order_status_from_detail` already
+        # recurses into nested dicts/lists so it handles both shapes.
+        raw_status = order_status_from_detail(detail) or ""
+        new_status = normalize_ledger_status(raw_status)
+
+        previous_status = item.status
+        if new_status != previous_status:
+            summary["changes"].append({
+                "key": key,
+                "symbol": item.symbol,
+                "previous": previous_status,
+                "current": new_status,
+            })
+            if new_status in TERMINAL_LEDGER_STATUSES:
+                summary["terminal_transitions"] += 1
+            try:
+                notify(_format_status_change_message(
+                    item, previous_status, new_status, detail,
+                ))
+            except Exception as exc:
+                # Telegram failure must not break the poll cycle.
+                summary["errors"].append({"key": key, "err": f"notify failed: {str(exc)[:120]}"})
+
+        # Always refresh lastDetail + updatedAt so the on-disk ledger
+        # reflects the most recent DNSE view (even when status didn't
+        # change — useful for "filledQuantity" updates on partial fills).
+        ledger[key] = LedgerOrder(**{**item.__dict__, "status": new_status, "lastDetail": detail, "updatedAt": _utc_iso()})
+        dirty = True
+
+    if dirty:
+        try:
+            save_ledger(ledger, data_dir)
+        except Exception as exc:
+            summary["errors"].append({"key": "<save_ledger>", "err": str(exc)[:200]})
+
+    return summary
+
+
+def _utc_iso() -> str:
+    """Return current UTC time as an ISO-8601 string (used for ledger updates)."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def run_auto_bot(
     engine_config: EngineConfig,
     strategy_config: StrategyConfig,
@@ -966,6 +1162,29 @@ def run_auto_bot(
         now = vietnam_now()
         today = local_date(now)
         state = load_state(engine_config.dataDir, strategy_name=strategy_name)
+
+        # Order-status monitor — runs every cycle (~60s). Polls DNSE for
+        # status of every non-terminal order in the ledger; sends a
+        # Telegram notification on every status change. The per-order
+        # throttle inside ``_monitor_order_statuses`` prevents hammering
+        # DNSE. Always runs (even off-hours) so we catch late fills and
+        # rejections from after-hours cancel/replace attempts.
+        try:
+            monitor_summary = _monitor_order_statuses(
+                client, account_no, token, engine_config.dataDir,
+                throttle_seconds=int(os.environ.get("ORDER_MONITOR_THROTTLE_SECONDS", "60")),
+            )
+            if monitor_summary.get("polled") or monitor_summary.get("changes") or monitor_summary.get("errors"):
+                print(
+                    f"[{now.isoformat()}] order monitor: "
+                    f"polled={monitor_summary['polled']} "
+                    f"throttle_skipped={monitor_summary['skipped_throttle']} "
+                    f"changes={len(monitor_summary['changes'])} "
+                    f"terminal={monitor_summary['terminal_transitions']} "
+                    f"errors={len(monitor_summary['errors'])}"
+                )
+        except Exception as exc:
+            print(f"[{now.isoformat()}] order monitor crashed: {type(exc).__name__}: {str(exc)[:200]}")
         if should_sync_market_holidays(state.marketHolidaySyncDate, today):
             print(f"[{now.isoformat()}] Syncing Vietnam market holidays")
             result = sync_market_holidays(engine_config.dataDir)
