@@ -907,3 +907,69 @@ def portfolio_snapshot_message(snap: dict[str, Any], top_n: int = 8) -> str:
         lines.append(f"⚠️ endpoint errors: {', '.join(errors)}")
 
     return "\n".join(lines)
+
+
+def force_run_summary_message(
+    strategy_name: str,
+    trade_date: str,
+    poll_result: dict[str, Any],
+    submit_result: dict[str, Any] | None,
+    live_submit: bool,
+) -> str:
+    """Telegram message for a ``force-run-trading`` invocation.
+
+    Shown when the operator triggers an ad-hoc bot re-run via
+    ``python3 -m vietnam_algo.main force-run-trading ...``. Surfaces:
+      - the strategy name + trade date
+      - how many orders the strategy generated
+      - what kind of orders (new entry / partial close / full close)
+      - the submit result (if --live-submit) — how many went through,
+        how many were skipped, how many failed
+      - the dry-run notice (if dry-run)
+    """
+    count = poll_result.get("count", 0)
+    lines: list[str] = [
+        "🔧 Vietnam Algo: FORCE-RUN trading decision pipeline",
+        f"strategy: {strategy_name}",
+        f"date: {trade_date}",
+        f"liveSubmit: {live_submit}",
+        "",
+        f"📊 strategy result: {count} order(s) planned",
+    ]
+    for label, key in (
+        ("new entries (NB)", "newOrders"),
+        ("partial closes (NS)", "partialOrders"),
+        ("full closes (NS)", "closeOrders"),
+        ("signals fetched", "signalsFetched"),
+        ("deals tracked", "dealsTracked"),
+    ):
+        if key in poll_result:
+            lines.append(f"  {label}: {poll_result[key]}")
+    if poll_result.get("latestOrdersJson"):
+        lines.append(f"  latestOrdersJson: {poll_result['latestOrdersJson']}")
+
+    lines.append("")
+    if submit_result is None:
+        if live_submit:
+            lines.append("⚠️ submit: SKIPPED (no deals_actioned from strategy)")
+        else:
+            lines.append("ℹ️ submit: SKIPPED (dry-run; pass --live-submit to place for real)")
+    elif "error" in submit_result:
+        lines.append(f"❌ submit: ERROR — {submit_result['error']}")
+    else:
+        submitted = submit_result.get("submitted", [])
+        skipped = submit_result.get("skipped_existing", 0)
+        unknown = submit_result.get("unknown", 0)
+        total = submit_result.get("total", 0)
+        icon = "✅" if unknown == 0 and len(submitted) > 0 else "🟡" if unknown == 0 else "🚨"
+        lines.append(f"{icon} submit: {len(submitted)}/{total} submitted, "
+                     f"{skipped} skipped-existing, {unknown} unknown")
+        if submitted:
+            lines.append(f"  dnseOrderIds: {','.join(str(x) for x in submitted[:10])}"
+                         + (f" +{len(submitted) - 10} more" if len(submitted) > 10 else ""))
+        if submit_result.get("out_of_zone"):
+            lines.append(f"  out_of_zone: {len(submit_result['out_of_zone'])} (live-quote gate)")
+        if submit_result.get("skipped_off_hours"):
+            lines.append(f"  skipped_off_hours: {submit_result['skipped_off_hours']} (current time is outside trading window)")
+
+    return "\n".join(lines)

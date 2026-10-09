@@ -519,6 +519,31 @@ def build_parser() -> argparse.ArgumentParser:
     # --strategy is already added by add_daily_engine_arguments; we accept the
     # registered-strategy names too. Don't redeclare it here.
 
+    # 2026-10-09: force-run-trading — bypass all schedule gates and
+    # run the strategy's mid-day poll + DNSE submit path once. The
+    # bot's main loop is gated by ``should_poll_strategy`` (1h
+    # throttle), ``state.orderSubmitDate`` (once per day),
+    # ``state.eodDate`` (once per day), etc. — useful for normal
+    # operation but frustrating when you want to verify the trading
+    # logic right now without waiting. ``--force`` flips every gate
+    # off for one cycle; ``--live-submit`` does the same DNSE submit
+    # the bot would do. Use case: "I just edited the strategy, did
+    # the signal change? Let me re-poll and see".
+    force_run = subparsers.add_parser(
+        "force-run-trading",
+        help="bypass schedule gates and run the trading logic once, "
+             "optionally submitting to DNSE. Useful for ad-hoc re-runs "
+             "after a code change or to verify the strategy picks up a "
+             "new signal without waiting for the next 60-minute cycle.",
+    )
+    add_dnse_auth_arguments(force_run)
+    add_daily_engine_arguments(force_run)
+    add_backtest_arguments(force_run)
+    force_run.add_argument("--account-no", required=True)
+    force_run.add_argument("--loan-package-id", type=int, required=True)
+    force_run.add_argument("--live-submit", action="store_true", help="submit the planned orders to DNSE; otherwise dry-run")
+    force_run.add_argument("--no-notify", action="store_true", help="don't send a Telegram message — useful for scripted checks")
+
     # New: list available strategies
     subparsers.add_parser(
         "list-strategies",
@@ -1672,6 +1697,152 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {entry['name']:<25}  {entry['description']}")
             if entry["env"]:
                 print(f"    env: vietnam_algo/env/{entry['env']}")
+        return 0
+
+    if args.command == "force-run-trading":
+        # Bypass every schedule gate and run the strategy's mid-day
+        # poll once, optionally submitting to DNSE. The flow mirrors
+        # the mid-day-poll block in ``run_auto_bot`` but skips:
+        #   - should_poll_strategy's 1-hour throttle
+        #   - state.orderSubmitDate (already-submitted-today gate)
+        #   - state.eodDate / state.startOfDayDate
+        # so an operator can re-run the decision pipeline right now
+        # to verify a code change or catch a signal that arrived after
+        # the last scheduled cycle.
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        from .algos.registry import STRATEGY_REGISTRY
+        from .bots.runner import (
+            _submit_autofin_deals_to_dnse,
+            notify,
+            vietnam_now,
+            local_date,
+            load_state,
+        )
+        from .libs.dnse.auth import load_shared_trading_token
+        from .libs.notifier import force_run_summary_message
+
+        engine_config = (
+            _with_strategy(args, args.strategy)
+            if getattr(args, "strategy", None)
+            else engine_config_from_args(args)
+        )
+        strategy_config = strategy_config_from_args(args)
+        client = dnse_client_from_args(args)
+
+        # Resolve the strategy adapter
+        strategy_name = args.strategy
+        if strategy_name not in STRATEGY_REGISTRY:
+            print(f"ERROR: unknown strategy {strategy_name!r}. "
+                  f"Available: {sorted(STRATEGY_REGISTRY.keys())}")
+            return 2
+        strategy_adapter = STRATEGY_REGISTRY[strategy_name]
+
+        # Load the trading token (for live submit)
+        token: str | None = None
+        token_data = load_shared_trading_token(engine_config.dataDir)
+        if token_data and token_data.get("token"):
+            token = str(token_data["token"])
+        if args.live_submit and not token:
+            print("ERROR: --live-submit requested but no trading token at "
+                  "data/live/dnse_trading_token.json. Run "
+                  "'python3 -m vietnam_algo.main run-get-otp' first.")
+            return 3
+
+        # Compute the trade date — force today's date (not whatever's
+        # in the state file) so the run reflects the current session
+        # even if the bot hasn't yet stamped today's date.
+        now = vietnam_now()
+        today = local_date(now)
+        state = load_state(engine_config.dataDir, strategy_name=strategy_name)
+        print(
+            f"force-run-trading: now={now.isoformat()} "
+            f"date={today} strategy={strategy_name} live_submit={args.live_submit}"
+        )
+        print(
+            f"  state: orderSubmitDate={state.orderSubmitDate!r} "
+            f"eodDate={state.eodDate!r} startOfDayDate={state.startOfDayDate!r}"
+        )
+        print(
+            f"  bypass: should_poll_strategy throttle; state.orderSubmitDate / "
+            f"eodDate / startOfDayDate gates"
+        )
+
+        # Run the strategy's decision pipeline (mirrors the mid-day
+        # poll block in run_auto_bot).
+        try:
+            poll_result = strategy_adapter.generate_orders(
+                engine_config, strategy_config,
+                trade_date=today,
+                live_submit=args.live_submit,
+            )
+        except Exception as exc:
+            print(f"ERROR: generate_orders raised: {type(exc).__name__}: {exc}")
+            if not args.no_notify:
+                notify(
+                    f"🚨 Vietnam Algo: force-run-trading FAILED\n"
+                    f"strategy: {strategy_name}\n"
+                    f"date: {today}\n"
+                    f"err: {str(exc)[:300]}"
+                )
+            return 4
+
+        count = poll_result.get("count", 0) if isinstance(poll_result, dict) else 0
+        deals = poll_result.get("deals_actioned") if isinstance(poll_result, dict) else None
+        print(f"\nstrategy result: {count} order(s) planned")
+        if isinstance(poll_result, dict):
+            # Print a summary of the result for quick operator review.
+            for k in ("latestOrdersCsv", "latestOrdersJson", "source", "tradeDate",
+                      "autofinHoldingCount", "autofinRiskCount", "autofinClosingCount",
+                      "signalsFetched", "dealsTracked", "newOrders", "closeOrders",
+                      "partialOrders"):
+                if k in poll_result:
+                    print(f"  {k}: {poll_result[k]}")
+
+        submit_result: dict | None = None
+        if args.live_submit and deals:
+            try:
+                submit_result = _submit_autofin_deals_to_dnse(
+                    deals,
+                    account_no=args.account_no,
+                    loan_package_id=args.loan_package_id,
+                    trading_token=token,
+                    client=client,
+                    data_dir=engine_config.dataDir,
+                    trade_date=today,
+                )
+                print(
+                    f"\nsubmit result: "
+                    f"{len(submit_result['submitted'])} submitted, "
+                    f"{submit_result['skipped_existing']} skipped-existing, "
+                    f"{submit_result['unknown']} unknown "
+                    f"(of {submit_result['total']} planned)"
+                )
+                if submit_result.get("submitted"):
+                    print(f"  dnseOrderIds: {submit_result['submitted']}")
+                if submit_result.get("out_of_zone"):
+                    print(f"  out_of_zone: {len(submit_result['out_of_zone'])}")
+            except Exception as exc:
+                print(f"\nERROR: submit raised: {type(exc).__name__}: {exc}")
+                submit_result = {"error": str(exc)[:300]}
+        elif args.live_submit and not deals:
+            print("\nsubmit: SKIPPED (no deals_actioned from strategy)")
+        else:
+            print("\nsubmit: SKIPPED (dry-run; pass --live-submit to actually place)")
+
+        # Telegram summary
+        if not args.no_notify:
+            try:
+                notify(force_run_summary_message(
+                    strategy_name=strategy_name,
+                    trade_date=today,
+                    poll_result=poll_result if isinstance(poll_result, dict) else {},
+                    submit_result=submit_result,
+                    live_submit=args.live_submit,
+                ))
+            except Exception as exc:
+                print(f"notify failed: {type(exc).__name__}: {exc}")
+
         return 0
 
     if args.command == "run-get-otp":
