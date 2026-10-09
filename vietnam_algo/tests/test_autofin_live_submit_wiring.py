@@ -134,7 +134,9 @@ def test_buy_order_converted_with_default_loan_package(stub_ledger, in_continuou
     assert o.side == "NB"
     assert o.price == 14100
     assert o.quantity == 1000
-    assert o.loanPackageId == 1775
+    # 2026-10-09: bot doesn't use margin → loanPackageId=0 (which
+    # the place_stock_order body builder omits from the JSON).
+    assert o.loanPackageId == 0
     assert o.orderType == "LO"
     assert o.sourceDate == "2026-10-06"
     assert isinstance(o.sourceOrderId, int)
@@ -269,7 +271,11 @@ def test_per_symbol_loan_package_override(stub_ledger, in_continuous_session):
         loan_package_id_by_symbol={"HDB": 9999},
     )
     orders = {o.symbol: o for o in stub_ledger.calls[0]["orders"]}
-    assert orders["ABW"].loanPackageId == 1775
+    # 2026-10-09: bot doesn't use margin → loanPackageId=0 by default.
+    # The per-symbol override ``{"HDB": 9999}`` still wins because the
+    # user explicitly opted that symbol into margin (e.g. when a
+    # future strategy does want it).
+    assert orders["ABW"].loanPackageId == 0
     assert orders["HDB"].loanPackageId == 9999
 
 

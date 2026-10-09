@@ -241,6 +241,71 @@ def test_place_stock_order_supports_sell_side(monkeypatch: pytest.MonkeyPatch) -
     assert body["side"] == "NS"
 
 
+def test_place_stock_order_omits_loan_package_when_none(monkeypatch) -> None:
+    """2026-10-09 fix: cash-only orders (UPCOM, bonds) don't need a
+    margin package. When ``loan_package_id`` is None or 0, omit
+    the field entirely. The user reported this when an ABB BUY on
+    UPCOM was rejected because the bot was passing
+    ``loanPackageId=1775`` (HDB margin) which the UPCOM engine
+    doesn't accept.
+    """
+    captured = _capture_request(monkeypatch, {"id": 1})
+    client = _client()
+    client.place_stock_order(
+        account_no="0003937868",
+        trading_token="t",
+        symbol="ABB",  # ABB is on UPCOM — cash-only
+        side="NB",
+        quantity=100,
+        price=17500,
+        loan_package_id=None,
+        order_type="LO",
+    )
+    body = json.loads(captured["req"].data)
+    assert "loanPackageId" not in body, (
+        f"cash-only orders (UPCOM) must NOT send loanPackageId; "
+        f"got body={body!r}"
+    )
+    assert body["orderType"] == "LO"
+    assert body["price"] == 17500
+
+
+def test_place_stock_order_omits_loan_package_when_zero(monkeypatch) -> None:
+    """``loan_package_id=0`` is also treated as 'no margin package'."""
+    captured = _capture_request(monkeypatch, {"id": 1})
+    client = _client()
+    client.place_stock_order(
+        account_no="0003937868",
+        trading_token="t",
+        symbol="ABB",
+        side="NB",
+        quantity=100,
+        price=17500,
+        loan_package_id=0,
+        order_type="LO",
+    )
+    body = json.loads(captured["req"].data)
+    assert "loanPackageId" not in body
+
+
+def test_place_stock_order_includes_loan_package_when_positive(monkeypatch) -> None:
+    """HOSE/HNX margin orders still include the loanPackageId."""
+    captured = _capture_request(monkeypatch, {"id": 1})
+    client = _client()
+    client.place_stock_order(
+        account_no="0003937868",
+        trading_token="t",
+        symbol="HPG",  # HPG is on HOSE — margin-eligible
+        side="NB",
+        quantity=100,
+        price=30000,
+        loan_package_id=1775,
+        order_type="LO",
+    )
+    body = json.loads(captured["req"].data)
+    assert body["loanPackageId"] == 1775
+
+
 # -----------------------------------------------------------------------------
 # order_detail
 # -----------------------------------------------------------------------------

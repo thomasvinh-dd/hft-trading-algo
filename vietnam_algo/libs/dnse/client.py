@@ -637,7 +637,7 @@ class DnseClient:
         side: str,
         quantity: int,
         price: int | float,
-        loan_package_id: int,
+        loan_package_id: int | None = None,
         order_type: str = "LO",
         market_type: str = "STOCK",
         order_category: str = "NORMAL",
@@ -679,14 +679,26 @@ class DnseClient:
         # ``schedule.order_type_for_session()`` returns ATO/ATC for
         # the auction sub-windows, so this branch fires for those.
         is_auction_or_market = str(order_type).upper() != "LO"
-        body = {
+        body: dict[str, Any] = {
             "symbol": str(symbol).upper(),
             "side": str(side).upper(),
             "orderType": str(order_type).upper(),
             "price": 0 if is_auction_or_market else int(price),
             "quantity": int(quantity),
-            "loanPackageId": int(loan_package_id),
         }
+        # 2026-10-09: ``loanPackageId`` is OPTIONAL. Cash-only boards
+        # (UPCOM, bonds) and spot orders don't need a margin package.
+        # Sending a margin package id on a UPCOM order triggers
+        # ``INVALID_INPUT`` / the order is rejected. The user reported
+        # this on 2026-10-09: the force-run passed
+        # ``--loan-package-id 1775`` (HDB margin) which the HOSE/HNX
+        # engines accept but the UPCOM engine rejects. Now:
+        #   - If ``loan_package_id`` is None or 0, omit the field
+        #     entirely (cash / spot / UPCOM orders).
+        #   - If a positive int is passed, include it (HOSE/HNX
+        #     margin orders). The HOSE/HNX engines require it.
+        if loan_package_id is not None and int(loan_package_id) > 0:
+            body["loanPackageId"] = int(loan_package_id)
         return self.request(
             "POST",
             f"/accounts/{account_no}/orders",

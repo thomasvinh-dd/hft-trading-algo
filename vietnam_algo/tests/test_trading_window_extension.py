@@ -219,7 +219,9 @@ def _entry_deal(symbol="ABW", side="NB", price=14100, quantity=1000):
 
 
 def test_submit_in_continuous_uses_LO_with_signal_price(stub_ledger, monkeypatch) -> None:
-    """Continuous morning: orderType stays LO, price matches signal."""
+    """Continuous morning: orderType stays LO, price matches signal.
+    2026-10-09: bot doesn't use margin → loanPackageId=0 by default.
+    """
     _patch_now(monkeypatch, 2026, 10, 8, 10, 0)  # 10:00 ICT, continuous
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
     result = _submit_autofin_deals_to_dnse(
@@ -232,6 +234,7 @@ def test_submit_in_continuous_uses_LO_with_signal_price(stub_ledger, monkeypatch
     o = stub_ledger.calls[0]["orders"][0]
     assert o.orderType == "LO"
     assert o.price == 14100
+    assert o.loanPackageId == 0  # bot is cash-only since 2026-10-09
 
 
 def test_submit_in_ato_uses_ATO_with_price_zero(stub_ledger, monkeypatch) -> None:
@@ -248,6 +251,7 @@ def test_submit_in_ato_uses_ATO_with_price_zero(stub_ledger, monkeypatch) -> Non
     o = stub_ledger.calls[0]["orders"][0]
     assert o.orderType == "ATO"
     assert o.price == 0
+    assert o.loanPackageId == 0  # bot is cash-only since 2026-10-09
     # The reason string preserves the original signal price for audit.
     assert "session=ATO" in o.reason
     assert "signal_price=14100" in o.reason
@@ -267,6 +271,7 @@ def test_submit_in_atc_uses_ATC_with_price_zero(stub_ledger, monkeypatch) -> Non
     o = stub_ledger.calls[0]["orders"][0]
     assert o.orderType == "ATC"
     assert o.price == 0
+    assert o.loanPackageId == 0
     assert "session=ATC" in o.reason
 
 
@@ -284,6 +289,7 @@ def test_submit_in_post_close_uses_LO(stub_ledger, monkeypatch) -> None:
     o = stub_ledger.calls[0]["orders"][0]
     assert o.orderType == "LO"
     assert o.price == 14100
+    assert o.loanPackageId == 0
 
 
 def test_submit_off_hours_short_circuits(stub_ledger, monkeypatch) -> None:

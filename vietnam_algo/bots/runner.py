@@ -766,7 +766,15 @@ def _submit_autofin_deals_to_dnse(
                 continue
             else:
                 price = signal_price
-            lp = (loan_package_id_by_symbol or {}).get(sym, loan_package_id)
+            # 2026-10-09: the bot does NOT use margin. Always submit
+            # as a cash order (``loanPackageId=0`` → field omitted
+            # from the body by ``place_stock_order``). The launch
+            # script's ``--loan-package-id`` is preserved for
+            # back-compat with the existing CLI but is effectively a
+            # no-op now; if you ever need to enable margin for a
+            # specific strategy, pass a positive id via
+            # ``loan_package_id_by_symbol`` (per-symbol override).
+            lp = (loan_package_id_by_symbol or {}).get(sym, 0)
             # The session's orderType (ATO/ATC/LO) overrides whatever
             # the autofin adapter emitted — the strategy can't know
             # which session it's submitting in without leaking
