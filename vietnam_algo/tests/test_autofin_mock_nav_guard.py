@@ -122,7 +122,7 @@ def test_general_production_env_files_have_no_mock_nav() -> None:
     MOCK_NAV only in a local override env file, not in the
     production env that gets sourced on every bot launch.
     """
-    env_path = _RUNNER.parent.parent.parent / "env" / ".env.autofin-signal"
+    env_path = _RUNNER.parent.parent / "env" / ".env.autofin-signal"
     if not env_path.exists():
         pytest.skip(f"env file {env_path} not present in this checkout")
     content = env_path.read_text()
@@ -138,3 +138,95 @@ def test_general_production_env_files_have_no_mock_nav() -> None:
                 f"{stripped!r}. To override NAV in dry-run use "
                 f"DRY_RUN_INITIAL_NAV instead."
             )
+
+
+# -----------------------------------------------------------------------------
+# Test the 2026-10-09 live-cash fix: decide_orders() must use the live
+# cash from the DNSE portfolio in live-submit mode, not the dry-run
+# state's default 100M VND.
+# -----------------------------------------------------------------------------
+
+
+def test_decide_orders_uses_dry_run_cash_when_no_override() -> None:
+    """Dry-run: decide_orders uses the dry-run state's cash.
+    Pure-function behaviour, no side effects.
+    """
+    from vietnam_algo.libs.autofin_signals import AutofinSignal
+    from vietnam_algo.algos.autofin_signal import decide_orders
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir)
+        from vietnam_algo.libs.dry_run_state import save_dry_run_state, DryRunState
+        st = DryRunState(initial_nav=100_000_000, cash=100_000_000)
+        save_dry_run_state(st, data_dir, strategy_name="autofin_signal")
+
+        sig = AutofinSignal(
+            symbol="ABB", company_name="test",
+            last_recomment="Khuyến nghị đầu tư",
+            supply_from=17100, supply_to=17400,
+            tp_from=18400, tp_to=18400,
+            sl_from=14700, sl_to=15900,
+            rate_for_nav=0.30,
+            is_waitting_buy=False, is_waitting_sell=False,
+            market_type=4, raw={},
+        )
+        all_orders, _, _ = decide_orders(
+            holding=[],
+            signals=[sig],
+            our_deals={},
+            our_positions={},
+            nav=10_000_000,
+            current_prices={"ABB": 17500},
+            data_dir=data_dir,
+            actioned_deals=set(),
+        )
+        # With dry-run cash=100M, target_value = 10M*0.3 = 3M (capped at 100M);
+        # qty=3000000/17400 ≈ 172, rounded to 100 lots. So we should see
+        # a BUY for ABB.
+        buys = [o for o in all_orders if o.get("side") == "NB"]
+        assert len(buys) == 1
+
+
+def test_decide_orders_uses_live_override_when_provided() -> None:
+    """Live-submit: ``available_cash_vnd_override`` is used instead of
+    the dry-run state's 100M cash. The 2026-10-09 fix for the
+    second half of the 04:30 incident.
+    """
+    from vietnam_algo.libs.autofin_signals import AutofinSignal
+    from vietnam_algo.algos.autofin_signal import decide_orders
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir)
+        from vietnam_algo.libs.dry_run_state import save_dry_run_state, DryRunState
+        st = DryRunState(initial_nav=100_000_000, cash=100_000_000)
+        save_dry_run_state(st, data_dir, strategy_name="autofin_signal")
+
+        sig = AutofinSignal(
+            symbol="ABB", company_name="test",
+            last_recomment="Khuyến nghị đầu tư",
+            supply_from=17100, supply_to=17400,
+            tp_from=18400, tp_to=18400,
+            sl_from=14700, sl_to=15900,
+            rate_for_nav=0.30,
+            is_waitting_buy=False, is_waitting_sell=False,
+            market_type=4, raw={},
+        )
+        # With override=2M, target_value = min(3M, 2M) = 2M. qty =
+        # 2M / 17400 ≈ 114, rounded down to 100. cost=1.74M, less than
+        # both 2M and 10M.
+        all_orders, _, _ = decide_orders(
+            holding=[],
+            signals=[sig],
+            our_deals={},
+            our_positions={},
+            nav=10_000_000,
+            current_prices={"ABB": 17500},
+            data_dir=data_dir,
+            actioned_deals=set(),
+            available_cash_vnd_override=2_000_000,
+        )
+        buys = [o for o in all_orders if o.get("side") == "NB"]
+        assert len(buys) == 1
+        assert buys[0]["quantity"] == 100

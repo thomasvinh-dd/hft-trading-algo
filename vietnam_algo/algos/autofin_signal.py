@@ -1865,6 +1865,7 @@ def decide_orders(
     autofin_fractions: dict[str, float] | None = None,
     new_entry_min_cash_pct: float = 0.05,
     new_entry_top_n: int = 1,
+    available_cash_vnd_override: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
 
@@ -1949,15 +1950,28 @@ def decide_orders(
         if did:
             autofin_holding_by_id[did] = dict(d)
 
-    # 1a. Determine the cash budget for new BUYs. We use the dry-run
-    # state's cash as the source of truth when available, so the bot
-    # doesn't emit BUY orders it can't actually afford in the simulated
-    # account. Without this, the user reported (2026-09-16) the bot
-    # was planning ``NB 300 GAS @ 90K`` (= 27M VND) when the portfolio
-    # only had ~30K cash. The nav-based sizing formula
-    # ``nav * rateForNav`` is preserved as the upper bound.
-    available_cash_vnd: float | None = None
-    if data_dir is not None:
+    # 1a. Determine the cash budget for new BUYs.
+    #
+    # Two paths:
+    #
+    # (a) DRY-RUN: use the dry-run state's cash as the source of
+    #     truth so the bot doesn't emit BUY orders it can't actually
+    #     afford in the simulated account. Without this, the user
+    #     reported (2026-09-16) the bot was planning
+    #     ``NB 300 GAS @ 90K`` (= 27M VND) when the portfolio only had
+    #     ~30K cash.
+    #
+    # (b) LIVE-SUBMIT: use the LIVE cash from the DNSE portfolio
+    #     snapshot. Without this, the dry-run state's initial NAV
+    #     (default 100M VND) leaks into live sizing — the strategy
+    #     would plan ABB at 1,700 shares on a 10M-VND account because
+    #     it thinks the available_cash is 100M. The 2026-10-08 04:30
+    #     ICT incident was partly this bug. The caller (generate_orders)
+    #     passes ``available_cash_vnd_override`` explicitly when
+    #     ``live_submit`` is True; here we fall back to the dry-run
+    #     state only when the caller didn't pass a value.
+    available_cash_vnd: float | None = available_cash_vnd_override
+    if available_cash_vnd is None and data_dir is not None:
         try:
             from vietnam_algo.libs.dry_run_state import init_dry_run_state as _init_dry
             _dry = _init_dry(data_dir, strategy_name="autofin_signal")
@@ -2985,6 +2999,31 @@ class AutofinSignalAdapter(StrategyAdapter):
 
         # 6-9. Delegate to the pure decision function. This is the same
         # function the daily-replay backtest calls.
+        #
+        # 2026-10-09 fix: pass the LIVE available_cash in live-submit
+        # mode so the strategy sizes positions against the real cash
+        # (e.g. 10M VND for our test account) rather than the dry-run
+        # state's 100M VND. Without this override, the dry-run state
+        # was the cash source-of-truth regardless of live_submit, and
+        # the strategy emitted ABB at 1,700 shares when the account
+        # only has 10M VND of withdrawable cash. See the companion
+        # MOCK_NAV guard in the same function.
+        live_cash_vnd = None
+        if live_submit and isinstance(snap, dict):
+            cash_block = snap.get("cash") or {}
+            try:
+                live_cash_vnd = float(cash_block.get("withdrawableCash")
+                                       or cash_block.get("availableCash")
+                                       or 0)
+            except (TypeError, ValueError):
+                live_cash_vnd = None
+            if live_cash_vnd and live_cash_vnd > 0:
+                print(
+                    f"[autofin_signal] live_cash_vnd={live_cash_vnd:,.0f} VND "
+                    f"(from DNSE; overrides dry-run state's "
+                    f"100,000,000 VND default)"
+                )
+
         all_orders, new_our_deals, deals_actioned = decide_orders(
             holding=holding,
             signals=signals,
@@ -3006,6 +3045,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             #   threshold (default 5% of NAV)
             new_entry_min_cash_pct=new_entry_min_cash_pct,
             new_entry_top_n=new_entry_top_n if allow_new_entries else 0,
+            available_cash_vnd_override=live_cash_vnd,
         )
 
         # 9b. Notification-driven mid-day TP/SL detection. Per user feedback
