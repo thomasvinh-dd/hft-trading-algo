@@ -1169,9 +1169,25 @@ def run_auto_bot(
         # throttle inside ``_monitor_order_statuses`` prevents hammering
         # DNSE. Always runs (even off-hours) so we catch late fills and
         # rejections from after-hours cancel/replace attempts.
+        #
+        # The trading token: the monitor runs at the TOP of the loop,
+        # before ``ensure_fresh_trading_token`` has had a chance to run
+        # in the ``should_submit_orders`` block below. So we read the
+        # shared token file that the ``get_otp`` cron writes
+        # (data/live/dnse_trading_token.json) — same one the submit path
+        # would use. If the file is missing (e.g. first cycle after VPS
+        # reboot, before the next get_otp cron) we pass None and let
+        # DNSE accept the GET without it (it does on some sessions).
         try:
+            _monitor_token = None
+            try:
+                _shared = load_shared_trading_token(engine_config.dataDir)
+                if _shared and _shared.get("token"):
+                    _monitor_token = str(_shared["token"])
+            except Exception:
+                pass
             monitor_summary = _monitor_order_statuses(
-                client, account_no, token, engine_config.dataDir,
+                client, account_no, _monitor_token, engine_config.dataDir,
                 throttle_seconds=int(os.environ.get("ORDER_MONITOR_THROTTLE_SECONDS", "60")),
             )
             if monitor_summary.get("polled") or monitor_summary.get("changes") or monitor_summary.get("errors"):

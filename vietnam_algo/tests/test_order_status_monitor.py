@@ -421,6 +421,59 @@ def test_monitor_no_token_still_polls(tmp_path, notify_spy) -> None:
     assert client.calls[0][1] is None
 
 
+def test_monitor_token_loaded_from_shared_file(tmp_path, monkeypatch, notify_spy) -> None:
+    """The main-loop integration loads the trading token from
+    data/live/dnse_trading_token.json (the file the get_otp cron
+    writes). If the file is missing, the monitor still runs with
+    token=None — DNSE accepts GETs without it on some sessions.
+    """
+    # The 2026-10-08 token-less crash: the monitor was called with the
+    # variable ``token`` which is only assigned inside the
+    # should_submit_orders block. The fix: load from
+    # load_shared_trading_token() at the top of the loop, BEFORE the
+    # token is assigned by the submit path. If the file is missing
+    # (e.g. fresh VPS reboot), pass None and let DNSE accept the GET
+    # without it.
+    from vietnam_algo.libs.dnse.auth import load_shared_trading_token
+    shared = tmp_path / "live" / "dnse_trading_token.json"
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    shared.write_text(json.dumps({
+        "token": "uuid-from-get-otp-cron",
+        "account_no": "0003937868",
+        "issued_at": "2026-10-08T15:43:01Z",
+    }))
+
+    # Verify the shared token loader returns the expected UUID.
+    payload = load_shared_trading_token(tmp_path)
+    assert payload["token"] == "uuid-from-get-otp-cron"
+
+    # And the monitor uses it on order_detail.
+    _ledger_with(tmp_path, [
+        {"symbol": "ABB", "side": "NB", "status": "open", "dnseOrderId": "1"},
+    ])
+    client = _StubClient([_detail("filled", id="1")])
+    _monitor_order_statuses(client, "A", payload["token"], tmp_path, throttle_seconds=0)
+    assert client.calls[0][1] == "uuid-from-get-otp-cron"
+
+
+def test_monitor_with_missing_shared_token_falls_back_to_none(tmp_path, notify_spy) -> None:
+    """If the shared token file is missing, the monitor still runs
+    with token=None rather than crashing."""
+    # No dnse_trading_token.json file.
+    from vietnam_algo.libs.dnse.auth import load_shared_trading_token
+    payload = load_shared_trading_token(tmp_path)
+    assert payload is None
+
+    # The monitor accepts None and falls through.
+    _ledger_with(tmp_path, [
+        {"symbol": "ABB", "side": "NB", "status": "open", "dnseOrderId": "1"},
+    ])
+    client = _StubClient([_detail("filled", id="1")])
+    summary = _monitor_order_statuses(client, "A", None, tmp_path, throttle_seconds=0)
+    assert summary["polled"] == 1
+    assert client.calls[0][1] is None
+
+
 # -----------------------------------------------------------------------------
 # _monitor_order_statuses — ledger persistence
 # -----------------------------------------------------------------------------
