@@ -546,7 +546,7 @@ def _submit_autofin_deals_to_dnse(
     data_dir: "Path",
     trade_date: str,
     loan_package_id_by_symbol: dict[str, int] | None = None,
-    live_quote_tolerance_pct: float = 0.05,
+    live_quote_tolerance_pct: float = 0.03,
 ) -> dict:
     """Convert autofin adapter's ``deals_actioned`` into ``DnseOrder``
     records and submit them to DNSE via ``execute_orders_with_ledger``.

@@ -679,7 +679,7 @@ def _expand_signals_with_held_unentered(
     holding: list[dict[str, Any]],
     our_deals: dict[str, dict[str, Any]],
     current_prices: dict[str, float],
-    above_zone_tolerance_pct: float = 0.05,
+    above_zone_tolerance_pct: float = 0.03,
 ) -> list[AutofinSignal]:
     """Augment ``signals`` with held-but-not-entered deals that are
     currently in the buy zone.
@@ -761,8 +761,8 @@ def _plan_orders_for_new_positions(
     min_order_value_vnd: float = 1_000_000,
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
-    above_zone_tolerance_pct: float = 0.05,
-    below_zone_tolerance_pct: float = 0.05,
+    above_zone_tolerance_pct: float = 0.03,
+    below_zone_tolerance_pct: float = 0.03,
     already_planned_symbols: set[str] | None = None,
     available_cash_vnd: float | None = None,
     new_entry_min_cash_pct: float = 0.05,
@@ -972,8 +972,15 @@ def _plan_orders_for_new_positions(
             if s_lo > 0 and cur < s_lo * (1.0 - below_zone_tolerance_pct):
                 continue
             # Inside the zone (or just outside either tolerance) →
-            # enter at the better price (capped at the zone ceiling).
-            entry_price = int(round(min(cur, s_hi))) if s_hi > 0 else int(round(cur))
+            # 2026-10-09: enter at the LIVE market price, not capped
+            # at the zone ceiling. The 3% zone-tolerance check above
+            # is the gate that filters out-of-zone prices; the entry
+            # price is just whatever the market shows. This is more
+            # honest (we pay what we'd actually pay) and aligns the
+            # planning price with the live-quote gate at submit time
+            # (which uses the same DNSE best-ask as the live best-ask
+            # fetched at planning time — see generate_orders below).
+            entry_price = int(round(cur))
         else:
             # No live price → legacy fallback.
             entry_price = int(round(ref_price))
@@ -2990,6 +2997,60 @@ class AutofinSignalAdapter(StrategyAdapter):
                     last_close = float(bars[-1].close or 0)
                     if last_close > 0:
                         current_prices[sym] = last_close
+
+        # 5d'. 2026-10-09 fix: in LIVE-SUBMIT mode, override
+        # ``current_prices`` with the LIVE best-ask from DNSE
+        # (``client.get_latest_quote``). The local price file
+        # ``data/prices/{SYMBOL}.json`` is yesterday's close, which
+        # can be hours stale by mid-day — a 1-2 % move between
+        # yesterday's close and today's live ask would silently
+        # shift the planned entry price and break the zone-tolerance
+        # gate. The 04:30 ABB attempt used yesterday's close (17,500
+        # VND) to plan a BUY at 17,400 VND, but the live ask during
+        # the lunch break may have been materially different. We
+        # fetch the live quote here, on every cycle in live mode,
+        # and override the local price. Dry-run / backtest mode
+        # keeps the local price (no DNSE call) so the daily replay
+        # backtest still works without network.
+        if live_submit and self._client_lazy is not None:
+            for sym in seen_symbols:
+                try:
+                    quote = self._client_lazy().get_latest_quote(sym)
+                except Exception as exc:
+                    # Graceful degradation: network blip → fall back
+                    # to the local price we already loaded.
+                    print(
+                        f"[autofin_signal] live quote for {sym} failed "
+                        f"({type(exc).__name__}: {str(exc)[:100]}); "
+                        f"using local price"
+                    )
+                    continue
+                # Get the G1 (HOSE) best offer, fall back to first offer
+                # in any board. Convert from kVND to VND (multiply by
+                # 1000). The pre-existing ``_extract_best_ask_in_vnd``
+                # helper in bots/runner.py does this — inline a
+                # minimal copy here to avoid a runner→algos import
+                # cycle.
+                best_ask_vnd = None
+                for q in quote.get("quotes") or []:
+                    if (q.get("boardId") or "").upper() in ("G1", "G4", "G3"):
+                        for off in q.get("offer") or []:
+                            p = off.get("price")
+                            try:
+                                p_vnd = float(p) * 1000
+                            except (TypeError, ValueError):
+                                continue
+                            if p_vnd > 0 and (best_ask_vnd is None or p_vnd < best_ask_vnd):
+                                best_ask_vnd = p_vnd
+                        break  # use first matching board
+                if best_ask_vnd and best_ask_vnd > 0:
+                    local_price = current_prices.get(sym, 0)
+                    current_prices[sym] = best_ask_vnd
+                    print(
+                        f"[autofin_signal] {sym} live best-ask = "
+                        f"{best_ask_vnd:,.0f} VND (overrides local price "
+                        f"{local_price:,.0f})"
+                    )
 
         # 5e. Compute the set of symbols we already have planned entries
         # for (used to skip duplicate BUY emissions on consecutive EOD
