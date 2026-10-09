@@ -254,7 +254,18 @@ def test_live_quote_overrides_local_price_in_live_submit_mode(
     can be hours stale. A 1-2 % mid-day drift would silently shift
     the planned entry price and break the zone-tolerance gate.
     """
-    adapter, stub_client = _make_adapter()
+    from vietnam_algo.libs.dnse.client import DnseClient
+
+    # Stub the DNSE client directly (the strategy instantiates
+    # ``DnseClient`` at line ~2842 with the env-var credentials)
+    stub_dnse = MagicMock(spec=DnseClient)
+    stub_dnse.get_latest_quote.return_value = _dnse_quote_response("ABB", 17.8)
+
+    # Patch the DnseClient class to return our stub
+    from vietnam_algo.libs.dnse import client as dnse_client_mod
+    monkeypatch.setattr(dnse_client_mod, "DnseClient", lambda *a, **kw: stub_dnse)
+
+    adapter = _make_adapter()[0]
     state = _state_with_signal()
     state_path = tmp_path / "live" / "autofin_signal_state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,7 +274,13 @@ def test_live_quote_overrides_local_price_in_live_submit_mode(
     # Build a proper AutofinSignal (not a dict)
     from vietnam_algo.libs.autofin_signals import AutofinSignal, parse_signal
     sig = parse_signal(_make_signal_for())
-    stub_client.fetch_signals.return_value = [sig]
+
+    # Stub the autofin client (signals)
+    adapter._client_lazy = lambda: MagicMock(
+        fetch_holding=MagicMock(return_value=[]),
+        fetch_signals=MagicMock(return_value=[sig]),
+        fetch_closing=MagicMock(return_value=[]),
+    )
 
     # Stub the local ABB price file to return 17,500 (yesterday's close)
     from vietnam_algo.libs import universe
@@ -284,11 +301,6 @@ def test_live_quote_overrides_local_price_in_live_submit_mode(
             "errors": [],
         },
     )
-
-    # Stub the DNSE live quote to return a DIFFERENT price from the
-    # local: 17,500 (close) vs 17,800 (live). The 300-VND gap (1.7%)
-    # is within the 3% tolerance. We assert the strategy uses 17,800.
-    stub_client.get_latest_quote.return_value = _dnse_quote_response("ABB", 17.8)
 
     cfg = MagicMock()
     cfg.dataDir = tmp_path
@@ -318,7 +330,16 @@ def test_live_quote_failure_falls_back_to_local_price(
     the cycle. Same graceful-degradation as the live-quote gate at
     submit time.
     """
-    adapter, stub_client = _make_adapter()
+    from vietnam_algo.libs.dnse.client import DnseClient
+
+    # Stub the DNSE client to fail
+    stub_dnse = MagicMock(spec=DnseClient)
+    stub_dnse.get_latest_quote.side_effect = RuntimeError("DNSE unreachable")
+
+    from vietnam_algo.libs.dnse import client as dnse_client_mod
+    monkeypatch.setattr(dnse_client_mod, "DnseClient", lambda *a, **kw: stub_dnse)
+
+    adapter = _make_adapter()[0]
     state = _state_with_signal()
     state_path = tmp_path / "live" / "autofin_signal_state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,9 +347,11 @@ def test_live_quote_failure_falls_back_to_local_price(
 
     from vietnam_algo.libs.autofin_signals import parse_signal
     sig = parse_signal(_make_signal_for())
-    stub_client.fetch_signals.return_value = [sig]
-    # Live quote fails
-    stub_client.get_latest_quote.side_effect = RuntimeError("DNSE unreachable")
+    adapter._client_lazy = lambda: MagicMock(
+        fetch_holding=MagicMock(return_value=[]),
+        fetch_signals=MagicMock(return_value=[sig]),
+        fetch_closing=MagicMock(return_value=[]),
+    )
 
     from vietnam_algo.libs import universe
     monkeypatch.setattr(
@@ -378,7 +401,19 @@ def test_dry_run_mode_does_not_fetch_live_quotes(
     backtest / dry-run uses only local price data so it can run
     offline / in CI.
     """
-    adapter, stub_client = _make_adapter()
+    from vietnam_algo.libs.dnse.client import DnseClient
+
+    # If the strategy wrongly creates a DNSE client in dry-run,
+    # this stub will be called and raise.
+    stub_dnse = MagicMock(spec=DnseClient)
+    stub_dnse.get_latest_quote.side_effect = RuntimeError(
+        "should not be called in dry-run"
+    )
+
+    from vietnam_algo.libs.dnse import client as dnse_client_mod
+    monkeypatch.setattr(dnse_client_mod, "DnseClient", lambda *a, **kw: stub_dnse)
+
+    adapter = _make_adapter()[0]
     state = _state_with_signal()
     state_path = tmp_path / "live" / "autofin_signal_state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -386,10 +421,10 @@ def test_dry_run_mode_does_not_fetch_live_quotes(
 
     from vietnam_algo.libs.autofin_signals import parse_signal
     sig = parse_signal(_make_signal_for())
-    stub_client.fetch_signals.return_value = [sig]
-    # If the strategy wrongly tries to fetch live quote, this raises
-    stub_client.get_latest_quote.side_effect = RuntimeError(
-        "should not be called in dry-run"
+    adapter._client_lazy = lambda: MagicMock(
+        fetch_holding=MagicMock(return_value=[]),
+        fetch_signals=MagicMock(return_value=[sig]),
+        fetch_closing=MagicMock(return_value=[]),
     )
 
     from vietnam_algo.libs import universe
@@ -410,10 +445,9 @@ def test_dry_run_mode_does_not_fetch_live_quotes(
     adapter.generate_orders(
         cfg, sc, trade_date="2026-10-09", live_submit=False,
     )
-    # If we got here, the dry-run path didn't call get_latest_quote
-    # (which would have raised). The AssertionError below would fire
-    # if get_latest_quote was called.
-    assert stub_client.get_latest_quote.call_count == 0, (
+    # If we got here, the dry-run path didn't construct a DnseClient
+    # and therefore didn't call get_latest_quote.
+    assert stub_dnse.get_latest_quote.call_count == 0, (
         "dry-run mode must NOT call client.get_latest_quote() — "
         "that would defeat the purpose of offline backtest mode"
     )

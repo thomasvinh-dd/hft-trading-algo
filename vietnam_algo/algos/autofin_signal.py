@@ -3000,7 +3000,7 @@ class AutofinSignalAdapter(StrategyAdapter):
 
         # 5d'. 2026-10-09 fix: in LIVE-SUBMIT mode, override
         # ``current_prices`` with the LIVE best-ask from DNSE
-        # (``client.get_latest_quote``). The local price file
+        # (``dnse.get_latest_quote``). The local price file
         # ``data/prices/{SYMBOL}.json`` is yesterday's close, which
         # can be hours stale by mid-day — a 1-2 % move between
         # yesterday's close and today's live ask would silently
@@ -3012,10 +3012,10 @@ class AutofinSignalAdapter(StrategyAdapter):
         # and override the local price. Dry-run / backtest mode
         # keeps the local price (no DNSE call) so the daily replay
         # backtest still works without network.
-        if live_submit and self._client_lazy is not None:
+        if live_submit and "dnse" in locals() and dnse is not None:
             for sym in seen_symbols:
                 try:
-                    quote = self._client_lazy().get_latest_quote(sym)
+                    quote = dnse.get_latest_quote(sym)
                 except Exception as exc:
                     # Graceful degradation: network blip → fall back
                     # to the local price we already loaded.
