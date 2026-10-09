@@ -2834,13 +2834,33 @@ class AutofinSignalAdapter(StrategyAdapter):
 
         # 5b. MOCK_NAV override — for dry-run testing with funded account
         # but zero balance. Lets us see the order plan without real money.
+        #
+        # 2026-10-09 fix: only apply in DRY-RUN mode. When the strategy
+        # is running with ``--live-submit`` the MOCK_NAV override is
+        # IGNORED so positions are sized against the real NAV from
+        # DNSE. The 04:30 ICT incident on 2026-10-08 happened because
+        # the production env file had ``MOCK_NAV=100000000`` set, so
+        # the strategy sized ABB to 1,700 shares (NAV=100M × 30 % ÷
+        # 17,400 VND) on a real-money account that only has 10M VND
+        # of withdrawable cash. With the live account, the same
+        # signal should size to ~170 shares (NAV=10M × 30 % ÷ 17,400),
+        # which fits within the 10M withdrawable.
         mock_nav = os.environ.get("MOCK_NAV", "").strip()
-        if mock_nav:
+        if mock_nav and not live_submit:
             try:
                 nav = float(mock_nav)
                 positions = dict(positions)
+                print(
+                    f"[autofin_signal] MOCK_NAV override active: nav={nav:,.0f} VND "
+                    f"(dry-run mode; ignored in live-submit)"
+                )
             except ValueError:
                 pass
+        elif mock_nav and live_submit:
+            print(
+                f"[autofin_signal] ⚠️ MOCK_NAV={mock_nav} IGNORED — "
+                f"live-submit mode uses real NAV from DNSE: {nav:,.0f} VND"
+            )
 
         # Cache the authoritative position map on the adapter so the
         # notification poll (called later in this same cycle) can size
