@@ -2951,7 +2951,15 @@ class AutofinSignalAdapter(StrategyAdapter):
             and _minutes_since_open >= 0
             and _minutes_since_open <= start_of_day_cutoff_min
         )
-        allow_new_entries = in_morning
+        # 2026-10-09: ``force-run-trading`` CLI sets this env var to
+        # bypass the start-of-day cutoff. The normal bot main loop
+        # never sets it; the only way to bypass is to invoke the
+        # force-run-trading subcommand. The cutoff is the user's
+        # policy ("only one entry attempt per day, in the morning
+        # window"); force-run is an explicit override for
+        # ad-hoc re-runs.
+        force_new_entry = os.environ.get("AUTOFIN_FORCE_NEW_ENTRY", "").strip() == "1"
+        allow_new_entries = in_morning or force_new_entry
 
         # 5d. Build a symbol → last_close price map from local price data.
         # Used to (a) gate entry on price-within-buy-zone and (b) include
@@ -3010,11 +3018,19 @@ class AutofinSignalAdapter(StrategyAdapter):
         # MOCK_NAV guard in the same function.
         live_cash_vnd = None
         if live_submit and isinstance(snap, dict):
-            cash_block = snap.get("cash") or {}
+            # The portfolio snapshot's cash fields live under
+            # ``snap["balance"]`` (set by build_portfolio_snapshot
+            # from DNSE's /balances endpoint), not ``snap["cash"]``.
+            # Use withdrawableCash as the primary signal — that's
+            # what the operator can actually deploy into a new BUY
+            # without margin — and fall back to availableCash.
+            balance_block = snap.get("balance") or {}
             try:
-                live_cash_vnd = float(cash_block.get("withdrawableCash")
-                                       or cash_block.get("availableCash")
-                                       or 0)
+                live_cash_vnd = float(
+                    balance_block.get("withdrawableCash")
+                    or balance_block.get("availableCash")
+                    or 0
+                )
             except (TypeError, ValueError):
                 live_cash_vnd = None
             if live_cash_vnd and live_cash_vnd > 0:
@@ -3046,6 +3062,11 @@ class AutofinSignalAdapter(StrategyAdapter):
             new_entry_min_cash_pct=new_entry_min_cash_pct,
             new_entry_top_n=new_entry_top_n if allow_new_entries else 0,
             available_cash_vnd_override=live_cash_vnd,
+        )
+        print(
+            f"[autofin_signal] new_entry_top_n={new_entry_top_n if allow_new_entries else 0} "
+            f"(allow_new_entries={allow_new_entries}, "
+            f"in_morning={in_morning}, force_new_entry={force_new_entry})"
         )
 
         # 9b. Notification-driven mid-day TP/SL detection. Per user feedback

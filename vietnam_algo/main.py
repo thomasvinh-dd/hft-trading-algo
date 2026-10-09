@@ -1706,9 +1706,18 @@ def main(argv: list[str] | None = None) -> int:
         #   - should_poll_strategy's 1-hour throttle
         #   - state.orderSubmitDate (already-submitted-today gate)
         #   - state.eodDate / state.startOfDayDate
+        #   - the autofin start-of-day cutoff (09:15-09:45 ICT) for
+        #     new entries (force-run can re-evaluate any time)
+        #   - new_entry_top_n (default 1) — force-run considers ALL
+        #     fresh signals, not just the top 1, so an operator can
+        #     re-evaluate ABB even if AIG happens to be ranked first
+        #     by autofin's signal order
         # so an operator can re-run the decision pipeline right now
         # to verify a code change or catch a signal that arrived after
         # the last scheduled cycle.
+        import os as _os
+        _os.environ["AUTOFIN_FORCE_NEW_ENTRY"] = "1"
+        _os.environ["AUTOFIN_NEW_ENTRY_TOP_N"] = "10"
         from datetime import datetime as _dt
         from zoneinfo import ZoneInfo
         from .algos.registry import STRATEGY_REGISTRY

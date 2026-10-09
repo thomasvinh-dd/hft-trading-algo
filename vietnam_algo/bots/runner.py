@@ -713,6 +713,13 @@ def _submit_autofin_deals_to_dnse(
     # If we're outside the trading day entirely (off_hours), skip
     # the submit — the order is preserved in the deals_actioned
     # payload so the next mid-day poll can re-attempt it.
+    #
+    # The off-hours check is NOT bypassed by force-run-trading —
+    # DNSE will reject any order submitted outside the 09:00-15:00 ICT
+    # trading window (lunch break, weekends, holidays), so the right
+    # thing to do is short-circuit. The user should wait for the
+    # next trading session, OR use the dry-run flag to inspect
+    # what WOULD have been submitted.
     session = current_session(vietnam_now())
     if session == TradingSession.OFF_HOURS:
         notify(
