@@ -661,8 +661,11 @@ class DnseClient:
         places ``LO``.
 
         ``price`` is in VND (full đồng, not kVND). For non-``LO`` order
-        types DNSE expects ``price=0``; the call sites only place ``LO``
-        so this isn't a concern in the current bot.
+        types (MP, ATO, ATC, MAK, MOK, PLO) DNSE expects ``price=0``
+        because the auction / market-to-limit / post-close session
+        determines the fill price. The previous implementation only
+        zeroed MP; the 2026-10-08 extension added ATO/ATC support so
+        we now zero any non-LO orderType.
 
         Returns the parsed JSON response. The new order's id is at
         ``response["id"]`` or ``response["orderId"]`` (the helper
@@ -670,11 +673,17 @@ class DnseClient:
         NOT retried — a 5xx/429 error propagates as ``RuntimeError`` so
         the ledger records the failure honestly.
         """
+        # Any non-LO order type (MP / ATO / ATC / MAK / MOK / PLO)
+        # has its fill price determined by the exchange, so the body
+        # must carry price=0 per the DNSE spec. The bot's
+        # ``schedule.order_type_for_session()`` returns ATO/ATC for
+        # the auction sub-windows, so this branch fires for those.
+        is_auction_or_market = str(order_type).upper() != "LO"
         body = {
             "symbol": str(symbol).upper(),
             "side": str(side).upper(),
             "orderType": str(order_type).upper(),
-            "price": int(price) if order_type.upper() != "MP" else 0,
+            "price": 0 if is_auction_or_market else int(price),
             "quantity": int(quantity),
             "loanPackageId": int(loan_package_id),
         }

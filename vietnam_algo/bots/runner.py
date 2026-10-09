@@ -38,7 +38,10 @@ from vietnam_algo.libs.notifier import (
 )
 from vietnam_algo.libs.schedule import (
     TradingSchedule,
+    TradingSession,
+    current_session,
     local_date,
+    order_type_for_session,
     should_poll_strategy,
     should_run_eod,
     should_run_start_of_day,
@@ -690,6 +693,42 @@ def _submit_autofin_deals_to_dnse(
         return int(digest, 16)
 
     orders: list[DnseOrder] = []
+    # 2026-10-08 extension: the bot now places orders during the full
+    # HOSE/HNX trading day (09:00-15:00 ICT), not just the continuous
+    # sub-windows. The orderType chosen depends on the current
+    # trading session:
+    #   - ATO (09:00-09:15) → ATO, price=0 (auction determines fill)
+    #   - CONTINUOUS (09:15-11:30, 13:00-14:30) → LO, price=signal
+    #   - ATC (14:30-14:45) → ATC, price=0
+    #   - POST_CLOSE (14:45-15:00) → LO, price=signal (HOSE/HNX;
+    #     UPCOM rejects — DNSE surfaces that as a 4xx)
+    # If we're outside the trading day entirely (off_hours), skip
+    # the submit — the order is preserved in the deals_actioned
+    # payload so the next mid-day poll can re-attempt it.
+    session = current_session(vietnam_now())
+    if session == TradingSession.OFF_HOURS:
+        notify(
+            "\n".join([
+                "⚠️ Vietnam Algo: autofin LIVE submit SKIPPED (off-hours)",
+                f"date: {trade_date}",
+                f"orders: {sum(1 for d in deals_actioned for _ in (d.get('dnse_orders') or []))}",
+                "reason: current time is outside the trading window (09:00-15:00 ICT).",
+                "next attempt: next mid-day poll during the next trading session.",
+            ])
+        )
+        return {
+            "submitted": [],
+            "skipped_existing": 0,
+            "unknown": 0,
+            "total": 0,
+            "out_of_zone": out_of_zone,
+            "skipped_off_hours": sum(
+                1 for d in deals_actioned for _ in (d.get("dnse_orders") or [])
+            ),
+        }
+    session_order_type = order_type_for_session(session)
+    is_auction = session in (TradingSession.ATO, TradingSession.ATC)
+
     for deal in deals_actioned:
         for o in deal.get("dnse_orders", []) or []:
             sym = str(o.get("symbol") or "").upper().strip()
@@ -697,23 +736,40 @@ def _submit_autofin_deals_to_dnse(
             if not sym or side not in ("NB", "NS"):
                 continue
             try:
-                price = int(o.get("price") or 0)
                 quantity = int(o.get("quantity") or 0)
             except (TypeError, ValueError):
                 continue
-            if price <= 0 or quantity <= 0:
+            if quantity <= 0:
                 continue
+            # In auction windows the fill price is determined by the
+            # exchange; the bot must send price=0. The signal price
+            # is preserved in the reason string for the audit log.
+            signal_price = int(o.get("price") or 0)
+            if is_auction:
+                price = 0
+            elif signal_price <= 0:
+                continue
+            else:
+                price = signal_price
             lp = (loan_package_id_by_symbol or {}).get(sym, loan_package_id)
+            # The session's orderType (ATO/ATC/LO) overrides whatever
+            # the autofin adapter emitted — the strategy can't know
+            # which session it's submitting in without leaking
+            # clock-time decisions into the signal layer.
+            otype = session_order_type
+            reason = str(o.get("reason") or f"autofin:{deal.get('action', '?')}")
+            if is_auction and signal_price > 0:
+                reason = f"{reason} [session={session.value} signal_price={signal_price}]"
             orders.append(DnseOrder(
                 symbol=sym,
                 side=side,
                 quantity=quantity,
                 price=price,
                 loanPackageId=lp,
-                orderType=str(o.get("orderType") or "LO"),
+                orderType=otype,
                 sourceOrderId=_stable_id(deal, o),
                 sourceDate=trade_date,
-                reason=str(o.get("reason") or f"autofin:{deal.get('action', '?')}"),
+                reason=reason,
             ))
 
     if not orders:

@@ -15,8 +15,10 @@ behavior in isolation, without hitting real DNSE.
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -28,6 +30,19 @@ from vietnam_algo.bots.runner import (
     _extract_best_ask_in_vnd,
     _submit_autofin_deals_to_dnse,
 )
+
+
+@pytest.fixture
+def in_continuous_session(monkeypatch):
+    """Pin ``vietnam_now()`` to a continuous-trading moment so the
+    session-aware submit path in ``_submit_autofin_deals_to_dnse`` does
+    not return the off-hours short-circuit. Required because the
+    2026-10-08 session-detection extension rejects orders placed
+    during 11:30-13:00, 15:00-09:00 next day, weekends, and holidays.
+    """
+    fixed = datetime(2026, 10, 8, 10, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+    monkeypatch.setattr(runner_mod, "vietnam_now", lambda: fixed)
+    return fixed
 
 
 # -----------------------------------------------------------------------------
@@ -165,7 +180,7 @@ def _patch_executor(monkeypatch, captured: dict) -> None:
 
 
 def test_live_gate_drops_new_entry_when_ask_above_zone_tolerance(
-    monkeypatch,
+    monkeypatch, in_continuous_session,
 ):
     """Ask 15,000 VND > supply_T * 1.05 = 14,805 → drop the new entry."""
     captured: dict = {}
@@ -205,7 +220,7 @@ def test_live_gate_drops_new_entry_when_ask_above_zone_tolerance(
 
 
 def test_live_gate_drops_new_entry_when_ask_below_zone_tolerance(
-    monkeypatch,
+    monkeypatch, in_continuous_session,
 ):
     """Ask 12,500 VND < supply_F * 0.95 = 13,110 → drop the new entry."""
     captured: dict = {}
@@ -240,7 +255,7 @@ def test_live_gate_drops_new_entry_when_ask_below_zone_tolerance(
 
 
 def test_live_gate_lets_through_when_ask_within_tolerance(
-    monkeypatch,
+    monkeypatch, in_continuous_session,
 ):
     """Ask 14,500 VND is above 14,100 but within 14,100*1.05 = 14,805 → pass.
     (Same as the ABW live case at 14,500 ask — bot's LO at 14,100 still
@@ -277,7 +292,7 @@ def test_live_gate_lets_through_when_ask_within_tolerance(
 
 
 def test_live_gate_does_not_check_partial_close_or_full_close(
-    monkeypatch,
+    monkeypatch, in_continuous_session,
 ):
     """SELL orders bypass the live gate entirely (no get_latest_quote call)."""
     captured: dict = {}
@@ -307,7 +322,7 @@ def test_live_gate_does_not_check_partial_close_or_full_close(
 
 
 def test_live_gate_graceful_degradation_on_api_failure(
-    monkeypatch,
+    monkeypatch, in_continuous_session,
 ):
     """If ``get_latest_quote`` raises, proceed with the planning step's
     local-cache price (don't block the submit)."""
@@ -333,7 +348,7 @@ def test_live_gate_graceful_degradation_on_api_failure(
     assert captured["orders"][0].symbol == "ABW"
 
 
-def test_live_gate_disabled_via_env_var(monkeypatch):
+def test_live_gate_disabled_via_env_var(monkeypatch, in_continuous_session):
     """Setting ``AUTOFIN_LIVE_QUOTE_GATE=0`` skips the live-quote fetch
     entirely (uses the local-cache price from planning)."""
     captured: dict = {}
@@ -358,7 +373,7 @@ def test_live_gate_disabled_via_env_var(monkeypatch):
     assert client.get_latest_quote.call_count == 0
 
 
-def test_live_gate_skips_when_supply_zone_undeclared(monkeypatch):
+def test_live_gate_skips_when_supply_zone_undeclared(monkeypatch, in_continuous_session):
     """If supply_F / supply_T are 0 (zone not in deal dict), don't gate.
     Common for HELD-but-not-entered deals where the holding record
     didn't carry the zone forward."""
@@ -383,7 +398,7 @@ def test_live_gate_skips_when_supply_zone_undeclared(monkeypatch):
     assert client.get_latest_quote.call_count == 0
 
 
-def test_live_gate_partial_drop_one_through_one_dropped(monkeypatch):
+def test_live_gate_partial_drop_one_through_one_dropped(monkeypatch, in_continuous_session):
     """Mixed batch: ABW pass, HDB drop."""
     captured: dict = {}
     _patch_executor(monkeypatch, captured)

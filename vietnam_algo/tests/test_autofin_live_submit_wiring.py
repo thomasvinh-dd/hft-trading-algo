@@ -62,6 +62,23 @@ def stub_ledger(monkeypatch):
     return stub
 
 
+@pytest.fixture
+def in_continuous_session(monkeypatch):
+    """Pin ``vietnam_now()`` to a continuous-trading moment so the
+    session-aware submit path in ``_submit_autofin_deals_to_dnse`` does
+    not return the off-hours short-circuit. Required because the
+    tests don't run in the morning, and 2026-10-08's
+    session-detection extension rejects orders placed during
+    11:30-13:00, 15:00-09:00 next day, weekends, and holidays.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    fixed = datetime(2026, 10, 8, 10, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+    from vietnam_algo.bots import runner
+    monkeypatch.setattr(runner, "vietnam_now", lambda: fixed)
+    return fixed
+
+
 def test_empty_deals_actioned_short_circuits(stub_ledger):
     """An empty deals_actioned list should NOT call the ledger."""
     result = _submit_autofin_deals_to_dnse(
@@ -77,7 +94,7 @@ def test_empty_deals_actioned_short_circuits(stub_ledger):
     assert stub_ledger.calls == []
 
 
-def test_buy_order_converted_with_default_loan_package(stub_ledger):
+def test_buy_order_converted_with_default_loan_package(stub_ledger, in_continuous_session):
     """A single entry BUY maps to one DnseOrder with the configured loan package."""
     deals = [
         {
@@ -125,7 +142,7 @@ def test_buy_order_converted_with_default_loan_package(stub_ledger):
     assert o.reason.startswith("autofin_buy:deal#")
 
 
-def test_partial_close_sell_converted_correctly(stub_ledger):
+def test_partial_close_sell_converted_correctly(stub_ledger, in_continuous_session):
     """A partial close SELL is a NS side order."""
     deals = [
         {
@@ -161,7 +178,7 @@ def test_partial_close_sell_converted_correctly(stub_ledger):
     assert o.quantity == 100
 
 
-def test_source_order_id_stable_across_calls(stub_ledger):
+def test_source_order_id_stable_across_calls(stub_ledger, in_continuous_session):
     """The same deal+side+price+kind must produce the same sourceOrderId
     so the ledger dedup prevents double-submit on bot restart."""
     deals = [
@@ -199,7 +216,7 @@ def test_source_order_id_stable_across_calls(stub_ledger):
     )
 
 
-def test_different_kind_produces_different_id(stub_ledger):
+def test_different_kind_produces_different_id(stub_ledger, in_continuous_session):
     """A SELL (partial_close) for the same deal must NOT collide with the BUY."""
     entry_deal = {
         "action": "new_entry", "symbol": "ABW", "deal_id": "1785456000:ABW",
@@ -232,7 +249,7 @@ def test_different_kind_produces_different_id(stub_ledger):
     )
 
 
-def test_per_symbol_loan_package_override(stub_ledger):
+def test_per_symbol_loan_package_override(stub_ledger, in_continuous_session):
     """When loan_package_id_by_symbol is provided, the matching symbol uses
     its override; others fall back to loan_package_id."""
     deals = [
@@ -256,7 +273,7 @@ def test_per_symbol_loan_package_override(stub_ledger):
     assert orders["HDB"].loanPackageId == 9999
 
 
-def test_invalid_orders_skipped(stub_ledger):
+def test_invalid_orders_skipped(stub_ledger, in_continuous_session):
     """Orders with missing/zero price or qty are silently skipped (no submit)."""
     deals = [
         {"action": "new_entry", "symbol": "X", "deal_id": "1:X", "dnse_orders": [
@@ -281,7 +298,7 @@ def test_invalid_orders_skipped(stub_ledger):
     assert stub_ledger.calls[0]["orders"][0].symbol == "W"
 
 
-def test_skipped_existing_and_unknown_counts(monkeypatch):
+def test_skipped_existing_and_unknown_counts(monkeypatch, in_continuous_session):
     """The result dict must surface skipped_existing_ledger and unknown counts."""
 
     def stub_ledger(client, account_no, trading_token, orders, data_dir, run_id):
