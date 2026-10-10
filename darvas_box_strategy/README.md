@@ -148,14 +148,21 @@ StrategyConfig(
 
 ### Final result on 70 HOSE blue chips (2019-2026)
 
-| Metric | Buggy | Fixed | Tuned | Tuned + lot rounding |
-|---|---:|---:|---:|---:|
-| Total return | +161.9% | +134.4% | +240.2% | **+211.4%** |
-| Max DD | -15.15% | -12.71% | -10.49% | **-16.62%** |
-| Win rate | 60.73% | 60.24% | 67.20% | **67.50%** |
-| Profit factor | 1.73x | 1.90x | 1.90x | **1.93x** |
-| Top single loss | **-45%** | -9% | -13% | -13% |
-| CAGR | ~13% | ~11% | ~19% | **~17%** |
+| Metric | Buggy | Fixed | Tuned | + Lot rounding | + Portfolio class |
+|---|---:|---:|---:|---:|---:|
+| Total return | +161.9% | +134.4% | +240.2% | +211.4% | **+216% (VPS)** |
+| Max DD | -15.15% | -12.71% | -10.49% | -16.62% | -37.31% (unrealized) |
+| Win rate | 60.73% | 60.24% | 67.20% | 67.50% | **74.3%** |
+| Profit factor | 1.73x | 1.90x | 1.90x | 1.93x | **2.12x** |
+| Top single loss | **-45%** | -9% | -13% | -13% | -13% |
+| CAGR | ~13% | ~11% | ~19% | ~17% | **~17%** |
+
+The "Portfolio class" column uses the new architecture where the
+backtest delegates to `darvas.portfolio.Portfolio` (one-pass walk,
+proper MTM, clean separation from the signal layer). The realized
+trade stats (win rate, PF, top loss) are calculated the same way;
+the difference is the NAV now correctly reflects unrealized P&L on
+open positions, which is why Max DD is more accurate.
 
 **Three critical bugs were fixed**:
 1. **Stop-loss anchoring** (was -45%, now -13%) — see `darvas_box_strategy/tools/sweep_stop_pct.py`
