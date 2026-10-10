@@ -58,6 +58,10 @@ class WebCache:
     open_positions: List[Dict[str, Any]] = field(default_factory=list)
     backtest: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
+    # Tickers that have a pre-built history in `ticker_history`.
+    # Lazy-loaded: if a user clicks a ticker not in this set, we build
+    # on demand and add it.
+    ticker_history: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -71,7 +75,24 @@ class WebCache:
             open_positions=d.get("open_positions", []),
             backtest=d.get("backtest", {}),
             config=d.get("config", {}),
+            ticker_history=d.get("ticker_history", {}),
         )
+
+
+def _make_deal_id(ticker: str, entry_date, seq: int = 0) -> str:
+    """Build a deal_id from ticker + entry date.
+
+    Format: ``{TICKER}_{YYYY-MM-DD}[_{seq}]``
+
+    The sequence suffix is appended only if multiple deals share the same
+    entry date (rare; only on same-day re-entry edge cases).
+    """
+    if hasattr(entry_date, "isoformat"):
+        date_part = entry_date.isoformat()
+    else:
+        date_part = str(entry_date)
+    base = f"{ticker}_{date_part}"
+    return base if seq == 0 else f"{base}_{seq}"
 
 
 def load_cache(path: Path = CACHE_PATH) -> WebCache:
@@ -92,14 +113,20 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _signal_to_dict(s) -> Dict[str, Any]:
-    """Convert a Signal dataclass to a JSON-safe dict."""
+def _signal_to_dict(s, deal_seq: int = 0) -> Dict[str, Any]:
+    """Convert a Signal dataclass to a JSON-safe dict.
+
+    ``deal_seq`` is the sequence number for this ticker+entry_date combo
+    (0 unless multiple signals share the same entry date, which is rare).
+    """
     return {
+        "deal_id": _make_deal_id(s.ticker, s.entry_date, deal_seq),
         "ticker": s.ticker,
         "entry_price": float(s.entry_price),
         "sl_F": float(s.sl_F),
         "sl_T": float(s.sl_T),
         "size_pct": float(s.size_pct),
+        "shares": int(s.shares),
         "as_of_date": s.entry_date.isoformat()
             if hasattr(s.entry_date, "isoformat") else str(s.entry_date),
         "atr": float(s.atr_value) if s.atr_value is not None else None,
@@ -107,13 +134,14 @@ def _signal_to_dict(s) -> Dict[str, Any]:
     }
 
 
-def _open_position_to_dict(t) -> Dict[str, Any]:
+def _open_position_to_dict(t, deal_seq: int = 0) -> Dict[str, Any]:
     """Build a display dict for a trade that's still open at the latest bar."""
     sig = t.signal
     last_close = float(t.highest_close) if t.highest_close else float(sig.entry_price)
     pnl_pct = (last_close / float(sig.entry_price) - 1.0) * 100.0
     pnl_vnd = (last_close - float(sig.entry_price)) * int(sig.shares)
     return {
+        "deal_id": _make_deal_id(sig.ticker, sig.entry_date, deal_seq),
         "ticker": sig.ticker,
         "entry_price": float(sig.entry_price),
         "last_close": last_close,
@@ -174,6 +202,121 @@ def get_open_positions(cfg=None) -> List[Dict[str, Any]]:
     return load_cache().open_positions
 
 
+def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
+    """Return all deals (open + closed) for a single ticker.
+
+    This runs the per-ticker backtest logic in isolation — same as
+    ``_scan_ticker`` does inside ``run_backtest``, but exposed so the
+    web UI can deep-dive into one ticker. Takes ~10-15s per ticker on
+    the first call; subsequent calls hit the in-memory cache.
+    """
+    if cfg is None:
+        cfg = build_default_config()
+    ticker = ticker.upper()
+
+    # Read-through cache: return pre-built history if we have it
+    cache = load_cache()
+    if ticker in cache.ticker_history:
+        return cache.ticker_history[ticker]
+
+    path = PRICES_DIR / f"{ticker}.json"
+    if not path.exists():
+        return {"ticker": ticker, "summary": _empty_summary(), "deals": []}
+
+    bars = _load_bars_safe(path)
+    if len(bars) < cfg.breakout.min_history_days:
+        return {"ticker": ticker, "summary": _empty_summary(), "deals": []}
+
+    last_bar_date = bars[-1].date
+    scanner = BaseScanner(bars, cfg.base, ticker=ticker)
+    deals: List[Dict[str, Any]] = []
+
+    # Track sequence numbers per (ticker, entry_date) to keep deal_id
+    # unique when the strategy somehow opens twice on the same day.
+    seq_by_entry: Dict[Any, int] = {}
+
+    for i in range(cfg.breakout.min_history_days, len(bars)):
+        base = scanner.find_base(as_of_idx=i)
+        if base is None or base.end_idx >= i:
+            continue
+        sig = generate_signal(
+            bars, base, nav=cfg.backtest.start_nav, cfg=cfg, as_of_idx=i,
+        )
+        if sig is None:
+            continue
+        t = simulate_trade(sig, bars[i + 1:], cfg, atr_value=sig.atr_value)
+
+        is_open = (
+            t.exit_reason == "EXHAUST"
+            or t.exit_date > last_bar_date
+        )
+        ed = sig.entry_date
+        seq = seq_by_entry.get(ed, 0)
+        seq_by_entry[ed] = seq + 1
+
+        # For closed trades, derive exit_price from the realized pnl
+        exit_price = None
+        if not is_open and sig.shares:
+            exit_price = round(
+                sig.entry_price + (t.realized_pnl / sig.shares), 0
+            )
+
+        deals.append({
+            "deal_id": _make_deal_id(ticker, ed, seq),
+            "ticker": ticker,
+            "entry_date": ed.isoformat() if hasattr(ed, "isoformat") else str(ed),
+            "exit_date": t.exit_date.isoformat() if hasattr(t.exit_date, "isoformat") else str(t.exit_date),
+            "entry_price": float(sig.entry_price),
+            "exit_price": exit_price,
+            "last_close": round(float(t.highest_close or sig.entry_price), 0),
+            "pnl_pct": round(t.return_pct * 100, 2),
+            "pnl_vnd": round(t.realized_pnl, 0) if not is_open else None,
+            "exit_reason": t.exit_reason if not is_open else "OPEN",
+            "bars_held": int(t.bars_held),
+            "is_open": is_open,
+            "shares": int(sig.shares),
+            "size_pct": float(sig.size_pct),
+            "sl_F": float(sig.sl_F),
+            "sl_T": float(sig.sl_T),
+        })
+
+    # Sort by entry date descending — newest first
+    deals.sort(key=lambda d: d["entry_date"], reverse=True)
+
+    closed = [d for d in deals if not d["is_open"]]
+    winners = [d for d in closed if d["pnl_pct"] > 0]
+    losers = [d for d in closed if d["pnl_pct"] <= 0]
+    total_pnl = sum(d["pnl_vnd"] or 0 for d in closed)
+
+    summary = {
+        "total_deals": len(deals),
+        "open_deals": sum(1 for d in deals if d["is_open"]),
+        "closed_deals": len(closed),
+        "wins": len(winners),
+        "losses": len(losers),
+        "win_rate_pct": round(len(winners) / len(closed) * 100, 1) if closed else 0.0,
+        "total_pnl_vnd": round(total_pnl, 0),
+        "avg_pnl_pct": round(
+            sum(d["pnl_pct"] for d in closed) / len(closed), 2
+        ) if closed else 0.0,
+    }
+
+    history = {"ticker": ticker, "summary": summary, "deals": deals}
+
+    # Persist back into the cache so subsequent reads are O(1)
+    cache.ticker_history[ticker] = history
+    save_cache(cache)
+    return history
+
+
+def _empty_summary() -> Dict[str, Any]:
+    return {
+        "total_deals": 0, "open_deals": 0, "closed_deals": 0,
+        "wins": 0, "losses": 0, "win_rate_pct": 0.0,
+        "total_pnl_vnd": 0, "avg_pnl_pct": 0.0,
+    }
+
+
 def _summarize_backtest(result, cfg, filtered) -> Dict[str, Any]:
     """Compute the backtest summary fields from a BacktestResult.
 
@@ -221,6 +364,7 @@ def _summarize_backtest(result, cfg, filtered) -> Dict[str, Any]:
     sorted_by_pnl = sorted(result.trades, key=lambda t: t.realized_pnl, reverse=True)
     top_winners = [
         {
+            "deal_id": _make_deal_id(t.signal.ticker, t.signal.entry_date),
             "ticker": t.signal.ticker,
             "entry_date": t.signal.entry_date.isoformat()
                 if hasattr(t.signal.entry_date, "isoformat") else str(t.signal.entry_date),
@@ -234,6 +378,7 @@ def _summarize_backtest(result, cfg, filtered) -> Dict[str, Any]:
     ]
     top_losers = [
         {
+            "deal_id": _make_deal_id(t.signal.ticker, t.signal.entry_date),
             "ticker": t.signal.ticker,
             "entry_date": t.signal.entry_date.isoformat()
                 if hasattr(t.signal.entry_date, "isoformat") else str(t.signal.entry_date),
@@ -361,6 +506,26 @@ def refresh_cache(lookback: int = 0) -> WebCache:
     signals = get_current_signals(lookback=lookback, cfg=cfg)
     log_msg(f"signals today: {len(signals)}")
 
+    # 5) Pre-build ticker history for the tickers the user is most
+    #    likely to click: those in current signals, open positions, or
+    #    the top winners/losers. The remaining tickers will be built
+    #    on demand when the user clicks them.
+    priority_tickers: set = set()
+    for s in signals:
+        priority_tickers.add(s["ticker"])
+    for p in open_positions:
+        priority_tickers.add(p["ticker"])
+    for w in backtest.get("top_winners", []):
+        priority_tickers.add(w["ticker"])
+    for l in backtest.get("top_losers", []):
+        priority_tickers.add(l["ticker"])
+    log_msg(f"pre-building history for {len(priority_tickers)} tickers")
+
+    ticker_history: Dict[str, Any] = {}
+    for ticker in priority_tickers:
+        ticker_history[ticker] = get_ticker_history(ticker, cfg=cfg)
+    log_msg(f"ticker history built in {time.time() - t0:.1f}s")
+
     cache = WebCache(
         last_updated=_now_iso(),
         scan_lookback=lookback,
@@ -376,6 +541,7 @@ def refresh_cache(lookback: int = 0) -> WebCache:
             "sl_T_pct": cfg.exits.sl_T_pct,
             "sl_F_pct": cfg.exits.sl_F_pct,
         },
+        ticker_history=ticker_history,
     )
     save_cache(cache)
     log_msg(f"refresh_cache done in {time.time() - t0:.1f}s")

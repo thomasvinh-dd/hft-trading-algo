@@ -62,7 +62,7 @@
         <h2>Opening signals (today)</h2>
         <span class="muted" id="signals-meta"></span>
       </header>
-      <div class="table-wrap">
+      <div class="table-wrap scroll">
         <table id="signals-table">
           <thead>
             <tr>
@@ -85,7 +85,7 @@
         <h2>Open positions</h2>
         <span class="muted" id="positions-meta"></span>
       </header>
-      <div class="table-wrap">
+      <div class="table-wrap scroll">
         <table id="positions-table">
           <thead>
             <tr>
@@ -107,7 +107,7 @@
   <section class="two-col">
     <section class="card">
       <header class="card-header"><h2>Top winners</h2></header>
-      <div class="table-wrap">
+      <div class="table-wrap scroll">
         <table id="winners-table">
           <thead>
             <tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>Exit reason</th></tr>
@@ -118,7 +118,7 @@
     </section>
     <section class="card">
       <header class="card-header"><h2>Top losers</h2></header>
-      <div class="table-wrap">
+      <div class="table-wrap scroll">
         <table id="losers-table">
           <thead>
             <tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>Exit reason</th></tr>
@@ -149,6 +149,39 @@
     <p>Last refresh: <span id="last-updated">—</span></p>
   </footer>
 </main>
+
+<!-- Ticker history modal: shown when a ticker cell is clicked -->
+<div id="ticker-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal">
+    <header class="modal-header">
+      <div>
+        <h2 id="modal-ticker-name">—</h2>
+        <span class="muted small" id="modal-ticker-subtitle"></span>
+      </div>
+      <button id="modal-close" class="modal-close" aria-label="Close">×</button>
+    </header>
+    <div class="modal-body">
+      <section class="kpis ticker-kpis" id="modal-summary"></section>
+      <div class="table-wrap scroll modal-table-wrap">
+        <table id="modal-deals-table">
+          <thead>
+            <tr>
+              <th>Deal ID</th>
+              <th>Entry</th>
+              <th>Entry px</th>
+              <th>Exit</th>
+              <th>Exit px</th>
+              <th>PnL %</th>
+              <th>Reason</th>
+              <th>Days</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

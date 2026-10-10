@@ -79,6 +79,43 @@ class FlaskAppTests(unittest.TestCase):
         r = self.client.get("/nonexistent")
         self.assertEqual(r.status_code, 404)
 
+    def test_ticker_route(self):
+        """Ticker history endpoint should return summary + deals."""
+        with patch("darvas_box_strategy.web.app.get_ticker_history") as mock:
+            mock.return_value = {
+                "ticker": "MSN",
+                "summary": {
+                    "total_deals": 5, "open_deals": 1, "closed_deals": 4,
+                    "wins": 3, "losses": 1, "win_rate_pct": 75.0,
+                    "total_pnl_vnd": 12345678, "avg_pnl_pct": 12.3,
+                },
+                "deals": [
+                    {
+                        "deal_id": "MSN_2026-10-09", "ticker": "MSN",
+                        "entry_date": "2026-10-09", "exit_date": "2026-10-20",
+                        "entry_price": 75200, "exit_price": 80000,
+                        "last_close": 80000, "pnl_pct": 6.4, "pnl_vnd": 4000000,
+                        "exit_reason": "TRAIL", "bars_held": 7,
+                        "is_open": False, "shares": 5000, "size_pct": 0.4,
+                        "sl_F": 61664, "sl_T": 67680,
+                    },
+                ],
+            }
+            r = self.client.get("/api/ticker/MSN")
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertEqual(data["ticker"], "MSN")
+        self.assertEqual(data["summary"]["total_deals"], 5)
+        self.assertEqual(len(data["deals"]), 1)
+        self.assertEqual(data["deals"][0]["deal_id"], "MSN_2026-10-09")
+
+    def test_ticker_route_rejects_invalid(self):
+        r = self.client.get("/api/ticker/this-is-way-too-long-to-be-a-ticker")
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get("/api/ticker/..")
+        # Either 400 (rejected) or 200 (no data) — both acceptable
+        self.assertIn(r.status_code, (200, 400))
+
 
 class StaticAssetsTests(unittest.TestCase):
     def test_css_loads(self):
@@ -207,3 +244,115 @@ class SummarizeBacktestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MakeDealIdTests(unittest.TestCase):
+    """Tests for the deal_id generator."""
+
+    def test_basic_format(self):
+        from darvas_box_strategy.web.data import _make_deal_id
+        from datetime import date
+        self.assertEqual(_make_deal_id("MSN", date(2026, 10, 9)), "MSN_2026-10-09")
+
+    def test_seq_appended(self):
+        from darvas_box_strategy.web.data import _make_deal_id
+        from datetime import date
+        self.assertEqual(
+            _make_deal_id("MSN", date(2026, 10, 9), seq=2),
+            "MSN_2026-10-09_2",
+        )
+
+    def test_seq_zero_omitted(self):
+        """seq=0 should not add a suffix — the common case is unambiguous."""
+        from darvas_box_strategy.web.data import _make_deal_id
+        from datetime import date
+        self.assertEqual(
+            _make_deal_id("MSN", date(2026, 10, 9), seq=0),
+            "MSN_2026-10-09",
+        )
+
+    def test_string_date(self):
+        from darvas_box_strategy.web.data import _make_deal_id
+        # Non-date objects should be coerced via str()
+        self.assertEqual(_make_deal_id("VIX", "2026-05-07"), "VIX_2026-05-07")
+
+
+class SignalToDictWithDealIdTests(unittest.TestCase):
+    """The frontend depends on every signal having a deal_id."""
+
+    def test_signal_includes_deal_id(self):
+        from darvas_box_strategy.web.data import _signal_to_dict
+        from datetime import date
+
+        class FakeSignal:
+            ticker = "MSN"
+            entry_price = 75200.0
+            sl_F = 61664.0
+            sl_T = 67680.0
+            size_pct = 0.40
+            entry_date = date(2026, 10, 9)
+            atr_value = 1234.5
+            shares = 5000
+
+        d = _signal_to_dict(FakeSignal())
+        self.assertEqual(d["deal_id"], "MSN_2026-10-09")
+        self.assertIn("deal_id", d)
+        # The rest of the dict should still have all the existing fields
+        self.assertEqual(d["ticker"], "MSN")
+        self.assertEqual(d["entry_price"], 75200.0)
+
+
+class OpenPositionToDictWithDealIdTests(unittest.TestCase):
+    def test_position_includes_deal_id(self):
+        from darvas_box_strategy.web.data import _open_position_to_dict
+        from datetime import date
+
+        class FakeSignal:
+            ticker = "MSN"
+            entry_price = 75200.0
+            sl_F = 61664.0
+            sl_T = 67680.0
+            size_pct = 0.40
+            entry_date = date(2026, 10, 9)
+            shares = 5000
+
+        class FakeTrade:
+            signal = FakeSignal()
+            highest_close = 76000.0
+            bars_held = 5
+
+        d = _open_position_to_dict(FakeTrade())
+        self.assertEqual(d["deal_id"], "MSN_2026-10-09")
+        self.assertEqual(d["ticker"], "MSN")
+        self.assertEqual(d["shares"], 5000)
+        # PnL math should be 1.06% = (76000/75200 - 1) * 100
+        self.assertAlmostEqual(d["pnl_pct"], 1.0638, places=2)
+
+
+class WebCacheDealIdTests(unittest.TestCase):
+    """WebCache needs to round-trip the new ticker_history field."""
+
+    def test_ticker_history_round_trip(self):
+        from darvas_box_strategy.web.data import WebCache, save_cache, load_cache
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cache.json"
+            c = WebCache(
+                last_updated="2026-01-01T00:00:00",
+                ticker_history={
+                    "MSN": {
+                        "summary": {"total_deals": 5},
+                        "deals": [{"deal_id": "MSN_2026-10-09", "pnl_pct": 6.4}],
+                    }
+                },
+            )
+            save_cache(c, path=path)
+            loaded = load_cache(path=path)
+            self.assertIn("MSN", loaded.ticker_history)
+            self.assertEqual(loaded.ticker_history["MSN"]["deals"][0]["deal_id"],
+                             "MSN_2026-10-09")
+
+    def test_ticker_history_default_empty(self):
+        from darvas_box_strategy.web.data import WebCache
+        c = WebCache()
+        self.assertEqual(c.ticker_history, {})

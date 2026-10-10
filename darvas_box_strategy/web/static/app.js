@@ -98,7 +98,7 @@ function renderSignals(signals) {
       ? '<span class="pos">HIGH</span>'
       : '<span class="muted">regular</span>';
     tr.innerHTML = `
-      <td><strong>${s.ticker}</strong></td>
+      <td><a class="ticker-cell" data-ticker="${s.ticker}">${s.ticker}</a></td>
       <td>${VND(s.entry_price)}</td>
       <td>${(s.size_pct * 100).toFixed(0)}%</td>
       <td>${VND(s.sl_T)}</td>
@@ -107,6 +107,7 @@ function renderSignals(signals) {
     `;
     tbody.appendChild(tr);
   }
+  attachTickerClicks(tbody);
 }
 
 function renderPositions(positions) {
@@ -123,7 +124,7 @@ function renderPositions(positions) {
     const tr = document.createElement("tr");
     const pnlClass = p.pnl_pct >= 0 ? "pos" : "neg";
     tr.innerHTML = `
-      <td><strong>${p.ticker}</strong></td>
+      <td><a class="ticker-cell" data-ticker="${p.ticker}">${p.ticker}</a></td>
       <td>${VND(p.entry_price)}</td>
       <td>${VND(p.last_close)}</td>
       <td class="${pnlClass}">${PCT(p.pnl_pct)}</td>
@@ -132,6 +133,7 @@ function renderPositions(positions) {
     `;
     tbody.appendChild(tr);
   }
+  attachTickerClicks(tbody);
 }
 
 function renderTradeList(sel, trades) {
@@ -142,7 +144,7 @@ function renderTradeList(sel, trades) {
     const tr = document.createElement("tr");
     const pnlClass = t.pnl_pct >= 0 ? "pos" : "neg";
     tr.innerHTML = `
-      <td><strong>${t.ticker}</strong></td>
+      <td><a class="ticker-cell" data-ticker="${t.ticker}">${t.ticker}</a></td>
       <td class="muted small">${t.entry_date}</td>
       <td class="muted small">${t.exit_date}</td>
       <td class="${pnlClass}">${PCT(t.pnl_pct)}</td>
@@ -150,6 +152,7 @@ function renderTradeList(sel, trades) {
     `;
     tbody.appendChild(tr);
   }
+  attachTickerClicks(tbody);
 }
 
 function renderExitReasons(reasons) {
@@ -211,5 +214,98 @@ async function refresh() {
 
 document.addEventListener("DOMContentLoaded", () => {
   $("#refresh-btn").addEventListener("click", refresh);
+  $("#modal-close").addEventListener("click", closeTickerModal);
+  $("#ticker-modal").addEventListener("click", (e) => {
+    if (e.target.id === "ticker-modal") closeTickerModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeTickerModal();
+  });
   load();
 });
+
+function attachTickerClicks(container) {
+  container.querySelectorAll(".ticker-cell").forEach((el) => {
+    if (el.dataset.bound) return;
+    el.dataset.bound = "1";
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      openTickerModal(el.dataset.ticker);
+    });
+  });
+}
+
+async function openTickerModal(ticker) {
+  const modal = $("#ticker-modal");
+  modal.classList.remove("hidden");
+  setText("#modal-ticker-name", ticker);
+  setText("#modal-ticker-subtitle", "Loading…");
+  $("#modal-summary").innerHTML = "";
+  $("#modal-deals-table tbody").innerHTML = "";
+
+  try {
+    const r = await fetchJSON(`/api/ticker/${encodeURIComponent(ticker)}`);
+    renderTickerHistory(r);
+  } catch (e) {
+    setText("#modal-ticker-subtitle", `Error: ${e.message}`);
+  }
+}
+
+function closeTickerModal() {
+  $("#ticker-modal").classList.add("hidden");
+}
+
+function renderTickerHistory(h) {
+  if (!h || !h.deals) {
+    setText("#modal-ticker-subtitle", "No data");
+    return;
+  }
+  const s = h.summary || {};
+  setText("#modal-ticker-subtitle",
+    `${s.total_deals || 0} deal(s) — ${s.closed_deals || 0} closed, ${s.open_deals || 0} open`);
+
+  // Build summary tiles
+  const fmtVnd = v => (v == null ? "—" : VND(v));
+  const summary = $("#modal-summary");
+  summary.innerHTML = `
+    <div class="kpi"><div class="kpi-label">Win rate</div>
+      <div class="kpi-value">${(s.win_rate_pct || 0).toFixed(1)}%</div></div>
+    <div class="kpi"><div class="kpi-label">Total PnL</div>
+      <div class="kpi-value ${(s.total_pnl_vnd || 0) >= 0 ? "pos" : "neg"}">
+        ${fmtVnd(s.total_pnl_vnd)}</div></div>
+    <div class="kpi"><div class="kpi-label">Avg return</div>
+      <div class="kpi-value">${(s.avg_pnl_pct || 0).toFixed(2)}%</div></div>
+    <div class="kpi"><div class="kpi-label">Wins / losses</div>
+      <div class="kpi-value">${s.wins || 0} / ${s.losses || 0}</div></div>
+  `;
+
+  // Build deals table
+  const tbody = $("#modal-deals-table tbody");
+  tbody.innerHTML = "";
+  if (!h.deals.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="8" class="empty">No deals for this ticker.</td>`;
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const d of h.deals) {
+    const tr = document.createElement("tr");
+    const pnlClass = d.pnl_pct >= 0 ? "pos" : "neg";
+    const reasonCell = d.is_open
+      ? `<span class="reason-open">OPEN</span>`
+      : `<span>${d.exit_reason}</span>`;
+    const exitPx = d.is_open ? "—" : VND(d.exit_price);
+    const pnlVnd = d.pnl_vnd == null ? "—" : VND(d.pnl_vnd);
+    tr.innerHTML = `
+      <td class="deal-id-cell">${d.deal_id}</td>
+      <td class="muted small">${d.entry_date}</td>
+      <td>${VND(d.entry_price)}</td>
+      <td class="muted small">${d.is_open ? "—" : d.exit_date}</td>
+      <td>${exitPx}</td>
+      <td class="${pnlClass}">${PCT(d.pnl_pct)}</td>
+      <td>${reasonCell}</td>
+      <td>${d.bars_held}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}

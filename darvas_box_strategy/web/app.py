@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "darvas_box_strategy"))
 from darvas_box_strategy.web.data import (
     CACHE_PATH,
     CACHE_MAX_AGE_SECONDS,
+    get_ticker_history,
     load_cache,
     refresh_cache,
     save_cache,
@@ -84,6 +85,21 @@ def create_app() -> Flask:
             "count": len(cache.open_positions),
             "positions": cache.open_positions,
         })
+
+    @app.route("/api/ticker/<ticker>")
+    def api_ticker(ticker):
+        ticker = ticker.upper()
+        # Reject anything that isn't a normal ticker symbol
+        if not ticker or not ticker.replace(".", "").replace("-", "").isalnum():
+            return jsonify({"error": "invalid ticker"}), 400
+        if len(ticker) > 10:
+            return jsonify({"error": "ticker too long"}), 400
+        try:
+            history = get_ticker_history(ticker)
+        except Exception as e:
+            log.exception("ticker history failed")
+            return jsonify({"error": str(e)}), 500
+        return jsonify(history)
 
     @app.route("/api/backtest")
     def api_backtest():
