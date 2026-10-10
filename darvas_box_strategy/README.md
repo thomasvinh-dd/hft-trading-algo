@@ -267,20 +267,41 @@ ssh root@185.227.135.227 "systemctl restart darvas-web"
 |---|---|---|
 | `/` | GET | HTML dashboard |
 | `/api/health` | GET | Liveness check + cache status |
-| `/api/signals` | GET | Today's breakout signals |
-| `/api/positions` | GET | Currently open positions (from latest backtest) |
+| `/api/signals` | GET | Today's breakout signals (with `deal_id`) |
+| `/api/positions` | GET | Currently open positions (with `deal_id`) |
 | `/api/backtest` | GET | Full backtest summary + equity curve |
-| `/api/refresh` | POST | Re-run scan + backtest (slow, ~4 min) |
+| `/api/ticker/<ticker>` | GET | All deals for a single ticker (with `deal_id`s) |
+| `/api/refresh` | POST | Re-run scan + backtest (slow, ~5 min) |
 
 ### Sections shown
 
 - **KPIs** — Total return, CAGR, Max DD, Win rate, Profit factor, Trade count
 - **Equity curve** — Daily NAV over the backtest period (SVG chart, no JS deps)
-- **Opening signals** — Today's breakouts with entry, size, stops, conviction
-- **Open positions** — Trades still active at the latest data point, with PnL
-- **Top winners / losers** — Best and worst 5 trades of the backtest
+- **Opening signals** — Today's breakouts with entry, size, stops, conviction (scrollable)
+- **Open positions** — Trades still active at the latest data point, with PnL (scrollable)
+- **Top winners / losers** — Best and worst 5 trades of the backtest (scrollable)
 - **Exit reasons** — Distribution of exit types (TRAIL, SL_HARD, TIER, ...)
 - **Per-ticker breakdown** — Top 10 tickers by realized PnL
+
+### deal_id
+
+Every signal, open position, top winner/loser, and ticker-history deal
+has a `deal_id` of the form `TICKER_YYYY-MM-DD` (with optional `_N`
+suffix for the rare same-day re-entry case). The same `deal_id` is
+used across tables so you can cross-reference, e.g. a position in the
+open-positions table with its entry in the ticker history.
+
+### Click a ticker for history
+
+Click any ticker cell (in signals, positions, winners, or losers) to
+open a modal showing all past deals for that ticker. The modal shows:
+- Summary tiles (win rate, total PnL, avg return, W/L count)
+- Full deal list with entry/exit dates, prices, PnL, exit reason,
+  bars held — and the `deal_id` for each row
+
+Tickers in current signals / positions / top winners / top losers are
+pre-built during the refresh (~20s extra). Other tickers are built on
+first click (~1s) and cached for subsequent views.
 
 ## VPS testing (2026-09)
 
