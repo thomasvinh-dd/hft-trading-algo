@@ -497,9 +497,20 @@ def refresh_cache(lookback: int = 0) -> WebCache:
     # 2) Derive the backtest summary from the result.
     backtest = _summarize_backtest(result, cfg, filtered)
 
-    # 3) Find currently-open positions from the trade list.
-    #    A trade is "still open" if exit_date > last available bar date
-    #    OR exit_reason == "EXHAUST" (last available bar was the entry).
+    # 3) Find currently-open positions from the trade list. A trade
+    #    is "logically open" if exit_reason == "EXHAUST" (backtest
+    #    ran out of bars before the trade exited — in live trading
+    #    the strategy would still be holding it) OR exit_date >
+    #    last available bar date.
+    #
+    #    The trade list may have MULTIPLE signals for the same ticker
+    #    at different entry prices (the simulator doesn't know about
+    #    portfolio constraints). We dedupe by ticker, keeping the
+    #    most recent entry — this matches what a live broker would
+    #    show as currently held. The portfolio_open_positions field
+    #    is also populated by the backtest but is empty in practice
+    #    because all EXHAUST positions get closed at the end of the
+    #    portfolio's day-by-day loop.
     last_bar_date_by_ticker: Dict[str, Any] = {}
     for ticker in filtered:
         path = PRICES_DIR / f"{ticker}.json"
@@ -523,9 +534,28 @@ def refresh_cache(lookback: int = 0) -> WebCache:
                 open_trades.append(t)
         except TypeError:
             continue
-    open_trades.sort(key=lambda t: t.signal.entry_date, reverse=True)
-    open_positions = [_open_position_to_dict(t) for t in open_trades[:20]]
-    log_msg(f"open positions: {len(open_positions)}")
+
+    # Dedupe by ticker, keeping the most recent entry (the one
+    # that would be currently held in a live portfolio). This
+    # fixes the bug where MSB appeared 3x with different entry
+    # prices because the simulator generated multiple valid signals.
+    open_trades.sort(
+        key=lambda t: (
+            t.signal.ticker,
+            t.signal.entry_date if hasattr(t.signal.entry_date, "isoformat")
+            else str(t.signal.entry_date),
+        ),
+        reverse=True,
+    )
+    seen_tickers: set = set()
+    deduped_open: List[Any] = []
+    for t in open_trades:
+        if t.signal.ticker in seen_tickers:
+            continue
+        seen_tickers.add(t.signal.ticker)
+        deduped_open.append(t)
+    open_positions = [_open_position_to_dict(t) for t in deduped_open[:20]]
+    log_msg(f"open positions (deduped by ticker): {len(open_positions)}")
 
     # 4) Find "today's signals" by scanning the latest bar.
     signals = get_current_signals(lookback=lookback, cfg=cfg)

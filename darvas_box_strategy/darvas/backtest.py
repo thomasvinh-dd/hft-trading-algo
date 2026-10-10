@@ -50,6 +50,11 @@ class BacktestResult:
     concurrent_position_peak: int = 0
     concurrent_skipped: int = 0
     portfolio_mode: bool = False
+    # The actual positions held at end-of-backtest per the portfolio layer.
+    # Keyed by ticker. Populated by run_backtest(..., portfolio=True).
+    # Currently empty in practice (EXHAUST positions get closed in the
+    # loop) but kept for future use and to surface the portfolio state.
+    portfolio_open_positions: dict = field(default_factory=dict)
 
     @property
     def n_trades(self):
@@ -247,7 +252,7 @@ def _portfolio_layer(cfg, trades, start, end, mtm_mode="close"):
             mtm_value = sum(pos["entry_value"] for pos in open_positions.values())
         daily_nav.append((d, cash + mtm_value))
 
-    return daily_nav, [], peak_concurrent, skipped
+    return daily_nav, [], peak_concurrent, skipped, open_positions
 
 def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
                  progress=True, ca_events=...,
@@ -370,7 +375,7 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
             )
 
     if portfolio and result.trades and result.start and result.end:
-        nav_curve, _, peak, skipped = _portfolio_layer_with_bars(
+        nav_curve, _, peak, skipped, open_pos = _portfolio_layer_with_bars(
             cfg, result.trades, result.start, result.end,
             bars_by_ticker=bars_by_ticker,
             mtm_mode=mtm_mode,
@@ -378,6 +383,7 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
         result.nav_curve = nav_curve
         result.concurrent_position_peak = peak
         result.concurrent_skipped = skipped
+        result.portfolio_open_positions = open_pos
     elif result.trades and result.start and result.end:
         result.nav_curve, result.daily_returns = _build_nav_curve(
             result.trades, cfg.backtest.start_nav, result.start, result.end,
@@ -413,7 +419,7 @@ def _portfolio_layer_with_bars(cfg, trades, start, end, *, bars_by_ticker,
         by_ticker_exit[(t.signal.ticker, t.exit_date)] = t
 
     if end < start:
-        return [], [], 0, 0
+        return [], [], 0, 0, {}
     all_dates = []
     cursor = start
     while cursor <= end:
@@ -477,7 +483,7 @@ def _portfolio_layer_with_bars(cfg, trades, start, end, *, bars_by_ticker,
             mtm_value = sum(pos["entry_value"] for pos in open_positions.values())
         daily_nav.append((d, cash + mtm_value))
 
-    return daily_nav, [], peak_concurrent, skipped
+    return daily_nav, [], peak_concurrent, skipped, open_positions
 
 
 __all__ = ["BacktestResult", "run_backtest"]

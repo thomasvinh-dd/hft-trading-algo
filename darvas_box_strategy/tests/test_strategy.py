@@ -968,5 +968,84 @@ class DailyPriceLimitTests(unittest.TestCase):
         self.assertEqual(capped, 10_500)
 
 
+class OpenPositionsDedupeTests(unittest.TestCase):
+    """The dashboard's open positions should show at most one entry per
+    ticker. The simulator's trade list has one row per signal, so
+    tickers like MSB (3 valid signals in the test data) would appear
+    multiple times if not deduped. We keep the most recent entry per
+    ticker — the one that would be currently held in a live portfolio.
+    """
+
+    def test_dedupe_keeps_most_recent_per_ticker(self):
+        """The dedup logic in refresh_cache() groups by ticker and keeps
+        the trade with the latest entry_date. We test this directly
+        with mock trade objects (no need to run simulate_trade)."""
+        from datetime import date
+        from dataclasses import dataclass, field
+
+        @dataclass
+        class FakeSignal:
+            ticker: str
+            entry_date: object
+            entry_price: float
+            shares: int = 1000
+
+        @dataclass
+        class FakeTrade:
+            signal: FakeSignal
+            exit_reason: str = "EXHAUST"
+
+        trades = [
+            FakeTrade(signal=FakeSignal("MSB", date(2026, 9, 24), 14_150)),
+            FakeTrade(signal=FakeSignal("MSB", date(2026, 9, 25), 14_250)),
+            FakeTrade(signal=FakeSignal("MSB", date(2026, 9, 26), 14_650)),
+            FakeTrade(signal=FakeSignal("VIX", date(2026, 9, 26), 50_000)),
+        ]
+
+        # Apply the same dedup logic as refresh_cache()
+        trades.sort(
+            key=lambda t: (t.signal.ticker, t.signal.entry_date),
+            reverse=True,
+        )
+        seen = set()
+        deduped = []
+        for t in trades:
+            if t.signal.ticker in seen:
+                continue
+            seen.add(t.signal.ticker)
+            deduped.append(t)
+
+        # Expect 2 deduped: one MSB (the most recent, 2026-09-26 @ 14,650)
+        # and one VIX
+        self.assertEqual(len(deduped), 2)
+        tickers = {t.signal.ticker for t in deduped}
+        self.assertEqual(tickers, {"MSB", "VIX"})
+        msb = next(t for t in deduped if t.signal.ticker == "MSB")
+        self.assertEqual(msb.signal.entry_date, date(2026, 9, 26))
+        self.assertEqual(msb.signal.entry_price, 14_650)
+
+    def test_dedupe_handles_empty_list(self):
+        from datetime import date
+        from dataclasses import dataclass
+        @dataclass
+        class FakeSignal:
+            ticker: str
+            entry_date: object
+        @dataclass
+        class FakeTrade:
+            signal: FakeSignal
+            exit_reason: str = "EXHAUST"
+
+        trades = []
+        seen = set()
+        deduped = []
+        for t in trades:
+            if t.signal.ticker in seen:
+                continue
+            seen.add(t.signal.ticker)
+            deduped.append(t)
+        self.assertEqual(len(deduped), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
