@@ -133,7 +133,7 @@ class SignalGeneratorTests(unittest.TestCase):
                           breakout_jump=200, vol_spike=2.0)
         cfg = self._cfg()
         b = detect_base(bars, cfg.base, as_of_idx=67, ticker="X")
-        sig = generate_signal(bars, b, nav=1_000_000_000, cfg=cfg, as_of_idx=68)
+        sig = generate_signal(bars, b, nav=1e9, cfg=cfg, as_of_idx=68)
         # 2.0x volume is below the new default high_conviction_mult=3.5
         # but above volume_mult=3.0, so it's still high enough to fire
         # with low conviction.
@@ -146,7 +146,7 @@ class SignalGeneratorTests(unittest.TestCase):
         cfg_low = self._cfg()
         cfg_low = dataclasses.replace(cfg_low, breakout=dataclasses.replace(
             cfg_low.breakout, volume_mult=1.5, high_conviction_mult=2.5))
-        sig_low = generate_signal(bars, b, nav=1_000_000_000, cfg=cfg_low, as_of_idx=68)
+        sig_low = generate_signal(bars, b, nav=1e9, cfg=cfg_low, as_of_idx=68)
         self.assertIsNotNone(sig_low)
         self.assertEqual(sig_low.conviction, "low")
 
@@ -155,7 +155,7 @@ class SignalGeneratorTests(unittest.TestCase):
                           breakout_jump=200, vol_spike=3.0)
         cfg = self._cfg()
         b = detect_base(bars, cfg.base, as_of_idx=67, ticker="X")
-        sig = generate_signal(bars, b, nav=1_000_000_000, cfg=cfg, as_of_idx=68)
+        sig = generate_signal(bars, b, nav=1e9, cfg=cfg, as_of_idx=68)
         self.assertIsNotNone(sig)
         self.assertEqual(sig.conviction, "high")
 
@@ -164,7 +164,7 @@ class SignalGeneratorTests(unittest.TestCase):
                           breakout_jump=200, vol_spike=1.0)
         cfg = self._cfg()
         b = detect_base(bars, cfg.base, as_of_idx=67, ticker="X")
-        sig = generate_signal(bars, b, nav=1_000_000_000, cfg=cfg, as_of_idx=68)
+        sig = generate_signal(bars, b, nav=1e9, cfg=cfg, as_of_idx=68)
         self.assertIsNone(sig)
 
     def test_skip_imminent_ca(self):
@@ -184,11 +184,11 @@ class SignalGeneratorTests(unittest.TestCase):
         )
         b = detect_base(bars, cfg.base, as_of_idx=67, ticker="X")
         upcoming = [CAEvent(ticker="X", ex_date=date(2025, 3, 11))]
-        sig = generate_signal(bars, b, nav=1_000_000_000, cfg=cfg, as_of_idx=68,
+        sig = generate_signal(bars, b, nav=1e9, cfg=cfg, as_of_idx=68,
                               upcoming_ca=upcoming)
         self.assertIsNone(sig)
         upcoming_far = [CAEvent(ticker="X", ex_date=date(2025, 3, 14))]
-        sig2 = generate_signal(bars, b, nav=1_000_000_000, cfg=cfg, as_of_idx=68,
+        sig2 = generate_signal(bars, b, nav=1e9, cfg=cfg, as_of_idx=68,
                                upcoming_ca=upcoming_far)
         self.assertIsNotNone(sig2)
 
@@ -684,7 +684,7 @@ class BoardLotRoundingTests(unittest.TestCase):
         scanner = BaseScanner(bars, cfg.base, ticker="X")
         base = scanner.find_base(as_of_idx=5)
         self.assertIsNotNone(base)
-        sig = generate_signal(bars, base, nav=1_000_000_000.0, cfg=cfg, as_of_idx=5)
+        sig = generate_signal(bars, base, nav=1e9, cfg=cfg, as_of_idx=5)
         self.assertIsNotNone(sig)
         # shares must be a multiple of 100
         self.assertEqual(sig.shares % 100, 0)

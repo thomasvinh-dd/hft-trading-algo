@@ -1,4 +1,15 @@
-"""Signal generation: breakout trigger + position sizing."""
+"""Signal generation: breakout trigger.
+
+Two APIs:
+  - ``generate_signal(bars, base, cfg, ...)`` — returns a PURE Signal
+    (no NAV, no sizing). Use this in new code with the Portfolio.
+  - ``generate_signal(bars, base, nav, cfg, ...)`` — DEPRECATED wrapper
+    that returns the legacy Signal with shares/size_pct baked in.
+    Used by the existing backtest/executor path.
+
+The new clean Signal lives in darvas.signals; the legacy one (with
+shares) is defined here for backward compat.
+"""
 from __future__ import annotations
 
 import math
@@ -9,42 +20,32 @@ from .base_detector import Base
 from .config import StrategyConfig
 from .data_loader import PriceBar, atr as _atr
 from .filters import compute_weekly_ma, lookup_sector_momentum
+from .signals import Signal as _PureSignal, SignalHistory as _SignalHistory
 
 
 @dataclass(frozen=True)
-class Signal:
-    ticker: str
-    # The breakout/signal bar's date — when the buy trigger fired.
-    signal_date: object
-    # The actual entry day — when the order fills (next bar after signal).
-    # For backtest this is bars[as_of_idx + 1].date. For live trading this
-    # is the next trading day after the alert. Used for deal_id, portfolio
-    # bookkeeping, and T+2.5 settlement modeling.
-    entry_date: object
-    entry_price: float
-    base: Base
-    sl_F: float
-    sl_T: float
-    tiers: tuple
-    conviction: str
-    size_pct: float
-    shares: int
-    max_volume: int
-    bars_remaining: int
-    extra: dict = field(default_factory=dict)
-    atr_value: float | None = None
+class Signal(_PureSignal):
+    """LEGACY Signal with sizing fields. Subclass of the pure Signal.
+
+    The fields below (size_pct, shares, max_volume) were historically
+    computed in the signal generator. They live here for backward
+    compat with the existing backtest/executor path, but the new
+    Portfolio architecture puts sizing in the Portfolio layer instead.
+    """
+    size_pct: float = 0.0
+    shares: int = 0
+    max_volume: int = 0
 
     @property
-    def sl_midpoint(self):
-        return (self.sl_F + self.sl_T) / 2.0
-
-    @property
-    def risk_per_share(self):
-        return self.entry_price - self.sl_F
-
-    @property
-    def notional(self):
+    def notional(self) -> float:
         return self.shares * self.entry_price
+
+
+# Re-export SignalHistory under the same name
+SignalHistory = _SignalHistory
+
+
+__all__ = ["Signal", "SignalHistory", "generate_signal"]
 
 
 def _avg_volume(bars, idx, window=20):
@@ -172,6 +173,15 @@ def _vol_targeted_size_pct(atr_value, entry_price, cfg, conviction):
 def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
                     market_bars=None, sector_momentum_by_date=None,
                     ml_model=None):
+    """Generate a Signal. Computes sizing using the legacy path
+    (nav-based, lot-rounded, max-volume-capped).
+
+    New code should use the Portfolio + pure Signal pattern:
+      from darvas_box_strategy.darvas.signals import Signal, SignalHistory
+      from darvas_box_strategy.darvas.portfolio import Portfolio, size_position
+      sig = generate_signal(bars, base, cfg, as_of_idx=...)  # no nav
+      shares, size_pct = size_position(sig, portfolio.get_nav(), cfg)
+    """
     breakout_idx = base.end_idx + 1
     if as_of_idx is None:
         as_of_idx = breakout_idx
@@ -235,7 +245,7 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
     # ATR at signal time (for ATR-based trailing stop and vol-targeting)
     atr_value = _atr(bars[: breakout_idx + 1], window=cfg.trailing.trail_atr_window)
 
-    # Sizing: vol-targeted or conviction-based
+    # Sizing (legacy path — uses nav, lot-rounds, caps at max volume)
     if cfg.backtest.vol_target_pct > 0:
         size_pct = _vol_targeted_size_pct(atr_value, breakout_bar.close, cfg, conviction)
     else:
@@ -245,8 +255,6 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
     if raw_shares <= 0:
         return None
 
-    # Round down to a board lot. HOSE = 100 shares. If the result is 0
-    # the signal is too small for one lot — drop it.
     lot = cfg.backtest.board_lot if cfg.backtest.board_lot > 0 else 1
     shares = (raw_shares // lot) * lot
     if shares <= 0:
@@ -254,33 +262,21 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
 
     max_volume = int(avg_vol * 0.05)
     if shares > max_volume > 0:
-        # Same lot rounding for the volume cap
         shares = (max_volume // lot) * lot
         if shares <= 0:
             return None
 
     sl_buffer = 1.0 - cfg.exits.sl_buffer_pct
     if cfg.exits.use_entry_anchored_stops:
-        # Anchor stops to ENTRY price (entry-anchored). Avoids the bug where
-        # stops placed at ancient base_low result in -45% "stop-losses" when
-        # the stock has already moved 5-10x from base before the breakout.
         sl_F = breakout_bar.close * (1.0 - cfg.exits.sl_F_pct)
         sl_T = breakout_bar.close * (1.0 - cfg.exits.sl_T_pct)
     else:
-        # Legacy: base-anchored stops. Can be -30% to -45% from entry if the
-        # stock has run far from base before breakout. Kept for backward compatibility
-        # but NOT recommended.
         sl_F = base.base_low * sl_buffer
         sl_T = (base.base_low + breakout_bar.close) / 2.0
 
-    # The signal bar is `breakout_idx` (today's close broke out).
-    # The fill happens on the NEXT bar. For backtest this is bars[as_of_idx + 1].
-    # For live trading, the order is placed at the next session's open.
     if breakout_idx + 1 < len(bars):
         entry_date = bars[breakout_idx + 1].date
     else:
-        # Defensive: if signal is on the last bar, entry is the same day
-        # (would never actually happen in production, but for safety).
         entry_date = breakout_bar.date
 
     return Signal(
@@ -298,7 +294,8 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
         max_volume=max_volume,
         bars_remaining=len(bars) - breakout_idx - 1,
         atr_value=atr_value,
+        extra={"avg_vol": avg_vol},
     )
 
 
-__all__ = ["Signal", "generate_signal"]
+__all__ = ["Signal", "SignalHistory", "generate_signal"]
