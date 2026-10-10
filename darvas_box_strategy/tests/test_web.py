@@ -117,6 +117,36 @@ class FlaskAppTests(unittest.TestCase):
         self.assertIn(r.status_code, (200, 400))
 
 
+class ModalHiddenRegressionTests(unittest.TestCase):
+    """Regression: the ticker history modal must be hidden by default.
+
+    Previously the modal was visible on page load because
+    ``.modal-overlay { display: flex; }`` had the same specificity as
+    ``.hidden { display: none; }`` and won the cascade. The fix uses
+    ``.modal-overlay.hidden { display: none; }`` to bump specificity.
+    """
+
+    def test_css_specificity(self):
+        import re
+        css_path = (Path(__file__).resolve().parents[1] / "web" / "static" / "styles.css")
+        css = css_path.read_text()
+        # The fix must be present
+        self.assertRegex(
+            css,
+            r"\.modal-overlay\.hidden\s*\{\s*display:\s*none",
+            "Modal needs .modal-overlay.hidden { display: none } to win "
+            "the cascade against .modal-overlay { display: flex }",
+        )
+
+    def test_index_has_hidden_class(self):
+        from darvas_box_strategy.web.app import create_app
+        app = create_app()
+        c = app.test_client()
+        r = c.get("/")
+        # The modal element must have the "hidden" class on page load
+        self.assertIn(b'id="ticker-modal" class="modal-overlay hidden"', r.data)
+
+
 class StaticAssetsTests(unittest.TestCase):
     def test_css_loads(self):
         from darvas_box_strategy.web.app import create_app
