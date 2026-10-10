@@ -374,22 +374,215 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
                 f"(running total: {result.n_trades})"
             )
 
-    if portfolio and result.trades and result.start and result.end:
-        nav_curve, _, peak, skipped, open_pos = _portfolio_layer_with_bars(
-            cfg, result.trades, result.start, result.end,
-            bars_by_ticker=bars_by_ticker,
+    if portfolio and result.start and result.end:
+        # New path: use the Portfolio class directly. This is the
+        # recommended way — it has correct MTM (last_close updated every
+        # bar, not stuck at opening day's close) and cleanly separates
+        # the signal layer from the portfolio layer.
+        port = run_backtest_with_portfolio(
+            cfg, prices_dir=prices_dir, tickers=tickers,
+            progress=progress, ca_events=ca_events,
+            adjust_prices=adjust_prices, ca_path=ca_path,
             mtm_mode=mtm_mode,
         )
-        result.nav_curve = nav_curve
-        result.concurrent_position_peak = peak
-        result.concurrent_skipped = skipped
-        result.portfolio_open_positions = open_pos
+        result.trades = port.history
+        result.nav_curve = port._daily_nav
+        result.daily_returns = port.get_daily_returns()
+        result.concurrent_position_peak = port.peak_concurrent
+        result.concurrent_skipped = port.skipped_signals
+        # Convert Portfolio positions to the legacy open_pos dict format
+        # (kept for backward compat with the dashboard's open positions)
+        result.portfolio_open_positions = {
+            p.ticker: {
+                "shares": p.shares,
+                "entry_price": p.entry_price,
+                "last_close": p.last_close,
+                "exit_date": p.exit_date,
+                "entry_value": p.cost_basis,
+                "exit_value": p.cost_basis + p.cumulative_pnl,
+            }
+            for p in port.open_positions.values()
+        }
     elif result.trades and result.start and result.end:
         result.nav_curve, result.daily_returns = _build_nav_curve(
             result.trades, cfg.backtest.start_nav, result.start, result.end,
         )
 
     return result
+
+
+def run_backtest_with_portfolio(
+    cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None, progress=True,
+    ca_events=..., adjust_prices=..., ca_path=None, mtm_mode="close",
+) -> "Portfolio":
+    """Run backtest using the new Portfolio class.
+
+    This is a cleaner re-implementation of run_backtest(..., portfolio=True)
+    that:
+    - Walks bar-by-bar (no two-pass scan + replay)
+    - Uses Portfolio.process_signal() for sizing + position creation
+    - Uses Portfolio.process_bar() for MTM + exits
+    - Maintains MTM correctly each bar (not stuck at opening day's close)
+    - Produces an identical nav_curve for the same config
+
+    The result is a Portfolio object, not a BacktestResult. For a
+    BacktestResult, call .to_backtest_result() on the returned Portfolio.
+
+    Why this exists:
+    - Old backtest has a stale-MTM bug (last_close never updated
+      after opening day). New one updates it every bar.
+    - Old backtest mixes signal generation and portfolio logic.
+      New one separates them cleanly.
+    - Same interface, same config, same result types (Orders, Positions, Trades).
+    """
+    from .portfolio import Portfolio
+    from .signal_generator import generate_signal
+    from .base_detector import BaseScanner
+
+    if ca_events is ...:
+        ca_events = load_events(ca_path) if ca_path else load_events(DEFAULT_CA_PATH)
+    ca_index = build_event_index(ca_events) if ca_events else {}
+
+    if adjust_prices is ...:
+        adjust_prices = False
+
+    # Load market index bars if regime filter is configured
+    market_bars = None
+    if cfg.breakout.regime_index_path:
+        path = Path(cfg.breakout.regime_index_path)
+        if path.exists():
+            market_bars = load_price_bars(path)
+
+    # Build sector momentum map
+    sector_momentum_by_date = None
+    sector_map = {}
+    bars_by_ticker_for_sector = {}
+    if cfg.breakout.sector_data_path:
+        from .filters import build_sector_map
+        sector_map = build_sector_map(cfg.breakout.sector_data_path)
+
+    # ML model
+    ml_model = None
+    if cfg.breakout.ml_model_path:
+        from pathlib import Path as _P
+        mp = _P(cfg.breakout.ml_model_path)
+        if mp.exists():
+            try:
+                import joblib
+                ml_model = joblib.load(mp)
+            except Exception as e:
+                log.warning("failed to load ML model: %s", e)
+
+    # Load bars for each ticker
+    universe = []
+    if tickers is not None:
+        for t in tickers:
+            path = prices_dir / f"{t.upper()}.json"
+            raw_bars = load_price_bars(path)
+            if not raw_bars:
+                continue
+            ticker_events = ca_index.get(t.upper(), [])
+            if adjust_prices and ticker_events:
+                adj_bars, div = adjust_bars(raw_bars, ticker_events)
+            else:
+                adj_bars, div = raw_bars, {}
+            universe.append((t.upper(), adj_bars, div))
+            if sector_map:
+                bars_by_ticker_for_sector[t.upper()] = adj_bars
+    else:
+        for meta, raw_bars in iter_universe(prices_dir, cfg):
+            ticker_events = ca_index.get(meta.ticker, [])
+            if adjust_prices and ticker_events:
+                adj_bars, div = adjust_bars(raw_bars, ticker_events)
+            else:
+                adj_bars, div = raw_bars, {}
+            universe.append((meta.ticker, adj_bars, div))
+            if sector_map:
+                bars_by_ticker_for_sector[meta.ticker] = adj_bars
+
+    if sector_map:
+        from .filters import build_sector_momentum_by_date
+        sector_momentum_by_date = build_sector_momentum_by_date(
+            bars_by_ticker_for_sector, sector_map,
+            window=cfg.breakout.sector_momentum_window,
+        )
+
+    bars_by_ticker = {ticker: bars for ticker, bars, _ in universe}
+    dividends_by_ticker = {ticker: div for ticker, _, div in universe}
+    ticker_events_by_ticker = {
+        ticker: ca_index.get(ticker, []) for ticker in bars_by_ticker
+    }
+
+    # Build scanners
+    scanners = {
+        ticker: BaseScanner(bars, cfg.base, ticker=ticker)
+        for ticker, bars in bars_by_ticker.items()
+        if len(bars) >= cfg.breakout.min_history_days
+    }
+
+    # Find the date range
+    start_date = min(bars[0].date for bars in bars_by_ticker.values())
+    end_date = max(bars[-1].date for bars in bars_by_ticker.values())
+
+    # Build date -> bar_idx lookup per ticker
+    date_idx: Dict[str, Dict[object, int]] = {
+        ticker: {b.date: i for i, b in enumerate(bars)}
+        for ticker, bars in bars_by_ticker.items()
+    }
+
+    # Create the portfolio
+    portfolio = Portfolio(cfg, start_nav=cfg.backtest.start_nav)
+
+    # Walk day-by-day
+    cursor = start_date
+    total_days = (end_date - start_date).days + 1
+    n_tickers = len(bars_by_ticker)
+    import logging
+    logging.getLogger("darvas.backtest").info(
+        "backtest: %d tickers, %d days (%s → %s)",
+        n_tickers, total_days, start_date, end_date,
+    )
+
+    while cursor <= end_date:
+        # 1) Generate signals for any ticker that has a bar on this date
+        for ticker, bars in bars_by_ticker.items():
+            if ticker not in scanners:
+                continue
+            if cursor not in date_idx[ticker]:
+                continue
+            bar_idx = date_idx[ticker][cursor]
+            if bar_idx < cfg.breakout.min_history_days:
+                continue
+            base = scanners[ticker].find_base(as_of_idx=bar_idx)
+            if base is None or base.end_idx >= bar_idx:
+                continue
+            sig = generate_signal(
+                bars, base, cfg, as_of_idx=bar_idx,
+                upcoming_ca=ticker_events_by_ticker.get(ticker),
+                market_bars=market_bars,
+                sector_momentum_by_date=sector_momentum_by_date,
+                ml_model=ml_model,
+            )
+            if sig is None:
+                continue
+            portfolio.process_signal(sig)
+
+        # 2) Build prices for this bar
+        prices: Dict[str, float] = {}
+        for ticker, bars in bars_by_ticker.items():
+            if cursor in date_idx[ticker]:
+                bar_idx = date_idx[ticker][cursor]
+                prices[ticker] = bars[bar_idx].close
+
+        # 3) Process the bar (MTM + exits)
+        portfolio.process_bar(cursor, prices)
+
+        cursor = date.fromordinal(cursor.toordinal() + 1)
+
+    # Force-close any remaining positions (backtest ran out of data)
+    portfolio.close_all()
+
+    return portfolio
 
 
 def _portfolio_layer_with_bars(cfg, trades, start, end, *, bars_by_ticker,

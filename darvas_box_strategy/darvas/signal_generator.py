@@ -170,18 +170,67 @@ def _vol_targeted_size_pct(atr_value, entry_price, cfg, conviction):
     return size
 
 
-def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
+def generate_signal(bars, base, *args, as_of_idx=None, upcoming_ca=None,
                     market_bars=None, sector_momentum_by_date=None,
-                    ml_model=None):
-    """Generate a Signal. Computes sizing using the legacy path
-    (nav-based, lot-rounded, max-volume-capped).
+                    ml_model=None, nav=None, cfg=None):
+    """Generate a Signal.
 
-    New code should use the Portfolio + pure Signal pattern:
-      from darvas_box_strategy.darvas.signals import Signal, SignalHistory
-      from darvas_box_strategy.darvas.portfolio import Portfolio, size_position
-      sig = generate_signal(bars, base, cfg, as_of_idx=...)  # no nav
-      shares, size_pct = size_position(sig, portfolio.get_nav(), cfg)
+    Two calling conventions are supported (for backward compat):
+      - generate_signal(bars, base, nav, cfg, ...) — legacy: 4 positional
+        args (or kw nav=..., cfg=...), nav required, sizing is computed
+        in-line, returned Signal has size_pct/shares.
+      - generate_signal(bars, base, cfg, ...) — new: 3 positional args
+        (or kw cfg=...), cfg only, pure Signal with no sizing. The
+        Portfolio sizes the position later.
+
+    New code should use the no-nav form and let the Portfolio size.
     """
+    # Backward compat: allow kw-only nav= and cfg= alongside positional
+    if len(args) == 0 and (nav is not None or cfg is not None):
+        args = (nav, cfg) if nav is not None else (cfg,)
+    elif len(args) == 1 and cfg is not None:
+        # Positional cfg + kw nav — invalid
+        raise TypeError(
+            "Cannot pass both positional cfg and keyword nav=..."
+        )
+
+    # Parse positional args to detect calling convention
+    if len(args) == 1:
+        # New API: (bars, base, cfg) — 3 positional args total
+        cfg = args[0]
+        nav = None
+    elif len(args) == 2:
+        # Legacy API: (bars, base, nav, cfg) — 4 positional args total
+        nav, cfg = args
+    else:
+        raise TypeError(
+            f"generate_signal() takes 3 or 4 positional arguments "
+            f"but {2 + len(args)} were given. "
+            f"Use generate_signal(bars, base, cfg) for pure Signal, "
+            f"or generate_signal(bars, base, nav, cfg) for legacy."
+        )
+
+    # Run the pure signal generation
+    sig = _generate_pure_signal(
+        bars, base, cfg, as_of_idx=as_of_idx,
+        upcoming_ca=upcoming_ca, market_bars=market_bars,
+        sector_momentum_by_date=sector_momentum_by_date,
+        ml_model=ml_model,
+    )
+    if sig is None:
+        return None
+
+    if nav is None:
+        # New API: return pure signal
+        return sig
+
+    # Legacy API: add sizing
+    return _with_legacy_sizing(sig, nav, cfg)
+
+
+def _generate_pure_signal(bars, base, cfg, *, as_of_idx, upcoming_ca,
+                           market_bars, sector_momentum_by_date, ml_model):
+    """Pure signal: no sizing, just the opportunity with exit levels."""
     breakout_idx = base.end_idx + 1
     if as_of_idx is None:
         as_of_idx = breakout_idx
@@ -245,27 +294,6 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
     # ATR at signal time (for ATR-based trailing stop and vol-targeting)
     atr_value = _atr(bars[: breakout_idx + 1], window=cfg.trailing.trail_atr_window)
 
-    # Sizing (legacy path — uses nav, lot-rounds, caps at max volume)
-    if cfg.backtest.vol_target_pct > 0:
-        size_pct = _vol_targeted_size_pct(atr_value, breakout_bar.close, cfg, conviction)
-    else:
-        size_pct = cfg.backtest.size_high if conviction == "high" else cfg.backtest.size_low
-    position_value = nav * size_pct
-    raw_shares = int(position_value // breakout_bar.close)
-    if raw_shares <= 0:
-        return None
-
-    lot = cfg.backtest.board_lot if cfg.backtest.board_lot > 0 else 1
-    shares = (raw_shares // lot) * lot
-    if shares <= 0:
-        return None
-
-    max_volume = int(avg_vol * 0.05)
-    if shares > max_volume > 0:
-        shares = (max_volume // lot) * lot
-        if shares <= 0:
-            return None
-
     sl_buffer = 1.0 - cfg.exits.sl_buffer_pct
     if cfg.exits.use_entry_anchored_stops:
         sl_F = breakout_bar.close * (1.0 - cfg.exits.sl_F_pct)
@@ -289,12 +317,36 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
         sl_T=round(sl_T, 4),
         tiers=cfg.exits.tiers,
         conviction=conviction,
-        size_pct=size_pct,
-        shares=shares,
-        max_volume=max_volume,
-        bars_remaining=len(bars) - breakout_idx - 1,
         atr_value=atr_value,
+        bars_remaining=len(bars) - breakout_idx - 1,
         extra={"avg_vol": avg_vol},
+    )
+
+
+def _with_legacy_sizing(sig, nav, cfg):
+    """Decorate a pure Signal with legacy sizing fields (size_pct, shares, max_volume).
+
+    Used only by the legacy generate_signal(bars, base, nav, cfg, ...) call
+    sites. New code should use Portfolio.size_position() instead.
+
+    Returns None if the position is too small for one board lot —
+    matches the legacy behavior where generate_signal returned None
+    for un-tradable signals.
+    """
+    from .portfolio import size_position
+    shares, size_pct = size_position(sig, nav, cfg)
+    if shares <= 0:
+        return None
+    avg_vol = sig.extra.get("avg_vol", 0) if sig.extra else 0
+    max_volume = int(avg_vol * 0.05) if avg_vol else 0
+    return Signal(
+        ticker=sig.ticker, signal_date=sig.signal_date,
+        entry_date=sig.entry_date, entry_price=sig.entry_price,
+        base=sig.base, sl_F=sig.sl_F, sl_T=sig.sl_T,
+        tiers=sig.tiers, conviction=sig.conviction,
+        atr_value=sig.atr_value, bars_remaining=sig.bars_remaining,
+        extra=sig.extra,
+        size_pct=size_pct, shares=shares, max_volume=max_volume,
     )
 
 

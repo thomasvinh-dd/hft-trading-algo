@@ -1047,5 +1047,31 @@ class OpenPositionsDedupeTests(unittest.TestCase):
         self.assertEqual(len(deduped), 0)
 
 
+class PortfolioBacktestTests(unittest.TestCase):
+    """The new run_backtest_with_portfolio() integrates the Portfolio
+    class with the signal generator. Verify the wiring works end-to-end."""
+
+    def test_run_backtest_with_portfolio_returns_portfolio(self):
+        from darvas_box_strategy.darvas.backtest import run_backtest_with_portfolio
+        from darvas_box_strategy.bot.cli import build_default_config
+        from pathlib import Path
+        cfg = build_default_config()
+        # Use a single ticker for speed
+        portfolio = run_backtest_with_portfolio(
+            cfg,
+            prices_dir=Path("/home/vst/Documents/Ai-trade/hft-trading-algo/vietnam_algo/data/prices"),
+            tickers=["SHB"],
+            progress=False,
+        )
+        # Should return a Portfolio
+        self.assertTrue(hasattr(portfolio, "history"))
+        self.assertTrue(hasattr(portfolio, "open_positions"))
+        # History should have at least some closed trades
+        self.assertGreater(len(portfolio.history), 0)
+        # No open positions on the last bar (or some, depending on data)
+        # for a single ticker
+        self.assertLessEqual(len(portfolio.open_positions), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

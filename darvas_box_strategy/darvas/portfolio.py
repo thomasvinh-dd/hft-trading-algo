@@ -581,6 +581,33 @@ class Portfolio:
             f"history={len(self.history)})"
         )
 
+    def to_backtest_result(self, *, start_date=None, end_date=None):
+        """Convert to a BacktestResult for compatibility with the old API.
+
+        This lets callers that expect BacktestResult continue to work
+        while the new Portfolio is the source of truth. The trade list
+        comes from portfolio.history (closed trades), the nav curve
+        from portfolio._daily_nav, and the open positions from
+        portfolio.open_positions.
+        """
+        from .backtest import BacktestResult
+        result = BacktestResult(portfolio_mode=True)
+        result.trades = list(self.history)
+        result.nav_curve = list(self._daily_nav)
+        result.daily_returns = self.get_daily_returns()
+        result.concurrent_position_peak = self.peak_concurrent
+        result.concurrent_skipped = self.skipped_signals
+        if self._daily_nav:
+            result.start = self._daily_nav[0][0]
+            result.end = self._daily_nav[-1][0]
+        elif start_date and end_date:
+            result.start = start_date
+            result.end = end_date
+        # Note: portfolio_open_positions remains empty in this
+        # serialization — the new Portfolio doesn't need a separate
+        # "open" dict because positions are stored in self.open_positions.
+        return result
+
 
 __all__ = [
     "Order",
