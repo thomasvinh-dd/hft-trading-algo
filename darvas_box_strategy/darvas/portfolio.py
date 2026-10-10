@@ -56,11 +56,42 @@ class Order:
 
 
 @dataclass
+class TradeFill:
+    """A single fill event in a trade's history.
+
+    Used to render the deal-detail timeline: every entry, partial exit,
+    full exit, and dividend is recorded. The list of TradeFills on a
+    Position/Trade shows the full process from signal to final exit.
+    """
+    date: object           # when the fill happened
+    kind: str              # ENTRY | TIER | TRAIL | SL_HARD | SL_SCALE | TIME_STOP | DIVIDEND
+    price: float           # fill price (or dividend per share for DIVIDEND)
+    shares: int            # shares bought (+) or sold (-). 0 for DIVIDEND.
+    pnl_delta: float       # realized PnL change from this fill (0 for ENTRY)
+    cumulative_pnl: float  # running PnL after this fill
+    remaining: int         # shares still held after this fill
+    note: str = ""         # extra context (e.g. "TP hit", "Hard stop")
+
+    def to_dict(self) -> dict:
+        return {
+            "date": self.date.isoformat() if hasattr(self.date, "isoformat") else str(self.date),
+            "kind": self.kind,
+            "price": self.price,
+            "shares": self.shares,
+            "pnl_delta": self.pnl_delta,
+            "cumulative_pnl": self.cumulative_pnl,
+            "remaining": self.remaining,
+            "note": self.note,
+        }
+
+
+@dataclass
 class Position:
     """An open position held by the portfolio.
 
     Mutable: the portfolio updates last_close, peak_close, remaining,
-    cumulative_pnl, etc. as new bars come in.
+    cumulative_pnl, etc. as new bars come in. The `fills` list is the
+    bar-by-bar history used to render the deal-detail timeline.
     """
     ticker: str
     signal: Signal
@@ -83,11 +114,17 @@ class Position:
     # For trade history reconstruction
     exit_date: Optional[object] = None
     exit_reason: Optional[str] = None
+    # Bar-by-bar event history (for the deal-detail timeline)
+    fills: list = field(default_factory=list)
 
 
 @dataclass
 class Trade:
-    """A closed position in the portfolio's history."""
+    """A closed position in the portfolio's history.
+
+    The `fills` list is the bar-by-bar event log (entry, tier exits,
+    SL hits, trail, dividends). Renders the deal-detail timeline.
+    """
     ticker: str
     signal: Signal
     entry_date: object
@@ -103,6 +140,8 @@ class Trade:
     highest_close: float
     last_close: float
     dividend_income: float = 0.0
+    # Bar-by-bar timeline (list of TradeFill dicts)
+    fills: list = field(default_factory=list)
 
     @property
     def is_winner(self) -> bool:
@@ -282,7 +321,7 @@ class Portfolio:
 
         # Open the position
         self.cash -= cost
-        self.open_positions[ticker] = Position(
+        pos = Position(
             ticker=ticker,
             signal=signal,
             shares=shares,
@@ -293,6 +332,18 @@ class Portfolio:
             peak_close=signal.entry_price,
             last_close=signal.entry_price,
         )
+        # Record the ENTRY event for the deal-detail timeline
+        pos.fills.append(TradeFill(
+            date=signal.entry_date,
+            kind="ENTRY",
+            price=signal.entry_price,
+            shares=shares,
+            pnl_delta=0.0,
+            cumulative_pnl=0.0,
+            remaining=shares,
+            note=f"Buy {shares:,} @ {signal.entry_price:,.0f} (size={size_pct:.0%})",
+        ))
+        self.open_positions[ticker] = pos
         self.peak_concurrent = max(self.peak_concurrent, len(self.open_positions))
 
         return Order(
@@ -506,6 +557,17 @@ class Portfolio:
             kind=kind,
             reason=f"close {shares} @ {fill_price:,.0f}",
         )
+        # Record this fill in the position's timeline
+        pos.fills.append(TradeFill(
+            date=bar_date,
+            kind=kind,
+            price=fill_price,
+            shares=-shares,  # negative = sold
+            pnl_delta=pnl - cost,
+            cumulative_pnl=pos.cumulative_pnl,
+            remaining=pos.remaining,
+            note=f"Sell {shares:,} @ {fill_price:,.0f}",
+        ))
         if pos.remaining <= 0:
             self._archive_position(pos, fill_price, kind, bar_date)
         return order
@@ -535,6 +597,7 @@ class Portfolio:
             highest_close=pos.peak_close,
             last_close=pos.last_close,
             dividend_income=pos.dividend_income,
+            fills=list(pos.fills),  # copy the timeline
         )
         self.history.append(trade)
 
@@ -611,6 +674,7 @@ class Portfolio:
 
 __all__ = [
     "Order",
+    "TradeFill",
     "Position",
     "Trade",
     "Portfolio",

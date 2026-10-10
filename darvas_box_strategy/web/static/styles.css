@@ -301,3 +301,56 @@ footer code {
   color: var(--accent);
   font-weight: 500;
 }
+
+/* Deal-detail timeline */
+.fill-kind {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.fill-kind-ENTRY {
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent);
+}
+.fill-kind-TIER {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--green);
+}
+.fill-kind-TRAIL {
+  background: rgba(63, 185, 80, 0.20);
+  color: var(--green);
+}
+.fill-kind-SL_HARD,
+.fill-kind-SL_SCALE {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--red);
+}
+.fill-kind-TIME_STOP {
+  background: rgba(210, 153, 34, 0.15);
+  color: var(--yellow);
+}
+.fill-kind-DIVIDEND {
+  background: rgba(125, 133, 144, 0.15);
+  color: var(--muted);
+}
+.fill-kind-EXHAUST {
+  background: rgba(125, 133, 144, 0.15);
+  color: var(--muted);
+}
+
+.fill-positive { color: var(--green); }
+.fill-negative { color: var(--red); }
+
+.deal-id-link {
+  cursor: pointer;
+  color: var(--accent);
+  text-decoration: none;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+}
+.deal-id-link:hover {
+  text-decoration: underline;
+}

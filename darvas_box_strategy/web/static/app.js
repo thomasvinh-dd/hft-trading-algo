@@ -218,8 +218,17 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#ticker-modal").addEventListener("click", (e) => {
     if (e.target.id === "ticker-modal") closeTickerModal();
   });
+  $("#deal-modal-close").addEventListener("click", closeDealModal);
+  $("#deal-modal").addEventListener("click", (e) => {
+    if (e.target.id === "deal-modal") closeDealModal();
+  });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeTickerModal();
+    if (e.key === "Escape") {
+      // Close whichever modal is open
+      const dealOpen = !$("#deal-modal").classList.contains("hidden");
+      if (dealOpen) closeDealModal();
+      else closeTickerModal();
+    }
   });
   load();
 });
@@ -253,6 +262,101 @@ async function openTickerModal(ticker) {
 
 function closeTickerModal() {
   $("#ticker-modal").classList.add("hidden");
+}
+
+// ---- Deal detail modal ----
+
+function attachDealClicks(container) {
+  container.querySelectorAll(".deal-id-link").forEach((el) => {
+    if (el.dataset.bound) return;
+    el.dataset.bound = "1";
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      openDealModal(el.dataset.dealId);
+    });
+  });
+}
+
+async function openDealModal(dealId) {
+  const modal = $("#deal-modal");
+  modal.classList.remove("hidden");
+  setText("#deal-modal-title", dealId);
+  setText("#deal-modal-subtitle", "Loading…");
+  $("#deal-modal-summary").innerHTML = "";
+  $("#deal-fills-table tbody").innerHTML = "";
+
+  try {
+    const d = await fetchJSON(`/api/deal/${encodeURIComponent(dealId)}`);
+    renderDealDetail(d);
+  } catch (e) {
+    setText("#deal-modal-subtitle", `Error: ${e.message}`);
+  }
+}
+
+function closeDealModal() {
+  $("#deal-modal").classList.add("hidden");
+}
+
+function renderDealDetail(d) {
+  if (!d) {
+    setText("#deal-modal-subtitle", "No data");
+    return;
+  }
+  // Subtitle
+  const status = d.is_open ? "OPEN" : `Closed ${d.exit_reason}`;
+  setText("#deal-modal-subtitle",
+    `${d.ticker} • ${d.shares.toLocaleString()} shares • ${status} • held ${d.bars_held} bars`);
+
+  // Summary tiles
+  const fmtVnd = v => (v == null ? "—" : VND(v));
+  const pnlClass = (d.pnl_pct || 0) >= 0 ? "pos" : "neg";
+  const pnlVnd = d.is_open ? null : d.pnl_vnd;
+  $("#deal-modal-summary").innerHTML = `
+    <div class="kpi"><div class="kpi-label">Entry</div>
+      <div class="kpi-value">${VND(d.entry_price)}</div></div>
+    <div class="kpi"><div class="kpi-label">${d.is_open ? "Last close" : "Exit"}</div>
+      <div class="kpi-value">${d.is_open ? VND(d.last_close) : VND(d.exit_price)}</div></div>
+    <div class="kpi"><div class="kpi-label">P&L</div>
+      <div class="kpi-value ${pnlClass}">${d.is_open ? "—" : PCT(d.pnl_pct)}</div></div>
+    <div class="kpi"><div class="kpi-label">P&L VND</div>
+      <div class="kpi-value ${pnlClass}">${fmtVnd(pnlVnd)}</div></div>
+    <div class="kpi"><div class="kpi-label">High</div>
+      <div class="kpi-value">${VND(d.highest_close)}</div></div>
+    <div class="kpi"><div class="kpi-label">Bars</div>
+      <div class="kpi-value">${d.bars_held}</div></div>
+  `;
+
+  // Fills table — the bar-by-bar timeline
+  const tbody = $("#deal-fills-table tbody");
+  tbody.innerHTML = "";
+  const fills = d.fills || [];
+  if (fills.length === 0) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="8" class="empty">No fill events recorded for this deal.</td>`;
+    tbody.appendChild(tr);
+    return;
+  }
+  let runningShares = 0;
+  for (const f of fills) {
+    const tr = document.createElement("tr");
+    const isBuy = (f.shares || 0) > 0;
+    const isSell = (f.shares || 0) < 0;
+    const pnlClass = (f.pnl_delta || 0) > 0 ? "fill-positive" :
+                      (f.pnl_delta || 0) < 0 ? "fill-negative" : "";
+    // Track running shares for visual context (not in fill data)
+    runningShares = f.remaining != null ? f.remaining : runningShares;
+    tr.innerHTML = `
+      <td class="muted small">${f.date || ""}</td>
+      <td><span class="fill-kind fill-kind-${f.kind}">${f.kind}</span></td>
+      <td>${f.price ? VND(f.price) : "—"}</td>
+      <td class="${isBuy ? "fill-positive" : isSell ? "fill-negative" : ""}">${f.shares > 0 ? "+" : ""}${(f.shares || 0).toLocaleString()}</td>
+      <td class="${pnlClass}">${f.pnl_delta ? (f.pnl_delta > 0 ? "+" : "") + VND(f.pnl_delta) : "—"}</td>
+      <td class="${(f.cumulative_pnl || 0) >= 0 ? "fill-positive" : "fill-negative"}">${f.cumulative_pnl != null ? (f.cumulative_pnl > 0 ? "+" : "") + VND(f.cumulative_pnl) : "—"}</td>
+      <td>${(f.remaining || 0).toLocaleString()}</td>
+      <td class="muted small">${f.note || ""}</td>
+    `;
+    tbody.appendChild(tr);
+  }
 }
 
 function renderTickerHistory(h) {
@@ -295,9 +399,8 @@ function renderTickerHistory(h) {
       ? `<span class="reason-open">OPEN</span>`
       : `<span>${d.exit_reason}</span>`;
     const exitPx = d.is_open ? "—" : VND(d.exit_price);
-    const pnlVnd = d.pnl_vnd == null ? "—" : VND(d.pnl_vnd);
     tr.innerHTML = `
-      <td class="deal-id-cell">${d.deal_id}</td>
+      <td><a class="deal-id-link" data-deal-id="${d.deal_id}">${d.deal_id}</a></td>
       <td class="muted small">${d.entry_date}</td>
       <td>${VND(d.entry_price)}</td>
       <td class="muted small">${d.is_open ? "—" : d.exit_date}</td>
@@ -308,4 +411,5 @@ function renderTickerHistory(h) {
     `;
     tbody.appendChild(tr);
   }
+  attachDealClicks(tbody);
 }

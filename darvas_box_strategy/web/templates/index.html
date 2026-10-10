@@ -183,6 +183,39 @@
   </div>
 </div>
 
+<!-- Deal detail modal: shown when a deal_id cell is clicked -->
+<div id="deal-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal">
+    <header class="modal-header">
+      <div>
+        <h2 id="deal-modal-title">—</h2>
+        <span class="muted small" id="deal-modal-subtitle"></span>
+      </div>
+      <button id="deal-modal-close" class="modal-close" aria-label="Close">×</button>
+    </header>
+    <div class="modal-body">
+      <section class="kpis ticker-kpis" id="deal-modal-summary"></section>
+      <div class="table-wrap scroll modal-table-wrap">
+        <table id="deal-fills-table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Event</th>
+              <th>Price</th>
+              <th>Shares</th>
+              <th>Δ PnL</th>
+              <th>Cum PnL</th>
+              <th>Remaining</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

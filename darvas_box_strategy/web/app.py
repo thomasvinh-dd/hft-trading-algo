@@ -101,6 +101,58 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
         return jsonify(history)
 
+    @app.route("/api/deal/<deal_id>")
+    def api_deal(deal_id):
+        """Return the full timeline (fills) for one deal.
+
+        deal_id is the trade's identifier, e.g. ``MSN_2026-10-07``.
+        Searches the cached history for the matching trade, including
+        any currently-open position for the same ticker+date.
+
+        Returns the trade summary + a list of fills showing every
+        entry, tier exit, SL hit, trail, and dividend event in
+        chronological order. Used to render the deal-detail modal.
+        """
+        # Validate the deal_id format (TICKER_YYYY-MM-DD)
+        if "_" not in deal_id or len(deal_id) > 25:
+            return jsonify({"error": "invalid deal_id format"}), 400
+        ticker, _, entry_date_str = deal_id.partition("_")
+        ticker = ticker.upper()
+        if not ticker or not ticker.isalnum():
+            return jsonify({"error": "invalid ticker in deal_id"}), 400
+
+        cache = load_cache()
+        ticker_hist = cache.ticker_history.get(ticker, {})
+        if not ticker_hist:
+            return jsonify({"error": f"no history for {ticker}"}), 404
+
+        # Find the matching deal
+        for d in ticker_hist.get("deals", []):
+            if d.get("deal_id") == deal_id:
+                return jsonify({
+                    "ticker": ticker,
+                    "deal_id": deal_id,
+                    "entry_date": d.get("entry_date"),
+                    "signal_date": d.get("signal_date"),
+                    "entry_price": d.get("entry_price"),
+                    "exit_price": d.get("exit_price"),
+                    "exit_date": d.get("exit_date"),
+                    "exit_reason": d.get("exit_reason"),
+                    "shares": d.get("shares"),
+                    "is_open": d.get("is_open"),
+                    "bars_held": d.get("bars_held"),
+                    "highest_close": d.get("highest_close"),
+                    "last_close": d.get("last_close"),
+                    "pnl_pct": d.get("pnl_pct"),
+                    "pnl_vnd": d.get("pnl_vnd"),
+                    "size_pct": d.get("size_pct"),
+                    "sl_F": d.get("sl_F"),
+                    "sl_T": d.get("sl_T"),
+                    # The timeline — what happened bar-by-bar
+                    "fills": d.get("fills", []),
+                })
+        return jsonify({"error": f"deal {deal_id} not found"}), 404
+
     @app.route("/api/backtest")
     def api_backtest():
         cache = load_cache()

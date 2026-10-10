@@ -212,6 +212,63 @@ def get_open_positions(cfg=None) -> List[Dict[str, Any]]:
     return load_cache().open_positions
 
 
+def _fills_to_dicts(fills, signal=None) -> List[Dict[str, Any]]:
+    """Convert a list of FillEvent (or TradeFill) into JSON-safe dicts.
+
+    The fill objects come from the executor (FillEvent) or the new
+    Portfolio (TradeFill). They have a slightly different shape, so
+    we normalize them here. The deal-detail modal uses the dict
+    format below.
+
+    The old executor's simulate_trade does not record an ENTRY fill —
+    the fills list starts with the first exit event. We synthesize
+    a proper ENTRY here using the signal's entry_price and shares.
+    We also compute cumulative_pnl correctly: sum the per-fill
+    realized_pnl values (not the gross proceeds).
+    """
+    out: List[Dict[str, Any]] = []
+    # Synthesize ENTRY if the fills list doesn't have one
+    has_entry = any(getattr(f, "kind", "") == "ENTRY" for f in fills)
+    if not has_entry and signal is not None:
+        out.append({
+            "date": signal.entry_date.isoformat()
+                if hasattr(signal.entry_date, "isoformat") else str(signal.entry_date),
+            "kind": "ENTRY",
+            "price": float(signal.entry_price),
+            "shares": int(signal.shares),
+            "pnl_delta": 0.0,
+            "cumulative_pnl": 0.0,
+            "remaining": int(signal.shares),
+            "note": f"Buy {int(signal.shares):,} @ {signal.entry_price:,.0f}",
+        })
+    running_pnl = 0.0
+    for f in fills:
+        # FillEvent: date, kind, level, shares, proceeds, fraction_of_pos,
+        #            cumulative_proceeds, realized_pnl
+        # TradeFill: date, kind, price, shares, pnl_delta,
+        #            cumulative_pnl, remaining, note
+        d = {}
+        if hasattr(f, "to_dict"):
+            # New TradeFill
+            d = f.to_dict()
+        else:
+            # Old FillEvent — compute running PnL from realized_pnl
+            pnl_delta = float(getattr(f, "realized_pnl", 0.0))
+            running_pnl += pnl_delta
+            d = {
+                "date": f.date.isoformat() if hasattr(f.date, "isoformat") else str(f.date),
+                "kind": f.kind,
+                "price": float(f.level),
+                "shares": int(f.shares) if f.kind != "DIVIDEND" else 0,
+                "pnl_delta": pnl_delta,
+                "cumulative_pnl": running_pnl,
+                "remaining": 0,  # not tracked in old format
+                "note": "",
+            }
+        out.append(d)
+    return out
+
+
 def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
     """Return all deals (open + closed) for a single ticker.
 
@@ -295,6 +352,8 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
             "size_pct": float(sig.size_pct),
             "sl_F": float(sig.sl_F),
             "sl_T": float(sig.sl_T),
+            # The bar-by-bar event log — used by the deal-detail modal
+            "fills": _fills_to_dicts(getattr(t, "fills", ()), signal=sig),
         })
 
     # Sort by entry date descending — newest first

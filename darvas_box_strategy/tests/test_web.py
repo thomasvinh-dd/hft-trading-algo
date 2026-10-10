@@ -272,6 +272,25 @@ class SummarizeBacktestTests(unittest.TestCase):
         self.assertEqual(s["win_rate_pct"], 0.0)
 
 
+class DealEndpointTests(unittest.TestCase):
+    """The /api/deal/<deal_id> endpoint returns the full timeline
+    (fills) for one deal — used by the deal-detail modal."""
+
+    def setUp(self):
+        from darvas_box_strategy.web.app import create_app
+        self.app = create_app()
+        self.client = self.app.test_client()
+
+    def test_deal_endpoint_rejects_invalid(self):
+        r = self.client.get("/api/deal/INVALID%20ID")
+        self.assertIn(r.status_code, (400, 404))
+
+    def test_deal_endpoint_returns_404_for_unknown(self):
+        r = self.client.get("/api/deal/XXXX_2099-01-01")
+        # Either 404 (no history) or 200 with empty data — both ok
+        self.assertIn(r.status_code, (200, 404))
+
+
 if __name__ == "__main__":
     unittest.main()
 
