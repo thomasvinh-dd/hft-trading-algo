@@ -21,6 +21,25 @@ class TelegramConfig:
     enabled: bool = True
 
 
+def _parse_env_file(path: Path) -> dict:
+    """Parse a simple KEY=VALUE .env file. Returns dict.
+
+    Lines starting with '#' or empty lines are ignored. Values may be
+    optionally wrapped in single or double quotes. Used by the tests
+    to verify file-parsing logic in isolation from real credentials.
+    """
+    if not path.exists():
+        return {}
+    out: dict = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
 def load_telegram_config(env_path: Optional[Path] = None) -> Optional[TelegramConfig]:
     """Load Telegram credentials.
 
@@ -41,31 +60,15 @@ def load_telegram_config(env_path: Optional[Path] = None) -> Optional[TelegramCo
     # parents[1] = darvas_box_strategy/
     darvas_env = Path(__file__).resolve().parents[1] / "data" / "bot.env"
     if (not token or not chat_id) and darvas_env.exists():
-        for line in darvas_env.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k == "TELEGRAM_BOT_TOKEN" and not token:
-                token = v
-            elif k == "TELEGRAM_CHAT_ID" and not chat_id:
-                chat_id = v
+        parsed = _parse_env_file(darvas_env)
+        token = token or parsed.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = chat_id or parsed.get("TELEGRAM_CHAT_ID", "")
 
     # Fall back to the autofin .env (shared file)
     if (not token or not chat_id) and env_path and env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k == "TELEGRAM_BOT_TOKEN" and not token:
-                token = v
-            elif k == "TELEGRAM_CHAT_ID" and not chat_id:
-                chat_id = v
+        parsed = _parse_env_file(env_path)
+        token = token or parsed.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = chat_id or parsed.get("TELEGRAM_CHAT_ID", "")
 
     enabled = os.environ.get("TELEGRAM_NOTIFICATIONS", "1").strip().lower() not in {
         "0", "false", "no", "off"

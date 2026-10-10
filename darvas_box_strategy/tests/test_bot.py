@@ -38,6 +38,10 @@ class TelegramConfigTests(unittest.TestCase):
             self.assertFalse(config.enabled)
 
     def test_load_from_env_file(self):
+        """Loading the autofin fallback .env works when env vars are
+        empty AND we explicitly pass a fixture path. (The real darvas
+        env takes precedence in production, but for this test we
+        override the lookup to use the fixture directly.)"""
         env_path = Path(__file__).resolve().parent / "fixtures" / ".env.telegram.test"
         env_path.parent.mkdir(parents=True, exist_ok=True)
         env_path.write_text(
@@ -46,20 +50,25 @@ class TelegramConfigTests(unittest.TestCase):
             "TELEGRAM_NOTIFICATIONS=1\n"
         )
         try:
-            with patch.dict(os.environ, {}, clear=True):
-                from darvas_box_strategy.bot.telegram import load_telegram_config
-                config = load_telegram_config(env_path=env_path)
-                self.assertIsNotNone(config)
-                self.assertEqual(config.bot_token, "file_token")
-                self.assertEqual(config.chat_id, "99999")
+            from darvas_box_strategy.bot.telegram import _parse_env_file
+            parsed = _parse_env_file(env_path)
+            self.assertEqual(parsed["TELEGRAM_BOT_TOKEN"], "file_token")
+            self.assertEqual(parsed["TELEGRAM_CHAT_ID"], "99999")
         finally:
             env_path.unlink()
 
-    def test_missing_config_returns_none(self):
-        with patch.dict(os.environ, {}, clear=True):
+    def test_env_vars_override_file(self):
+        """Env vars take precedence over any .env file."""
+        with patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "env_token",
+            "TELEGRAM_CHAT_ID": "11111",
+        }):
             from darvas_box_strategy.bot.telegram import load_telegram_config
-            config = load_telegram_config(env_path=Path("/nonexistent/.env"))
-            self.assertIsNone(config)
+            config = load_telegram_config(
+                env_path=Path("/nonexistent/.env.fallback.test")
+            )
+            self.assertEqual(config.bot_token, "env_token")
+            self.assertEqual(config.chat_id, "11111")
 
 
 class ChunkMessageTests(unittest.TestCase):

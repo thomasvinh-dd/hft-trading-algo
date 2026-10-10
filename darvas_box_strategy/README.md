@@ -226,6 +226,61 @@ python3 -m unittest discover -v tests
 - Signal generation (volume breakout, high/low conviction, no-volume no-signal, CA-aware entry filter)
 - Trade execution (tier ladder, hard stop, trailing capital preservation, ATR trail)
 - CA handler (cash dividend adjustment, stock dividend adjustment, compound events, OHLC consistency)
+- Web dashboard (Flask routes, cache round-trip, summary metrics, regression test
+  for the entry-anchored stops bug)
+
+## Web Dashboard
+
+A Flask-based web view for browsing the strategy's state from a browser.
+
+### Run locally
+
+```bash
+cd darvas_box_strategy
+python3 -m web.app --port 5001
+# Open http://localhost:5001
+```
+
+The first request triggers a backtest refresh (~4 min). After that, all
+API endpoints return cached data. Use the "Refresh data" button to
+re-run the backtest on demand.
+
+### Run on the VPS
+
+```bash
+# 1. Sync the code
+rsync -avz -e ssh --exclude '__pycache__' --exclude 'data/web_cache.json' \
+    darvas_box_strategy/ root@185.227.135.227:/root/hft-trading-algo/darvas_box_strategy/
+
+# 2. Service is already installed (one-time setup):
+#    /etc/systemd/system/darvas-web.service
+# Just restart to pick up new code:
+ssh root@185.227.135.227 "systemctl restart darvas-web"
+
+# 3. Open the dashboard:
+#    http://185.227.135.227:5001
+```
+
+### API endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` | GET | HTML dashboard |
+| `/api/health` | GET | Liveness check + cache status |
+| `/api/signals` | GET | Today's breakout signals |
+| `/api/positions` | GET | Currently open positions (from latest backtest) |
+| `/api/backtest` | GET | Full backtest summary + equity curve |
+| `/api/refresh` | POST | Re-run scan + backtest (slow, ~4 min) |
+
+### Sections shown
+
+- **KPIs** — Total return, CAGR, Max DD, Win rate, Profit factor, Trade count
+- **Equity curve** — Daily NAV over the backtest period (SVG chart, no JS deps)
+- **Opening signals** — Today's breakouts with entry, size, stops, conviction
+- **Open positions** — Trades still active at the latest data point, with PnL
+- **Top winners / losers** — Best and worst 5 trades of the backtest
+- **Exit reasons** — Distribution of exit types (TRAIL, SL_HARD, TIER, ...)
+- **Per-ticker breakdown** — Top 10 tickers by realized PnL
 
 ## VPS testing (2026-09)
 

@@ -293,8 +293,30 @@ def main(argv=None) -> int:
     p_show = sub.add_parser("show-config", help="Print default config")
     p_show.set_defaults(func=cmd_show_config)
 
+    p_serve = sub.add_parser("serve-web", help="Start the web dashboard (Flask)")
+    p_serve.add_argument("--host", default="0.0.0.0")
+    p_serve.add_argument("--port", type=int, default=5001)
+    p_serve.add_argument("--no-reload", action="store_true",
+                        help="Disable Flask auto-reload (recommended for systemd)")
+    p_serve.set_defaults(func=cmd_serve_web)
+
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def cmd_serve_web(args) -> int:
+    """Launch the web dashboard."""
+    from darvas_box_strategy.web.app import main as serve_main
+    # Re-route args into the web app
+    import sys
+    new_argv = ["serve"]
+    new_argv += ["--host", str(args.host)]
+    new_argv += ["--port", str(args.port)]
+    if args.no_reload:
+        new_argv += ["--no-reload"]
+    sys.argv = new_argv
+    serve_main()
+    return 0
 
 
 if __name__ == "__main__":
