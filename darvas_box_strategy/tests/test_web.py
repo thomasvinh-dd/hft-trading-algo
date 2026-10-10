@@ -344,19 +344,23 @@ class OpenPositionToDictWithDealIdTests(unittest.TestCase):
             sl_T = 67680.0
             size_pct = 0.40
             entry_date = date(2026, 10, 9)
+            signal_date = date(2026, 10, 8)
             shares = 5000
 
         class FakeTrade:
             signal = FakeSignal()
             highest_close = 76000.0
+            last_close = 75700.0  # current price (lower than peak)
             bars_held = 5
 
         d = _open_position_to_dict(FakeTrade())
         self.assertEqual(d["deal_id"], "MSN_2026-10-09")
         self.assertEqual(d["ticker"], "MSN")
         self.assertEqual(d["shares"], 5000)
-        # PnL math should be 1.06% = (76000/75200 - 1) * 100
-        self.assertAlmostEqual(d["pnl_pct"], 1.0638, places=2)
+        # PnL math uses last_close (not highest_close): (75700/75200 - 1) * 100
+        self.assertAlmostEqual(d["pnl_pct"], 0.6649, places=2)
+        # last_close in the response should be 75700, not 76000
+        self.assertEqual(d["last_close"], 75700.0)
 
 
 class WebCacheDealIdTests(unittest.TestCase):

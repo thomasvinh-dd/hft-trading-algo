@@ -152,10 +152,21 @@ def _portfolio_layer(cfg, trades, start, end, mtm_mode="close"):
             bars_cache[ticker] = []  # placeholder
         return bars_cache.get(ticker, [])
 
-    # Group trades by entry_date for the replay loop.
+    # Group trades by the date the portfolio "books" them — i.e. the
+    # signal day, not the actual fill day. This matches the order
+    # placement timing: the alert arrives on the signal bar, the order
+    # is placed at next session's open, and the fill happens on the
+    # entry_date. The portfolio "opens" the trade on the signal day
+    # (cost is reserved) and the executor tracks fill + PnL from the
+    # entry_date onwards. Using signal_date here preserves the legacy
+    # backtest behavior; using entry_date shifts each trade one bar
+    # later in the equity curve (less time in market = less PnL).
     by_entry = defaultdict(list)
     for t in trades:
-        by_entry[t.signal.entry_date].append(t)
+        # Prefer signal_date; fall back to entry_date for any test
+        # signals that don't have it (legacy).
+        key_date = getattr(t.signal, "signal_date", t.signal.entry_date)
+        by_entry[key_date].append(t)
 
     # Index trades by ticker for exit lookups.
     by_ticker_exit = {}
@@ -390,7 +401,10 @@ def _portfolio_layer_with_bars(cfg, trades, start, end, *, bars_by_ticker,
 
     by_entry = defaultdict(list)
     for t in trades:
-        by_entry[t.signal.entry_date].append(t)
+        # Use signal_date for portfolio booking (see _portfolio_layer
+        # comment above for the rationale).
+        key_date = getattr(t.signal, "signal_date", t.signal.entry_date)
+        by_entry[key_date].append(t)
 
     by_ticker_exit = {}
     for t in trades:

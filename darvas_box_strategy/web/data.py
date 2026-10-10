@@ -135,9 +135,17 @@ def _signal_to_dict(s, deal_seq: int = 0) -> Dict[str, Any]:
 
 
 def _open_position_to_dict(t, deal_seq: int = 0) -> Dict[str, Any]:
-    """Build a display dict for a trade that's still open at the latest bar."""
+    """Build a display dict for a trade that's still open at the latest bar.
+
+    Uses the actual last observed close (not the peak) so the displayed
+    PnL matches what a live broker would show right now.
+    """
     sig = t.signal
-    last_close = float(t.highest_close) if t.highest_close else float(sig.entry_price)
+    # Prefer the executor's last_close (latest bar, post-limit). Fall back
+    # to highest_close for trades simulated before this field was added.
+    last_close = float(getattr(t, "last_close", 0.0) or 0.0) or float(
+        t.highest_close if t.highest_close else sig.entry_price
+    )
     pnl_pct = (last_close / float(sig.entry_price) - 1.0) * 100.0
     pnl_vnd = (last_close - float(sig.entry_price)) * int(sig.shares)
     return {
@@ -153,6 +161,8 @@ def _open_position_to_dict(t, deal_seq: int = 0) -> Dict[str, Any]:
         "pnl_vnd": pnl_vnd,
         "entry_date": sig.entry_date.isoformat()
             if hasattr(sig.entry_date, "isoformat") else str(sig.entry_date),
+        "signal_date": sig.signal_date.isoformat()
+            if hasattr(sig.signal_date, "isoformat") else str(sig.signal_date),
         "bars_held": int(t.bars_held) if hasattr(t, "bars_held") else 0,
     }
 
@@ -265,10 +275,17 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
             "deal_id": _make_deal_id(ticker, ed, seq),
             "ticker": ticker,
             "entry_date": ed.isoformat() if hasattr(ed, "isoformat") else str(ed),
+            "signal_date": sig.signal_date.isoformat()
+                if hasattr(sig.signal_date, "isoformat") else str(sig.signal_date),
             "exit_date": t.exit_date.isoformat() if hasattr(t.exit_date, "isoformat") else str(t.exit_date),
             "entry_price": float(sig.entry_price),
             "exit_price": exit_price,
-            "last_close": round(float(t.highest_close or sig.entry_price), 0),
+            # last_close is the actual latest bar (not the peak). For closed
+            # trades, the exit_price is more meaningful; for open trades,
+            # last_close is what a live broker would show right now.
+            "last_close": round(float(
+                getattr(t, "last_close", 0.0) or t.highest_close or sig.entry_price
+            ), 0),
             "pnl_pct": round(t.return_pct * 100, 2),
             "pnl_vnd": round(t.realized_pnl, 0) if not is_open else None,
             "exit_reason": t.exit_reason if not is_open else "OPEN",
@@ -368,9 +385,13 @@ def _summarize_backtest(result, cfg, filtered) -> Dict[str, Any]:
             "ticker": t.signal.ticker,
             "entry_date": t.signal.entry_date.isoformat()
                 if hasattr(t.signal.entry_date, "isoformat") else str(t.signal.entry_date),
+            "signal_date": t.signal.signal_date.isoformat()
+                if hasattr(t.signal.signal_date, "isoformat") else str(t.signal.signal_date),
             "exit_date": t.exit_date.isoformat()
                 if hasattr(t.exit_date, "isoformat") else str(t.exit_date),
             "pnl_pct": round(t.return_pct * 100, 2),
+            "shares": t.signal.shares,
+            "size_pct": round(t.signal.size_pct * 100, 0),
             "exit_reason": t.exit_reason,
             "bars_held": t.bars_held,
         }
@@ -382,9 +403,13 @@ def _summarize_backtest(result, cfg, filtered) -> Dict[str, Any]:
             "ticker": t.signal.ticker,
             "entry_date": t.signal.entry_date.isoformat()
                 if hasattr(t.signal.entry_date, "isoformat") else str(t.signal.entry_date),
+            "signal_date": t.signal.signal_date.isoformat()
+                if hasattr(t.signal.signal_date, "isoformat") else str(t.signal.signal_date),
             "exit_date": t.exit_date.isoformat()
                 if hasattr(t.exit_date, "isoformat") else str(t.exit_date),
             "pnl_pct": round(t.return_pct * 100, 2),
+            "shares": t.signal.shares,
+            "size_pct": round(t.signal.size_pct * 100, 0),
             "exit_reason": t.exit_reason,
             "bars_held": t.bars_held,
         }

@@ -34,6 +34,7 @@ class TradeResult:
     cost_paid: float
     bars_held: int
     highest_close: float
+    last_close: float = 0.0  # latest bar.close during the trade (NOT peak)
     dividend_income: float = 0.0
 
     @property
@@ -41,10 +42,32 @@ class TradeResult:
         return self.realized_pnl > 0
 
 
+def _cap_to_daily_limit(bar, prev_close: float, limit_pct: float) -> float:
+    """Cap bar.close to the daily price limit relative to prev_close.
+
+    VN HOSE: ±7% per day. So today's close must be in [prev*(1-L), prev*(1+L)].
+    Used by simulate_trade to model the regulatory price limit.
+    """
+    if prev_close <= 0 or limit_pct <= 0:
+        return bar.close
+    upper = prev_close * (1.0 + limit_pct)
+    lower = prev_close * (1.0 - limit_pct)
+    if bar.close > upper:
+        return upper
+    if bar.close < lower:
+        return lower
+    return bar.close
+
+
 def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_value=None):
     exits_cfg = cfg.exits
     trail_cfg = cfg.trailing
     cost_rate = cfg.backtest.cost_bps / 10_000.0
+    lot = cfg.backtest.board_lot if cfg.backtest.board_lot > 0 else 1
+    daily_limit = cfg.backtest.daily_price_limit_pct
+    # T+2.5 settlement: skip the first N-1 bars for exit logic.
+    # 0 = legacy (immediate exit allowed)
+    t_plus_n = max(0, exits_cfg.t_plus_n_bars - 1) if exits_cfg.t_plus_n_bars > 0 else 0
 
     remaining = signal.shares
     entry_value = signal.shares * signal.entry_price
@@ -57,7 +80,9 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
     trail_floor = 0.0
     peak_close = signal.entry_price
     highest_close = signal.entry_price
+    last_close = signal.entry_price
     last_bar = None
+    prev_close = signal.entry_price  # for daily price limit anchoring
 
     # ATR-based trail: precompute the trail distance from the ATR.
     # The trail follows `peak - atr_value * trail_atr_mult`. If ATR
@@ -74,9 +99,18 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
     bars_held = 0
     for bar in bars_after:
         last_bar = bar
-        highest_close = max(highest_close, bar.close)
-        peak_close = max(peak_close, bar.close)
+        # Apply the daily price limit relative to the previous close.
+        # This caps unrealistic gap moves (e.g. -15% in a day when the
+        # regulatory limit is ±7%).
+        effective_close = _cap_to_daily_limit(bar, prev_close, daily_limit)
+        highest_close = max(highest_close, effective_close)
+        peak_close = max(peak_close, effective_close)
+        last_close = effective_close
         bars_held += 1
+
+        # T+2.5 settlement: don't allow exits during the lock-up period.
+        # Dividends, however, still apply to the position we hold.
+        in_settlement = bars_held <= t_plus_n
 
         if dividend_per_share and bar.date in dividend_per_share and remaining > 0:
             cash_div = dividend_per_share[bar.date]
@@ -90,16 +124,20 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=income,
             ))
 
+        if in_settlement:
+            prev_close = effective_close
+            continue
+
         # Time stop: if held too long and not in profit, close at close.
         max_hold = getattr(cfg.backtest, "max_holding_bars", 0) or 0
-        if max_hold > 0 and remaining > 0 and bars_held >= max_hold and bar.close < signal.entry_price:
-            proceeds = remaining * bar.close
-            pnl = (bar.close - signal.entry_price) * remaining
+        if max_hold > 0 and remaining > 0 and bars_held >= max_hold and effective_close < signal.entry_price:
+            proceeds = remaining * effective_close
+            pnl = (effective_close - signal.entry_price) * remaining
             cost = proceeds * cost_rate * 0.5
             cumulative_proceeds += proceeds - cost
             cumulative_pnl += pnl - cost
             fills.append(FillEvent(
-                date=bar.date, kind="TIME_STOP", level=bar.close, shares=remaining,
+                date=bar.date, kind="TIME_STOP", level=effective_close, shares=remaining,
                 proceeds=proceeds - cost, fraction_of_pos=1.0,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
             ))
@@ -115,14 +153,14 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             # Optionally floor at first-tier exit price
             if trail_cfg.trail_floor_lock_profit:
                 trail_threshold = max(trail_threshold, trail_floor)
-            if bar.close <= trail_threshold:
-                proceeds = remaining * bar.close
-                pnl = (bar.close - signal.entry_price) * remaining
+            if effective_close <= trail_threshold:
+                proceeds = remaining * effective_close
+                pnl = (effective_close - signal.entry_price) * remaining
                 cost = proceeds * cost_rate * 0.5
                 cumulative_proceeds += proceeds - cost
                 cumulative_pnl += pnl - cost
                 fills.append(FillEvent(
-                    date=bar.date, kind="TRAIL", level=bar.close, shares=remaining,
+                    date=bar.date, kind="TRAIL", level=effective_close, shares=remaining,
                     proceeds=proceeds - cost, fraction_of_pos=1.0,
                     cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
                 ))
@@ -135,7 +173,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             if bar.high < tier_price:
                 break
             tier_shares = max(int(remaining * pct), 0)
-            if remaining - tier_shares < 100:
+            if remaining - tier_shares < lot:
                 tier_shares = remaining
             if tier_shares <= 0:
                 tier_idx += 1
@@ -210,14 +248,18 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             remaining = 0
             break
 
+        prev_close = effective_close
+
     if remaining > 0 and last_bar is not None:
-        proceeds = remaining * last_bar.close
-        pnl = (last_bar.close - signal.entry_price) * remaining
+        # Use the last observed (limit-capped) close for the EXHAUST price
+        effective_close = last_close
+        proceeds = remaining * effective_close
+        pnl = (effective_close - signal.entry_price) * remaining
         cost = proceeds * cost_rate * 0.5
         cumulative_proceeds += proceeds - cost
         cumulative_pnl += pnl - cost
         fills.append(FillEvent(
-            date=last_bar.date, kind="EXHAUST", level=last_bar.close, shares=remaining,
+            date=last_bar.date, kind="EXHAUST", level=effective_close, shares=remaining,
             proceeds=proceeds - cost, fraction_of_pos=1.0,
             cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
         ))
@@ -240,6 +282,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
         cost_paid=entry_value * cost_rate + sum(f.realized_pnl for f in fills) - cumulative_pnl,
         bars_held=len(fills),
         highest_close=highest_close,
+        last_close=last_close,
         dividend_income=dividend_income,
     )
 

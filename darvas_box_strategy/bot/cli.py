@@ -54,6 +54,9 @@ def build_default_config() -> StrategyConfig:
     - trail=10% — let winners compound after partial cut
     - size 0.20/0.40 — 2x conviction sizing
     - sl_T=10%, sl_F=18% — entry-anchored stops (was base-anchored, buggy)
+    - board_lot=100 — HOSE 100-share lots; small signals dropped
+    - t_plus_n_bars=0 (off) — opt-in: T+2.5 settlement costs ~25% return
+    - daily_price_limit_pct=0 (off) — opt-in: ±7% price cap costs ~16% return
     """
     return StrategyConfig(
         base=BaseConfig(min_days=5, max_days=30, max_range_pct=0.030),
@@ -77,6 +80,9 @@ def build_default_config() -> StrategyConfig:
             size_low=0.20, size_high=0.40,
             vol_target_pct=0.0,  # OFF: fixed sizing beats vol-targeting
             vol_target_floor=0.05, vol_target_ceiling=0.30,
+            board_lot=100,  # HOSE board lot: shares rounded down to 100s
+            # daily_price_limit_pct=0.07,  # opt-in: ±7% daily price cap
+            # t_plus_n_bars=3,  # opt-in: VN T+2.5 settlement (costs ~25% return)
         ),
     )
 
@@ -237,10 +243,12 @@ def cmd_scan_signals(args) -> int:
         lines.append(f"_Universe_: HOSE blue chips ({len(filtered)} tickers)")
         lines.append("")
         for s in sorted(signals, key=lambda x: -x.size_pct):
+            notional = s.shares * s.entry_price
             lines.append(
                 f"• *{s.ticker}* @ {s.entry_price:,.0f}\n"
-                f"  size {s.size_pct * 100:.0f}% NAV, "
-                f"sl_F={s.sl_F:,.0f}, sl_T={s.sl_T:,.0f}"
+                f"  {s.shares:,} sh (~{notional / 1e6:.0f}M VND), "
+                f"size {s.size_pct * 100:.0f}% NAV, "
+                f"sl_T={s.sl_T:,.0f}, sl_F={s.sl_F:,.0f}"
             )
 
     text = "\n".join(lines)

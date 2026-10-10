@@ -148,19 +148,33 @@ StrategyConfig(
 
 ### Final result on 70 HOSE blue chips (2019-2026)
 
-| Metric | Buggy | Fixed | Tuned |
-|---|---:|---:|---:|
-| Total return | +161.9% | +134.4% | **+240.2%** |
-| Max DD | -15.15% | -12.71% | **-10.49%** |
-| Win rate | 60.73% | 60.24% | **67.20%** |
-| Profit factor | 1.73x | 1.90x | **1.90x** |
-| Top single loss | **-45%** | -9% | -13% |
-| CAGR | ~13% | ~11% | **~19%** |
+| Metric | Buggy | Fixed | Tuned | Tuned + lot rounding |
+|---|---:|---:|---:|---:|
+| Total return | +161.9% | +134.4% | +240.2% | **+211.4%** |
+| Max DD | -15.15% | -12.71% | -10.49% | **-16.62%** |
+| Win rate | 60.73% | 60.24% | 67.20% | **67.50%** |
+| Profit factor | 1.73x | 1.90x | 1.90x | **1.93x** |
+| Top single loss | **-45%** | -9% | -13% | -13% |
+| CAGR | ~13% | ~11% | ~19% | **~17%** |
 
 **Three critical bugs were fixed**:
 1. **Stop-loss anchoring** (was -45%, now -13%) — see `darvas_box_strategy/tools/sweep_stop_pct.py`
 2. **Vol-targeting** (was 2%, now off) — fixed 2× sizing wins in trend markets
 3. **Trail width** (was 7%, now 10%) — let winners compound
+
+**Realism improvements** (2026-10):
+1. **100-share board lot rounding** — shares rounded down to HOSE's 100-share lot
+   on entry. Drops signals too small for 1 lot. Costs ~13% return (240% → 211%)
+   but reflects what a live broker would actually do.
+2. **last_close tracking** — open positions now show the actual current price
+   (not the peak since entry), so PnL matches what a live broker would show.
+3. **signal_date vs entry_date** — Signal has both fields now. `signal_date`
+   is the breakout bar; `entry_date` is the actual fill day (next bar).
+4. **Telegram signals** now show `5,300 sh (~399M VND)` per signal.
+5. **T+2.5 settlement** (opt-in via `exits.t_plus_n_bars=3`) — costs ~25% return
+   if enabled. Off by default.
+6. **Daily ±7% price limit** (opt-in via `backtest.daily_price_limit_pct=0.07`)
+   — costs ~16% return if enabled. Off by default.
 
 ### Walk-forward validation on 70 HOSE blue chips (TRAIN 2019-2022 → TEST 2023-2026)
 

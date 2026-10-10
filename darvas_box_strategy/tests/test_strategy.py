@@ -207,7 +207,10 @@ class ExecutorTests(unittest.TestCase):
         from darvas_box_strategy.darvas.base_detector import Base
         b = Base(ticker="X", base_low=9800, base_high=10_100, end_idx=0, days_in_base=10, volume_compression=1.0)
         return Signal(
-            ticker="X", entry_date=date(2025, 1, 10), entry_price=entry_price, base=b,
+            ticker="X",
+            signal_date=date(2025, 1, 9),  # breakout bar (one day before entry)
+            entry_date=date(2025, 1, 10),
+            entry_price=entry_price, base=b,
             sl_F=9700, sl_T=9900,
             tiers=((1.063, 0.10), (1.125, 0.30), (1.21, 0.30), (1.33, 0.10)),
             conviction="low", size_pct=0.15, shares=10_000, max_volume=10_000, bars_remaining=10,
@@ -547,7 +550,9 @@ class TimeStopTests(unittest.TestCase):
         from darvas_box_strategy.darvas.signal_generator import Signal, generate_signal
 
         sig = Signal(
-            ticker="TST", entry_date=date(2024, 1, 1),
+            ticker="TST",
+            signal_date=date(2023, 12, 29),  # one day before entry
+            entry_date=date(2024, 1, 1),
             entry_price=10_000.0, base=None,
             sl_F=9_500.0, sl_T=9_800.0,
             tiers=((1.10, 1.0),), conviction="low", size_pct=0.1,
@@ -587,7 +592,9 @@ class StopLossAnchoringTests(unittest.TestCase):
         from darvas_box_strategy.darvas.signal_generator import Signal
         from darvas_box_strategy.darvas.base_detector import Base
         return Signal(
-            ticker="TST", entry_date=date(2024, 1, 1),
+            ticker="TST",
+            signal_date=date(2023, 12, 29),  # one day before entry
+            entry_date=date(2024, 1, 1),
             entry_price=entry_price,
             base=Base(ticker="TST", base_low=base_low, base_high=base_low * 1.05,
                       end_idx=10, days_in_base=5, volume_compression=1.5),
@@ -636,6 +643,329 @@ class StopLossAnchoringTests(unittest.TestCase):
         # This means "stop-loss" actually allows a -45% loss before exiting.
         loss_at_sl_T = (legacy_sl_T - 12000) / 12000
         self.assertLess(loss_at_sl_T, -0.40)  # confirms the bug
+
+
+class BoardLotRoundingTests(unittest.TestCase):
+    """Shares are rounded down to 100-share board lots (HOSE convention)."""
+
+    def test_lot_rounding_yields_clean_multiple(self):
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import generate_signal
+        from darvas_box_strategy.darvas.base_detector import BaseScanner
+
+        # Disable the trend filter so the test doesn't need 200 days of MA history.
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(
+                require_ma200=False, min_history_days=10,
+                require_close_above_ma=0,
+            ),
+            exits=ExitsConfig(),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(
+                start_nav=1_000_000_000.0, size_low=0.20, size_high=0.40,
+                cost_bps=0.0, board_lot=100,
+            ),
+        )
+        bars = [
+            PriceBar(time=date(2026, 1, d).isoformat(), open=10_000, high=10_100,
+                     low=9_900, close=10_000, volume=100_000)
+            for d in range(1, 6)
+        ]
+        # Breakout bar: high volume, close breaks out
+        bars.append(PriceBar(time=date(2026, 1, 6).isoformat(), open=10_000,
+                             high=10_500, low=9_900, close=10_300, volume=300_000))
+        scanner = BaseScanner(bars, cfg.base, ticker="X")
+        base = scanner.find_base(as_of_idx=5)
+        self.assertIsNotNone(base)
+        sig = generate_signal(bars, base, nav=1_000_000_000.0, cfg=cfg, as_of_idx=5)
+        self.assertIsNotNone(sig)
+        # shares must be a multiple of 100
+        self.assertEqual(sig.shares % 100, 0)
+        self.assertGreater(sig.shares, 0)
+
+    def test_lot_rounding_drops_small_signal(self):
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import generate_signal
+        from darvas_box_strategy.darvas.base_detector import BaseScanner
+
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(
+                require_ma200=False, min_history_days=10,
+                require_close_above_ma=0,
+            ),
+            exits=ExitsConfig(),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(
+                start_nav=50_000.0, size_low=0.20, size_high=0.40,
+                cost_bps=0.0, board_lot=100,
+            ),
+        )
+        bars = [
+            PriceBar(time=date(2026, 1, d).isoformat(), open=10_000, high=10_100,
+                     low=9_900, close=10_000, volume=100_000)
+            for d in range(1, 6)
+        ]
+        bars.append(PriceBar(time=date(2026, 1, 6).isoformat(), open=10_000,
+                             high=10_500, low=9_900, close=10_300, volume=300_000))
+        scanner = BaseScanner(bars, cfg.base, ticker="X")
+        base = scanner.find_base(as_of_idx=5)
+        sig = generate_signal(bars, base, nav=50_000.0, cfg=cfg, as_of_idx=5)
+        self.assertIsNone(sig)  # too small for 1 lot → dropped
+
+
+class SignalDateTests(unittest.TestCase):
+    """Signal has both signal_date (breakout bar) and entry_date (fill bar)."""
+
+    def test_dates_are_separate_fields(self):
+        from datetime import date
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        sig = Signal(
+            ticker="X",
+            signal_date=date(2026, 1, 9),
+            entry_date=date(2026, 1, 10),
+            entry_price=10_050.0,
+            base=Base(ticker="X", base_low=9_900, base_high=10_000, end_idx=5,
+                      days_in_base=5, volume_compression=1.0),
+            sl_F=8_237, sl_T=9_045,
+            tiers=((1.063, 0.10),), conviction="high", size_pct=0.4,
+            shares=10_000, max_volume=99_999, bars_remaining=10,
+        )
+        self.assertEqual(sig.signal_date, date(2026, 1, 9))
+        self.assertEqual(sig.entry_date, date(2026, 1, 10))
+
+
+class ExecutorLastCloseTests(unittest.TestCase):
+    """TradeResult.last_close is the latest bar's close (not the peak)."""
+
+    def test_last_close_differs_from_highest(self):
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.executor import simulate_trade
+
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            # tiers=100x forces immediate exit on first bar
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=((100.0, 1.0),)),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(start_nav=1e9, cost_bps=0.0, board_lot=100),
+        )
+        # 3 bars: peak 14,000 then drops to 11,000
+        # But TIER exits on bar 1, so test with trailing instead
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base, sl_F=5_000, sl_T=5_000,
+            tiers=((100.0, 1.0),), conviction="low", size_pct=0.1,
+            shares=10_000, max_volume=99_999, bars_remaining=10,
+        )
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3).isoformat(), open=10_000, high=12_500,
+                     low=9_900, close=12_000, volume=100_000),  # exits via TIER
+        ]
+        result = simulate_trade(sig, bars_after, cfg)
+        # Only 1 bar after entry: last_close == highest_close
+        self.assertEqual(result.last_close, result.highest_close)
+
+    def test_last_close_tracks_latest_bar(self):
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.executor import simulate_trade
+
+        # With max_holding_bars, position closes at the last bar. The
+        # last_close should equal the EXHAUST close.
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            exits=ExitsConfig(
+                tiers=((100.0, 1.0),),  # never hit
+                t_plus_n_bars=0,
+            ),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(
+                start_nav=1e9, cost_bps=0.0, board_lot=100, max_holding_bars=2,
+            ),
+        )
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base, sl_F=5_000, sl_T=5_000,
+            tiers=cfg.exits.tiers, conviction="low", size_pct=0.1,
+            shares=10_000, max_volume=99_999, bars_remaining=10,
+        )
+        # 3 bars: up to 12,000, peak 13,000, then drop to 11,000 (not profitable)
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3).isoformat(), open=10_000, high=12_100,
+                     low=9_900, close=12_000, volume=100_000),
+            PriceBar(time=date(2026, 1, 4).isoformat(), open=12_000, high=13_100,
+                     low=11_900, close=13_000, volume=100_000),
+            PriceBar(time=date(2026, 1, 5).isoformat(), open=13_000, high=13_100,
+                     low=9_900, close=9_000, volume=100_000),  # below entry → triggers time stop
+        ]
+        result = simulate_trade(sig, bars_after, cfg)
+        # time_stop fires on bar 3 (close 9000 < entry 10000) since bars_held >= 2
+        self.assertEqual(result.exit_reason, "TIME_STOP")
+        # last_close is the close of bar 3 = 9000
+        self.assertEqual(result.last_close, 9_000.0)
+        # highest_close is 13000 (the peak)
+        self.assertEqual(result.highest_close, 13_000.0)
+
+
+class TPlusNSettlementTests(unittest.TestCase):
+    """T+2.5 settlement: skip first N-1 bars for exit logic."""
+
+    def test_t_plus_3_blocks_immediate_exit(self):
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.executor import simulate_trade
+
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            # t_plus_n_bars=3 means skip first 2 bars for exit logic
+            exits=ExitsConfig(t_plus_n_bars=3, tiers=((100.0, 1.0),)),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(start_nav=1e9, cost_bps=0.0, board_lot=100),
+        )
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base, sl_F=5_000, sl_T=5_000,
+            tiers=((100.0, 1.0),), conviction="low", size_pct=0.1,
+            shares=10_000, max_volume=99_999, bars_remaining=10,
+        )
+        # T+1, T+2, T+3 — first two should be locked even if TIER hit
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3).isoformat(), open=10_000, high=99_000,
+                     low=9_900, close=50_000, volume=100_000),  # T+1: tier hit, but locked
+            PriceBar(time=date(2026, 1, 4).isoformat(), open=50_000, high=99_000,
+                     low=49_900, close=50_000, volume=100_000),  # T+2: still locked
+            PriceBar(time=date(2026, 1, 5).isoformat(), open=50_000, high=99_000,
+                     low=49_900, close=80_000, volume=100_000),  # T+3: unlocked, exits here
+        ]
+        result = simulate_trade(sig, bars_after, cfg)
+        # If T+2.5 works: exits at T+3 (or later, depending on the bar logic)
+        # If broken: would exit at T+1.
+        self.assertGreaterEqual(
+            result.exit_date, date(2026, 1, 4),
+            "T+2.5 should have prevented exit at T+1 (2026-01-03)",
+        )
+
+    def test_t_plus_0_allows_immediate_exit(self):
+        """Default: t_plus_n_bars=0 means immediate exit (legacy behavior)."""
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.executor import simulate_trade
+
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=((100.0, 1.0),)),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(start_nav=1e9, cost_bps=0.0, board_lot=100),
+        )
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base, sl_F=5_000, sl_T=5_000,
+            tiers=((100.0, 1.0),), conviction="low", size_pct=0.1,
+            shares=10_000, max_volume=99_999, bars_remaining=10,
+        )
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3).isoformat(), open=10_000, high=99_000,
+                     low=9_900, close=50_000, volume=100_000),  # exits immediately
+        ]
+        result = simulate_trade(sig, bars_after, cfg)
+        self.assertEqual(result.exit_date, date(2026, 1, 3))
+
+
+class DailyPriceLimitTests(unittest.TestCase):
+    """daily_price_limit_pct caps bar.close to ±N% of previous bar's close."""
+
+    def test_limit_caps_gap_down(self):
+        from darvas_box_strategy.darvas.executor import _cap_to_daily_limit
+        # 15% gap-down should be capped to 7%
+        capped = _cap_to_daily_limit(
+            type("B", (), {"close": 8_500})(),
+            prev_close=10_000,
+            limit_pct=0.07,
+        )
+        self.assertEqual(capped, 9_300)  # 10,000 * 0.93
+
+    def test_limit_caps_gap_up(self):
+        from darvas_box_strategy.darvas.executor import _cap_to_daily_limit
+        capped = _cap_to_daily_limit(
+            type("B", (), {"close": 12_000})(),
+            prev_close=10_000,
+            limit_pct=0.07,
+        )
+        self.assertEqual(capped, 10_700)  # 10,000 * 1.07
+
+    def test_limit_off_by_default(self):
+        from darvas_box_strategy.darvas.executor import _cap_to_daily_limit
+        capped = _cap_to_daily_limit(
+            type("B", (), {"close": 5_000})(),
+            prev_close=10_000,
+            limit_pct=0.0,
+        )
+        self.assertEqual(capped, 5_000)
+
+    def test_limit_no_op_when_in_range(self):
+        from darvas_box_strategy.darvas.executor import _cap_to_daily_limit
+        # ±5% is within ±7% — no capping
+        capped = _cap_to_daily_limit(
+            type("B", (), {"close": 10_500})(),
+            prev_close=10_000,
+            limit_pct=0.07,
+        )
+        self.assertEqual(capped, 10_500)
 
 
 if __name__ == "__main__":

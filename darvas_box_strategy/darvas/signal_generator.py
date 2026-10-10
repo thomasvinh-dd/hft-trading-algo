@@ -14,6 +14,12 @@ from .filters import compute_weekly_ma, lookup_sector_momentum
 @dataclass(frozen=True)
 class Signal:
     ticker: str
+    # The breakout/signal bar's date — when the buy trigger fired.
+    signal_date: object
+    # The actual entry day — when the order fills (next bar after signal).
+    # For backtest this is bars[as_of_idx + 1].date. For live trading this
+    # is the next trading day after the alert. Used for deal_id, portfolio
+    # bookkeeping, and T+2.5 settlement modeling.
     entry_date: object
     entry_price: float
     base: Base
@@ -235,13 +241,23 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
     else:
         size_pct = cfg.backtest.size_high if conviction == "high" else cfg.backtest.size_low
     position_value = nav * size_pct
-    shares = int(position_value // breakout_bar.close)
+    raw_shares = int(position_value // breakout_bar.close)
+    if raw_shares <= 0:
+        return None
+
+    # Round down to a board lot. HOSE = 100 shares. If the result is 0
+    # the signal is too small for one lot — drop it.
+    lot = cfg.backtest.board_lot if cfg.backtest.board_lot > 0 else 1
+    shares = (raw_shares // lot) * lot
     if shares <= 0:
         return None
 
     max_volume = int(avg_vol * 0.05)
     if shares > max_volume > 0:
-        shares = max_volume
+        # Same lot rounding for the volume cap
+        shares = (max_volume // lot) * lot
+        if shares <= 0:
+            return None
 
     sl_buffer = 1.0 - cfg.exits.sl_buffer_pct
     if cfg.exits.use_entry_anchored_stops:
@@ -252,14 +268,25 @@ def generate_signal(bars, base, nav, cfg, *, as_of_idx=None, upcoming_ca=None,
         sl_T = breakout_bar.close * (1.0 - cfg.exits.sl_T_pct)
     else:
         # Legacy: base-anchored stops. Can be -30% to -45% from entry if the
-        # stock has run far from the base. Kept for backward compatibility
+        # stock has run far from base before breakout. Kept for backward compatibility
         # but NOT recommended.
         sl_F = base.base_low * sl_buffer
         sl_T = (base.base_low + breakout_bar.close) / 2.0
 
+    # The signal bar is `breakout_idx` (today's close broke out).
+    # The fill happens on the NEXT bar. For backtest this is bars[as_of_idx + 1].
+    # For live trading, the order is placed at the next session's open.
+    if breakout_idx + 1 < len(bars):
+        entry_date = bars[breakout_idx + 1].date
+    else:
+        # Defensive: if signal is on the last bar, entry is the same day
+        # (would never actually happen in production, but for safety).
+        entry_date = breakout_bar.date
+
     return Signal(
         ticker=base.ticker,
-        entry_date=breakout_bar.date,
+        signal_date=breakout_bar.date,
+        entry_date=entry_date,
         entry_price=breakout_bar.close,
         base=base,
         sl_F=round(sl_F, 4),
