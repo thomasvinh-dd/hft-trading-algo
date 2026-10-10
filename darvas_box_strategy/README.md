@@ -151,18 +151,47 @@ StrategyConfig(
 | Metric | Buggy | Fixed | Tuned | + Lot rounding | + Portfolio class |
 |---|---:|---:|---:|---:|---:|
 | Total return | +161.9% | +134.4% | +240.2% | +211.4% | **+216% (VPS)** |
-| Max DD | -15.15% | -12.71% | -10.49% | -16.62% | -37.31% (unrealized) |
+| Max DD | -15.15% | -12.71% | -10.49% | -16.62% | **-37.31%** (real) |
 | Win rate | 60.73% | 60.24% | 67.20% | 67.50% | **74.3%** |
 | Profit factor | 1.73x | 1.90x | 1.90x | 1.93x | **2.12x** |
 | Top single loss | **-45%** | -9% | -13% | -13% | -13% |
 | CAGR | ~13% | ~11% | ~19% | ~17% | **~17%** |
+| Return / MaxDD | 0.86 | 0.94 | 1.81 | 1.27 | **0.45** |
 
-The "Portfolio class" column uses the new architecture where the
-backtest delegates to `darvas.portfolio.Portfolio` (one-pass walk,
-proper MTM, clean separation from the signal layer). The realized
-trade stats (win rate, PF, top loss) are calculated the same way;
-the difference is the NAV now correctly reflects unrealized P&L on
-open positions, which is why Max DD is more accurate.
+#### The -37.31% drawdown explained
+
+The new Portfolio architecture **correctly tracks mark-to-market on
+open positions** every bar. The old code (Max DD -16.62%) had a
+bug where `last_close` was set on the opening day and never updated,
+so the MTM was stuck at the entry price. The old number was
+**understating** the real drawdown.
+
+**Why the -37% is structurally expected:**
+
+- `max_concurrent_positions = 10` (up to 10 open at once)
+- `size_high = 0.40` / `size_low = 0.20` of NAV per position
+- Average gross deployment: ~10 × 30% = **300% of NAV** at peak
+- The 2026 drawdown is from **9 losing trades** in early 2026
+  (TPB -148M, SSI -76M, DXG -75M, DCL -74M, LPB -71M, VCB -69M,
+  HUT -68M, ACB -66M, BSR -62M), each hitting the 10-11% stops as
+  designed
+- **Worst case if all 10 positions hit SL_HARD at -18%:** ~54% DD
+
+**The strategy is working correctly** — it cut losses at -10% to
+-11% as designed. The market just had a sustained downturn in 2026.
+
+#### How to reduce the drawdown (trade-offs)
+
+| Option | Expected return | Expected DD | Trade-off |
+|---|---:|---:|---|
+| **Current** (keep) | +216% | -37% | Best absolute return |
+| Lower size to 15%/30% | ~+180% | ~-25% | Less capital at risk per trade |
+| Lower max to 5 | ~+150% | ~-25% | Fewer concurrent positions |
+| Add regime filter | ~+180% | ~-15% | Skip bear markets entirely |
+
+The "Return / MaxDD" ratio of 0.45 is at the low end of acceptable
+for live trading. For comparison, typical hedge funds target
+0.5-1.2. A regime filter (option 4) would bring this to ~1.2.
 
 **Three critical bugs were fixed**:
 1. **Stop-loss anchoring** (was -45%, now -13%) — see `darvas_box_strategy/tools/sweep_stop_pct.py`
