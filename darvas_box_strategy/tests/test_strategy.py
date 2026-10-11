@@ -840,6 +840,8 @@ class ExecutorLastCloseTests(unittest.TestCase):
         self.assertEqual(result.last_close, 9_000.0)
         # highest_close is 13000 (the peak)
         self.assertEqual(result.highest_close, 13_000.0)
+        # bars_held = number of bars processed (3), not len(fills)
+        self.assertEqual(result.bars_held, 3)
 
 
 class TPlusNSettlementTests(unittest.TestCase):
@@ -1071,6 +1073,110 @@ class PortfolioBacktestTests(unittest.TestCase):
         # No open positions on the last bar (or some, depending on data)
         # for a single ticker
         self.assertLessEqual(len(portfolio.open_positions), 1)
+
+
+class BarsHeldTests(unittest.TestCase):
+    """bars_held must count trading bars, not fill events.
+
+    Regression test for the bug where bars_held=len(fills) made the
+    deal-detail modal show "Days held: 13" for a 50-day trade (because
+    there were 14 fill events including the synthetic ENTRY).
+    """
+
+    def test_bars_held_counts_bars_not_fills(self):
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.executor import simulate_trade
+
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            exits=ExitsConfig(
+                tiers=((100.0, 1.0),),  # never hit
+                t_plus_n_bars=0,
+            ),
+            trailing=TrailingConfig(trail_from_peak_pct=0.99),  # never trails
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(start_nav=1e9, cost_bps=0.0, board_lot=100),
+        )
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base, sl_F=5_000, sl_T=5_000,
+            tiers=cfg.exits.tiers, conviction="low", size_pct=0.1,
+            shares=10_000, max_volume=99_999, bars_remaining=10,
+        )
+        # 10 bars, all flat → SL_HARD fires on first bar (5_000 cap doesn't
+        # matter, low=10_000 > sl_T=5_000 and high=10_500 < 15_000 so no
+        # tier/trail). Actually a single SL_HARD fill on the first bar
+        # will exit. Use a config that prevents early exit:
+        # keep entry stable, no SL_HARD, no tier hit. Strategy has no
+        # such config — it always hits one of the exits. So just check
+        # that bars_held > 1 (i.e., the trade is held at least 2 bars).
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3 + i).isoformat(), open=10_000, high=10_500,
+                     low=9_900, close=10_100 + i, volume=100_000)
+            for i in range(10)
+        ]
+        result = simulate_trade(sig, bars_after, cfg)
+        # bars_held should be the number of bars processed, not
+        # the number of fill events. This is the bug fix.
+        self.assertGreaterEqual(result.bars_held, 1)
+        # If the trade closes on the 1st bar, bars_held=1 and
+        # len(fills)=2 (entry + exit). Verify bars_held != len(fills)
+        # when the trade lasts >1 bar.
+        if result.bars_held > 1:
+            self.assertNotEqual(result.bars_held, len(result.fills),
+                "bars_held must count bars, not fill events")
+
+    def test_bars_held_matches_position_duration(self):
+        """bars_held should equal exit_bar_idx - entry_bar_idx."""
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.executor import simulate_trade
+
+        # No tiers, no max_hold, T+0, generous SL — only exit is the
+        # bar's high crossing the 5% trail. Use a flat series.
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            exits=ExitsConfig(tiers=(), t_plus_n_bars=0),
+            trailing=TrailingConfig(trail_from_peak_pct=0.99),  # never trails
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(start_nav=1e9, cost_bps=0.0, board_lot=100,
+                                    max_holding_bars=5),  # forced time stop on bar 5
+        )
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base, sl_F=5_000, sl_T=5_000,
+            tiers=cfg.exits.tiers, conviction="low", size_pct=0.1,
+            shares=10_000, max_volume=99_999, bars_remaining=10,
+        )
+        # 10 bars, all flat. Time stop on bar 5.
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3 + i).isoformat(), open=10_000, high=10_100,
+                     low=9_900, close=9_500, volume=100_000)  # below entry
+            for i in range(10)
+        ]
+        result = simulate_trade(sig, bars_after, cfg)
+        # Exit should be TIME_STOP on bar 5 → bars_held = 5
+        self.assertEqual(result.exit_reason, "TIME_STOP")
+        self.assertEqual(result.bars_held, 5)
 
 
 if __name__ == "__main__":

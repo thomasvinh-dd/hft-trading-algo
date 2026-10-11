@@ -322,8 +322,9 @@ function renderDealDetail(d) {
       <div class="kpi-value ${pnlClass}">${fmtVnd(pnlVnd)}</div></div>
     <div class="kpi"><div class="kpi-label">High</div>
       <div class="kpi-value">${VND(d.highest_close)}</div></div>
-    <div class="kpi"><div class="kpi-label">Bars</div>
-      <div class="kpi-value">${d.bars_held}</div></div>
+    <div class="kpi"><div class="kpi-label">Days held</div>
+      <div class="kpi-value">${d.bars_held != null ? d.bars_held : "—"}</div>
+      <div class="kpi-sub muted small">trading bars</div></div>
   `;
 
   // Fills table — the bar-by-bar timeline
@@ -332,19 +333,30 @@ function renderDealDetail(d) {
   const fills = d.fills || [];
   if (fills.length === 0) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td colspan="8" class="empty">No fill events recorded for this deal.</td>`;
+    tr.innerHTML = `<td colspan="9" class="empty">No fill events recorded for this deal.</td>`;
     tbody.appendChild(tr);
     return;
   }
-  let runningShares = 0;
-  for (const f of fills) {
+  // Parse dates once for delta calculation
+  const MS = 86400000;
+  const dateMs = fills.map(f => f.date ? Date.parse(f.date) : null);
+  let prevDateMs = null;
+  for (let i = 0; i < fills.length; i++) {
+    const f = fills[i];
     const tr = document.createElement("tr");
     const isBuy = (f.shares || 0) > 0;
     const isSell = (f.shares || 0) < 0;
     const pnlClass = (f.pnl_delta || 0) > 0 ? "fill-positive" :
                       (f.pnl_delta || 0) < 0 ? "fill-negative" : "";
-    // Track running shares for visual context (not in fill data)
-    runningShares = f.remaining != null ? f.remaining : runningShares;
+    // Δ days since the previous event
+    let deltaDays = "";
+    if (i === 0) {
+      deltaDays = "—";
+    } else if (dateMs[i] != null && prevDateMs != null) {
+      const days = Math.round((dateMs[i] - prevDateMs) / MS);
+      deltaDays = days === 0 ? "same day" : `+${days}d`;
+    }
+    prevDateMs = dateMs[i];
     tr.innerHTML = `
       <td class="muted small">${f.date || ""}</td>
       <td><span class="fill-kind fill-kind-${f.kind}">${f.kind}</span></td>
@@ -353,6 +365,7 @@ function renderDealDetail(d) {
       <td class="${pnlClass}">${f.pnl_delta ? (f.pnl_delta > 0 ? "+" : "") + VND(f.pnl_delta) : "—"}</td>
       <td class="${(f.cumulative_pnl || 0) >= 0 ? "fill-positive" : "fill-negative"}">${f.cumulative_pnl != null ? (f.cumulative_pnl > 0 ? "+" : "") + VND(f.cumulative_pnl) : "—"}</td>
       <td>${(f.remaining || 0).toLocaleString()}</td>
+      <td class="muted small">${deltaDays}</td>
       <td class="muted small">${f.note || ""}</td>
     `;
     tbody.appendChild(tr);
