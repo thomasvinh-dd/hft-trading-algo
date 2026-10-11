@@ -303,25 +303,27 @@ function renderDealDetail(d) {
     return;
   }
   // Subtitle
-  const status = d.is_open ? "OPEN" : `Closed ${d.exit_reason}`;
+  const status = d.is_open ? "OPEN" : `Closed ${d.exit_reason || "?"}`;
+  const sharesTxt = d.shares != null ? d.shares.toLocaleString() : "?";
+  const barsTxt = d.bars_held != null ? d.bars_held : "?";
   setText("#deal-modal-subtitle",
-    `${d.ticker} • ${d.shares.toLocaleString()} shares • ${status} • held ${d.bars_held} bars`);
+    `${d.ticker || "?"} • ${sharesTxt} shares • ${status} • held ${barsTxt} bars`);
 
-  // Summary tiles
+  // Summary tiles — every value goes through fmtVnd to handle nulls
   const fmtVnd = v => (v == null ? "—" : VND(v));
   const pnlClass = (d.pnl_pct || 0) >= 0 ? "pos" : "neg";
   const pnlVnd = d.is_open ? null : d.pnl_vnd;
   $("#deal-modal-summary").innerHTML = `
     <div class="kpi"><div class="kpi-label">Entry</div>
-      <div class="kpi-value">${VND(d.entry_price)}</div></div>
+      <div class="kpi-value">${fmtVnd(d.entry_price)}</div></div>
     <div class="kpi"><div class="kpi-label">${d.is_open ? "Last close" : "Exit"}</div>
-      <div class="kpi-value">${d.is_open ? VND(d.last_close) : VND(d.exit_price)}</div></div>
+      <div class="kpi-value">${d.is_open ? fmtVnd(d.last_close) : fmtVnd(d.exit_price)}</div></div>
     <div class="kpi"><div class="kpi-label">P&L</div>
       <div class="kpi-value ${pnlClass}">${d.is_open ? "—" : PCT(d.pnl_pct)}</div></div>
     <div class="kpi"><div class="kpi-label">P&L VND</div>
       <div class="kpi-value ${pnlClass}">${fmtVnd(pnlVnd)}</div></div>
     <div class="kpi"><div class="kpi-label">High</div>
-      <div class="kpi-value">${VND(d.highest_close)}</div></div>
+      <div class="kpi-value">${fmtVnd(d.highest_close)}</div></div>
     <div class="kpi"><div class="kpi-label">Days held</div>
       <div class="kpi-value">${d.bars_held != null ? d.bars_held : "—"}</div>
       <div class="kpi-sub muted small">trading bars</div></div>
@@ -344,8 +346,9 @@ function renderDealDetail(d) {
   for (let i = 0; i < fills.length; i++) {
     const f = fills[i];
     const tr = document.createElement("tr");
-    const isBuy = (f.shares || 0) > 0;
-    const isSell = (f.shares || 0) < 0;
+    const shares = f.shares || 0;
+    const isBuy = shares > 0;
+    const isSell = shares < 0;
     const pnlClass = (f.pnl_delta || 0) > 0 ? "fill-positive" :
                       (f.pnl_delta || 0) < 0 ? "fill-negative" : "";
     // Δ days since the previous event
@@ -359,9 +362,9 @@ function renderDealDetail(d) {
     prevDateMs = dateMs[i];
     tr.innerHTML = `
       <td class="muted small">${f.date || ""}</td>
-      <td><span class="fill-kind fill-kind-${f.kind}">${f.kind}</span></td>
+      <td><span class="fill-kind fill-kind-${f.kind || "?"}">${f.kind || "?"}</span></td>
       <td>${f.price ? VND(f.price) : "—"}</td>
-      <td class="${isBuy ? "fill-positive" : isSell ? "fill-negative" : ""}">${f.shares > 0 ? "+" : ""}${(f.shares || 0).toLocaleString()}</td>
+      <td class="${isBuy ? "fill-positive" : isSell ? "fill-negative" : ""}">${shares > 0 ? "+" : ""}${shares.toLocaleString()}</td>
       <td class="${pnlClass}">${f.pnl_delta ? (f.pnl_delta > 0 ? "+" : "") + VND(f.pnl_delta) : "—"}</td>
       <td class="${(f.cumulative_pnl || 0) >= 0 ? "fill-positive" : "fill-negative"}">${f.cumulative_pnl != null ? (f.cumulative_pnl > 0 ? "+" : "") + VND(f.cumulative_pnl) : "—"}</td>
       <td>${(f.remaining || 0).toLocaleString()}</td>

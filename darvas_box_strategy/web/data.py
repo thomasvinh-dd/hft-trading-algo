@@ -343,6 +343,7 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
             "last_close": round(float(
                 getattr(t, "last_close", 0.0) or t.highest_close or sig.entry_price
             ), 0),
+            "highest_close": round(float(getattr(t, "highest_close", 0.0) or sig.entry_price), 0),
             "pnl_pct": round(t.return_pct * 100, 2),
             "pnl_vnd": round(t.realized_pnl, 0) if not is_open else None,
             "exit_reason": t.exit_reason if not is_open else "OPEN",
