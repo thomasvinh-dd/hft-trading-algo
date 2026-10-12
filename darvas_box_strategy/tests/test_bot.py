@@ -126,8 +126,11 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(cfg.backtest.max_concurrent_positions, 10)
         self.assertEqual(cfg.backtest.cooldown_bars_after_stop, 5)
         self.assertEqual(cfg.backtest.vol_target_pct, 0.0)  # OFF: fixed sizing wins
-        self.assertEqual(cfg.backtest.size_low, 0.20)
-        self.assertEqual(cfg.backtest.size_high, 0.40)
+        # size_low=0.15, size_high=0.30 — see tools/sweep_dd.py
+        # (was 0.20/0.40; reduced to lower drawdown without
+        #  sacrificing return; see README for the trade-off table)
+        self.assertEqual(cfg.backtest.size_low, 0.15)
+        self.assertEqual(cfg.backtest.size_high, 0.30)
         self.assertEqual(cfg.trailing.trail_mode, "pct")
         self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.10)  # trail after partial cut
         self.assertTrue(cfg.exits.use_entry_anchored_stops)
