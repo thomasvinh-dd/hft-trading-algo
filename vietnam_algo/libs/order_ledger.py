@@ -165,6 +165,15 @@ def normalize_ledger_status(status: str) -> str:
     # returns ``"partial"``. Without this conversion, a partial fill
     # would be mapped to ``"unknown"`` and the operator would lose
     # visibility on the fill.
+    #
+    # 2026-10-12: added explicit handling for ``pendingCancel`` and
+    # ``pendingReplace`` so the monitor keeps polling them (they are
+    # non-terminal) and the operator gets a clear "cancel requested"
+    # message. Before this fix, both mapped to ``"unknown"`` which
+    # was also non-terminal but indistinguishable from a parse error
+    # — operators couldn't tell whether the order was in-flight
+    # transition or whether the monitor had failed to parse the
+    # response.
     raw = (status or "").strip()
     if not raw:
         return "unknown"
@@ -189,6 +198,12 @@ def normalize_ledger_status(status: str) -> str:
         return "closed"
     if clean == "DONE_FOR_DAY":
         return "closed"
+    if clean in {"PENDING_CANCEL", "PENDING_REPLACE"}:
+        # 2026-10-12: in-flight transitions, not terminal. Use a
+        # distinct label so the operator can tell the cancel was
+        # requested but the server hasn't confirmed yet. The monitor
+        # keeps polling these.
+        return "pending_cancel" if clean == "PENDING_CANCEL" else "pending_replace"
     if clean in {"NEW", "OPEN", "PENDING", "PENDING_NEW", "WAITING", "QUEUED"}:
         return "open"
     return "unknown"
