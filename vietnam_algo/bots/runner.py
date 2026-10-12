@@ -536,6 +536,48 @@ def _extract_best_ask_in_vnd(quote: object) -> int | None:
     return int(round(v * 1000.0))
 
 
+def _extract_best_bid_in_vnd(quote: object) -> int | None:
+    """Extract the best-bid price (in absolute VND) from a DNSE
+    ``/price/{sym}/quotes/latest`` response.
+
+    Mirror of :func:`_extract_best_ask_in_vnd` but reads the
+    ``bid[0].price`` (top of book) instead of ``offer``. Used
+    by the order-monitor re-pricing logic to chase a falling
+    SELL order (i.e. a SELL limit that nobody is hitting because
+    the market is dropping — we re-price DOWN to follow the bid).
+    """
+    if not isinstance(quote, dict):
+        return None
+    boards = quote.get("quotes")
+    if not isinstance(boards, list) or not boards:
+        return None
+    target = None
+    for b in boards:
+        if isinstance(b, dict) and b.get("boardId") == "G1":
+            target = b
+            break
+    if target is None:
+        for b in boards:
+            if isinstance(b, dict) and isinstance(b.get("bid"), list) and b["bid"]:
+                target = b
+                break
+    if target is None:
+        return None
+    bid_levels = target.get("bid")
+    if not isinstance(bid_levels, list) or not bid_levels:
+        return None
+    first = bid_levels[0]
+    if not isinstance(first, dict):
+        return None
+    try:
+        v = float(first.get("price") or 0)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    return int(round(v * 1000.0))
+
+
 def _submit_autofin_deals_to_dnse(
     deals_actioned: list[dict],
     *,
@@ -1032,22 +1074,37 @@ def _format_reprice_message(
     new_dnse_order_id: str,
     cancelled_dnse_order_id: str,
     cap_price: int,
-    best_ask: int,
+    market_price: int,
     final_action: str = "replaced",
 ) -> str:
     """Build a Telegram message for a re-price attempt.
 
     ``final_action`` is one of:
       - ``"replaced"``: cancelled old, placed new at ``new_price``
-      - ``"abandoned"``: cancelled old, new ask above cap so we skip
+      - ``"abandoned"``: cancelled old, market beyond cap so we skip
+
+    The ``market_price`` is the live best-ask for BUY orders or
+    the live best-bid for SELL orders. The Telegram message says
+    "best-ask" or "best-bid" accordingly so the operator can tell
+    which side of the book we were following.
     """
-    side_label = "BUY" if item.side == "NB" else "SELL"
+    is_buy = item.side == "NB"
+    side_label = "BUY" if is_buy else "SELL"
+    market_label = "best-ask" if is_buy else "best-bid"
     if final_action == "replaced":
         icon = "🔁"
-        header = f"{icon} Vietnam Algo: order {item.symbol} RE-PRICED {item.price} → {new_price}"
+        arrow = "↑" if is_buy else "↓"
+        header = (
+            f"{icon} Vietnam Algo: order {item.symbol} RE-PRICED "
+            f"{item.price:,} {arrow} {new_price:,}"
+        )
     else:
         icon = "🛑"
-        header = f"{icon} Vietnam Algo: order {item.symbol} ABANDONED (ask above cap)"
+        cap_label = "above cap" if is_buy else "below cap"
+        header = (
+            f"{icon} Vietnam Algo: order {item.symbol} ABANDONED "
+            f"({market_label} {cap_label})"
+        )
     lines: list[str] = [
         header,
         f"  side: {side_label}",
@@ -1056,7 +1113,7 @@ def _format_reprice_message(
     ]
     if final_action == "replaced":
         lines.append(f"  new price: {new_price:,} (dnseOrderId={new_dnse_order_id})")
-    lines.append(f"  best-ask: {best_ask:,}")
+    lines.append(f"  {market_label}: {market_price:,}")
     lines.append(f"  cap: {cap_price:,}")
     lines.append(f"  re-price #{item.repriceCount + 1}")
     return "\n".join(lines)
@@ -1073,7 +1130,7 @@ def _maybe_reprice_stale_order(
     max_reprices: int = 1,
     reprice_tolerance_pct: float = 0.03,
 ) -> dict[str, Any]:
-    """Re-price a stale, unfilled BUY limit order to chase the live ask.
+    """Re-price a stale, unfilled limit order to chase the live market.
 
     2026-10-13: the autofin bot placed ABB BUY 100 @ 17,500 on
     2026-10-12 14:48 ICT (live ask was 17,500 at that time).
@@ -1082,32 +1139,43 @@ def _maybe_reprice_stale_order(
     EOD. The user asked for a way to chase a rising market
     without runaway behaviour.
 
+    2026-10-13 (later): user asked to apply the same logic to
+    SELL orders. Symmetric behaviour: a SELL limit that nobody
+    is hitting because the market is dropping gets re-priced
+    DOWN to follow the bid. The risk is identical (we exit at
+    a worse price than planned) and the cap is the same 3 %
+    (BELOW the original price for SELL, ABOVE for BUY).
+
     Algorithm
     ---------
-    1. **Eligibility**: side = NB (BUY), status = open, dnseOrderId
-       set, original price > 0.
+    1. **Eligibility**: side ∈ {NB, NS}, status = open,
+       dnseOrderId set, original price > 0.
     2. **Staleness**: order has been open for >= ``reprice_after_seconds``
        (default 15 min). The timer starts at ``createdAt`` so it
        survives bot restarts.
-    3. **Cap**: ``new_price <= original_price * (1 + reprice_tolerance_pct)``.
-       Default 3 % above the original limit, matching the autofin
-       zone tolerance. We will NOT chase a stock that's already
-       drifted more than 3 % above the signal price.
-    4. **Ask direction**: only re-price UP (we never lower a limit on
-       a BUY). If ``best_ask < item.price``, skip.
-    5. **Within cap**: if ``best_ask > cap``, ABANDON (cancel + skip).
+    3. **Cap**:
+         - BUY:  ``new_price <= original_price * (1 + tol)`` (3 % above)
+         - SELL: ``new_price >= original_price * (1 - tol)`` (3 % below)
+       The cap is symmetric and the same 3 % envelope.
+    4. **Direction**:
+         - BUY:  only re-price UP. If ``best_ask < item.price``, skip.
+         - SELL: only re-price DOWN. If ``best_bid > item.price``, skip.
+    5. **Within cap**: if the relevant side's price is beyond the cap
+       (BUY ask > cap, SELL bid < cap), ABANDON (cancel + skip).
     6. **Count**: at most ``max_reprices`` re-prices per order
        (default 1). This is the kill-switch against runaway chasing.
 
     On a successful re-price:
       - Cancel the old order via ``client.cancel_order``
-      - Place a new order at the new price with the same qty + side
-      - Update the ledger entry: ``price`` = new price, ``repriceCount`` +1,
-        ``lastRepricedAt`` = now ISO, ``originalPrice`` preserved
-        from first submit
+      - Look up the cash package id via
+        ``client.get_cash_loan_package_id``
+      - Place a new order at the new market-following price
+      - Update the ledger entry: ``price`` = new price,
+        ``repriceCount`` +1, ``lastRepricedAt`` = now ISO,
+        ``originalPrice`` preserved from first submit
       - Send Telegram via ``_format_reprice_message``
 
-    On an abandon (ask above cap):
+    On an abandon (price beyond cap):
       - Cancel the old order
       - Update ledger: ``status`` = "cancelled", ``error`` = "reprice cap exceeded"
       - Send Telegram saying we abandoned
@@ -1118,10 +1186,11 @@ def _maybe_reprice_stale_order(
             "reason": str (only on skip/abandon),
             "old_price": int,
             "new_price": int,
-            "best_ask": int,
+            "market_price": int,  # best_ask for BUY, best_bid for SELL
             "cap": int,
             "new_dnse_order_id": str,
             "cancelled_dnse_order_id": str,
+            "side": "NB" | "NS",
         }
     """
     summary: dict[str, Any] = {
@@ -1129,14 +1198,15 @@ def _maybe_reprice_stale_order(
         "reason": "",
         "old_price": item.price,
         "new_price": item.price,
-        "best_ask": 0,
+        "market_price": 0,
         "cap": 0,
         "new_dnse_order_id": "",
         "cancelled_dnse_order_id": "",
+        "side": item.side,
     }
     # 1. Eligibility
-    if item.side != "NB":
-        summary["reason"] = "side is not BUY"
+    if item.side not in ("NB", "NS"):
+        summary["reason"] = f"side {item.side!r} is not BUY or SELL"
         return summary
     if item.status != "open":
         summary["reason"] = f"status is {item.status!r}, not open"
@@ -1157,6 +1227,8 @@ def _maybe_reprice_stale_order(
         summary["reason"] = "no trading token"
         return summary
 
+    is_buy = item.side == "NB"
+
     # 2. Staleness
     original_price = item.originalPrice if item.originalPrice > 0 else item.price
     placed_epoch = _parse_iso_to_epoch(item.createdAt)
@@ -1168,29 +1240,50 @@ def _maybe_reprice_stale_order(
         summary["reason"] = f"order too young ({age_seconds:.0f}s < {reprice_after_seconds}s)"
         return summary
 
-    # 3. Cap
-    cap_price = int(original_price * (1.0 + reprice_tolerance_pct))
+    # 3. Cap (symmetric for BUY/SELL)
+    if is_buy:
+        cap_price = int(original_price * (1.0 + reprice_tolerance_pct))
+    else:
+        cap_price = int(original_price * (1.0 - reprice_tolerance_pct))
     summary["cap"] = cap_price
 
-    # 4. Fetch live best-ask
+    # 4. Fetch live quote (best_ask for BUY, best_bid for SELL)
     try:
         quote = client.get_latest_quote(item.symbol)
     except Exception as exc:
         summary["reason"] = f"get_latest_quote failed: {type(exc).__name__}: {str(exc)[:120]}"
         return summary
-    best_ask = _extract_best_ask_in_vnd(quote)
-    summary["best_ask"] = best_ask
-    if best_ask is None or best_ask <= 0:
-        summary["reason"] = "no best-ask in quote"
+    if is_buy:
+        market_price = _extract_best_ask_in_vnd(quote)
+        market_label = "best-ask"
+    else:
+        market_price = _extract_best_bid_in_vnd(quote)
+        market_label = "best-bid"
+    summary["market_price"] = market_price if market_price is not None else 0
+    if market_price is None or market_price <= 0:
+        summary["reason"] = f"no {market_label} in quote"
         return summary
 
-    # 5. Ask direction
-    if best_ask <= item.price:
-        summary["reason"] = f"best-ask {best_ask} not above current limit {item.price}"
-        return summary
+    # 5. Direction
+    if is_buy:
+        # Only re-price UP — if the market is at or below our limit,
+        # the order has a chance to fill naturally.
+        if market_price <= item.price:
+            summary["reason"] = (
+                f"best-ask {market_price} not above current limit {item.price}"
+            )
+            return summary
+    else:
+        # Only re-price DOWN — if the market is at or above our limit,
+        # the order has a chance to fill naturally.
+        if market_price >= item.price:
+            summary["reason"] = (
+                f"best-bid {market_price} not below current limit {item.price}"
+            )
+            return summary
 
     # 6. Within cap?
-    if best_ask > cap_price:
+    if is_buy and market_price > cap_price:
         # Ask is above the cap — abandon the position.
         try:
             client.cancel_order(account_no, trading_token, item.dnseOrderId)
@@ -1199,7 +1292,22 @@ def _maybe_reprice_stale_order(
             return summary
         summary["action"] = "abandoned"
         summary["cancelled_dnse_order_id"] = item.dnseOrderId
-        summary["reason"] = f"best-ask {best_ask} > cap {cap_price}; cancelled and abandoned"
+        summary["reason"] = (
+            f"best-ask {market_price} > cap {cap_price}; cancelled and abandoned"
+        )
+        return summary
+    if (not is_buy) and market_price < cap_price:
+        # Bid is below the cap — abandon the position.
+        try:
+            client.cancel_order(account_no, trading_token, item.dnseOrderId)
+        except Exception as exc:
+            summary["reason"] = f"abandon-cancel failed: {type(exc).__name__}: {str(exc)[:120]}"
+            return summary
+        summary["action"] = "abandoned"
+        summary["cancelled_dnse_order_id"] = item.dnseOrderId
+        summary["reason"] = (
+            f"best-bid {market_price} < cap {cap_price}; cancelled and abandoned"
+        )
         return summary
 
     # 7. Re-price: cancel old, place new
@@ -1229,7 +1337,7 @@ def _maybe_reprice_stale_order(
             symbol=item.symbol,
             side=item.side,
             quantity=item.quantity,
-            price=best_ask,
+            price=market_price,
             loan_package_id=cash_pkg_id,
             order_type="LO",
         )
@@ -1245,7 +1353,7 @@ def _maybe_reprice_stale_order(
         new_order_status = normalize_ledger_status(str(new_order_status_raw))
 
     summary["action"] = "replaced"
-    summary["new_price"] = best_ask
+    summary["new_price"] = market_price
     summary["new_dnse_order_id"] = new_order_id
     summary["new_status"] = new_order_status
     return summary
@@ -1448,13 +1556,21 @@ def _monitor_order_statuses(
         ledger[key] = LedgerOrder(**{**item.__dict__, "status": new_status, "lastDetail": detail, "updatedAt": _utc_iso()})
         dirty = True
 
-        # 2026-10-13: re-price stale unfilled BUY limit orders so they
-        # can fill when the market drifts up. Only runs on open BUY
-        # orders that are old enough (reprice_after_seconds). Does NOT
-        # re-price SELL orders — those should sit at the limit and
-        # wait for a buyer. The cap (reprice_tolerance_pct) prevents
-        # runaway chasing of a runaway market.
-        if new_status == "open" and item.side == "NB" and key not in _ORDER_REPRICE_ABANDONED:
+        # 2026-10-13: re-price stale unfilled limit orders so they
+        # can fill when the market drifts away.
+        #   - BUY  (NB): chase the live best-ask UP, cap = 3 % above
+        #     the original price.
+        #   - SELL (NS): chase the live best-bid DOWN, cap = 3 %
+        #     below the original price.
+        # The cap (reprice_tolerance_pct) prevents runaway chasing of
+        # a runaway market. The kill-switch (max_reprices) prevents
+        # infinite re-pricing. The 15-min staleness window
+        # (reprice_after_seconds) filters out short-term whipsaw.
+        if (
+            new_status == "open"
+            and item.side in ("NB", "NS")
+            and key not in _ORDER_REPRICE_ABANDONED
+        ):
             reprice_summary = _maybe_reprice_stale_order(
                 client, account_no, trading_token, item,
                 now_epoch=now_epoch,
@@ -1469,9 +1585,10 @@ def _monitor_order_statuses(
                 summary["repriced"].append({
                     "key": key,
                     "symbol": item.symbol,
+                    "side": item.side,
                     "old_price": reprice_summary["old_price"],
                     "new_price": reprice_summary["new_price"],
-                    "best_ask": reprice_summary["best_ask"],
+                    "market_price": reprice_summary["market_price"],
                     "new_order_id": reprice_summary["new_dnse_order_id"],
                 })
                 ledger[key] = LedgerOrder(**{
@@ -1498,19 +1615,21 @@ def _monitor_order_statuses(
                         new_dnse_order_id=reprice_summary["new_dnse_order_id"],
                         cancelled_dnse_order_id=reprice_summary["cancelled_dnse_order_id"],
                         cap_price=reprice_summary["cap"],
-                        best_ask=reprice_summary["best_ask"],
+                        market_price=reprice_summary["market_price"],
                         final_action="replaced",
                     ))
                 except Exception as exc:
                     summary["errors"].append({"key": key, "err": f"reprice notify failed: {str(exc)[:120]}"})
             elif action == "abandoned":
-                # Ask above cap — we cancelled the order. Mark terminal
-                # so the monitor won't poll it again. Send Telegram.
+                # Market beyond cap — we cancelled the order. Mark
+                # terminal so the monitor won't poll it again. Send
+                # Telegram.
                 summary["abandoned"].append({
                     "key": key,
                     "symbol": item.symbol,
+                    "side": item.side,
                     "cap": reprice_summary["cap"],
-                    "best_ask": reprice_summary["best_ask"],
+                    "market_price": reprice_summary["market_price"],
                 })
                 ledger[key] = LedgerOrder(**{
                     **item.__dict__,
@@ -1527,7 +1646,7 @@ def _monitor_order_statuses(
                         new_dnse_order_id="",
                         cancelled_dnse_order_id=reprice_summary["cancelled_dnse_order_id"],
                         cap_price=reprice_summary["cap"],
-                        best_ask=reprice_summary["best_ask"],
+                        market_price=reprice_summary["market_price"],
                         final_action="abandoned",
                     ))
                 except Exception as exc:

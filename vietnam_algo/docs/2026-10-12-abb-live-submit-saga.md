@@ -88,13 +88,15 @@ next 12 minutes and stayed there; the order never filled and
 expired at EOD. We placed the order at the right price at the
 time, but the market kept moving away.
 
-The fix is **re-pricing stale unfilled BUY orders** (commit
-forthcoming, see ``vietnam_algo/bots/runner.py:_maybe_reprice_stale_order``):
+The fix is **re-pricing stale unfilled limit orders** (see
+``vietnam_algo/bots/runner.py:_maybe_reprice_stale_order``):
 
 - After ``ORDER_REPRICE_AFTER_SECONDS`` (default 900 = 15 min) of
-  being open, the order monitor looks up the live best-ask.
-- If the best-ask is **above the current limit** but **below the
-  cap** (``original_price * (1 + ORDER_REPRICE_TOLERANCE_PCT)``,
+  being open, the order monitor looks up the live quote for the
+  symbol.
+- For **BUY** orders: re-prices UP. If the best-ask is **above
+  the current limit** but **below the cap**
+  (``original_price * (1 + ORDER_REPRICE_TOLERANCE_PCT)``,
   default 3 % above the original price), the monitor:
   - Cancels the old order
   - Places a new order at the new best-ask
@@ -103,19 +105,29 @@ forthcoming, see ``vietnam_algo/bots/runner.py:_maybe_reprice_stale_order``):
     preserved from first submit
   - Sends a Telegram: "🔁 Vietnam Algo: order ABB RE-PRICED
     17,500 → 17,600"
-- If the best-ask is **above the cap**, the monitor:
+- For **SELL** orders: re-prices DOWN. If the best-bid is
+  **below the current limit** but **above the cap**
+  (``original_price * (1 - ORDER_REPRICE_TOLERANCE_PCT)``,
+  default 3 % below the original price), the monitor:
+  - Cancels the old order
+  - Places a new order at the new best-bid
+  - Sends a Telegram: "🔁 Vietnam Algo: order VCB RE-PRICED
+    20,000 ↓ 19,500"
+- If the relevant market-side price is **beyond the cap**, the
+  monitor:
   - Cancels the old order
   - Marks the ledger entry ``status="cancelled"`` with
-    ``error="best-ask X > cap Y; cancelled and abandoned"``
+    ``error="best-ask X > cap Y; cancelled and abandoned"`` (or
+    ``best-bid X < cap Y`` for SELL)
   - Sends a Telegram: "🛑 Vietnam Algo: order ABB ABANDONED
-    (ask above cap)"
+    (best-ask above cap)"
 - The cap is computed from ``originalPrice`` (the FIRST submit
   price), not the current (possibly re-priced) price. This
   prevents a runaway market from compounding the cap.
 
-Kill-switch: at most ``ORDER_MAX_REPRICES`` (default 1) re-prices
-per order. If the first re-price doesn't fill within 15 min, the
-order is abandoned.
+Kill-switch: at most ``ORDER_MAX_REPRICES`` (default 1, set to
+2 in the production launch script) re-prices per order. After
+that, the order is abandoned no matter what.
 
 The next time ABB (or any other stock) drifts away from our
 limit, the bot will automatically chase up to the cap and

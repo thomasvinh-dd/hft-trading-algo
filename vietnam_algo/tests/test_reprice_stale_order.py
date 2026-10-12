@@ -61,6 +61,33 @@ QUOTE_NO_OFFER = {
         {"boardId": "G1", "offer": []}
     ]
 }
+# Symmetric SELL re-pricing fixtures. ``bid`` instead of ``offer``;
+# ``price`` is in THOUSANDS of VND (17.4 = 17,400 VND).
+QUOTE_BID_BELOW_20000 = {
+    "quotes": [
+        {"boardId": "G1", "bid": [{"price": 17.4}]}
+    ]
+}
+QUOTE_BID_ABOVE_20000 = {
+    "quotes": [
+        {"boardId": "G1", "bid": [{"price": 20.6}]}
+    ]
+}
+QUOTE_BID_AT_19500 = {
+    "quotes": [
+        {"boardId": "G1", "bid": [{"price": 19.5}]}
+    ]
+}
+QUOTE_BID_WAY_BELOW = {
+    "quotes": [
+        {"boardId": "G1", "bid": [{"price": 15.0}]}
+    ]
+}
+QUOTE_NO_BID = {
+    "quotes": [
+        {"boardId": "G1", "bid": []}
+    ]
+}
 
 
 class _StubClient:
@@ -139,15 +166,169 @@ def _make_order(
 # -----------------------------------------------------------------------------
 
 
-def test_skips_sell_orders() -> None:
-    """SELL orders should NOT be re-priced."""
-    order = _make_order(side="NS")
-    client = _StubClient()
+def test_reprice_works_for_sell_orders() -> None:
+    """Symmetric to BUY: a SELL limit order that nobody is hitting
+    because the market is dropping gets re-priced DOWN. The
+    user asked for this on 2026-10-13.
+    """
+    # SELL 100 @ 20,000, but the live bid is at 19,500 (below the limit).
+    # After 16 min staleness, re-price DOWN to 19,500.
+    order = LedgerOrder(
+        runId="2026-10-13",
+        sourceOrderId=42,
+        sourceDate="2026-10-13",
+        symbol="VCB",
+        side="NS",
+        quantity=100,
+        price=20000,
+        reason="autofin_tp:test",
+        status="open",
+        dnseOrderId="sell-123",
+        createdAt=(datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat().replace("+00:00", "Z"),
+        originalPrice=20000,
+        repriceCount=0,
+    )
+    client = _StubClient(
+        latest_quote=QUOTE_BID_AT_19500,
+        place_response={"id": "sell-456", "orderStatus": "New"},
+    )
+    summary = _maybe_reprice_stale_order(
+        client, "A", "tok", order,
+        now_epoch=datetime.now(timezone.utc).timestamp(),
+        reprice_tolerance_pct=0.03,
+    )
+    assert summary["action"] == "replaced"
+    assert summary["new_price"] == 19500
+    assert summary["market_price"] == 19500
+    # Cap for SELL is BELOW the original price (3% lower)
+    assert summary["cap"] == int(20000 * 0.97)  # 19,400
+    assert summary["cancelled_dnse_order_id"] == "sell-123"
+    assert summary["new_dnse_order_id"] == "sell-456"
+    assert summary["side"] == "NS"
+
+
+def test_sell_skips_when_bid_above_current_limit() -> None:
+    """SELL: if the bid is at or above our limit, the order
+    has a chance to fill naturally — don't re-price DOWN.
+    """
+    order = _make_order(side="NS", price=20000, original_price=20000)
+    client = _StubClient(latest_quote=QUOTE_BID_ABOVE_20000)
     summary = _maybe_reprice_stale_order(
         client, "A", "tok", order, now_epoch=datetime.now(timezone.utc).timestamp(),
     )
     assert summary["action"] == "skipped"
-    assert "side is not BUY" in summary["reason"]
+    assert "best-bid" in summary["reason"]
+    assert "not below current limit" in summary["reason"]
+
+
+def test_sell_abandons_when_bid_below_cap() -> None:
+    """SELL: if the new bid is below the cap (3% below original),
+    we cancel the order and ABANDON. Don't chase a falling market
+    past the cap.
+    """
+    order = _make_order(side="NS", price=20000, original_price=20000)
+    # 15.0 VND bid → 15,000 VND, way below the 3% cap (20,000 * 0.97 = 19,400)
+    client = _StubClient(latest_quote=QUOTE_BID_WAY_BELOW)
+    summary = _maybe_reprice_stale_order(
+        client, "A", "tok", order,
+        now_epoch=datetime.now(timezone.utc).timestamp(),
+        reprice_tolerance_pct=0.03,
+    )
+    assert summary["action"] == "abandoned"
+    # Cancel was called
+    cancel_calls = [c for c in client.calls if c["method"] == "cancel_order"]
+    assert len(cancel_calls) == 1
+    # No place_stock_order (we abandoned)
+    place_calls = [c for c in client.calls if c["method"] == "place_stock_order"]
+    assert place_calls == []
+    assert "best-bid" in summary["reason"]
+
+
+def test_sell_skips_when_no_bid_in_quote() -> None:
+    """SELL: if the quote response has no bid, skip — don't crash."""
+    order = _make_order(side="NS", price=20000)
+    client = _StubClient(latest_quote=QUOTE_NO_BID)
+    summary = _maybe_reprice_stale_order(
+        client, "A", "tok", order, now_epoch=datetime.now(timezone.utc).timestamp(),
+    )
+    assert summary["action"] == "skipped"
+    assert "no best-bid" in summary["reason"]
+
+
+def test_sell_uses_original_price_for_cap_when_present() -> None:
+    """If a SELL order has been re-priced before, ``originalPrice``
+    holds the FIRST submit price. The cap must be computed from
+    the original price, not the current (re-priced) one.
+    """
+    # First re-price: 20,000 → 19,500
+    # Second re-price: limit=19,500, bid=19,000
+    # 19,000 < cap (20,000 * 0.97 = 19,400) → ABANDONED
+    order = _make_order(side="NS", price=19500, original_price=20000, reprice_count=1)
+    client = _StubClient(latest_quote=QUOTE_BID_WAY_BELOW)
+    summary = _maybe_reprice_stale_order(
+        client, "A", "tok", order,
+        now_epoch=datetime.now(timezone.utc).timestamp(),
+        max_reprices=2,
+        reprice_tolerance_pct=0.03,
+    )
+    assert summary["action"] == "abandoned"
+    # Cap is from original 20,000, not current 19,500
+    assert summary["cap"] == int(20000 * 0.97)
+
+
+def test_sell_chase_stops_at_cap_boundary() -> None:
+    """SELL: the bid exactly at the cap should still be replaced
+    (cap is inclusive). Test: 20,000 * 0.97 = 19,400 exactly.
+    """
+    order = _make_order(side="NS", price=20000, original_price=20000)
+    client = _StubClient(
+        latest_quote={"quotes": [{"boardId": "G1", "bid": [{"price": 19.4}]}]}
+    )
+    summary = _maybe_reprice_stale_order(
+        client, "A", "tok", order,
+        now_epoch=datetime.now(timezone.utc).timestamp(),
+        reprice_tolerance_pct=0.03,
+    )
+    assert summary["action"] == "replaced"
+    assert summary["new_price"] == 19400
+
+
+def test_sell_below_cap_abandons() -> None:
+    """SELL: bid one VND below the cap (19,399 < 19,400) → ABANDON."""
+    order = _make_order(side="NS", price=20000, original_price=20000)
+    client = _StubClient(
+        latest_quote={"quotes": [{"boardId": "G1", "bid": [{"price": 19.399}]}]}
+    )
+    summary = _maybe_reprice_stale_order(
+        client, "A", "tok", order,
+        now_epoch=datetime.now(timezone.utc).timestamp(),
+        reprice_tolerance_pct=0.03,
+    )
+    assert summary["action"] == "abandoned"
+
+
+def test_sell_uses_bid_in_place_call_not_ask() -> None:
+    """SELL re-price must send the bid (not the ask) as the new
+    limit price. Symmetric to the BUY case which sends the ask.
+    """
+    order = _make_order(side="NS", price=20000, original_price=20000)
+    client = _StubClient(
+        latest_quote=QUOTE_BID_AT_19500,
+        place_response={"id": "sell-456", "orderStatus": "New"},
+    )
+    summary = _maybe_reprice_stale_order(
+        client, "A", "tok", order,
+        now_epoch=datetime.now(timezone.utc).timestamp(),
+    )
+    assert summary["action"] == "replaced"
+    place_calls = [c for c in client.calls if c["method"] == "place_stock_order"]
+    assert len(place_calls) == 1
+    place_args = place_calls[0]["args"]
+    place_kwargs = place_calls[0]["kwargs"]
+    if place_args:
+        assert place_args[5] == 19500  # the new bid, not the ask
+    else:
+        assert place_kwargs["price"] == 19500
 
 
 def test_skips_non_open_status() -> None:
@@ -330,7 +511,7 @@ def test_replaces_when_ask_within_cap() -> None:
     )
     assert summary["action"] == "replaced"
     assert summary["new_price"] == 17600  # the new ask, in VND
-    assert summary["best_ask"] == 17600
+    assert summary["market_price"] == 17600
     assert summary["cap"] == int(17500 * 1.03)  # 18,025
     assert summary["cancelled_dnse_order_id"] == "old-123"
     assert summary["new_dnse_order_id"] == "new-456"
