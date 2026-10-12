@@ -770,6 +770,38 @@ def _submit_autofin_deals_to_dnse(
         cash_pkg_cache[sym] = pkg_id
         return pkg_id
 
+    # 2026-10-12: orderType also depends on the SYMBOL's market, not
+    # just the trading session. UPCOM (``UPX``) only accepts ``LO`` —
+    # submitting ATC/ATO/MP on a UPCOM symbol returns HTTP 400
+    # ``INVALID_ORDER_TYPE_FOR_THE_EXCHANGE`` (logged on the
+    # 14:31 ICT ABB live-submit attempt). HNX (``HNX``) accepts ATC
+    # but not ATO. HOSE (``HSX``) accepts both. Look up the market
+    # per symbol and override the order type accordingly.
+    market_cache: dict[str, str] = {}
+    market_lookup_errors: list[str] = []
+
+    def _order_type_for_symbol(sym: str, default_otype: str) -> str:
+        """Return the orderType DNSE will accept for this symbol+session.
+        UPCOM always uses ``LO`` (no auction support).
+        """
+        if sym in market_cache:
+            market_id = market_cache[sym]
+        else:
+            try:
+                market_id = client.get_market_id(sym)
+                market_cache[sym] = market_id
+            except Exception as exc:
+                market_lookup_errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:200]}")
+                market_cache[sym] = "UNKNOWN"
+                market_id = "UNKNOWN"
+        if market_id == "UPX":
+            # UPCOM only supports LO. Send LO with the signal price.
+            return "LO"
+        if market_id == "HNX" and default_otype == "ATO":
+            # HNX doesn't have an opening auction; downgrade to LO.
+            return "LO"
+        return default_otype
+
     for deal in deals_actioned:
         for o in deal.get("dnse_orders", []) or []:
             sym = str(o.get("symbol") or "").upper().strip()
@@ -785,8 +817,13 @@ def _submit_autofin_deals_to_dnse(
             # In auction windows the fill price is determined by the
             # exchange; the bot must send price=0. The signal price
             # is preserved in the reason string for the audit log.
+            # 2026-10-12: if the market-aware override downgraded the
+            # orderType to LO (UPCOM doesn't have auctions, HNX has
+            # no ATO), the price is no longer auction-determined —
+            # send the signal price.
             signal_price = int(o.get("price") or 0)
             if is_auction:
+                # Will be re-evaluated after we know the market
                 price = 0
             elif signal_price <= 0:
                 continue
@@ -797,11 +834,17 @@ def _submit_autofin_deals_to_dnse(
             # back to ``loan_package_id_by_symbol`` then to the launch
             # script's default (``--loan-package-id``) for back-compat.
             lp = _resolve_cash_pkg(sym)
-            # The session's orderType (ATO/ATC/LO) overrides whatever
-            # the autofin adapter emitted — the strategy can't know
-            # which session it's submitting in without leaking
-            # clock-time decisions into the signal layer.
-            otype = session_order_type
+            # The session's orderType (ATO/ATC/LO) is the default,
+            # but UPCOM symbols (e.g. ABB) only support ``LO`` and
+            # DNSE rejects ATO/ATC with HTTP 400
+            # ``INVALID_ORDER_TYPE_FOR_THE_EXCHANGE``. The market-
+            # aware override is non-negotiable.
+            otype = _order_type_for_symbol(sym, session_order_type)
+            # If the orderType was downgraded from ATO/ATC to LO
+            # (UPCOM, or HNX-during-ATO), use the signal price
+            # instead of 0 — the LO orderType accepts a non-zero price.
+            if is_auction and otype == "LO":
+                price = signal_price
             reason = str(o.get("reason") or f"autofin:{deal.get('action', '?')}")
             if is_auction and signal_price > 0:
                 reason = f"{reason} [session={session.value} signal_price={signal_price}]"

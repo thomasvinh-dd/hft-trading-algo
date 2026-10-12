@@ -199,10 +199,17 @@ class _StubDnseClient:
     2026-10-12: the runner now calls ``client.get_cash_loan_package_id(
     account_no, sym)`` for every symbol in the submit batch. This stub
     pretends every symbol has the real cash package id ``1036``.
+
+    2026-10-12: the runner also calls ``client.get_market_id(sym)`` to
+    determine the symbol's board (HSX/HNX/UPX) so the orderType can be
+    overridden for UPCOM (always LO). The default market is ``HSX``;
+    tests can populate ``market_by_symbol`` to override.
     """
 
     def __init__(self) -> None:
         self.cash_pkg_by_symbol: dict[str, int] = {}  # default → 1036
+        self.market_by_symbol: dict[str, str] = {}  # default → HSX
+        self.get_latest_quote_calls: list[str] = []
 
     def get_cash_loan_package_id(self, account_no: str, symbol: str) -> int:
         sym = symbol.upper()
@@ -210,7 +217,14 @@ class _StubDnseClient:
             return self.cash_pkg_by_symbol[sym]
         return 1036  # default cash package id for tests
 
+    def get_market_id(self, symbol: str) -> str:
+        sym = symbol.upper()
+        if sym in self.market_by_symbol:
+            return self.market_by_symbol[sym]
+        return "HSX"  # default — accepts all order types
+
     def get_latest_quote(self, symbol: str) -> dict:
+        self.get_latest_quote_calls.append(symbol.upper())
         # Return a mid-zone price so the live-quote gate doesn't drop
         return {"sym": symbol.upper(), "g1": {"askPrice": 20000}}
 
@@ -454,3 +468,86 @@ def test_place_stock_order_keeps_price_for_LO(monkeypatch) -> None:
     body = json.loads(captured["req"].data)
     assert body["orderType"] == "LO"
     assert body["price"] == 50000
+
+
+# -----------------------------------------------------------------------------
+# 2026-10-12: market-aware order type override.
+#
+# UPCOM (UPX) only supports LO. ATO/ATC on UPCOM returns HTTP 400
+# ``INVALID_ORDER_TYPE_FOR_THE_EXCHANGE``. The runner must look up
+# each symbol's marketId and override the session's default order type
+# to ``LO`` for UPCOM symbols (and to ``LO`` for HNX during ATO,
+# since HNX has no opening auction).
+# -----------------------------------------------------------------------------
+
+
+def test_submit_in_atc_uses_LO_for_upcom_symbol(stub_ledger, stub_client, monkeypatch) -> None:
+    """UPCOM symbols (e.g. ABB) must use LO even during the ATC window.
+    The 14:31 ICT ABB live-submit attempt at ATC returned HTTP 400
+    ``INVALID_ORDER_TYPE_FOR_THE_EXCHANGE`` before this fix.
+    """
+    stub_client.market_by_symbol["ABB"] = "UPX"
+    _patch_now(monkeypatch, 2026, 10, 8, 14, 35)  # 14:35 ICT, ATC
+    from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+    result = _submit_autofin_deals_to_dnse(
+        [_entry_deal(symbol="ABB", price=17500)],
+        account_no="0003937868", loan_package_id=1775,
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
+        trade_date="2026-10-08",
+    )
+    assert result["total"] == 1
+    o = stub_ledger.calls[0]["orders"][0]
+    assert o.symbol == "ABB"
+    assert o.orderType == "LO", (
+        f"UPCOM symbol ABB must use LO during ATC, got {o.orderType}"
+    )
+    assert o.price == 17500, (
+        f"LO with the signal price (not 0); UPCOM doesn't have auctions"
+    )
+
+
+def test_submit_in_ato_uses_LO_for_hnx_symbol(stub_ledger, stub_client, monkeypatch) -> None:
+    """HNX symbols (e.g. SHB) must use LO during ATO since HNX has no
+    opening auction.
+    """
+    stub_client.market_by_symbol["SHB"] = "HNX"
+    _patch_now(monkeypatch, 2026, 10, 8, 9, 5)  # 09:05 ICT, ATO
+    from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+    result = _submit_autofin_deals_to_dnse(
+        [_entry_deal(symbol="SHB", price=10000)],
+        account_no="0003937868", loan_package_id=1775,
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
+        trade_date="2026-10-08",
+    )
+    assert result["total"] == 1
+    o = stub_ledger.calls[0]["orders"][0]
+    assert o.symbol == "SHB"
+    assert o.orderType == "LO", (
+        f"HNX symbol SHB must use LO during ATO (no opening auction), "
+        f"got {o.orderType}"
+    )
+    assert o.price == 10000
+
+
+def test_submit_in_atc_uses_ATC_for_hose_symbol(stub_ledger, stub_client, monkeypatch) -> None:
+    """HOSE symbols (e.g. VCB) must keep using ATC during the ATC window.
+    The market-aware override must NOT downgrade HOSE — only UPCOM (LO
+    only) and HNX-during-ATO (no ATO support).
+    """
+    stub_client.market_by_symbol["VCB"] = "HSX"
+    _patch_now(monkeypatch, 2026, 10, 8, 14, 35)  # 14:35 ICT, ATC
+    from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+    result = _submit_autofin_deals_to_dnse(
+        [_entry_deal(symbol="VCB", price=60000)],
+        account_no="0003937868", loan_package_id=1775,
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
+        trade_date="2026-10-08",
+    )
+    assert result["total"] == 1
+    o = stub_ledger.calls[0]["orders"][0]
+    assert o.symbol == "VCB"
+    assert o.orderType == "ATC", (
+        f"HOSE symbol VCB must keep using ATC during ATC window, "
+        f"got {o.orderType}"
+    )
+    assert o.price == 0  # ATC requires price=0

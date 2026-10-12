@@ -523,6 +523,31 @@ class DnseClient:
             query["indexName"] = index_name
         return self.request("GET", "/market/instruments", query)
 
+    def get_market_id(self, symbol: str) -> str:
+        """Return the ``marketId`` for ``symbol`` (e.g. ``UPX``, ``HSX``, ``HNX``).
+
+        The market determines which orderTypes DNSE accepts during
+        auction windows. For HOSE (``HSX``) all of ATO/ATC/LO/MTL
+        are valid; for HNX (``HNX``) ATC/LO/MAK/MOK/MTL/PLO are
+        valid; for UPCOM (``UPX``) ONLY ``LO`` is valid — the
+        server rejects ATO/ATC/MP with HTTP 400
+        ``INVALID_ORDER_TYPE_FOR_THE_EXCHANGE`` (logged on the
+        2026-10-12 14:31 ICT ABB live-submit attempt with ATC).
+        """
+        response = self.get_instruments(symbol=symbol.upper(), limit=1, page=1)
+        items = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(items, list) or not items:
+            raise RuntimeError(
+                f"DNSE returned no instruments for {symbol}: {response!r}"
+            )
+        market_id = items[0].get("marketId")
+        if not market_id:
+            raise RuntimeError(
+                f"DNSE returned instrument for {symbol} but no marketId: "
+                f"{items[0]!r}"
+            )
+        return str(market_id)
+
     def list_instruments_paginated(
         self,
         limit: int = 200,
