@@ -133,6 +133,67 @@ The next time ABB (or any other stock) drifts away from our
 limit, the bot will automatically chase up to the cap and
 Telegram the operator. No manual intervention needed.
 
+## Auto-recovery of failed entries (2026-10-13)
+
+After the 2026-10-12 ABB BUY at 17,500 expired at EOD without
+filling, the next-morning poll would have filtered ABB out as
+"already actioned" — even though we never actually held a
+position. The operator had to manually reset the actioned state
+to re-attempt, which is fragile and error-prone.
+
+The fix (commit ``df6a971``):
+``AutofinSignalAdapter._prune_terminal_unfilled_deals`` derives
+the actioned set from:
+
+1. The persistent actioned set on disk
+2. PLUS deals we still hold (``our_deals[did]._our_qty > 0``)
+3. PLUS deals with at least one non-terminal order on the books
+   (open / partial / submitting / unknown / prepared)
+
+and REMOVES deals whose latest order is in a terminal state
+WITHOUT a fill (expired / cancelled / rejected / closed /
+dry_run / skipped). After this, ABB (which has only an
+"expired" order on the books) is automatically re-actionable
+next day — no manual reset needed.
+
+The function is best-effort: any failure (missing ledger, parse
+error, ledger corruption) is treated as "no pruning" so we
+don't accidentally drop a deal that's still in flight.
+
+### Known caveat: dry-run pollution
+
+When ``force-run-trading`` runs in **dry-run** mode (without
+``--live-submit``), the strategy still updates
+``our_deals[did]._our_qty`` to the planned quantity (line 2120
+in ``autofin_signal.py``). In live mode this is correct: the
+filled order actually changes our position. In dry-run, we
+never executed the trade, but the state file records it as if
+we did. This is a side-effect of the dry-run reusing the same
+state file as live mode.
+
+**Impact on the auto-recovery fix**: a dry-run will leave the
+state saying ``_our_qty = 100`` for the new entry. When the
+next live cycle loads the state, ``_our_qty > 0`` → the deal
+is treated as "held" → the cleanup doesn't prune it from
+actioned_deals.
+
+**Workaround until fixed**: if you ran a dry-run and now need
+the live bot to re-attempt the same deal, manually reset the
+state:
+```python
+import json
+p = "/root/hft-trading-algo/vietnam_algo/data/live/autofin_signal_state.json"
+s = json.load(open(p))
+s["our_deals"]["<DID>"]["_our_qty"] = 0
+s["actioned_deals"] = [d for d in s["actioned_deals"] if d != "<DID>"]
+json.dump(s, open(p, "w"), indent=2, sort_keys=True)
+```
+
+**Proper fix** (open work item): separate the dry-run and
+live state, or guard the line-2120 update with ``if not
+dry_run`` (track via a top-level ``is_dry_run`` parameter
+plumbed through ``decide_orders``).
+
 ## Tests added (770 → 773)
 
 - ``vietnam_algo/tests/test_dnse_cash_loan_package.py``: +4 tests
