@@ -257,6 +257,8 @@ def test_handler_dry_run_calls_generate_orders(monkeypatch, tmp_path) -> None:
         startOfDayDate = "2026-10-08"
     monkeypatch.setattr(_bot_state_mod, "load_state", lambda *a, **kw: _State())
 
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
     from vietnam_algo.main import main
     rc = main(["force-run-trading",
                "--strategy", "autofin_signal",
@@ -266,9 +268,10 @@ def test_handler_dry_run_calls_generate_orders(monkeypatch, tmp_path) -> None:
                "--api-secret", "dummy-secret",
                "--no-notify"])
     assert rc == 0
-    # strategy was called with today's date
+    # strategy was called with today's date (in ICT)
     assert len(calls) == 1
-    assert calls[0]["trade_date"] == "2026-10-09"
+    today_ict = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date().isoformat()
+    assert calls[0]["trade_date"] == today_ict
     assert calls[0]["live_submit"] is False
     # submit was NOT called (dry-run)
     assert submit_called == []
