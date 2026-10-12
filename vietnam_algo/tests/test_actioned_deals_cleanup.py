@@ -1,0 +1,271 @@
+"""Tests for the actioned-deals cleanup logic in
+``vietnam_algo.algos.autofin_signal.AutofinSignalAdapter._prune_terminal_unfilled_deals``.
+
+User audit 2026-10-13: "previous day we still make the deal of ABB
+work so we should consider it as fresh on next day, no need to
+reset manually like this."
+
+The 2026-10-12 ABB BUY at 17,500 was placed but expired at EOD
+without filling. The deal's ``actioned_deals`` entry persisted
+across the bot restart, so on 2026-10-13 the morning poll filtered
+ABB out as "already actioned" — even though we never actually held
+the position. The operator had to manually reset the actioned
+state to re-attempt.
+
+Fix: ``_prune_terminal_unfilled_deals`` derives the actioned set
+from the persistent disk list PLUS:
+
+  1. deals we still hold (``our_deals[did]._our_qty > 0``)
+  2. deals with at least one non-terminal order on the books
+     (open / partial / submitting / unknown / prepared)
+
+and REMOVES deals whose latest order is in a terminal state
+without a fill (expired / cancelled / rejected / closed / dry_run
+/ skipped). After this, ABB (which has only an "expired" order on
+the books) is automatically re-actionable next day.
+
+These tests pin the behavior.
+"""
+from __future__ import annotations
+
+import sys
+import json
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+from vietnam_algo.libs.order_ledger import LedgerOrder
+
+
+def _ledger_order(
+    deal_id: str,
+    status: str,
+    updated_at: str = "2026-10-12T08:00:00Z",
+    symbol: str = "ABB",
+) -> LedgerOrder:
+    return LedgerOrder(
+        runId="2026-10-12",
+        sourceOrderId=12345,
+        sourceDate="2026-10-12",
+        symbol=symbol,
+        side="NB",
+        quantity=100,
+        price=17500,
+        reason=f"autofin_buy:deal#{deal_id}:nav30pct:Khuyến nghị đầu tư",
+        status=status,
+        dnseOrderId=f"dnse-{deal_id}",
+        createdAt="2026-10-12T07:00:00Z",
+        updatedAt=updated_at,
+    )
+
+
+def _write_ledger(tmp_path: Path, items: list[LedgerOrder]) -> Path:
+    """Write a minimal ``order_ledger.json`` to ``tmp_path/live/order_ledger.json``."""
+    live_dir = tmp_path / "live"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updatedAt": "2026-10-12T08:00:00Z",
+        "count": len(items),
+        "items": [item.__dict__ for item in items],
+    }
+    (live_dir / "order_ledger.json").write_text(json.dumps(payload, indent=2, default=str))
+    return tmp_path
+
+
+def test_empty_actioned_returns_empty(tmp_path) -> None:
+    """If the persistent actioned set is empty, return empty (no-op)."""
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(set(), {}, tmp_path)
+    assert result == set()
+
+
+def test_held_deal_is_kept_even_if_no_orders(tmp_path) -> None:
+    """A deal we currently hold is ALWAYS actioned, even if there
+    are no orders in the ledger. This handles the case where the
+    order was placed long ago and the ledger was wiped (or this is
+    a recovery from a partial state).
+    """
+    our_deals = {"1785456000:HDB": {"_our_qty": 100}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {"1785456000:HDB"}, our_deals, tmp_path,
+    )
+    assert "1785456000:HDB" in result
+
+
+def test_expired_order_no_position_releases_deal(tmp_path) -> None:
+    """The 2026-10-12 ABB case: order placed, expired at EOD, no fill.
+    No position. The deal should be REMOVED from actioned so it can
+    be re-attempted next day.
+    """
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [_ledger_order(did, "expired")])
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, {}, tmp_path,
+    )
+    assert did not in result
+
+
+def test_rejected_order_no_position_releases_deal(tmp_path) -> None:
+    """Rejected (server-side rejection, e.g. margin / symbol invalid)
+    should also release the deal — we never filled, we never held.
+    """
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [_ledger_order(did, "rejected")])
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, {}, tmp_path,
+    )
+    assert did not in result
+
+
+def test_cancelled_order_no_position_releases_deal(tmp_path) -> None:
+    """A cancelled order (operator cancelled, or the order monitor
+    cancelled it during a re-price attempt that didn't reach the
+    re-place phase) should release the deal IF there's no other
+    open order for it.
+    """
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [_ledger_order(did, "cancelled")])
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, {}, tmp_path,
+    )
+    assert did not in result
+
+
+def test_open_order_keeps_deal_actioned(tmp_path) -> None:
+    """An open (in-flight) order keeps the deal actioned. We don't
+    want to issue a duplicate order while the original is still
+    working through the exchange.
+    """
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [_ledger_order(did, "open")])
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, {}, tmp_path,
+    )
+    assert did in result
+
+
+def test_partial_fill_keeps_deal_actioned(tmp_path) -> None:
+    """A partially-filled order is non-terminal — keep actioned."""
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [_ledger_order(did, "partial")])
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, {}, tmp_path,
+    )
+    assert did in result
+
+
+def test_filled_then_sold_releases_deal(tmp_path) -> None:
+    """Filled + sold (qty=0 in our_deals) is "terminal-without-
+    current-position" — the deal should be re-actionable. This
+    handles the case where we closed out and autofin republishes
+    the same deal as a fresh entry.
+    """
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [_ledger_order(did, "filled")])
+    our_deals = {did: {"_our_qty": 0}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did not in result
+
+
+def test_filled_and_held_keeps_deal_actioned(tmp_path) -> None:
+    """Filled + still holding (qty > 0) → keep actioned. The
+    "current_qty > 0" check in _plan_orders_for_new_positions is
+    the actual guard against re-entry, but actioned_deals is the
+    first-line defense.
+    """
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [_ledger_order(did, "filled")])
+    our_deals = {did: {"_our_qty": 100}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did in result
+
+
+def test_repriced_order_keeps_deal_actioned(tmp_path) -> None:
+    """Re-priced orders leave an old "cancelled" order and a new
+    "open" order in the ledger. The latest one (by updatedAt) is
+    the re-priced one — it's "open", so the deal is kept actioned.
+    """
+    did = "1789344000:ABB"
+    items = [
+        _ledger_order(did, "cancelled", updated_at="2026-10-12T07:30:00Z"),
+        _ledger_order(did, "open", updated_at="2026-10-12T07:35:00Z"),
+    ]
+    _write_ledger(tmp_path, items)
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, {}, tmp_path,
+    )
+    assert did in result
+
+
+def test_no_ledger_file_keeps_deal_actioned(tmp_path) -> None:
+    """If the ledger doesn't exist (first-run, fresh install), the
+    cleanup is a no-op — we keep the persistent set intact. The
+    caller (load_state) handles the no-file case via the
+    ``try/except`` around the whole block.
+    """
+    # Don't write the ledger file
+    did = "1789344000:ABB"
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, {}, tmp_path,
+    )
+    assert did in result
+
+
+def test_mixed_deals_pruned_independently(tmp_path) -> None:
+    """A realistic mix: some deals get pruned, some kept. The
+    function must handle each one based on its own state, not
+    short-circuit on the first prune.
+    """
+    abb = "1789344000:ABB"   # expired, not held → prune
+    hdb = "1786492800:HDB"   # open → keep
+    tlg = "1786579200:TLG"   # held (qty > 0) → keep
+    vcb = "1789344000:VCB"   # rejected, not held → prune
+    items = [
+        _ledger_order(abb, "expired", symbol="ABB"),
+        _ledger_order(hdb, "open", symbol="HDB"),
+        _ledger_order(vcb, "rejected", symbol="VCB"),
+    ]
+    _write_ledger(tmp_path, items)
+    our_deals = {tlg: {"_our_qty": 100}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {abb, hdb, tlg, vcb}, our_deals, tmp_path,
+    )
+    assert abb not in result  # pruned
+    assert hdb in result  # kept (open)
+    assert tlg in result  # kept (held)
+    assert vcb not in result  # pruned
+
+
+def test_orphan_deal_no_orders_kept_conservatively(tmp_path) -> None:
+    """A deal in the persistent actioned set with NO order ledger
+    entries at all is a stale entry (probably from a prior bot
+    version). Keep it conservative: assume still actioned so we
+    don't double-enter.
+    """
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [])  # empty ledger
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, {}, tmp_path,
+    )
+    assert did in result
+
+
+def test_order_ledger_unreadable_falls_back_gracefully(tmp_path, monkeypatch) -> None:
+    """If ``load_ledger`` raises, the cleanup returns the original
+    set unchanged. The ``try/except`` in ``_load_state`` will then
+    fall back to the no-prune path entirely.
+    """
+    from vietnam_algo.algos import autofin_signal
+    def boom(data_dir):
+        raise RuntimeError("ledger file is corrupted")
+    monkeypatch.setattr(autofin_signal, "load_ledger", boom)
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {"1789344000:ABB"}, {}, tmp_path,
+    )
+    assert "1789344000:ABB" in result

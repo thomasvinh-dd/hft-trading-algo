@@ -46,6 +46,7 @@ from vietnam_algo.libs.autofin_signals import (
 from vietnam_algo.libs.config import StrategyConfig
 from vietnam_algo.libs.daily_engine import EngineConfig
 from vietnam_algo.libs.notifier import notify
+from vietnam_algo.libs.order_ledger import TERMINAL_LEDGER_STATUSES, load_ledger
 from vietnam_algo.libs.portfolio import build_portfolio_snapshot
 
 from .base import StrategyAdapter
@@ -2214,6 +2215,24 @@ class AutofinSignalAdapter(StrategyAdapter):
             for did, sig in self._our_deals.items():
                 if int(sig.get("_our_qty", 0) or 0) > 0:
                     actioned.add(str(did))
+            # 2026-10-13: prune deals whose most recent order is in a
+            # terminal state (expired / cancelled / rejected / closed
+            # / dry_run / skipped) AND we no longer hold the position.
+            # Without this, an order that never filled (e.g. the
+            # 2026-10-12 ABB BUY that expired at EOD) would keep its
+            # deal_id in actioned_deals forever, preventing the bot
+            # from re-attempting the same signal next day. The user
+            # audit on 2026-10-13 surfaced this: "previous day we
+            # still make the deal of ABB work so we should consider
+            # it as fresh on next day, no need to reset manually".
+            #
+            # The contract: a deal is "actioned" iff we EITHER still
+            # hold the position OR have an outstanding (non-terminal)
+            # order in the order ledger. When the order is terminal
+            # without a fill, the deal is re-actionable next cycle.
+            actioned = self._prune_terminal_unfilled_deals(
+                actioned, self._our_deals, data_dir,
+            )
             self._actioned_deals = actioned
         except Exception:
             self._our_deals = {}
@@ -2223,6 +2242,87 @@ class AutofinSignalAdapter(StrategyAdapter):
             self._last_notification_poll_at = None
             self._notified_event_ids = set()
             self._actioned_deals = set()
+
+    @staticmethod
+    def _prune_terminal_unfilled_deals(
+        actioned: set[str],
+        our_deals: dict[str, dict[str, Any]],
+        data_dir: Path,
+    ) -> set[str]:
+        """Remove deals from ``actioned`` when the latest order is
+        terminal-without-fill and we don't hold the position.
+
+        Returns the (possibly smaller) actioned set. Best-effort: any
+        failure (missing ledger, parse error) is treated as "no
+        pruning" so we don't accidentally drop a deal that's still
+        in flight. The caller should always call this even if the
+        ledger doesn't exist yet (first-run) — it's a no-op in that
+        case.
+        """
+        if not actioned:
+            return actioned
+        # 1. Determine which deals we still hold (qty > 0). These
+        #    are always actioned — re-entering a held position is
+        #    forbidden by the "current_qty > 0" check in
+        #    _plan_orders_for_new_positions.
+        held_dids: set[str] = {
+            did for did, sig in our_deals.items()
+            if int(sig.get("_our_qty", 0) or 0) > 0
+        }
+        # 2. Build deal_id -> latest-order-status from the order
+        #    ledger. The latest order is the one with the most recent
+        #    updatedAt (or createdAt as fallback). For each deal we
+        #    only care about the latest status, not the full history.
+        latest_by_did: dict[str, str] = {}
+        try:
+            ledger = load_ledger(data_dir)
+        except Exception:
+            ledger = {}
+        for item in ledger.values():
+            reason = item.reason or ""
+            m = re.search(r"deal#(\d+:[A-Z]+)", reason)
+            if not m:
+                continue
+            did = m.group(1)
+            ts = item.updatedAt or item.createdAt or ""
+            prev_ts = latest_by_did.get(did + "_ts", "")
+            if ts >= prev_ts:
+                latest_by_did[did + "_ts"] = ts
+                latest_by_did[did] = item.status
+        # The dict above mixed the value and the timestamp under the
+        # same key prefix; split them back out.
+        latest_status_by_did: dict[str, str] = {}
+        for k, v in latest_by_did.items():
+            if k.endswith("_ts"):
+                continue
+            latest_status_by_did[k] = v
+        # 3. Prune: keep the deal only if we hold it OR the latest
+        #    order is non-terminal (open / partial / submitting /
+        #    unknown / prepared) or filled. Terminal-without-fill
+        #    states (expired / cancelled / rejected / closed /
+        #    dry_run / skipped) release the deal back to the
+        #    planning pool.
+        pruned: set[str] = set()
+        for did in actioned:
+            if did in held_dids:
+                pruned.add(did)
+                continue
+            status = latest_status_by_did.get(did, "")
+            if not status:
+                # No order on the books for this deal — we may be
+                # looking at a stale entry from a prior bot version.
+                # Keep it conservative: assume still actioned so we
+                # don't double-enter.
+                pruned.add(did)
+                continue
+            if status in TERMINAL_LEDGER_STATUSES:
+                # Terminal without fill → release the deal.
+                continue
+            # Non-terminal: order is still in flight. Keep actioned
+            # so we don't issue a duplicate while the original is
+            # working through the exchange.
+            pruned.add(did)
+        return pruned
 
     def _save_state(self, data_dir: Path) -> None:
         path = data_dir / "live" / "autofin_signal_state.json"
