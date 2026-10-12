@@ -744,6 +744,32 @@ def _submit_autofin_deals_to_dnse(
     session_order_type = order_type_for_session(session)
     is_auction = session in (TradingSession.ATO, TradingSession.ATC)
 
+    # 2026-10-12: the DNSE server REQUIRES ``loanPackageId`` in every
+    # place_stock_order body, and treats ``0`` as "no value" (rejected
+    # with ``HTTP 400 INVALID_INPUT loanPackageId is required``). The
+    # only valid value is the actual cash-package id (e.g. ``1036``
+    # for ABB on account 0003937868), which varies per symbol. Look
+    # it up once per symbol and cache for the rest of the run.
+    cash_pkg_cache: dict[str, int] = {}
+    cash_pkg_lookup_errors: list[str] = []
+
+    def _resolve_cash_pkg(sym: str) -> int:
+        if sym in cash_pkg_cache:
+            return cash_pkg_cache[sym]
+        if sym in (loan_package_id_by_symbol or {}):
+            cash_pkg_cache[sym] = int(loan_package_id_by_symbol[sym])
+            return cash_pkg_cache[sym]
+        try:
+            pkg_id = client.get_cash_loan_package_id(account_no, sym)
+        except Exception as exc:
+            cash_pkg_lookup_errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:200]}")
+            # Use the launch-script's default as a last resort — better
+            # to send a wrong-but-valid number than to crash. The user
+            # will see the lookup error in the submit result anyway.
+            pkg_id = int(loan_package_id) if loan_package_id else 0
+        cash_pkg_cache[sym] = pkg_id
+        return pkg_id
+
     for deal in deals_actioned:
         for o in deal.get("dnse_orders", []) or []:
             sym = str(o.get("symbol") or "").upper().strip()
@@ -766,15 +792,11 @@ def _submit_autofin_deals_to_dnse(
                 continue
             else:
                 price = signal_price
-            # 2026-10-09: the bot does NOT use margin. Always submit
-            # as a cash order (``loanPackageId=0`` → field omitted
-            # from the body by ``place_stock_order``). The launch
-            # script's ``--loan-package-id`` is preserved for
-            # back-compat with the existing CLI but is effectively a
-            # no-op now; if you ever need to enable margin for a
-            # specific strategy, pass a positive id via
-            # ``loan_package_id_by_symbol`` (per-symbol override).
-            lp = (loan_package_id_by_symbol or {}).get(sym, 0)
+            # 2026-10-12: cash-package id is REQUIRED and per-symbol.
+            # Look it up via DNSE's ``loan-packages`` endpoint; falls
+            # back to ``loan_package_id_by_symbol`` then to the launch
+            # script's default (``--loan-package-id``) for back-compat.
+            lp = _resolve_cash_pkg(sym)
             # The session's orderType (ATO/ATC/LO) overrides whatever
             # the autofin adapter emitted — the strategy can't know
             # which session it's submitting in without leaking

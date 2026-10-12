@@ -193,6 +193,33 @@ def stub_ledger(monkeypatch):
     return stub
 
 
+class _StubDnseClient:
+    """Stand-in for ``DnseClient`` that returns a per-symbol cash package id.
+
+    2026-10-12: the runner now calls ``client.get_cash_loan_package_id(
+    account_no, sym)`` for every symbol in the submit batch. This stub
+    pretends every symbol has the real cash package id ``1036``.
+    """
+
+    def __init__(self) -> None:
+        self.cash_pkg_by_symbol: dict[str, int] = {}  # default → 1036
+
+    def get_cash_loan_package_id(self, account_no: str, symbol: str) -> int:
+        sym = symbol.upper()
+        if sym in self.cash_pkg_by_symbol:
+            return self.cash_pkg_by_symbol[sym]
+        return 1036  # default cash package id for tests
+
+    def get_latest_quote(self, symbol: str) -> dict:
+        # Return a mid-zone price so the live-quote gate doesn't drop
+        return {"sym": symbol.upper(), "g1": {"askPrice": 20000}}
+
+
+@pytest.fixture
+def stub_client() -> _StubDnseClient:
+    return _StubDnseClient()
+
+
 def _patch_now(monkeypatch, year, month, day, hour, minute):
     """Pin vietnam_now() to a specific moment so the session classifier
     returns a deterministic answer."""
@@ -218,78 +245,80 @@ def _entry_deal(symbol="ABW", side="NB", price=14100, quantity=1000):
     }
 
 
-def test_submit_in_continuous_uses_LO_with_signal_price(stub_ledger, monkeypatch) -> None:
+def test_submit_in_continuous_uses_LO_with_signal_price(stub_ledger, stub_client, monkeypatch) -> None:
     """Continuous morning: orderType stays LO, price matches signal.
-    2026-10-09: bot doesn't use margin → loanPackageId=0 by default.
+    2026-10-12: bot looks up the cash package id per symbol via
+    ``client.get_cash_loan_package_id()``. The stub returns ``1036``
+    for any symbol.
     """
     _patch_now(monkeypatch, 2026, 10, 8, 10, 0)  # 10:00 ICT, continuous
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(price=14100)],
         account_no="0003937868", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
     assert result["total"] == 1
     o = stub_ledger.calls[0]["orders"][0]
     assert o.orderType == "LO"
     assert o.price == 14100
-    assert o.loanPackageId == 0  # bot is cash-only since 2026-10-09
+    assert o.loanPackageId == 1036  # cash package id from stub
 
 
-def test_submit_in_ato_uses_ATO_with_price_zero(stub_ledger, monkeypatch) -> None:
+def test_submit_in_ato_uses_ATO_with_price_zero(stub_ledger, stub_client, monkeypatch) -> None:
     """ATO auction window: orderType overridden to ATO, price forced to 0."""
     _patch_now(monkeypatch, 2026, 10, 8, 9, 5)  # 09:05 ICT, ATO
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(price=14100)],
         account_no="0003937868", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
     assert result["total"] == 1
     o = stub_ledger.calls[0]["orders"][0]
     assert o.orderType == "ATO"
     assert o.price == 0
-    assert o.loanPackageId == 0  # bot is cash-only since 2026-10-09
+    assert o.loanPackageId == 1036  # cash package id from stub
     # The reason string preserves the original signal price for audit.
     assert "session=ATO" in o.reason
     assert "signal_price=14100" in o.reason
 
 
-def test_submit_in_atc_uses_ATC_with_price_zero(stub_ledger, monkeypatch) -> None:
+def test_submit_in_atc_uses_ATC_with_price_zero(stub_ledger, stub_client, monkeypatch) -> None:
     """ATC closing auction: orderType overridden to ATC, price forced to 0."""
     _patch_now(monkeypatch, 2026, 10, 8, 14, 35)  # 14:35 ICT, ATC
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(price=14100)],
         account_no="0003937868", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
     assert result["total"] == 1
     o = stub_ledger.calls[0]["orders"][0]
     assert o.orderType == "ATC"
     assert o.price == 0
-    assert o.loanPackageId == 0
+    assert o.loanPackageId == 1036
     assert "session=ATC" in o.reason
 
 
-def test_submit_in_post_close_uses_LO(stub_ledger, monkeypatch) -> None:
+def test_submit_in_post_close_uses_LO(stub_ledger, stub_client, monkeypatch) -> None:
     """Post-close window: bot sends LO with the signal price; DNSE routes by board."""
     _patch_now(monkeypatch, 2026, 10, 8, 14, 50)  # 14:50 ICT, post-close
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(price=14100)],
         account_no="0003937868", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
     assert result["total"] == 1
     o = stub_ledger.calls[0]["orders"][0]
     assert o.orderType == "LO"
     assert o.price == 14100
-    assert o.loanPackageId == 0
+    assert o.loanPackageId == 1036
 
 
 def test_submit_off_hours_short_circuits(stub_ledger, monkeypatch) -> None:

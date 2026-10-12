@@ -48,6 +48,43 @@ class _StubLedger:
         ], [], True
 
 
+class _StubDnseClient:
+    """Stand-in for ``DnseClient`` that returns a per-symbol cash package id.
+
+    2026-10-12: the runner now calls ``client.get_cash_loan_package_id(
+    account_no, sym)`` for every unique symbol in the submit batch
+    (DNSE requires ``loanPackageId`` to be a real package id, not 0).
+    The default mapping below mimics the real DNSE account
+    ``0003937868``: ABW=1036, HDB=1036 (cash), VND=1036, etc.
+
+    Tests that want a different per-symbol map can set
+    ``stub_client.cash_pkg_by_symbol = {...}`` before the call.
+    """
+
+    def __init__(self) -> None:
+        self.cash_pkg_by_symbol: dict[str, int] = {
+            "ABW": 1036,
+            "HDB": 1036,
+            "ABB": 1036,
+            "VCB": 1036,
+        }
+        self.get_latest_quote_calls: list[str] = []
+
+    def get_cash_loan_package_id(self, account_no: str, symbol: str) -> int:
+        sym = symbol.upper()
+        if sym not in self.cash_pkg_by_symbol:
+            raise RuntimeError(
+                f"StubDnseClient: no cash package for {sym}"
+            )
+        return self.cash_pkg_by_symbol[sym]
+
+    def get_latest_quote(self, symbol: str) -> dict:
+        self.get_latest_quote_calls.append(symbol.upper())
+        # Return a mid-zone price so the live-quote gate doesn't
+        # drop the deal in tests that aren't exercising that path.
+        return {"sym": symbol.upper(), "g1": {"askPrice": 20000}}
+
+
 @pytest.fixture
 def stub_ledger(monkeypatch):
     """Replace execute_orders_with_ledger with a stub that records its call.
@@ -60,6 +97,20 @@ def stub_ledger(monkeypatch):
     stub = _StubLedger()
     monkeypatch.setattr(daily_engine, "execute_orders_with_ledger", stub)
     return stub
+
+
+@pytest.fixture
+def stub_client() -> _StubDnseClient:
+    """A stub DNSE client that returns per-symbol cash package ids.
+
+    2026-10-12: ``_submit_autofin_deals_to_dnse`` now calls
+    ``client.get_cash_loan_package_id(account_no, sym)`` for every
+    symbol in the submit batch. Tests that pre-date this fix pass
+    ``client=None`` and relied on the default ``loan_package_id=0``;
+    the new tests (and migrated ones) use this stub to provide
+    real-looking package ids.
+    """
+    return _StubDnseClient()
 
 
 @pytest.fixture
@@ -94,7 +145,7 @@ def test_empty_deals_actioned_short_circuits(stub_ledger):
     assert stub_ledger.calls == []
 
 
-def test_buy_order_converted_with_default_loan_package(stub_ledger, in_continuous_session):
+def test_buy_order_converted_with_default_loan_package(stub_ledger, stub_client, in_continuous_session):
     """A single entry BUY maps to one DnseOrder with the configured loan package."""
     deals = [
         {
@@ -118,7 +169,7 @@ def test_buy_order_converted_with_default_loan_package(stub_ledger, in_continuou
         account_no="0003937868",
         loan_package_id=1775,
         trading_token="tok",
-        client=None,
+        client=stub_client,
         data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
@@ -134,9 +185,12 @@ def test_buy_order_converted_with_default_loan_package(stub_ledger, in_continuou
     assert o.side == "NB"
     assert o.price == 14100
     assert o.quantity == 1000
-    # 2026-10-09: bot doesn't use margin → loanPackageId=0 (which
-    # the place_stock_order body builder omits from the JSON).
-    assert o.loanPackageId == 0
+    # 2026-10-12: the runner now looks up the cash package id per
+    # symbol. For ABW on account 0003937868 the cash package is
+    # ``1036`` (GD tiền mặt / cash transaction). This replaces the
+    # earlier 2026-10-09 behaviour of ``loanPackageId=0`` which the
+    # DNSE server rejects with HTTP 400 INVALID_INPUT.
+    assert o.loanPackageId == 1036
     assert o.orderType == "LO"
     assert o.sourceDate == "2026-10-06"
     assert isinstance(o.sourceOrderId, int)
@@ -144,7 +198,7 @@ def test_buy_order_converted_with_default_loan_package(stub_ledger, in_continuou
     assert o.reason.startswith("autofin_buy:deal#")
 
 
-def test_partial_close_sell_converted_correctly(stub_ledger, in_continuous_session):
+def test_partial_close_sell_converted_correctly(stub_ledger, stub_client, in_continuous_session):
     """A partial close SELL is a NS side order."""
     deals = [
         {
@@ -168,7 +222,7 @@ def test_partial_close_sell_converted_correctly(stub_ledger, in_continuous_sessi
         account_no="0003937868",
         loan_package_id=1775,
         trading_token="tok",
-        client=None,
+        client=stub_client,
         data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
@@ -180,7 +234,7 @@ def test_partial_close_sell_converted_correctly(stub_ledger, in_continuous_sessi
     assert o.quantity == 100
 
 
-def test_source_order_id_stable_across_calls(stub_ledger, in_continuous_session):
+def test_source_order_id_stable_across_calls(stub_ledger, stub_client, in_continuous_session):
     """The same deal+side+price+kind must produce the same sourceOrderId
     so the ledger dedup prevents double-submit on bot restart."""
     deals = [
@@ -202,12 +256,12 @@ def test_source_order_id_stable_across_calls(stub_ledger, in_continuous_session)
     ]
     _submit_autofin_deals_to_dnse(
         deals, account_no="A", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
     _submit_autofin_deals_to_dnse(
         deals, account_no="A", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
     id_a = stub_ledger.calls[0]["orders"][0].sourceOrderId
@@ -236,12 +290,12 @@ def test_different_kind_produces_different_id(stub_ledger, in_continuous_session
     }
     _submit_autofin_deals_to_dnse(
         [entry_deal], account_no="A", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
     _submit_autofin_deals_to_dnse(
         [close_deal], account_no="A", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
     id_entry = stub_ledger.calls[0]["orders"][0].sourceOrderId
@@ -251,9 +305,9 @@ def test_different_kind_produces_different_id(stub_ledger, in_continuous_session
     )
 
 
-def test_per_symbol_loan_package_override(stub_ledger, in_continuous_session):
+def test_per_symbol_loan_package_override(stub_ledger, stub_client, in_continuous_session):
     """When loan_package_id_by_symbol is provided, the matching symbol uses
-    its override; others fall back to loan_package_id."""
+    its override; others fall back to the per-symbol lookup."""
     deals = [
         {"action": "new_entry", "symbol": "ABW", "deal_id": "1:ABW", "dnse_orders": [{
             "symbol": "ABW", "side": "NB", "price": 14100, "quantity": 1000,
@@ -266,21 +320,23 @@ def test_per_symbol_loan_package_override(stub_ledger, in_continuous_session):
     ]
     _submit_autofin_deals_to_dnse(
         deals, account_no="A", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-06",
         loan_package_id_by_symbol={"HDB": 9999},
     )
     orders = {o.symbol: o for o in stub_ledger.calls[0]["orders"]}
-    # 2026-10-09: bot doesn't use margin → loanPackageId=0 by default.
-    # The per-symbol override ``{"HDB": 9999}`` still wins because the
-    # user explicitly opted that symbol into margin (e.g. when a
-    # future strategy does want it).
-    assert orders["ABW"].loanPackageId == 0
+    # 2026-10-12: the per-symbol override wins BEFORE the cash-package
+    # lookup runs. ABW has no override, so the runner falls back to
+    # ``client.get_cash_loan_package_id("A", "ABW")`` which the stub
+    # returns as ``1036`` (the real DNSE cash package id).
+    assert orders["ABW"].loanPackageId == 1036
     assert orders["HDB"].loanPackageId == 9999
 
 
-def test_invalid_orders_skipped(stub_ledger, in_continuous_session):
+def test_invalid_orders_skipped(stub_ledger, stub_client, in_continuous_session):
     """Orders with missing/zero price or qty are silently skipped (no submit)."""
+    # Add W to the stub so the cash-pkg lookup succeeds
+    stub_client.cash_pkg_by_symbol.update({"X": 1036, "Y": 1036, "W": 1036, "Z": 1036})
     deals = [
         {"action": "new_entry", "symbol": "X", "deal_id": "1:X", "dnse_orders": [
             {"symbol": "X", "side": "NB", "price": 0, "quantity": 100, "kind": "entry", "reason": "r"},
@@ -297,7 +353,7 @@ def test_invalid_orders_skipped(stub_ledger, in_continuous_session):
     ]
     result = _submit_autofin_deals_to_dnse(
         deals, account_no="A", loan_package_id=1775,
-        trading_token="t", client=None, data_dir=Path("/tmp"),
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
     assert result["total"] == 1  # only the W order

@@ -421,6 +421,49 @@ class DnseClient:
             query["symbol"] = symbol
         return self.request("GET", f"/accounts/{account_no}/loan-packages", query)
 
+    def get_cash_loan_package_id(
+        self,
+        account_no: str,
+        symbol: str,
+        market_type: str = "STOCK",
+    ) -> int:
+        """Return the loan-package id for cash transactions on ``symbol``.
+
+        Each symbol on DNSE has its own list of loan packages, and
+        cash trades MUST specify one. The DNSE OpenAPI requires the
+        ``loanPackageId`` field even for spot/cash orders — omitting
+        it returns ``HTTP 400 INVALID_INPUT loanPackageId is required``
+        (logged on the 2026-10-12 13:48 ICT ABB live-submit attempt).
+        Sending ``0`` is also rejected: the server treats 0 as
+        "no value" not as "no package". The only valid values are
+        the package ids returned by ``get_loan_packages``.
+
+        The cash package is the one with ``type == "N"`` (normal /
+        spot). For margin trades the user picks the ``type == "M"``
+        package, but the autofin bot does not use margin so the
+        runner only needs the cash id.
+
+        Returns the int id (e.g. ``1036`` for ABB on account
+        ``0003937868``). Raises ``RuntimeError`` if no cash package
+        is found, or if the DNSE call fails.
+        """
+        response = self.get_loan_packages(account_no, market_type=market_type, symbol=symbol)
+        nested = response.get("loanPackages") if isinstance(response, dict) else None
+        if not isinstance(nested, list) or not nested:
+            raise RuntimeError(
+                f"DNSE returned no loan packages for {symbol} on "
+                f"account {account_no}: {response!r}"
+            )
+        for pkg in nested:
+            if isinstance(pkg, dict) and pkg.get("type") == "N":
+                pkg_id = pkg.get("id")
+                if pkg_id is not None:
+                    return int(pkg_id)
+        raise RuntimeError(
+            f"DNSE returned loan packages for {symbol} but none has "
+            f"type='N' (cash): {[p.get('type') for p in nested]}"
+        )
+
     def list_loan_packages(self, account_no: str, market_type: str = "STOCK", symbol: str | None = None) -> list[dict[str, Any]]:
         """Return the flattened list of loan packages (DNSE wraps them in `{loanPackages: [...]}`)."""
         response = self.get_loan_packages(account_no, market_type=market_type, symbol=symbol)
