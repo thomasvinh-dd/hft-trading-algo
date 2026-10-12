@@ -241,13 +241,18 @@ def test_place_stock_order_supports_sell_side(monkeypatch: pytest.MonkeyPatch) -
     assert body["side"] == "NS"
 
 
-def test_place_stock_order_omits_loan_package_when_none(monkeypatch) -> None:
-    """2026-10-09 fix: cash-only orders (UPCOM, bonds) don't need a
-    margin package. When ``loan_package_id`` is None or 0, omit
-    the field entirely. The user reported this when an ABB BUY on
-    UPCOM was rejected because the bot was passing
-    ``loanPackageId=1775`` (HDB margin) which the UPCOM engine
-    doesn't accept.
+def test_place_stock_order_zero_loan_package_for_cash_orders(monkeypatch) -> None:
+    """2026-10-12 fix: the DNSE server REQUIRES ``loanPackageId`` in
+    the body of every place_stock_order call — even cash orders. We
+    earlier omitted it when ``loan_package_id`` was None or 0, but
+    the live ABB submit at 13:25 ICT returned
+    ``HTTP 400 INVALID_INPUT loanPackageId is required``.
+
+    The value ``0`` is the sentinel for "no margin package" (cash).
+    Sending it does not trigger the UPCOM rejection that triggered
+    this whole 2026-10-09 → 2026-10-12 saga (the original failure
+    was sending ``1775`` for an ABB UPCOM order, not the absence of
+    the field).
     """
     captured = _capture_request(monkeypatch, {"id": 1})
     client = _client()
@@ -262,16 +267,18 @@ def test_place_stock_order_omits_loan_package_when_none(monkeypatch) -> None:
         order_type="LO",
     )
     body = json.loads(captured["req"].data)
-    assert "loanPackageId" not in body, (
-        f"cash-only orders (UPCOM) must NOT send loanPackageId; "
-        f"got body={body!r}"
+    assert body["loanPackageId"] == 0, (
+        f"loanPackageId must default to 0 (cash) when caller passes "
+        f"None; got body={body!r}"
     )
     assert body["orderType"] == "LO"
     assert body["price"] == 17500
 
 
-def test_place_stock_order_omits_loan_package_when_zero(monkeypatch) -> None:
-    """``loan_package_id=0`` is also treated as 'no margin package'."""
+def test_place_stock_order_explicit_zero_loan_package(monkeypatch) -> None:
+    """``loan_package_id=0`` is the explicit 'no margin package'
+    sentinel and is sent as ``loanPackageId=0``.
+    """
     captured = _capture_request(monkeypatch, {"id": 1})
     client = _client()
     client.place_stock_order(
@@ -285,7 +292,7 @@ def test_place_stock_order_omits_loan_package_when_zero(monkeypatch) -> None:
         order_type="LO",
     )
     body = json.loads(captured["req"].data)
-    assert "loanPackageId" not in body
+    assert body["loanPackageId"] == 0
 
 
 def test_place_stock_order_includes_loan_package_when_positive(monkeypatch) -> None:

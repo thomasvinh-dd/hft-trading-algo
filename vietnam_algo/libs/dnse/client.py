@@ -686,18 +686,22 @@ class DnseClient:
             "price": 0 if is_auction_or_market else int(price),
             "quantity": int(quantity),
         }
-        # 2026-10-09: ``loanPackageId`` is OPTIONAL. Cash-only boards
-        # (UPCOM, bonds) and spot orders don't need a margin package.
-        # Sending a margin package id on a UPCOM order triggers
-        # ``INVALID_INPUT`` / the order is rejected. The user reported
-        # this on 2026-10-09: the force-run passed
-        # ``--loan-package-id 1775`` (HDB margin) which the HOSE/HNX
-        # engines accept but the UPCOM engine rejects. Now:
-        #   - If ``loan_package_id`` is None or 0, omit the field
-        #     entirely (cash / spot / UPCOM orders).
-        #   - If a positive int is passed, include it (HOSE/HNX
-        #     margin orders). The HOSE/HNX engines require it.
-        if loan_package_id is not None and int(loan_package_id) > 0:
+        # 2026-10-12: ``loanPackageId`` is REQUIRED by the DNSE server
+        # even for cash orders. Earlier we omitted it when 0/None
+        # thinking it was optional, but the server returned
+        # ``HTTP 400 INVALID_INPUT loanPackageId is required`` (logged
+        # on the ABB live-submit at 13:25 ICT). The value ``0`` means
+        # "no margin package" (cash) — accepted by the server for
+        # cash-only boards (UPCOM, bonds) and for normal cash buys
+        # on HOSE/HNX. A positive integer (``1775`` for HDB, etc.)
+        # is the loan package id and the corresponding engine applies
+        # the margin terms.
+        if loan_package_id is None:
+            # Caller asked us to omit the field entirely. We still
+            # default to 0 for safety so the server doesn't reject
+            # the order — most callers should pass an explicit int.
+            body["loanPackageId"] = 0
+        else:
             body["loanPackageId"] = int(loan_package_id)
         return self.request(
             "POST",
