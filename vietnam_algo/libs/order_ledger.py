@@ -27,6 +27,15 @@ class LedgerOrder:
     updatedAt: str = ""
     lastDetail: dict[str, Any] | list[Any] | None = None
     error: str = ""
+    # 2026-10-13: re-pricing support for stale unfilled limit orders.
+    # ``repriceCount`` is how many times the order monitor has
+    # cancelled + re-placed this order at a higher limit. ``lastRepricedAt``
+    # is the ISO timestamp of the last re-price attempt (used to throttle
+    # the re-pricing cooldown across bot restarts). ``originalPrice`` is
+    # the price at first submit, used to compute the re-price cap.
+    repriceCount: int = 0
+    lastRepricedAt: str = ""
+    originalPrice: int = 0
 
 
 def ledger_path(data_dir: Path = DEFAULT_DATA_DIR) -> Path:
@@ -63,6 +72,9 @@ def load_ledger(data_dir: Path = DEFAULT_DATA_DIR) -> dict[str, LedgerOrder]:
                 updatedAt=str(row.get("updatedAt") or ""),
                 lastDetail=row.get("lastDetail"),
                 error=str(row.get("error") or ""),
+                repriceCount=int(row.get("repriceCount") or 0),
+                lastRepricedAt=str(row.get("lastRepricedAt") or ""),
+                originalPrice=int(row.get("originalPrice") or 0) or int(row.get("price") or 0),
             )
         except (TypeError, ValueError):
             continue

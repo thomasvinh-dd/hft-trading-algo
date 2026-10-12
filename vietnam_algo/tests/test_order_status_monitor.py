@@ -193,6 +193,7 @@ def test_monitor_no_orders_returns_empty_summary(tmp_path, notify_spy) -> None:
     assert summary == {
         "polled": 0, "skipped_throttle": 0, "changes": [],
         "errors": [], "terminal_transitions": 0,
+        "repriced": [], "abandoned": [],
     }
     assert client.calls == []
     assert notify_spy == []

@@ -477,6 +477,12 @@ def execute_orders_with_ledger(
             status="submitting",
             createdAt=now,
             updatedAt=now,
+            # 2026-10-13: pin the original price at first submit so
+            # the order monitor's re-pricing logic has a stable cap
+            # to compare against. Without this, a re-priced order
+            # would compute its cap against its own (new) price and
+            # chase the market forever.
+            originalPrice=int(payload["price"]),
         )
         save_ledger(ledger, data_dir)
         try:

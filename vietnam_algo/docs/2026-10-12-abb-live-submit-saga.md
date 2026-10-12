@@ -80,6 +80,47 @@ The current behaviour is acceptable because the SL is re-planned
 on every poll — the only downside is one extra `orderLedger` row
 with `status=unknown, error=TRADE_QUANTITY_NOT_ENOUGH` per cycle.
 
+## What we did about the rising-ask problem
+
+On 2026-10-12 14:48 ICT we placed ABB BUY 100 @ 17,500 (live
+ask was 17,500 at the time). The ask drifted to 17,600 over the
+next 12 minutes and stayed there; the order never filled and
+expired at EOD. We placed the order at the right price at the
+time, but the market kept moving away.
+
+The fix is **re-pricing stale unfilled BUY orders** (commit
+forthcoming, see ``vietnam_algo/bots/runner.py:_maybe_reprice_stale_order``):
+
+- After ``ORDER_REPRICE_AFTER_SECONDS`` (default 900 = 15 min) of
+  being open, the order monitor looks up the live best-ask.
+- If the best-ask is **above the current limit** but **below the
+  cap** (``original_price * (1 + ORDER_REPRICE_TOLERANCE_PCT)``,
+  default 3 % above the original price), the monitor:
+  - Cancels the old order
+  - Places a new order at the new best-ask
+  - Updates the ledger entry: ``price`` = new price,
+    ``repriceCount`` += 1, ``lastRepricedAt`` = now, ``originalPrice``
+    preserved from first submit
+  - Sends a Telegram: "🔁 Vietnam Algo: order ABB RE-PRICED
+    17,500 → 17,600"
+- If the best-ask is **above the cap**, the monitor:
+  - Cancels the old order
+  - Marks the ledger entry ``status="cancelled"`` with
+    ``error="best-ask X > cap Y; cancelled and abandoned"``
+  - Sends a Telegram: "🛑 Vietnam Algo: order ABB ABANDONED
+    (ask above cap)"
+- The cap is computed from ``originalPrice`` (the FIRST submit
+  price), not the current (possibly re-priced) price. This
+  prevents a runaway market from compounding the cap.
+
+Kill-switch: at most ``ORDER_MAX_REPRICES`` (default 1) re-prices
+per order. If the first re-price doesn't fill within 15 min, the
+order is abandoned.
+
+The next time ABB (or any other stock) drifts away from our
+limit, the bot will automatically chase up to the cap and
+Telegram the operator. No manual intervention needed.
+
 ## Tests added (770 → 773)
 
 - ``vietnam_algo/tests/test_dnse_cash_loan_package.py``: +4 tests
