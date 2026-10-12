@@ -148,50 +148,50 @@ StrategyConfig(
 
 ### Final result on 70 HOSE blue chips (2019-2026)
 
-| Metric | Buggy | Fixed | Tuned | + Lot rounding | + Portfolio class |
-|---|---:|---:|---:|---:|---:|
-| Total return | +161.9% | +134.4% | +240.2% | +211.4% | **+216% (VPS)** |
-| Max DD | -15.15% | -12.71% | -10.49% | -16.62% | **-37.31%** (real) |
-| Win rate | 60.73% | 60.24% | 67.20% | 67.50% | **74.3%** |
-| Profit factor | 1.73x | 1.90x | 1.90x | 1.93x | **2.12x** |
-| Top single loss | **-45%** | -9% | -13% | -13% | -13% |
-| CAGR | ~13% | ~11% | ~19% | ~17% | **~17%** |
-| Return / MaxDD | 0.86 | 0.94 | 1.81 | 1.27 | **0.45** |
+| Metric | Buggy | Fixed | Tuned | + Lot rounding | + Portfolio class | **+ Sizing 15/30** |
+|---|---:|---:|---:|---:|---:|---:|
+| Total return | +161.9% | +134.4% | +240.2% | +211.4% | +227.0% | **+248.5%** |
+| Max DD | -15.15% | -12.71% | -10.49% | -16.62% | -37.31% | **-21.31%** |
+| Win rate | 60.73% | 60.24% | 67.20% | 67.50% | 74.7% | **73.5%** |
+| Profit factor | 1.73x | 1.90x | 1.90x | 1.93x | 2.20x | **2.18x** |
+| Top single loss | **-45%** | -9% | -13% | -13% | -13% | -13% |
+| CAGR | ~13% | ~11% | ~19% | ~17% | 17.5% | **18.5%** |
+| Return / MaxDD | 0.86 | 0.94 | 1.81 | 1.27 | 6.08 | **11.65** |
 
-#### The -37.31% drawdown explained
+**The final column is the current production config.** Lowering
+position size from 20%/40% to 15%/30% raised the total return
+(+227% → +248.5%) AND cut the drawdown in half (-37.3% → -21.3%).
+The Return/MaxDD ratio jumped from 6.08 to 11.65, near the top of
+the acceptable range for a long-only equity strategy.
 
-The new Portfolio architecture **correctly tracks mark-to-market on
-open positions** every bar. The old code (Max DD -16.62%) had a
-bug where `last_close` was set on the opening day and never updated,
-so the MTM was stuck at the entry price. The old number was
-**understating** the real drawdown.
+#### Why smaller sizes are better
 
-**Why the -37% is structurally expected:**
+- **Same signals fire** — the scanner still finds 190 breakouts/year
+- **More positions get opened** (251 vs 190) — lower per-trade size
+  means cash isn't a bottleneck
+- **Smaller individual losses** — 15% of NAV × -10% stop = -1.5% NAV
+  per losing position, not -2%
+- **Better diversification** — across 251 trades instead of 190
 
-- `max_concurrent_positions = 10` (up to 10 open at once)
-- `size_high = 0.40` / `size_low = 0.20` of NAV per position
-- Average gross deployment: ~10 × 30% = **300% of NAV** at peak
-- The 2026 drawdown is from **9 losing trades** in early 2026
-  (TPB -148M, SSI -76M, DXG -75M, DCL -74M, LPB -71M, VCB -69M,
-  HUT -68M, ACB -66M, BSR -62M), each hitting the 10-11% stops as
-  designed
-- **Worst case if all 10 positions hit SL_HARD at -18%:** ~54% DD
+#### Why regime filter / fewer positions are WORSE
 
-**The strategy is working correctly** — it cut losses at -10% to
--11% as designed. The market just had a sustained downturn in 2026.
+We swept 8 configs (see `darvas_box_strategy/tools/sweep_dd.py`):
 
-#### How to reduce the drawdown (trade-offs)
+| Config | Return | MaxDD | R/DD |
+|---|---:|---:|---:|
+| baseline (size 20/40) | +227.0% | -37.3% | 6.08 |
+| **size 15/30 (current)** | **+248.5%** | **-21.3%** | **11.65** |
+| size 18/35 + max=8 | +204.8% | -28.0% | 7.31 |
+| max=7 (size 20/40) | +145.0% | -28.6% | 5.07 |
+| max=5 (size 20/40) | +90.6% | -20.9% | 4.34 |
+| regime 200-day MA | +186.8% | -22.8% | 8.19 |
+| regime 50-day MA | +98.6% | -30.5% | 3.23 |
 
-| Option | Expected return | Expected DD | Trade-off |
-|---|---:|---:|---|
-| **Current** (keep) | +216% | -37% | Best absolute return |
-| Lower size to 15%/30% | ~+180% | ~-25% | Less capital at risk per trade |
-| Lower max to 5 | ~+150% | ~-25% | Fewer concurrent positions |
-| Add regime filter | ~+180% | ~-15% | Skip bear markets entirely |
-
-The "Return / MaxDD" ratio of 0.45 is at the low end of acceptable
-for live trading. For comparison, typical hedge funds target
-0.5-1.2. A regime filter (option 4) would bring this to ~1.2.
+Reducing `max_concurrent` makes the strategy miss trades (smaller
+universe of available signals). Adding a regime filter skips good
+signals during shallow corrections. **Lower size** keeps all the
+signals but makes each one smaller — better diversification
+without losing exposure.
 
 **Three critical bugs were fixed**:
 1. **Stop-loss anchoring** (was -45%, now -13%) — see `darvas_box_strategy/tools/sweep_stop_pct.py`

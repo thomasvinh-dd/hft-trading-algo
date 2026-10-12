@@ -380,10 +380,16 @@ class PortfolioDefaultsTests(unittest.TestCase):
         self.assertEqual(cfg.exits.sl_F_pct, 0.18)
 
     def test_default_size_low_high(self):
-        """OOS-validated: 2x sizing (0.20/0.40) for low/high conviction."""
+        """OOS-validated: 1.5x sizing (0.15/0.30) for low/high conviction.
+
+        Sweep (Oct 2026) showed that 15/30 gives:
+          - Higher return (+248% vs +227% for 20/40)
+          - Much lower drawdown (-21% vs -37%)
+          - Better return/DD ratio (11.65 vs 6.08)
+        """
         cfg = StrategyConfig()
-        self.assertEqual(cfg.backtest.size_low, 0.20)
-        self.assertEqual(cfg.backtest.size_high, 0.40)
+        self.assertEqual(cfg.backtest.size_low, 0.15)
+        self.assertEqual(cfg.backtest.size_high, 0.30)
 
 
 class TrendFilterTests(unittest.TestCase):

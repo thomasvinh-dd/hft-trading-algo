@@ -77,7 +77,7 @@ def build_default_config() -> StrategyConfig:
             max_concurrent_positions=10,
             cooldown_bars_after_stop=5,
             cost_bps=25.0,
-            size_low=0.20, size_high=0.40,
+            size_low=0.15, size_high=0.30,
             vol_target_pct=0.0,  # OFF: fixed sizing beats vol-targeting
             vol_target_floor=0.05, vol_target_ceiling=0.30,
             board_lot=100,  # HOSE board lot: shares rounded down to 100s

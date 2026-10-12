@@ -150,8 +150,8 @@ class BacktestConfig:
     """
 
     start_nav: float = 1.0e9
-    size_low: float = 0.20
-    size_high: float = 0.40
+    size_low: float = 0.15
+    size_high: float = 0.30
     cost_bps: float = 25.0  # round-trip cost (slippage + commission); applied at exit
     max_concurrent_positions: int = 10
     cooldown_bars_after_stop: int = 5  # bars to skip after SL_HARD/SL_SCALE exit
