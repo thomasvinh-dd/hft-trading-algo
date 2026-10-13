@@ -518,6 +518,39 @@ function renderDealDetail(d) {
     `;
     tbody.appendChild(tr);
   }
+  // Final CLOSE marker — for closed deals, add a synthetic row
+  // that makes the lifecycle crystal clear: "this deal is now
+  // closed as of <date> via <exit_reason>".
+  if (!d.is_open && d.exit_date) {
+    const entryMs = d.entry_date ? Date.parse(d.entry_date) : null;
+    const exitMs = Date.parse(d.exit_date);
+    let heldTxt = "";
+    if (entryMs && exitMs) {
+      const calDays = Math.round((exitMs - entryMs) / MS);
+      heldTxt = `held ${calDays} cal days (${d.bars_held || "?"} trading bars)`;
+    }
+    const closeTr = document.createElement("tr");
+    closeTr.className = "fill-close-row";
+    const exitPrice = d.exit_price != null ? VND(d.exit_price) : "—";
+    const finalPnl = d.pnl_vnd != null
+      ? (d.pnl_vnd > 0 ? "+" : "") + VND(d.pnl_vnd)
+      : "—";
+    const finalPct = d.pnl_pct != null
+      ? (d.pnl_pct > 0 ? "+" : "") + d.pnl_pct.toFixed(2) + "%"
+      : "—";
+    closeTr.innerHTML = `
+      <td class="muted small">${d.exit_date}</td>
+      <td><span class="fill-kind fill-kind-CLOSE">CLOSE</span></td>
+      <td>${exitPrice}</td>
+      <td>—</td>
+      <td>—</td>
+      <td class="${(d.pnl_vnd || 0) >= 0 ? "fill-positive" : "fill-negative"}">${finalPnl}</td>
+      <td>0</td>
+      <td class="muted small">—</td>
+      <td class="muted small">Deal closed via <strong>${d.exit_reason || "?"}</strong> &middot; ${finalPct} &middot; ${heldTxt}</td>
+    `;
+    tbody.appendChild(closeTr);
+  }
 }
 
 function renderTickerHistory(h) {

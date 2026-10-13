@@ -497,6 +497,17 @@ The deal-detail modal uses color-coded chips for each `kind`:
 - **TIME_STOP** (yellow) — gave up on a losing position
 - **DIVIDEND** (cyan) — passive income
 - **EXHAUST** (gray) — backtest ran out of data
+- **CLOSE** (white, with a top border separator) — synthetic
+  marker at the end of the timeline for closed deals. Shows
+  the close date, exit reason, final P&L, and holding period.
+  Not an actual fill event; rendered by the dashboard so the
+  user can see the deal's full lifecycle at a glance.
+
+The CLOSE row is added by the dashboard for every closed deal.
+Open deals (still in progress) don't have it. The row is
+visually distinct from the regular fills (top border + slightly
+different background) so the eye can quickly find where each
+trade ended.
 
 ### Reading the timeline
 

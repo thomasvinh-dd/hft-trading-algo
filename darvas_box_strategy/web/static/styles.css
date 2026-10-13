@@ -434,6 +434,24 @@ footer code {
   background: rgba(125, 133, 144, 0.15);
   color: var(--muted);
 }
+.fill-kind-CLOSE {
+  background: var(--text);
+  color: var(--bg);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+/* The synthetic CLOSE row gets a top border to separate it from
+   the regular fills above. */
+.fill-close-row td {
+  border-top: 2px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+.fill-close-row td:first-child {
+  border-top-left-radius: 4px;
+}
+.fill-close-row td:last-child {
+  border-top-right-radius: 4px;
+}
 
 .fill-positive { color: var(--green); }
 .fill-negative { color: var(--red); }
