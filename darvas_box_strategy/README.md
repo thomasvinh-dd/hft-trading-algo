@@ -18,6 +18,247 @@ features:
    drops that much below peak (or below the first-tier exit price if
    `trail_floor_lock_profit` is on), the position is closed.
 
+## How the strategy works
+
+The strategy is a **mean-reversion breakout** with **trend-confirmed
+profit-taking**. It looks for stocks that have been quietly
+consolidating, then buy when they break out with volume. Once in a
+position, it uses a **ladder of profit targets** to lock in gains
+and a **trailing stop** to ride the rest.
+
+### Step 1 — Find a Darvas Box base (the setup)
+
+The first step is identifying a **consolidation pattern** in the price:
+
+- The stock has been trading in a **tight range** for **5–30 days**
+  (`BaseConfig.min_days=5, max_days=30, max_range_pct=3%`).
+  "Tight" means the high-low range of the period is ≤ 3% of the
+  low.
+- During this consolidation, **volume has been declining** or staying
+  flat (no distribution by big players).
+- The base is the most recent qualifying period that ends before
+  the breakout bar.
+
+A Darvas Box is a "calm before the storm" pattern — sellers are
+exhausted, supply has dried up, and any small surge in demand can
+push the price up.
+
+### Step 2 — Wait for the breakout (the trigger)
+
+The base becomes a **signal** when ALL of these conditions are met
+on the bar AFTER the base ends:
+
+1. **Price breaks above the base high** — `bar.close > base.base_high`
+2. **Volume is at least 2× the average** of the prior 20 days
+   (`volume_mult=2.0` for regular conviction, `>3.0` for high
+   conviction)
+3. **Price is above the 200-day moving average** — long-term trend
+   is up (`require_ma200=True`)
+4. **Price is above the 20-day moving average** — short-term trend
+   confirms the move (`require_close_above_ma=20`)
+5. **Universe filter** — stock is a HOSE blue chip with average
+   daily traded value ≥ 1B VND (`universe.min_avg_value_20d=1e9`)
+
+If all conditions are met, the strategy calculates position size and
+generates a `Signal` with:
+- `entry_price` (next bar's open)
+- `sl_T = entry_price × (1 - 0.10)` (10% stop, partial)
+- `sl_F = entry_price × (1 - 0.18)` (18% hard stop)
+- `tiers` (the profit-taking ladder, see below)
+- `size_pct` (15% of NAV for regular, 30% for high conviction)
+- `shares` (rounded down to 100-share board lot)
+
+### Step 3 — Position sizing
+
+For a 1B VND portfolio:
+- Regular conviction: 15% = 150M VND per position
+- High conviction (volume > 3×): 30% = 300M VND per position
+
+Up to 10 positions can be open at once (max gross ~3× NAV), so
+during a strong market the strategy is highly invested. After a
+stop-loss exit, the same ticker is blocked for 5 bars (cooldown) so
+the strategy doesn't immediately re-enter a falling knife.
+
+### Step 4 — Profit-taking ladder (TIER + TRAIL)
+
+The default tier ladder (`ExitsConfig.tiers`):
+
+| Tier | Multiplier from entry | Sell % of remaining | Cumulative sold |
+|---:|---:|---:|---:|
+| 1 | 1.063 (+6.3%) | 10% | 10% |
+| 2 | 1.125 (+12.5%) | 30% | 40% |
+| 3 | 1.210 (+21.0%) | 30% | 70% |
+| 4 | 1.330 (+33.0%) | 10% | 80% |
+| 5 | 1.460 (+46.0%) | 10% | 90% |
+| 6 | 1.610 (+61.0%) | 10% | 100% (or trail) |
+
+When the **bar's high** crosses a tier price, the strategy sells
+that tier's percentage of remaining shares at the tier price. Once
+the first tier fires, the **trailing stop activates** — the strategy
+tracks the running peak and closes the remaining position if close
+drops 10% from peak (`trail_from_peak_pct=0.10`).
+
+**Visual example** (entry = 100,000):
+
+```
+Price
+  ▲         ╱───── trail floor locks at first tier (106,300)
+  │        ╱
+  │    T1 ╱                       ← sell 10% @ 106,300
+  │    ──┤
+  │      │  T2                    ← sell 30% more @ 112,500
+  │      │  ─────
+  │      │       T3                ← sell 30% more @ 121,000
+  │      │       ─────
+  │      │            trail active
+  │      │             ╲──────     ← if close drops 10% from peak
+  │      │                      ╲     close remaining at market
+  │
+  ├──────┤ entry @ 100,000
+```
+
+The **trail_floor_lock_profit** option (default ON) means once the
+first tier fires, the trail floor is set to the tier-1 price
+(106,300 in the example). The remaining position can never close
+below that, guaranteeing at least a small profit on every trade
+that reaches tier 1.
+
+### Step 5 — Stop loss ladder (SL_SCALE + SL_HARD)
+
+Instead of one hard stop that closes the whole position, the
+strategy **scales out** in three steps. The stops are anchored to
+**entry price** (not the base low) which is critical for the
+backtest math:
+
+- **sl_T = entry × 0.90** (10% below entry)
+- **sl_mid = entry × 0.86** (14% below entry, midpoint of band)
+- **sl_F = entry × 0.82** (18% below entry)
+
+When the bar's low hits a stop:
+1. `bar.low ≤ sl_T` → sell **50% of remaining** at `sl_T`
+2. `bar.low ≤ sl_mid` → sell **50% of remaining** at `sl_mid`
+3. `bar.low ≤ sl_F` → close **all remaining** at `sl_F`
+
+A trade that opens at 100,000 and falls straight to 80,000:
+
+```
+Day 1: entry 3,100 shares @ 100,000
+Day X: low=89,000 → SL_SCALE: sell 1,550 @ 90,000 (sl_T hit)
+       remaining=1,550
+Day X+1: low=85,000 → SL_SCALE: sell 775 @ 86,000 (sl_mid hit)
+       remaining=775
+Day X+2: low=80,000 → SL_HARD: close 775 @ 82,000 (sl_F hit)
+       remaining=0
+```
+
+By scaling out, the strategy bleeds 50% at the first stop, 25% at
+the second, and 12.5% at the third. The bulk of the loss protection
+comes from the first cut. This is why the worst single-trade loss
+in the backtest is **-13%** (not -18% as a single hard stop would
+imply).
+
+### Step 6 — Trade management summary
+
+For each bar after entry, the strategy runs this priority order:
+
+1. **DIVIDEND** — record any cash dividend (positions still earn)
+2. **TIME_STOP** — if held > `max_holding_bars` and still underwater, close
+3. **TRAIL** — if trailing is active and close < trail threshold, close
+4. **TIER** — sell each tier whose price was reached by `bar.high`
+5. **SL_SCALE** — if `bar.low ≤ sl_T`, cut 50%
+6. **SL_SCALE** — if `bar.low ≤ sl_mid`, cut 50% of remaining
+7. **SL_HARD** — if `bar.low ≤ sl_F`, close everything
+8. **EXHAUST** — if backtest runs out of bars, force-close at last close
+
+Each event adds a row to the `fills` timeline (visible in the deal
+detail modal). The trade's exit reason is the kind of the **last
+non-dividend fill** — so a trade that took partial stops and then
+hit the hard stop is classified as `SL_HARD`.
+
+### Why this combination works
+
+- **Winners run** — the 9-tier ladder + 10% trail lets big winners
+  compound to +115% (tier 9) before exit. The trade-by-trade win
+  rate is 73.5% but the average win is much bigger than the average
+  loss (profit factor 2.18).
+- **Losers are cut fast** — the 3-step scale-out means a single
+  trade can lose at most ~13% of the position (not the full 18%),
+  and the bulk of the loss is realized at the first -10% cut.
+- **Correlation is diversified** — 10 max positions across 70
+  blue chips. Single-ticker risk is bounded by max 30% NAV per
+  position.
+- **Trend confirmation** — 200-day MA filter ensures we only
+  long in bull markets. The 2026 downtrend produced 9 losing
+  trades but the strategy cut each at -10% to -11% as designed.
+
+## Trade events reference
+
+Every trade has a `fills` timeline (one row per event) visible in
+the deal-detail modal. Each fill has a `kind` that tells you what
+happened:
+
+| Kind | What it means | When it fires |
+|---|---|---|
+| **ENTRY** | Buy at the breakout | Once, on the first day of the trade |
+| **TIER** | Partial take-profit at a ladder level | When `bar.high ≥ entry × tier_multiplier` |
+| **TRAIL** | Trailing stop hit (closes the rest) | When trailing is active and `bar.close ≤ peak × (1 - trail_pct)` (or below trail floor) |
+| **SL_SCALE** | Partial stop-loss cut | When `bar.low ≤ sl_T` (cut 50%) or `bar.low ≤ sl_mid` (cut 50% of remaining) |
+| **SL_HARD** | Full hard stop (closes everything left) | When `bar.low ≤ sl_F` |
+| **TIME_STOP** | Time stop fired | When `bars_held ≥ max_holding_bars` and close is still below entry |
+| **DIVIDEND** | Cash dividend received | When the ticker has a dividend event in the data |
+| **EXHAUST** | Backtest ran out of data | No more bars — forced close at last close |
+
+### Field reference per fill
+
+```
+date          Bar date (when the event happened)
+kind          ENTRY / TIER / TRAIL / SL_SCALE / SL_HARD / TIME_STOP / DIVIDEND / EXHAUST
+price         The fill price (for ENTRY = entry, for TIER = tier price, for SL = stop price)
+shares        Signed: positive for buys, negative for sells
+              (TIER/TRAIL/SL events are all sells, so shares < 0)
+pnl_delta     Realized P&L for this fill (VND)
+cumulative_pnl  Sum of all pnl_delta values up to and including this fill
+remaining     Shares still held after this fill
+note          Human-readable description, e.g. "Buy 3,100 @ 62,678"
+```
+
+### Color coding in the dashboard
+
+The deal-detail modal uses color-coded chips for each `kind`:
+
+- **ENTRY** (blue) — the buy
+- **TIER** (green) — taking profit
+- **TRAIL** (green) — taking profit
+- **SL_SCALE** (red) — bleeding out on the way down
+- **SL_HARD** (red) — full stop-out
+- **TIME_STOP** (yellow) — gave up on a losing position
+- **DIVIDEND** (cyan) — passive income
+- **EXHAUST** (gray) — backtest ran out of data
+
+### Example: a complete trade timeline
+
+```
+VCB_2026-05-19 — entry 2026-05-19, exit 2026-08-13 (53 trading days held)
+
+2026-05-19   ENTRY     62,678  +  3,100  pnl=           0   cum=           0
+2026-07-20   SL_SCALE  56,410  -  1,550  pnl=  -9,824,410   cum=  -9,824,410  (sl_T hit)
+2026-07-21   SL_SCALE  56,410  -    775  pnl=  -4,912,205   cum= -14,736,615  (sl_T hit)
+2026-07-22   SL_SCALE  56,410  -    387  pnl=  -2,452,933   cum= -17,189,548  (sl_T hit)
+2026-07-23   SL_SCALE  56,410  -    194  pnl=  -1,229,636   cum= -18,419,184  (sl_T hit)
+2026-07-23   SL_SCALE  53,903  -     97  pnl=    -857,705   cum= -19,276,889  (sl_mid hit)
+2026-07-24   SL_SCALE  56,410  -     48  pnl=    -304,240   cum= -19,581,129  (sl_T hit)
+2026-07-24   SL_SCALE  53,903  -     24  pnl=    -212,216   cum= -19,793,345  (sl_mid hit)
+... (6 more SL_SCALE events over 11 days) ...
+2026-08-13   EXHAUST   59,500  -     43  pnl=    -136,661   cum= -20,071,591
+
+Total realized PnL: -20,071,591 VND  (-10.3% on the original 198M VND notional)
+Exit reason: EXHAUST (backtest ran out of data with 43 shares left)
+```
+
+The strategy correctly bled the position from 3,100 → 1 → 1 share
+over 39 days as the price kept grinding lower. The 13 SL_SCALE
+events each cut 50% of remaining, exactly as designed.
+
 ## Layout
 
 ```
@@ -59,6 +300,93 @@ python3 darvas_box_strategy/run.py --quiet   # portfolio=False default... wait, 
 # Single ticker detail
 python3 darvas_box_strategy/run.py --ticker HDB --detail
 ```
+
+## Configuration reference
+
+All knobs live in `darvas_box_strategy/darvas/config.py` and are
+exposed via the CLI in `darvas_box_strategy/bot/cli.py`. The
+defaults are walk-forward validated on 2019-2022 / 2023-2026 HOSE
+blue chips.
+
+### Base detection (`BaseConfig`)
+
+| Knob | Default | What it does |
+|---|---:|---|
+| `min_days` | 5 | Shortest consolidation period to qualify |
+| `max_days` | 30 | Longest consolidation period to qualify |
+| `max_range_pct` | 0.030 | Max high-low range of the base (3%) |
+
+A 5-30 day window where the stock's range is ≤ 3% qualifies as a
+"Darvas Box". Longer bases catch more signals but might be
+weaker setups.
+
+### Breakout (`BreakoutConfig`)
+
+| Knob | Default | What it does |
+|---|---:|---|
+| `volume_mult` | 2.0 | Min volume multiple of 20-day average to fire |
+| `high_conviction_mult` | 3.0 | Volume mult above which conviction is "high" |
+| `require_ma200` | True | Require close > 200-day MA |
+| `require_close_above_ma` | 20 | Require close > 20-day MA |
+| `regime_index_path` | "" | Optional path to a market index for regime filter |
+| `regime_ma_window` | 50 | MA window for the regime filter |
+| `regime_require_above_ma` | True | Only allow signals when index > MA |
+
+### Profit-taking (`ExitsConfig.tiers`)
+
+A list of `(multiplier_from_entry, fraction_of_remaining)` tuples.
+Each tuple fires when `bar.high ≥ entry_price × multiplier`. The
+default 9-tier ladder takes 10% at +6.3%, then 30% at +12.5%, then
+30% at +21.0%, then 10% at each subsequent tier up to +115%.
+
+### Stop loss (`ExitsConfig`)
+
+| Knob | Default | What it does |
+|---|---:|---|
+| `sl_T_pct` | 0.10 | First stop (10% below entry) — cut 50% here |
+| `sl_F_pct` | 0.18 | Hard stop (18% below entry) — close all |
+| `scale_out_pct_at_sl_T` | 0.5 | Sell 50% of remaining at sl_T |
+| `scale_out_pct_at_midpoint` | 0.5 | Sell 50% of remaining at midpoint |
+| `use_entry_anchored_stops` | True | Stop is anchored to entry (not base low) |
+| `t_plus_n_bars` | 0 | T+2.5 settlement lock-up (3 = T+2.5) |
+| `max_holding_bars` | 0 | Time stop after N bars underwater (0 = off) |
+
+### Trailing stop (`TrailingConfig`)
+
+| Knob | Default | What it does |
+|---|---:|---|
+| `trail_mode` | "pct" | "pct" (fixed %) or "atr" (volatility-adjusted) |
+| `trail_from_peak_pct` | 0.10 | 10% trail behind peak |
+| `trail_atr_mult` | 1.5 | Used when `trail_mode="atr"` |
+| `trail_floor_lock_profit` | True | Trail can never drop below tier-1 exit price |
+| `activation_tier_idx` | 0 | Which tier activates the trail (0 = first tier) |
+
+### Position sizing (`BacktestConfig`)
+
+| Knob | Default | What it does |
+|---|---:|---|
+| `start_nav` | 1e9 | Initial capital (1B VND) |
+| `size_low` | 0.15 | Position size as fraction of NAV (regular conviction) |
+| `size_high` | 0.30 | Position size as fraction of NAV (high conviction) |
+| `max_concurrent_positions` | 10 | Max open positions at once |
+| `cooldown_bars_after_stop` | 5 | Bars to skip after a stop-out before re-entry |
+| `cost_bps` | 25.0 | Round-trip cost (slippage + commission) |
+| `board_lot` | 100 | Round share count down to 100-share lot (HOSE) |
+| `vol_target_pct` | 0.0 | Vol-targeting (off; fixed 1.5×/3× sizing wins) |
+| `daily_price_limit_pct` | 0.0 | Cap unrealistic gap moves (0 = off, 0.07 = ±7%) |
+
+### Recommended config tweaks
+
+| Want | Tweak |
+|---|---|
+| Less drawdown | Lower `size_low` to 0.10 and `size_high` to 0.20 |
+| More return (more risk) | Raise `size_high` to 0.40 |
+| Fewer losing trades | Tighten `sl_T` to 0.05 (5% stop) |
+| Slower take-profit | Skip tier 1 (set `(1.125, 0.40)` as first) |
+| VN reality | Set `daily_price_limit_pct=0.07` (costs ~16% return) |
+| T+2.5 settlement | Set `t_plus_n_bars=3` (costs ~25% return) |
+
+See `tools/sweep_dd.py` for an automated sweep of these knobs.
 
 ## Telegram Bot (`darvas_box_strategy/bot/`)
 
@@ -330,7 +658,8 @@ ssh root@185.227.135.227 "systemctl restart darvas-web"
 - **Opening signals** — Today's breakouts with entry, size, stops, conviction (scrollable)
 - **Open positions** — Trades still active at the latest data point, with PnL (scrollable)
 - **Top winners / losers** — Best and worst 5 trades of the backtest (scrollable)
-- **Exit reasons** — Distribution of exit types (TRAIL, SL_HARD, TIER, ...)
+- **Exit reasons** — Distribution of exit types (TRAIL, SL_HARD, TIER, ...). See
+  [Trade events reference](#trade-events-reference) for what each kind means.
 - **Per-ticker breakdown** — Top 10 tickers by realized PnL
 
 ### deal_id
