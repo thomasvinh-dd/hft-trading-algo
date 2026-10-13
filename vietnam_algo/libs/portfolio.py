@@ -160,21 +160,59 @@ def build_portfolio_snapshot(
             "avgPrice", "averagePrice", "costPrice", "costBasisPrice",
             "costBasis", "avgCost",
         )))
-        # Live market price (try multiple fallbacks)
-        market_price = None
-        for m in ("get_latest_quote", "get_close_price"):
-            res = _safe_call(client, m, symbol)
-            if isinstance(res, dict):
-                boards = res.get("quotes") or []
-                if boards and isinstance(boards[0], dict):
-                    bid_levels = boards[0].get("bid") or []
-                    offer_levels = boards[0].get("offer") or []
-                    if bid_levels and offer_levels:
-                        bid = _float(bid_levels[0].get("price"))
-                        offer = _float(offer_levels[0].get("price"))
-                        if bid > 0 and offer > 0:
-                            market_price = (bid + offer) / 2.0
-                            break
+        # 2026-10-13: market price resolution (units + source).
+        #
+        # DNSE returns prices in DIFFERENT UNITS across endpoints:
+        #   - /accounts/{acc}/positions returns ``marketPrice`` /
+        #     ``costPrice`` / ``breakEvenPrice`` in absolute VND
+        #     (e.g. ``31050`` = 31,050 VND).
+        #   - /price/{sym}/quotes/latest returns bid/offer in
+        #     THOUSANDS OF VND (kVND), so ``31.1`` = 31,100 VND.
+        #
+        # The previous portfolio code used ``get_latest_quote``
+        # directly without the ``× 1000`` conversion, so the
+        # reported market price was off by 1000× (e.g. BAF mkt
+        # showed as ``31`` instead of ``31,050``), which made
+        # the unrealized P&L look like ``-99.90%`` on every
+        # position in the EOD report (2026-10-13 21:25 ICT
+        # incident).
+        #
+        # Fix: prefer the positions endpoint's own ``marketPrice``
+        # field — it's already in absolute VND and reflects the
+        # last trade / close, which is the right thing for an
+        # EOD report. Fall back to the latest quote (with the
+        # ``× 1000`` conversion) only when the positions endpoint
+        # doesn't return a market price (e.g. delisted stock or
+        # a stale cache). This also drops N+1 API calls per
+        # EOD cycle — we no longer need to hit ``/quotes/latest``
+        # for every held symbol.
+        market_price: float | None = None
+        positions_mkt = _float(_first_field(row, ("marketPrice", "market_price", "lastPrice")))
+        if positions_mkt and positions_mkt > 0:
+            market_price = positions_mkt
+        else:
+            # Fallback: fetch the live quote and convert kVND→VND.
+            for m in ("get_latest_quote", "get_close_price"):
+                res = _safe_call(client, m, symbol)
+                if isinstance(res, dict):
+                    boards = res.get("quotes") or []
+                    if boards and isinstance(boards[0], dict):
+                        bid_levels = boards[0].get("bid") or []
+                        offer_levels = boards[0].get("offer") or []
+                        if bid_levels and offer_levels:
+                            bid = _float(bid_levels[0].get("price"))
+                            offer = _float(offer_levels[0].get("price"))
+                            if bid > 0 and offer > 0:
+                                # kVND × 1000 = absolute VND
+                                market_price = (bid + offer) / 2.0 * 1000.0
+                                break
+        # Last-resort fallback: if neither source returned a
+        # market price, use the cost basis (so unrealized P&L
+        # is 0 instead of misleadingly negative). This is
+        # rare in practice — DNSE always returns a market
+        # price for active positions.
+        if not market_price or market_price <= 0:
+            market_price = avg_price if avg_price and avg_price > 0 else 0.0
         market_value = market_price * quantity if market_price else 0.0
         cost_basis = avg_price * quantity if avg_price > 0 else 0.0
         unrealized_pnl = (market_price - avg_price) * quantity if (market_price and avg_price > 0) else 0.0

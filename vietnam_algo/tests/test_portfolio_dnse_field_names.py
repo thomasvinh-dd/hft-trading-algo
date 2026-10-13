@@ -156,3 +156,169 @@ def test_totals_reflect_actual_positions() -> None:
     client = _stub_client(positions_payload=payload)
     snap = build_portfolio_snapshot(client, "0003937868")
     assert snap["totals"]["positionCount"] == 1
+
+
+# -----------------------------------------------------------------------------
+# Market price unit-conversion fix (2026-10-13 21:25 ICT)
+#
+# DNSE returns prices in different units across endpoints:
+#   - /accounts/{acc}/positions returns marketPrice in absolute VND
+#     (31050 = 31,050 VND).
+#   - /price/{sym}/quotes/latest returns bid/offer in kVND
+#     (31.1 = 31,100 VND).
+#
+# The previous portfolio code used the latest quote directly
+# (no conversion) and reported "mkt=31" instead of "mkt=31,050",
+# making every position look like it was down ~99.90% in the
+# EOD report.
+#
+# The fix: prefer the positions endpoint's marketPrice (already
+# in VND); fall back to the latest quote (with the ×1000
+# conversion) only when the positions endpoint has no market
+# price for the position.
+# -----------------------------------------------------------------------------
+
+
+def test_uses_positions_market_price_when_available() -> None:
+    """Prefer positions endpoint's marketPrice (VND) over the live quote."""
+    payload = {
+        "positions": [
+            {
+                "symbol": "BAF", "openQuantity": 200,
+                "accumulateQuantity": 200, "closedQuantity": 0,
+                "costPrice": 31050, "marketPrice": 31100,
+            }
+        ]
+    }
+    # Even if the latest quote is mocked at kVND prices, the
+    # positions marketPrice should win (and the quote should NOT
+    # be fetched). This saves N API calls per EOD cycle.
+    client = _stub_client(positions_payload=payload, latest_quote=None)
+    snap = build_portfolio_snapshot(client, "0003937868")
+    pos = snap["positions"][0]
+    assert pos["marketPrice"] == 31100  # absolute VND, not 31.1
+    assert pos["marketValue"] == 200 * 31100
+    # Unrealized P&L: (31100 - 31050) * 200 = +10,000 VND = +0.161%
+    assert pos["unrealizedPnl"] == 10000
+    assert abs(pos["unrealizedPnlPct"] - 0.161) < 0.01
+
+
+def test_falls_back_to_live_quote_with_kvnd_conversion() -> None:
+    """If positions has no marketPrice, use latest quote × 1000."""
+    payload = {
+        "positions": [
+            {
+                "symbol": "BAF", "openQuantity": 200,
+                "accumulateQuantity": 200, "closedQuantity": 0,
+                "costPrice": 31050,
+                # No marketPrice field — simulates a stale or
+                # delisted-symbol cache where DNSE didn't return
+                # a recent trade price.
+            }
+        ]
+    }
+    # Live quote is in kVND: bid 31.1, offer 31.2 → mid 31.15 kVND
+    # = 31,150 VND.
+    quote_payload = {
+        "quotes": [
+            {
+                "boardId": "G1",
+                "bid": [{"price": 31.1, "quantity": 100}],
+                "offer": [{"price": 31.2, "quantity": 100}],
+            }
+        ]
+    }
+    client = _stub_client(
+        positions_payload=payload, latest_quote=quote_payload,
+    )
+    snap = build_portfolio_snapshot(client, "0003937868")
+    pos = snap["positions"][0]
+    # mid = (31.1 + 31.2) / 2 = 31.15 kVND × 1000 = 31,150 VND
+    assert pos["marketPrice"] == 31150
+    assert pos["marketValue"] == 200 * 31150
+
+
+def test_no_market_price_falls_back_to_cost_price() -> None:
+    """If neither positions nor quote has a price, use costPrice (PnL=0)."""
+    payload = {
+        "positions": [
+            {
+                "symbol": "BAF", "openQuantity": 200,
+                "accumulateQuantity": 200, "closedQuantity": 0,
+                "costPrice": 31050,
+            }
+        ]
+    }
+    # No market price, and the live quote call returns nothing useful.
+    empty_quote = {"quotes": [{"boardId": "G1", "bid": [], "offer": []}]}
+    client = _stub_client(
+        positions_payload=payload, latest_quote=empty_quote,
+    )
+    snap = build_portfolio_snapshot(client, "0003937868")
+    pos = snap["positions"][0]
+    # Falls back to avgPrice → marketPrice == costPrice → 0 P&L.
+    assert pos["marketPrice"] == 31050
+    assert pos["unrealizedPnl"] == 0
+    assert pos["unrealizedPnlPct"] == 0.0
+
+
+def test_abb_upcom_position_with_market_price_in_vnd() -> None:
+    """ABB (UPCOM) position uses positions marketPrice directly."""
+    payload = {
+        "positions": [
+            {
+                "symbol": "ABB", "openQuantity": 100,
+                "accumulateQuantity": 100, "closedQuantity": 0,
+                "costPrice": 17700, "marketPrice": 17600,
+            }
+        ]
+    }
+    client = _stub_client(positions_payload=payload, latest_quote=None)
+    snap = build_portfolio_snapshot(client, "0003937868")
+    pos = snap["positions"][0]
+    assert pos["marketPrice"] == 17600
+    assert pos["marketValue"] == 100 * 17600
+    # Unrealized P&L: (17600 - 17700) * 100 = -10,000 VND (-0.565%)
+    assert pos["unrealizedPnl"] == -10000
+    assert abs(pos["unrealizedPnlPct"] - (-0.565)) < 0.01
+
+
+def test_real_baf_abf_portfolio_pnl_correct() -> None:
+    """Reproduces the 2026-10-13 21:25 ICT EOD bug.
+
+    The old code reported BAF as ``mkt=31`` (i.e. 31 VND, from
+    the kVND quote un-converted) and ABB as ``mkt=18`` (i.e.
+    18 VND). Unrealized P&L was a misleading -99.90% on both
+    positions. The new code reads the positions endpoint's
+    marketPrice directly, which is in absolute VND.
+    """
+    payload = {
+        "positions": [
+            {
+                "symbol": "BAF", "openQuantity": 200,
+                "accumulateQuantity": 200, "closedQuantity": 0,
+                "costPrice": 31050, "marketPrice": 31100,
+            },
+            {
+                "symbol": "ABB", "openQuantity": 100,
+                "accumulateQuantity": 100, "closedQuantity": 0,
+                "costPrice": 17700, "marketPrice": 17600,
+            },
+        ]
+    }
+    client = _stub_client(positions_payload=payload, latest_quote=None)
+    snap = build_portfolio_snapshot(client, "0003937868")
+    by_sym = {p["symbol"]: p for p in snap["positions"]}
+    # BAF: (31100 - 31050) * 200 = +10,000 VND = +0.161%
+    assert by_sym["BAF"]["marketPrice"] == 31100
+    assert by_sym["BAF"]["unrealizedPnl"] == 10000
+    assert abs(by_sym["BAF"]["unrealizedPnlPct"] - 0.161) < 0.01
+    # ABB: (17600 - 17700) * 100 = -10,000 VND = -0.565%
+    assert by_sym["ABB"]["marketPrice"] == 17600
+    assert by_sym["ABB"]["unrealizedPnl"] == -10000
+    assert abs(by_sym["ABB"]["unrealizedPnlPct"] - (-0.565)) < 0.01
+    # And the totals roll up correctly.
+    expected_stock = 200 * 31100 + 100 * 17600
+    assert snap["totals"]["stockValue"] == expected_stock
+    expected_pnl = 10000 + (-10000)
+    assert snap["totals"]["totalUnrealizedPnl"] == expected_pnl
