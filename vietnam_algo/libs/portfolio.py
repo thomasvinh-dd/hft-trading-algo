@@ -137,7 +137,23 @@ def build_portfolio_snapshot(
         symbol = str(_first_field(row, ("symbol", "stockSymbol", "ticker", "secSymbol")) or "").strip().upper()
         if not symbol:
             continue
-        quantity = _int(_first_field(row, ("quantity", "qty", "totalQuantity")))
+        # 2026-10-13: DNSE's positions endpoint uses
+        # ``openQuantity`` (currently-held shares) and
+        # ``accumulateQuantity`` (lifetime buy total, may
+        # include sold lots). The previous parser only checked
+        # ``quantity`` / ``qty`` / ``totalQuantity``, none of
+        # which exist in the actual response — so positions
+        # were silently dropped and the strategy thought the
+        # account was flat when it was holding 100 ABB.
+        # Prefer ``openQuantity`` (the held count, excludes
+        # already-sold shares) and fall back to
+        # ``accumulateQuantity`` minus ``closedQuantity``.
+        open_qty = _int(_first_field(row, ("openQuantity", "openQuantity",)))
+        if open_qty <= 0:
+            acc_qty = _int(_first_field(row, ("accumulateQuantity",)))
+            closed_qty = _int(_first_field(row, ("closedQuantity",)))
+            open_qty = max(0, acc_qty - closed_qty)
+        quantity = open_qty if open_qty > 0 else _int(_first_field(row, ("quantity", "qty", "totalQuantity")))
         if quantity <= 0:
             continue
         avg_price = _float(_first_field(row, (
