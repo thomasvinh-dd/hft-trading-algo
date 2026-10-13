@@ -18,7 +18,22 @@
   </div>
 </header>
 
+<nav class="tab-bar" role="tablist">
+  <button class="tab-btn active" data-tab="performance" role="tab" aria-selected="true">
+    Bot Performance
+  </button>
+  <button class="tab-btn" data-tab="signals" role="tab" aria-selected="false">
+    Darvas Box — Signals &amp; Tickers
+  </button>
+</nav>
+
 <main>
+
+<!-- ============================================================== -->
+<!-- TAB 1: BOT PERFORMANCE — all P&L / equity / breakdown data     -->
+<!-- ============================================================== -->
+<section class="tab-panel active" id="tab-performance" role="tabpanel">
+
   <section class="card kpis">
     <div class="kpi">
       <div class="kpi-label">Total return</div>
@@ -56,52 +71,28 @@
     </div>
   </section>
 
-  <section class="two-col">
-    <section class="card">
-      <header class="card-header">
-        <h2>Opening signals (today)</h2>
-        <span class="muted" id="signals-meta"></span>
-      </header>
-      <div class="table-wrap scroll">
-        <table id="signals-table">
-          <thead>
-            <tr>
-              <th>Ticker</th>
-              <th>Entry</th>
-              <th>Size %</th>
-              <th>sl_T (10%)</th>
-              <th>sl_F (18%)</th>
-              <th>Conviction</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p id="signals-empty" class="empty hidden">No breakout signals at the latest bar.</p>
-    </section>
-
-    <section class="card">
-      <header class="card-header">
-        <h2>Open positions</h2>
-        <span class="muted" id="positions-meta"></span>
-      </header>
-      <div class="table-wrap scroll">
-        <table id="positions-table">
-          <thead>
-            <tr>
-              <th>Ticker</th>
-              <th>Entry</th>
-              <th>Last</th>
-              <th>PnL %</th>
-              <th>Shares</th>
-              <th>Days</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p id="positions-empty" class="empty hidden">No positions currently open.</p>
-    </section>
+  <section class="card">
+    <header class="card-header">
+      <h2>Open positions</h2>
+      <span class="muted" id="positions-meta"></span>
+    </header>
+    <div class="table-wrap scroll">
+      <table id="positions-table">
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Entry</th>
+            <th>Last</th>
+            <th>PnL %</th>
+            <th>PnL VND</th>
+            <th>Shares</th>
+            <th>Days</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="positions-empty" class="empty hidden">No positions currently open.</p>
   </section>
 
   <section class="two-col">
@@ -109,9 +100,7 @@
       <header class="card-header"><h2>Top winners</h2></header>
       <div class="table-wrap scroll">
         <table id="winners-table">
-          <thead>
-            <tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>Exit reason</th></tr>
-          </thead>
+          <thead><tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>PnL VND</th><th>Exit reason</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -120,9 +109,7 @@
       <header class="card-header"><h2>Top losers</h2></header>
       <div class="table-wrap scroll">
         <table id="losers-table">
-          <thead>
-            <tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>Exit reason</th></tr>
-          </thead>
+          <thead><tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>PnL VND</th><th>Exit reason</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -142,12 +129,81 @@
     <pre id="ticker-breakdown" class="pre-block"></pre>
   </section>
 
-  <footer class="muted small">
-    <p>Backtest is OOS-validated (TRAIN 2019–2022, TEST 2023–2026) on 70 HOSE blue chips.
-       Entry-anchored stops, 10% trail, 2× conviction sizing.
-       Data: <code id="data-period"></code></p>
-    <p>Last refresh: <span id="last-updated">—</span></p>
-  </footer>
+</section>
+
+<!-- ============================================================== -->
+<!-- TAB 2: SIGNALS + TICKERS — current signals & per-ticker data   -->
+<!-- ============================================================== -->
+<section class="tab-panel" id="tab-signals" role="tabpanel">
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Opening signals (today)</h2>
+      <span class="muted" id="signals-meta"></span>
+    </header>
+    <div class="table-wrap scroll">
+      <table id="signals-table">
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Entry</th>
+            <th>Size %</th>
+            <th>sl_T (10%)</th>
+            <th>sl_F (18%)</th>
+            <th>Conviction</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="signals-empty" class="empty hidden">No breakout signals at the latest bar.</p>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Ticker history</h2>
+      <span class="muted">Click any ticker to see all deals</span>
+    </header>
+    <div class="ticker-search">
+      <input type="text" id="ticker-search-input" placeholder="Enter ticker (e.g. VCB, HPG, FPT)…" autocomplete="off">
+      <button id="ticker-search-btn" class="btn">Load</button>
+      <span class="muted small" id="ticker-search-hint">Or click a ticker in the signals table above.</span>
+    </div>
+    <div class="ticker-quick">
+      <span class="muted small">Quick load:</span>
+      <div id="ticker-quick-buttons" class="ticker-quick-buttons"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Universe overview</h2>
+      <span class="muted" id="universe-meta"></span>
+    </header>
+    <div class="table-wrap scroll">
+      <table id="universe-table">
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Trades</th>
+            <th>Win %</th>
+            <th>Realized PnL</th>
+            <th>Avg hold (d)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+</section>
+
+<footer class="muted small">
+  <p>Backtest is OOS-validated (TRAIN 2019–2022, TEST 2023–2026) on 70 HOSE blue chips.
+     Entry-anchored stops, 10% trail, 1.5× conviction sizing.
+     Data: <code id="data-period"></code></p>
+  <p>Last refresh: <span id="last-updated">—</span></p>
+</footer>
 </main>
 
 <!-- Ticker history modal: shown when a ticker cell is clicked -->

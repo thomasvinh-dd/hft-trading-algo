@@ -123,11 +123,13 @@ function renderPositions(positions) {
   for (const p of positions) {
     const tr = document.createElement("tr");
     const pnlClass = p.pnl_pct >= 0 ? "pos" : "neg";
+    const pnlVnd = p.pnl_vnd != null ? VND(p.pnl_vnd) : "—";
     tr.innerHTML = `
       <td><a class="ticker-cell" data-ticker="${p.ticker}">${p.ticker}</a></td>
       <td>${VND(p.entry_price)}</td>
       <td>${VND(p.last_close)}</td>
       <td class="${pnlClass}">${PCT(p.pnl_pct)}</td>
+      <td class="${pnlClass}">${pnlVnd}</td>
       <td>${VND(p.shares)}</td>
       <td>${p.bars_held}</td>
     `;
@@ -143,11 +145,13 @@ function renderTradeList(sel, trades) {
   for (const t of trades) {
     const tr = document.createElement("tr");
     const pnlClass = t.pnl_pct >= 0 ? "pos" : "neg";
+    const pnlVnd = t.pnl_vnd != null ? VND(t.pnl_vnd) : "—";
     tr.innerHTML = `
       <td><a class="ticker-cell" data-ticker="${t.ticker}">${t.ticker}</a></td>
       <td class="muted small">${t.entry_date}</td>
       <td class="muted small">${t.exit_date}</td>
       <td class="${pnlClass}">${PCT(t.pnl_pct)}</td>
+      <td class="${pnlClass}">${pnlVnd}</td>
       <td>${t.exit_reason}</td>
     `;
     tbody.appendChild(tr);
@@ -189,9 +193,71 @@ async function load() {
     renderExitReasons(btR.backtest.exit_reasons);
     setText("#ticker-breakdown", btR.backtest.ticker_breakdown || "(none)");
     setStatus(btR.last_updated);
+    // Populate the universe overview on the Signals tab
+    populateUniverseOverview(btR.backtest);
   } catch (e) {
     setText("#cache-status", `Error: ${e.message}`);
   }
+}
+
+// ----- Universe overview (Signals tab) -----
+// Shows one row per ticker that has at least one trade. Helps the
+// user pick tickers to inspect from the search box.
+function populateUniverseOverview(bt) {
+  const tbody = $("#universe-table tbody");
+  if (!tbody) return;
+  const breakdown = (bt.ticker_breakdown || "").trim().split("\n").slice(1); // skip header
+  if (breakdown.length === 0 || !breakdown[0].trim()) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">No trade data.</td></tr>`;
+    return;
+  }
+  // Parse lines like: "VCB     12 trades  75.0% win  +123,456,789 VND   28.4d"
+  const rows = breakdown.map(line => {
+    const m = line.trim().match(/^(\S+)\s+(\d+)\s+trades?\s+([\d.]+)%\s+win\s+([+\-]?[\d,]+)\s+VND\s+([\d.]+)d/);
+    if (!m) return null;
+    return { ticker: m[1], trades: m[2], win: m[3], pnl: m[4], hold: m[5] };
+  }).filter(Boolean);
+  tbody.innerHTML = rows.map(r =>
+    `<tr><td><a class="ticker-link" data-ticker="${r.ticker}">${r.ticker}</a></td>` +
+    `<td>${r.trades}</td><td>${r.win}%</td>` +
+    `<td class="${r.pnl.startsWith('-') ? 'neg' : 'pos'}">${r.pnl}</td>` +
+    `<td>${r.hold}</td></tr>`
+  ).join("");
+  setText("#universe-meta", `${rows.length} tickers with trades`);
+  attachTickerClicks(tbody);
+}
+
+// ----- Quick-load chips (recent signals + open positions) -----
+function populateQuickTickers() {
+  const wrap = $("#ticker-quick-buttons");
+  if (!wrap) return;
+  const seen = new Set();
+  const tickers = [];
+  // From signals table
+  document.querySelectorAll("#signals-table .ticker-link").forEach(a => {
+    const t = a.dataset.ticker;
+    if (t && !seen.has(t)) { seen.add(t); tickers.push(t); }
+  });
+  // From positions table
+  document.querySelectorAll("#positions-table .ticker-link").forEach(a => {
+    const t = a.dataset.ticker;
+    if (t && !seen.has(t)) { seen.add(t); tickers.push(t); }
+  });
+  // From universe overview
+  document.querySelectorAll("#universe-table .ticker-link").forEach(a => {
+    const t = a.dataset.ticker;
+    if (t && !seen.has(t)) { seen.add(t); tickers.push(t); }
+  });
+  if (tickers.length === 0) {
+    wrap.innerHTML = `<span class="muted small">No tickers loaded yet.</span>`;
+    return;
+  }
+  wrap.innerHTML = tickers.slice(0, 24).map(t =>
+    `<button class="ticker-chip" data-ticker="${t}">${t}</button>`
+  ).join("");
+  wrap.querySelectorAll(".ticker-chip").forEach(b => {
+    b.addEventListener("click", () => openTickerModal(b.dataset.ticker));
+  });
 }
 
 async function refresh() {
@@ -230,6 +296,37 @@ document.addEventListener("DOMContentLoaded", () => {
       else closeTickerModal();
     }
   });
+
+  // ----- Tab switching -----
+  $$(".tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const tab = btn.dataset.tab;
+      $$(".tab-btn").forEach(b => {
+        b.classList.toggle("active", b === btn);
+        b.setAttribute("aria-selected", b === btn ? "true" : "false");
+      });
+      $$(".tab-panel").forEach(p => {
+        p.classList.toggle("active", p.id === `tab-${tab}`);
+      });
+      // Populate the quick-ticker chips on the Signals tab
+      if (tab === "signals") populateQuickTickers();
+    });
+  });
+
+  // ----- Ticker search on the Signals tab -----
+  const searchInput = $("#ticker-search-input");
+  const searchBtn = $("#ticker-search-btn");
+  if (searchInput && searchBtn) {
+    const doSearch = () => {
+      const v = searchInput.value.trim().toUpperCase();
+      if (v) openTickerModal(v);
+    };
+    searchBtn.addEventListener("click", doSearch);
+    searchInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") doSearch();
+    });
+  }
+
   load();
 });
 
