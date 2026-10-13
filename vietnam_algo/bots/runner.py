@@ -921,12 +921,24 @@ def _submit_autofin_deals_to_dnse(
         data_dir=data_dir,
         run_id=trade_date,
     )
+    # 2026-10-13 debug: surface the raw result statuses
+    def _sym(r: dict) -> str:
+        order = r.get("order")
+        if hasattr(order, "symbol"):
+            return str(order.symbol)
+        if isinstance(order, dict):
+            return str(order.get("symbol", "?"))
+        return "?"
+    print(f"[submit-debug] execute_orders_with_ledger returned {len(results)} results: {[(r.get('status'), _sym(r)) for r in results]}")
 
     submitted_ids: list[str] = []
     skipped_existing = 0
     unknown = 0
     for r in results:
         status = str(r.get("status", ""))
+        # 2026-10-13: debug aid for "0/0/0 of N planned" mystery
+        if status not in ("submitted", "skipped_existing_ledger", "unknown"):
+            print(f"[submit] unexpected status: {status!r} for {r.get('order', {}).get('symbol', '?')}: {str(r)[:200]}")
         if status == "submitted":
             dnse_id = r.get("detail", {}).get("id") if isinstance(r.get("detail"), dict) else None
             if not dnse_id:

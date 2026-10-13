@@ -502,8 +502,30 @@ def execute_orders_with_ledger(
             ledger[key] = LedgerOrder(**{**ledger[key].__dict__, "status": status, "dnseOrderId": order_id, "updatedAt": utc_now(), "lastDetail": detail})
             results.append({"status": "submitted", "order": payload, "response": response, "detail": detail})
         except Exception as exc:
-            ledger[key] = LedgerOrder(**{**ledger[key].__dict__, "status": "unknown", "updatedAt": utc_now(), "error": str(exc)})
-            results.append({"status": "unknown", "order": payload, "error": str(exc)})
+            # 2026-10-13: distinguish a permanent 4xx rejection from a
+            # transient 5xx / network error. A 4xx means DNSE will
+            # keep rejecting the same payload forever (e.g. a SELL for
+            # shares we don't have, a bad symbol, an invalid price).
+            # Marking those as "unknown" left them in the unsafe
+            # ledger set and blocked all subsequent submits via
+            # ``unsafe_existing_orders``. Reclassify as "rejected"
+            # (terminal) so they don't gate future cycles.
+            err_text = str(exc)
+            is_permanent_rejection = (
+                "HTTP 400" in err_text
+                or "HTTP 401" in err_text
+                or "HTTP 403" in err_text
+                or "HTTP 404" in err_text
+                or "HTTP 422" in err_text
+            )
+            terminal_status = "rejected" if is_permanent_rejection else "unknown"
+            ledger[key] = LedgerOrder(**{
+                **ledger[key].__dict__,
+                "status": terminal_status,
+                "updatedAt": utc_now(),
+                "error": err_text,
+            })
+            results.append({"status": terminal_status, "order": payload, "error": err_text})
         save_ledger(ledger, data_dir)
     complete = submission_complete(ledger, run_id)
     return results, reconciliation, complete
