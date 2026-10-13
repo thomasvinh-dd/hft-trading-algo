@@ -86,7 +86,7 @@ case "${1:-}" in
         echo "# vietnam-algo cron entries for $PROJECT_DIR"
         cat <<EOF
 30 1 * * 1-5 cd $PROJECT_DIR && $_env_sources && PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-get-otp >> $LOG_DIR/get_otp.log 2>&1
-15 8 * * 1-5 cd $PROJECT_DIR && $_env_sources && PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-common-sync --force >> $LOG_DIR/common_sync.log 2>&1
+15 8 * * 1-5 cd $PROJECT_DIR && $_env_sources && DNSE_PROXY_HTTP_URL="" PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-common-sync --force >> $LOG_DIR/common_sync.log 2>&1
 */5 * * * * $_watchdog
 EOF
         exit 0
@@ -105,7 +105,7 @@ existing="$(crontab -l 2>/dev/null || true)"
 filtered="$(printf '%s\n' "$existing" | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum' || true)"
 new_entries="$(cat <<EOF
 30 1 * * 1-5 cd $PROJECT_DIR && $_env_sources && PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-get-otp >> $LOG_DIR/get_otp.log 2>&1
-15 8 * * 1-5 cd $PROJECT_DIR && $_env_sources && PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-common-sync --force >> $LOG_DIR/common_sync.log 2>&1
+15 8 * * 1-5 cd $PROJECT_DIR && $_env_sources && DNSE_PROXY_HTTP_URL="" PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-common-sync --force >> $LOG_DIR/common_sync.log 2>&1
 */5 * * * * $_watchdog
 EOF
 )"
