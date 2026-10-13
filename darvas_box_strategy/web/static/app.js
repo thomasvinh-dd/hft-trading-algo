@@ -110,6 +110,35 @@ function renderSignals(signals) {
   attachTickerClicks(tbody);
 }
 
+function renderRecentSignals(recent) {
+  const tbody = $("#recent-signals-table tbody");
+  const empty = $("#recent-empty");
+  tbody.innerHTML = "";
+  if (!recent || !recent.length) {
+    empty.classList.remove("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+  setText("#recent-meta", `${recent.length} signal(s) in the last 7 trading days`);
+  for (const s of recent) {
+    const tr = document.createElement("tr");
+    const conv = s.high_conviction
+      ? '<span class="pos">HIGH</span>'
+      : '<span class="muted">regular</span>';
+    tr.innerHTML = `
+      <td class="muted small">${s.signal_date}</td>
+      <td><a class="ticker-cell" data-ticker="${s.ticker}">${s.ticker}</a></td>
+      <td>${VND(s.entry_price)}</td>
+      <td>${(s.size_pct * 100).toFixed(0)}%</td>
+      <td>${VND(s.sl_T)}</td>
+      <td>${VND(s.sl_F)}</td>
+      <td>${conv}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+  attachTickerClicks(tbody);
+}
+
 function renderPositions(positions) {
   const tbody = $("#positions-table tbody");
   const empty = $("#positions-empty");
@@ -185,6 +214,7 @@ async function load() {
       fetchJSON("/api/backtest"),
     ]);
     renderSignals(sigR.signals);
+    renderRecentSignals(sigR.recent);
     renderPositions(posR.positions);
     renderKPIs(btR.backtest);
     renderEquityCurve(btR.backtest.equity_curve);
@@ -203,25 +233,43 @@ async function load() {
 // ----- Universe overview (Signals tab) -----
 // Shows one row per ticker that has at least one trade. Helps the
 // user pick tickers to inspect from the search box.
+//
+// The ticker_breakdown field is a markdown table with this format:
+//   Tkr      N Wins      PnL (VND)
+//   -------------------------------
+//   GEE      7    6    242,472,572
+//   ...
+// We parse the table rows and expose them as a structured list.
 function populateUniverseOverview(bt) {
   const tbody = $("#universe-table tbody");
   if (!tbody) return;
-  const breakdown = (bt.ticker_breakdown || "").trim().split("\n").slice(1); // skip header
-  if (breakdown.length === 0 || !breakdown[0].trim()) {
+  const lines = (bt.ticker_breakdown || "").split("\n");
+  // Find lines that look like a ticker row: starts with a 3-4 char ticker
+  // followed by 2+ columns of numbers.
+  const rows = [];
+  for (const line of lines) {
+    // Skip headers, dividers, blanks, markdown fences
+    const t = line.trim();
+    if (!t || t.startsWith("```") || t.startsWith("Tkr") || t.startsWith("-")
+        || t.startsWith("*Top") || t.startsWith("*Bottom")) continue;
+    const m = t.match(/^(\S+)\s+(\d+)\s+(\d+)\s+([+\-]?[\d,]+)/);
+    if (m) {
+      const n = parseInt(m[2]);
+      const wins = parseInt(m[3]);
+      const pnlRaw = m[4];
+      const winPct = n > 0 ? (wins / n * 100).toFixed(0) : "0";
+      rows.push({ ticker: m[1], trades: n, wins, winPct, pnl: pnlRaw });
+    }
+  }
+  if (rows.length === 0) {
     tbody.innerHTML = `<tr><td colspan="5" class="empty">No trade data.</td></tr>`;
     return;
   }
-  // Parse lines like: "VCB     12 trades  75.0% win  +123,456,789 VND   28.4d"
-  const rows = breakdown.map(line => {
-    const m = line.trim().match(/^(\S+)\s+(\d+)\s+trades?\s+([\d.]+)%\s+win\s+([+\-]?[\d,]+)\s+VND\s+([\d.]+)d/);
-    if (!m) return null;
-    return { ticker: m[1], trades: m[2], win: m[3], pnl: m[4], hold: m[5] };
-  }).filter(Boolean);
   tbody.innerHTML = rows.map(r =>
     `<tr><td><a class="ticker-link" data-ticker="${r.ticker}">${r.ticker}</a></td>` +
-    `<td>${r.trades}</td><td>${r.win}%</td>` +
+    `<td>${r.trades} (${r.wins}W)</td><td>${r.winPct}%</td>` +
     `<td class="${r.pnl.startsWith('-') ? 'neg' : 'pos'}">${r.pnl}</td>` +
-    `<td>${r.hold}</td></tr>`
+    `<td>—</td></tr>`
   ).join("");
   setText("#universe-meta", `${rows.length} tickers with trades`);
   attachTickerClicks(tbody);

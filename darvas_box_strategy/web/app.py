@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "darvas_box_strategy"))
 from darvas_box_strategy.web.data import (
     CACHE_PATH,
     CACHE_MAX_AGE_SECONDS,
+    get_recent_signals,
     get_ticker_history,
     load_cache,
     refresh_cache,
@@ -70,11 +71,16 @@ def create_app() -> Flask:
         if not cache.signals:
             # First load or stale — trigger refresh in background
             threading.Thread(target=_safe_refresh, daemon=True).start()
+        # Also include recent signals (last 7 days) so the UI is
+        # useful even when there are no signals on the latest bar.
+        recent = get_recent_signals(days=7)
         return jsonify({
             "last_updated": cache.last_updated,
             "scan_lookback": cache.scan_lookback,
             "count": len(cache.signals),
             "signals": cache.signals,
+            "recent": recent,
+            "recent_count": len(recent),
         })
 
     @app.route("/api/positions")

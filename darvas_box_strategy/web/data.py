@@ -129,6 +129,10 @@ def _signal_to_dict(s, deal_seq: int = 0) -> Dict[str, Any]:
         "shares": int(s.shares),
         "as_of_date": s.entry_date.isoformat()
             if hasattr(s.entry_date, "isoformat") else str(s.entry_date),
+        "signal_date": s.signal_date.isoformat()
+            if hasattr(s.signal_date, "isoformat") else str(s.signal_date),
+        "entry_date": s.entry_date.isoformat()
+            if hasattr(s.entry_date, "isoformat") else str(s.entry_date),
         "atr": float(s.atr_value) if s.atr_value is not None else None,
         "high_conviction": bool(s.size_pct > 0.30),
     }
@@ -201,6 +205,74 @@ def get_current_signals(lookback: int = 0,
         signals.append(_signal_to_dict(sig))
     signals.sort(key=lambda x: (-x["size_pct"], x["ticker"]))
     return signals
+
+
+# Module-level cache for get_recent_signals — the scan takes 5-10s
+# across 70 tickers, but the result changes only when new bar data
+# arrives (typically once a day). 5-minute cache is plenty.
+_RECENT_SIGNALS_CACHE: Dict[str, Any] = {"data": None, "expires": 0.0}
+_RECENT_SIGNALS_TTL = 300  # 5 minutes
+
+
+def get_recent_signals(days: int = 7, cfg=None) -> List[Dict[str, Any]]:
+    """Scan the last ``days`` trading days for any breakout signals.
+
+    Used by the web dashboard's Signals tab to show "recent signals"
+    even when the latest bar has none. Returns signals sorted by
+    signal_date descending, then by size_pct descending.
+
+    Optimized: scans bars[i-1], bars[i-2], ... for the latest BASE
+    end_idx, then only generates a signal for that one bar (the day
+    after the base ends). This is much faster than scanning every
+    possible day.
+
+    Result is cached for 5 minutes (the scan takes 5-10s across
+    70 tickers).
+    """
+    import time
+    now = time.time()
+    if _RECENT_SIGNALS_CACHE["data"] is not None and now < _RECENT_SIGNALS_CACHE["expires"]:
+        return _RECENT_SIGNALS_CACHE["data"]
+    if cfg is None:
+        cfg = build_default_config()
+    tickers = load_blue_chips()
+    filtered = filter_universe(tickers, cfg)
+    out: List[Dict[str, Any]] = []
+    for ticker in filtered:
+        path = PRICES_DIR / f"{ticker}.json"
+        if not path.exists():
+            continue
+        bars = _load_bars_safe(path)
+        if len(bars) < cfg.breakout.min_history_days:
+            continue
+        # Find the most recent base that ended within the last `days`
+        # bars. The signal is at base.end_idx + 1.
+        scanner = BaseScanner(bars, cfg.base, ticker=ticker)
+        last_idx = len(bars) - 1
+        min_idx = max(cfg.breakout.min_history_days, last_idx - days)
+        # Search backwards from the latest bar for a valid base.
+        # The base.end_idx is fixed once found; the breakout is at
+        # end_idx + 1. We check up to `days` bars back.
+        sig = None
+        for check_idx in range(last_idx, min_idx - 1, -1):
+            base = scanner.find_base(as_of_idx=check_idx)
+            if base is None:
+                continue
+            breakout_idx = base.end_idx + 1
+            if breakout_idx >= len(bars):
+                continue
+            # Try to generate a signal at breakout_idx
+            sig = generate_signal(
+                bars, base, nav=cfg.backtest.start_nav, cfg=cfg, as_of_idx=breakout_idx,
+            )
+            if sig is not None:
+                break  # found the most recent one
+        if sig is not None:
+            out.append(_signal_to_dict(sig))
+    out.sort(key=lambda x: (x.get("signal_date", ""), -x["size_pct"]), reverse=True)
+    _RECENT_SIGNALS_CACHE["data"] = out
+    _RECENT_SIGNALS_CACHE["expires"] = now + _RECENT_SIGNALS_TTL
+    return out
 
 
 def get_open_positions(cfg=None) -> List[Dict[str, Any]]:

@@ -161,6 +161,30 @@
 
   <section class="card">
     <header class="card-header">
+      <h2>Recent signals (last 7 days)</h2>
+      <span class="muted" id="recent-meta"></span>
+    </header>
+    <div class="table-wrap scroll">
+      <table id="recent-signals-table">
+        <thead>
+          <tr>
+            <th>Signal date</th>
+            <th>Ticker</th>
+            <th>Entry</th>
+            <th>Size %</th>
+            <th>sl_T (10%)</th>
+            <th>sl_F (18%)</th>
+            <th>Conviction</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="recent-empty" class="empty hidden">No signals in the last 7 trading days.</p>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
       <h2>Ticker history</h2>
       <span class="muted">Click any ticker to see all deals</span>
     </header>

@@ -41,6 +41,10 @@ class FlaskAppTests(unittest.TestCase):
         self.assertIn("count", data)
         self.assertIn("signals", data)
         self.assertIsInstance(data["signals"], list)
+        # The endpoint also returns recent signals (last 7 trading
+        # days) so the UI is useful even when the latest bar has none.
+        self.assertIn("recent", data)
+        self.assertIsInstance(data["recent"], list)
 
     def test_positions_endpoint(self):
         r = self.client.get("/api/positions")
@@ -209,6 +213,7 @@ class SignalToDictTests(unittest.TestCase):
             sl_T = 67680.0
             size_pct = 0.40
             entry_date = date(2026, 10, 10)
+            signal_date = date(2026, 10, 9)
             atr_value = 1234.5
             shares = 5000
 
@@ -219,6 +224,7 @@ class SignalToDictTests(unittest.TestCase):
         self.assertEqual(d["sl_T"], 67680.0)
         self.assertEqual(d["size_pct"], 0.40)
         self.assertEqual(d["as_of_date"], "2026-10-10")
+        self.assertEqual(d["signal_date"], "2026-10-09")
         self.assertTrue(d["high_conviction"])  # 0.40 > 0.30
 
 
@@ -340,6 +346,7 @@ class SignalToDictWithDealIdTests(unittest.TestCase):
             sl_T = 67680.0
             size_pct = 0.40
             entry_date = date(2026, 10, 9)
+            signal_date = date(2026, 10, 8)
             atr_value = 1234.5
             shares = 5000
 
