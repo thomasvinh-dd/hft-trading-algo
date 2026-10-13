@@ -194,6 +194,7 @@ def test_monitor_no_orders_returns_empty_summary(tmp_path, notify_spy) -> None:
         "polled": 0, "skipped_throttle": 0, "changes": [],
         "errors": [], "terminal_transitions": 0,
         "repriced": [], "abandoned": [],
+        "force_replan": False, "force_replan_symbols": [],
     }
     assert client.calls == []
     assert notify_spy == []
@@ -493,3 +494,115 @@ def test_monitor_persists_updated_ledger_to_disk(tmp_path, notify_spy) -> None:
     assert abb.lastDetail is not None
     assert abb.lastDetail["filledQuantity"] == 1700
     assert abb.updatedAt != "2026-10-09T01:00:00Z"  # updated
+
+
+# -----------------------------------------------------------------------------
+# _monitor_order_statuses — force_replan flag
+#
+# 2026-10-13: when an order transitions to a terminal-without-fill state
+# (cancelled, rejected, expired), the strategy should re-plan and re-submit
+# on the next cycle rather than waiting for the 1-hour mid-day-poll throttle.
+# The order monitor sets ``summary["force_replan"] = True`` and lists the
+# affected symbols in ``summary["force_replan_symbols"]``. The main loop
+# then clears the strategy's ``last_poll_at`` so the next mid-day poll
+# bypasses the throttle.
+# -----------------------------------------------------------------------------
+
+
+def test_monitor_cancellation_sets_force_replan(tmp_path, notify_spy) -> None:
+    """Order going open → cancelled sets force_replan=True (should retry)."""
+    _ledger_with(tmp_path, [
+        {"symbol": "BAF", "side": "NB", "quantity": 200, "price": 30950,
+         "status": "open", "dnseOrderId": "156661"},
+    ])
+    client = _StubClient([_detail("cancelled", id="156661", filledQuantity=0,
+                                  canceledQuantity=200, leaveQuantity=0)])
+    summary = _monitor_order_statuses(client, "A", "tok", tmp_path, throttle_seconds=0)
+    assert summary["force_replan"] is True
+    assert "BAF" in summary["force_replan_symbols"]
+    assert summary["terminal_transitions"] == 1
+
+
+def test_monitor_rejection_sets_force_replan(tmp_path, notify_spy) -> None:
+    """Order going open → rejected sets force_replan=True (should retry)."""
+    _ledger_with(tmp_path, [
+        {"symbol": "ABW", "side": "NB", "quantity": 300, "price": 14100,
+         "status": "open", "dnseOrderId": "999"},
+    ])
+    client = _StubClient([_detail("rejected", id="999", filledQuantity=0,
+                                  rejectReason="INVALID_PRICE")])
+    summary = _monitor_order_statuses(client, "A", "tok", tmp_path, throttle_seconds=0)
+    assert summary["force_replan"] is True
+    assert "ABW" in summary["force_replan_symbols"]
+
+
+def test_monitor_expiration_sets_force_replan(tmp_path, notify_spy) -> None:
+    """Order going open → expired sets force_replan=True (should retry)."""
+    _ledger_with(tmp_path, [
+        {"symbol": "TLG", "side": "NB", "quantity": 100, "price": 53500,
+         "status": "open", "dnseOrderId": "888"},
+    ])
+    client = _StubClient([_detail("expired", id="888", filledQuantity=0)])
+    summary = _monitor_order_statuses(client, "A", "tok", tmp_path, throttle_seconds=0)
+    assert summary["force_replan"] is True
+    assert "TLG" in summary["force_replan_symbols"]
+
+
+def test_monitor_fill_does_not_set_force_replan(tmp_path, notify_spy) -> None:
+    """Order going open → filled does NOT set force_replan (already done)."""
+    _ledger_with(tmp_path, [
+        {"symbol": "ABB", "side": "NB", "quantity": 100, "price": 17700,
+         "status": "open", "dnseOrderId": "133161"},
+    ])
+    client = _StubClient([_detail("filled", id="133161", filledQuantity=100)])
+    summary = _monitor_order_statuses(client, "A", "tok", tmp_path, throttle_seconds=0)
+    assert summary["force_replan"] is False
+    assert summary["force_replan_symbols"] == []
+
+
+def test_monitor_partial_fill_then_cancellation_sets_force_replan(tmp_path, notify_spy) -> None:
+    """Order filled partially then cancelled: filledQuantity > 0 → no force_replan.
+
+    If a partial fill was followed by cancellation, the strategy already
+    received some shares. Re-planning could double-buy. Don't force_replan
+    in that case; the operator should re-evaluate the position manually.
+    """
+    _ledger_with(tmp_path, [
+        {"symbol": "BAF", "side": "NB", "quantity": 200, "price": 30950,
+         "status": "open", "dnseOrderId": "156661"},
+    ])
+    client = _StubClient([_detail("cancelled", id="156661", filledQuantity=100,
+                                  canceledQuantity=100, leaveQuantity=0)])
+    summary = _monitor_order_statuses(client, "A", "tok", tmp_path, throttle_seconds=0)
+    assert summary["force_replan"] is False  # partial fill → no retry
+
+
+def test_monitor_cancellation_collects_multiple_symbols(tmp_path, notify_spy) -> None:
+    """Multiple cancellations in the same cycle all set force_replan=True
+    and are accumulated in force_replan_symbols."""
+    _ledger_with(tmp_path, [
+        {"symbol": "BAF", "side": "NB", "quantity": 200, "price": 30950,
+         "status": "open", "dnseOrderId": "111"},
+        {"symbol": "ABW", "side": "NB", "quantity": 300, "price": 14100,
+         "status": "open", "dnseOrderId": "222"},
+    ])
+    client = _StubClient([
+        _detail("cancelled", id="111", filledQuantity=0),
+        _detail("cancelled", id="222", filledQuantity=0),
+    ])
+    summary = _monitor_order_statuses(client, "A", "tok", tmp_path, throttle_seconds=0)
+    assert summary["force_replan"] is True
+    assert sorted(summary["force_replan_symbols"]) == ["ABW", "BAF"]
+    assert summary["terminal_transitions"] == 2
+
+
+def test_monitor_no_change_does_not_set_force_replan(tmp_path, notify_spy) -> None:
+    """If status is unchanged (still open), no force_replan even with open order."""
+    _ledger_with(tmp_path, [
+        {"symbol": "ABB", "side": "NB", "status": "open", "dnseOrderId": "1"},
+    ])
+    client = _StubClient([_detail("open", id="1")])  # still open
+    summary = _monitor_order_statuses(client, "A", "tok", tmp_path, throttle_seconds=0)
+    assert summary["force_replan"] is False
+    assert summary["force_replan_symbols"] == []
+

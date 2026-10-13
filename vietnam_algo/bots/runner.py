@@ -1470,6 +1470,16 @@ def _monitor_order_statuses(
         "terminal_transitions": 0,
         "repriced": [],  # list of {key, symbol, old_price, new_price, new_order_id}
         "abandoned": [],  # list of {key, symbol, cap, best_ask}
+        # 2026-10-13: force_replan is True when an order transitioned to
+        # a terminal-without-fill state (cancelled, rejected, expired)
+        # AND the underlying deal is still relevant (not a "close"
+        # type — we don't re-plan exits). The main loop uses this
+        # flag to bypass the 1-hour mid-day-poll throttle so the
+        # bot re-plans and re-submits within the next 60s cycle.
+        "force_replan": False,
+        # Symbols that triggered the force_replan — informational,
+        # not used by the main loop but logged for the operator.
+        "force_replan_symbols": [],
     }
     if client is None:
         return summary
@@ -1542,6 +1552,37 @@ def _monitor_order_statuses(
             })
             if new_status in TERMINAL_LEDGER_STATUSES:
                 summary["terminal_transitions"] += 1
+            # 2026-10-13: when an order transitions to a terminal state
+            # WITHOUT a fill, the underlying deal is still "interesting"
+            # (the bot should retry). Mark ``force_replan = True`` so
+            # the main loop can clear the strategy's ``last_poll_at``,
+            # which lets the next mid-day poll (within ~60 s) re-plan
+            # and re-submit the order. The ``_prune_terminal_unfilled_deals``
+            # helper inside ``_load_state`` already releases the deal
+            # from ``actioned_deals`` so the next ``generate_orders``
+            # will see it as a fresh signal.
+            #
+            # We exclude ``filled`` (already done — no retry needed) and
+            # ``closed`` (DNSE-internal end-of-day state). SELL "close"
+            # orders that complete a position are also excluded because
+            # we don't want to re-open a closed position.
+            #
+            # ``filledQuantity`` is on ``detail`` (the DNSE response),
+            # not on ``LedgerOrder`` itself. If the order filled any
+            # quantity before being cancelled/rejected/expired, the
+            # strategy already owns those shares and re-planning could
+            # double-buy; skip the force_replan in that case.
+            _fill_qty = 0
+            if isinstance(detail, dict):
+                _fill_qty = int(detail.get("filledQuantity") or 0)
+            if (
+                new_status in {"cancelled", "rejected", "expired"}
+                and _fill_qty == 0
+            ):
+                summary["force_replan"] = True
+                sym = item.symbol
+                if sym and sym not in summary["force_replan_symbols"]:
+                    summary["force_replan_symbols"].append(sym)
             try:
                 notify(_format_status_change_message(
                     item, previous_status, new_status, detail,
@@ -1763,6 +1804,35 @@ def run_auto_bot(
                     f"terminal={monitor_summary['terminal_transitions']} "
                     f"errors={len(monitor_summary['errors'])}"
                 )
+            # 2026-10-13: when an order transitions to a terminal-without-fill
+            # state (cancelled, rejected, expired), the strategy should
+            # re-plan and re-submit on the next cycle — not wait for the
+            # 1-hour mid-day-poll throttle. The order monitor flags this
+            # via ``monitor_summary["force_replan"]``; we clear the
+            # strategy's ``last_poll_at`` here so the next poll bypasses
+            # the throttle. ``_prune_terminal_unfilled_deals`` (in
+            # ``_load_state``) will already have released the deal from
+            # ``actioned_deals`` so the re-plan picks it up.
+            if monitor_summary.get("force_replan") and engine_config.strategy == "autofin_signal":
+                try:
+                    _state_path = engine_config.dataDir / engine_config.liveDirName / "autofin_signal_state.json"
+                    if _state_path.exists():
+                        import json as _json_force
+                        _state = _json_force.loads(_state_path.read_text(encoding="utf-8"))
+                        if _state.get("last_poll_at"):
+                            _state["last_poll_at"] = None
+                            _state_path.write_text(
+                                _json_force.dumps(_state, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                            print(
+                                f"[{now.isoformat()}] order monitor cleared "
+                                f"last_poll_at for autofin_signal (force_replan "
+                                f"symbols={monitor_summary.get('force_replan_symbols', [])}); "
+                                f"next mid-day poll will re-plan and re-submit"
+                            )
+                except Exception as exc:
+                    print(f"[{now.isoformat()}] force_replan clear failed: {type(exc).__name__}: {str(exc)[:200]}")
         except Exception as exc:
             print(f"[{now.isoformat()}] order monitor crashed: {type(exc).__name__}: {str(exc)[:200]}")
         if should_sync_market_holidays(state.marketHolidaySyncDate, today):
