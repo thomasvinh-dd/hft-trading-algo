@@ -156,6 +156,34 @@ def _hydrate_shared_token_into_state(state, data_dir) -> bool:
     return True
 
 
+def _load_dnse_trading_token_from_disk(data_dir) -> str | None:
+    """Return the latest DNSE trading token from the shared file, or None.
+
+    Used by the T+2 settlement SL retry path. We can't piggy-back on
+    the local ``token`` variable inside ``run_auto_bot`` because that
+    variable is set inside the conditional CA-sync branch and would
+    either be unbound (when ``--no-sync-data`` skips the CA sync) or
+    silently hold the VIETSTOCK token (the wrong token for DNSE
+    calls). Reading the shared file directly is both correct and
+    independent of the data-sync setting.
+
+    The file is written by the ``run-get-otp`` cron (08:30 ICT) and
+    is the same one the order monitor reads at the top of the loop.
+    If the token is missing or expired we return None and the caller
+    skips the T+2 retry (it will retry on the next SOD cycle).
+    """
+    try:
+        shared = load_shared_trading_token(data_dir)
+    except Exception:
+        return None
+    if not shared:
+        return None
+    tok = shared.get("token")
+    if not tok:
+        return None
+    return str(tok)
+
+
 def _compute_dry_run_qty_scale(
     backtest_result_path: "Path | str | None",
     state: "DryRunState",
@@ -2282,13 +2310,23 @@ def run_auto_bot(
         # fetching while the other just reads from disk.
         if engine_config.syncData and should_sync_corporate_actions(now, state.corporateActionDate, schedule, holidays):
             print(f"[{now.isoformat()}] Syncing Vietstock corporate actions")
-            token = os.environ.get("VIETSTOCK_REQUEST_TOKEN", "")
-            cookie = os.environ.get("VIETSTOCK_COOKIE", "")
+            # 2026-10-13 bug fix: this branch used to assign
+            # ``token = os.environ.get("VIETSTOCK_REQUEST_TOKEN"...)``
+            # which silently SHADOWED the DNSE ``token`` defined at
+            # line 2237. The CA-sync block ran in the same function
+            # scope, so every subsequent use of ``token`` (T+2
+            # retry, mid-day/EOD order submits) got the VIETSTOCK
+            # value instead of the DNSE trading token — every
+            # downstream DNSE call returned 401/403. Rename the
+            # CA-sync variable to ``vs_token`` so the shadowing is
+            # impossible regardless of which order the branches fire.
+            vs_token = os.environ.get("VIETSTOCK_REQUEST_TOKEN", "")
+            vs_cookie = os.environ.get("VIETSTOCK_COOKIE", "")
             try:
                 result = sync_corporate_actions_incremental(
                     engine_config.dataDir,
-                    request_verification_token=token,
-                cookie=cookie,
+                    request_verification_token=vs_token,
+                cookie=vs_cookie,
                 to_date=today,
                 )
             except Exception as exc:
@@ -2484,12 +2522,31 @@ def run_auto_bot(
             # corresponding BUY is now settled (>=2 days old),
             # then re-submit them. Runs at SOD so the SL is in
             # place before the trading session starts.
-            if live_submit and token and client is not None:
+            #
+            # 2026-10-13 bug fix: the prior code used the local
+            # ``token`` variable that was only assigned inside the
+            # CA-sync branch above (``token = os.environ.get(
+            # "VIETSTOCK_REQUEST_TOKEN"...)``). With
+            # ``--no-sync-data`` (the new launcher default), that
+            # branch is skipped, so ``token`` is unbound and the
+            # T+2 retry path crashed the bot at SOD with
+            # ``UnboundLocalError: local variable 'token'``. Even
+            # when CA-sync ran, the variable held the VIETSTOCK
+            # token (a non-empty string), so the gate passed
+            # silently and the T+2 retry function was called with
+            # the wrong token — every retry would fail at the DNSE
+            # call with an HTTP 401/403. The fix is to load the
+            # shared DNSE trading token from the same file the
+            # order monitor uses (written by the get_otp cron).
+            t2_trading_token = _load_dnse_trading_token_from_disk(
+                engine_config.dataDir,
+            )
+            if live_submit and t2_trading_token and client is not None:
                 try:
                     t2_summary = retry_t2_settlement_sl_orders(
                         client=client,
                         account_no=account_no,
-                        trading_token=token,
+                        trading_token=t2_trading_token,
                         data_dir=engine_config.dataDir,
                         today_iso=today,
                         now_time=now.time(),
@@ -2663,12 +2720,20 @@ def run_auto_bot(
                     # have their SL retried at next-day's SOD
                     # because the BUY was today, not yesterday.
                     # A daily mid-day check is the safe cadence.
-                    if live_submit and token and client is not None:
+                    #
+                    # See SOD fix above — read the DNSE token
+                    # directly from disk instead of the local
+                    # ``token`` (which is the VIETSTOCK token, set
+                    # only when CA sync runs).
+                    t2_trading_token = _load_dnse_trading_token_from_disk(
+                        engine_config.dataDir,
+                    )
+                    if live_submit and t2_trading_token and client is not None:
                         try:
                             t2_summary = retry_t2_settlement_sl_orders(
                                 client=client,
                                 account_no=account_no,
-                                trading_token=token,
+                                trading_token=t2_trading_token,
                                 data_dir=engine_config.dataDir,
                                 today_iso=today,
                                 now_time=now.time(),

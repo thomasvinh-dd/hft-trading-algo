@@ -195,31 +195,294 @@ hit the hard stop is classified as `SL_HARD`.
 
 Every trade has a `fills` timeline (one row per event) visible in
 the deal-detail modal. Each fill has a `kind` that tells you what
-happened:
+happened.
 
-| Kind | What it means | When it fires |
-|---|---|---|
-| **ENTRY** | Buy at the breakout | Once, on the first day of the trade |
-| **TIER** | Partial take-profit at a ladder level | When `bar.high ≥ entry × tier_multiplier` |
-| **TRAIL** | Trailing stop hit (closes the rest) | When trailing is active and `bar.close ≤ peak × (1 - trail_pct)` (or below trail floor) |
-| **SL_SCALE** | Partial stop-loss cut | When `bar.low ≤ sl_T` (cut 50%) or `bar.low ≤ sl_mid` (cut 50% of remaining) |
-| **SL_HARD** | Full hard stop (closes everything left) | When `bar.low ≤ sl_F` |
-| **TIME_STOP** | Time stop fired | When `bars_held ≥ max_holding_bars` and close is still below entry |
-| **DIVIDEND** | Cash dividend received | When the ticker has a dividend event in the data |
-| **EXHAUST** | Backtest ran out of data | No more bars — forced close at last close |
+### Quick reference
+
+| Kind | What it means | When it fires | Effect on shares |
+|---|---|---|---|
+| **ENTRY** | Buy at the breakout | Once, on the first day of the trade | +shares (entry size) |
+| **TIER** | Partial take-profit at a ladder level | `bar.high ≥ entry × tier_multiplier` | -tier_pct × remaining |
+| **TRAIL** | Trailing stop hit (closes the rest) | Trailing active AND `bar.close ≤ peak × (1 - trail_pct)` (or below trail floor) | -all remaining |
+| **SL_SCALE** | Partial stop-loss cut | `bar.low ≤ sl_T` (cut 50%) or `bar.low ≤ sl_mid` (cut 50% of remaining) | -50% (or all if small) |
+| **SL_HARD** | Full hard stop (closes everything left) | `bar.low ≤ sl_F` | -all remaining |
+| **TIME_STOP** | Time stop fired | `bars_held ≥ max_holding_bars` AND close still below entry | -all remaining |
+| **DIVIDEND** | Cash dividend received | Ticker has a dividend event on this bar | unchanged (income credited) |
+| **EXHAUST** | Backtest ran out of data | No more bars | -all remaining (at last close) |
+
+### Detailed explanation of each event
+
+#### ENTRY — opening the position
+
+```
+Signal fires (yesterday's bar):
+  base detected → breakout confirmed → size computed
+  sh = round_down(nav × size_pct / entry_price, board_lot=100)
+  sl_T = entry × 0.90
+  sl_F = entry × 0.82
+  tiers = [(1.063, 0.10), (1.125, 0.30), ...]
+  trailing_active = False   ← trail only kicks in after first tier
+  tier_idx = 0              ← next tier to fire
+  remaining = sh
+
+Today (next bar after the signal):
+  ENTRY fill recorded at bar.open
+  remaining stays at sh
+  cumulative_pnl = 0
+```
+
+**The trade is now "open" and will be checked on every bar
+until all shares are sold.**
+
+The entry row's `note` field always says `Buy N @ X` so you can
+verify the price and share count at a glance.
+
+#### TIER — partial profit-taking
+
+When the bar's high reaches a tier price, that tier fires and
+sells its percentage of remaining shares at the tier price. The
+`while` loop in the executor processes ALL tiers that the bar
+crosses, so a single bar can fire multiple tiers (e.g. if price
+gaps up through tier 1, 2, and 3 in one day, all three fire).
+
+```
+Before bar:
+  remaining = 1,000
+  tier_idx = 2 (next tier is 1.210 = +21%, sell 30%)
+  cumulative_pnl = +30M
+
+Bar high = 125,000 (> 121,000):
+  TIER fires at 121,000
+  sell 1,000 × 30% = 300 shares @ 121,000
+  pnl_delta = (121,000 - 100,000) × 300 = +6.3M
+  remaining = 700
+  tier_idx = 3
+
+If bar high > 1.330 (133,000):
+  TIER 4 fires at 133,000
+  sell 700 × 10% = 70 shares @ 133,000
+  pnl_delta = (133,000 - 100,000) × 70 = +2.31M
+  remaining = 630
+  tier_idx = 4
+```
+
+**Important**: the tier price is fixed relative to ENTRY, not
+relative to the previous tier. So if entry is 100,000, tier 5 is
+always at 146,000 (1.46 × entry), regardless of what happened
+before. The tier's `level` in the fill row shows the actual
+fill price (= tier price).
+
+**First-tier side effect**: when `tier_idx == 0` fires, the trail
+activates. The `trail_floor` is set to the tier-1 price. Now
+`remaining` shares can never close below that price (unless
+`trail_floor_lock_profit=False`).
+
+#### TRAIL — trailing stop exits the rest
+
+The trail starts "armed" but inactive. It activates on the first
+tier (or whichever tier is set in `TrailingConfig.activation_tier_idx`).
+After activation, every bar checks:
+
+```
+trail_threshold = peak_close × (1 - trail_from_peak_pct)   ← default 10%
+if trail_floor_lock_profit:
+    trail_threshold = max(trail_threshold, trail_floor)   ← never below tier 1
+if bar.close ≤ trail_threshold:
+    TRAIL fires — close all remaining at bar.close
+```
+
+```
+Entry = 100,000, peak so far = 130,000
+trail_from_peak_pct = 0.10
+trail_threshold = 130,000 × 0.90 = 117,000
+trail_floor = 106,300 (tier 1 = 1.063 × entry)
+
+If bar.close = 115,000:
+  trail_threshold = 117,000
+  115,000 < 117,000 → TRAIL fires
+  remaining shares sold at 115,000
+  pnl_delta = (115,000 - 100,000) × remaining = +15,000 per share
+
+If tier 1 was set higher (say tier 1 = 1.20 = 120,000):
+  trail_floor = 120,000
+  trail_threshold = max(117,000, 120,000) = 120,000
+  Now trail only fires when close drops below 120,000 — locks in
+  a bigger profit at the cost of giving back more of the move.
+```
+
+**Why the trail matters**: a trade can hit tier 1 (+6.3%) and
+then ride the trend all the way to +50% before the trail fires.
+Without the trail, the strategy would either hold forever
+(catching every reversal) or use a hard exit (cutting winners
+short).
+
+#### SL_SCALE — bleeding out on the way down
+
+Three trigger levels, all anchored to ENTRY price. Each fires
+independently and cuts 50% of what's still held.
+
+```
+sl_T   = entry × 0.90   (10% below entry)
+sl_mid = entry × 0.86   (14% below entry)
+sl_F   = entry × 0.82   (18% below entry)
+```
+
+Order on a single bar (priority: T → mid → F):
+
+```
+if bar.low ≤ sl_T:
+    SL_SCALE at sl_T — sell 50% of remaining
+if bar.low ≤ sl_mid and remaining > 0:
+    SL_SCALE at sl_mid — sell 50% of remaining
+if bar.low ≤ sl_F and remaining > 0:
+    SL_HARD at sl_F — sell all remaining
+```
+
+**Board-lot edge case**: if `cut = round(remaining × 0.50)` is
+less than 1 board lot (100 shares), the cut is bumped to whatever
+remains. This prevents the strategy from leaving 49 shares
+stranded forever.
+
+**Example bar (entry 100,000)**:
+```
+low = 85,000  →  bar.low ≤ sl_T (90,000) and sl_mid (86,000) and sl_F (82,000)
+                ALL THREE fire on the same bar
+                cut_1 = round(3,100 × 0.5) = 1,550  → 1,550 sold @ 90,000 (sl_T)
+                cut_2 = round(1,550 × 0.5) = 775   →    775 sold @ 86,000 (sl_mid)
+                cut_3 = 1,550 - 1,550 - 775         =    775 sold @ 82,000 (sl_F)
+                remaining = 0  →  trade closed
+                Total loss = (90,000-100,000)×1,550 + (86,000-100,000)×775
+                           + (82,000-100,000)×775
+                           = -15.5M + -10.85M + -13.95M
+                           = -40.3M VND
+```
+
+#### SL_HARD — full hard stop
+
+The last line of defense. Fires only if the position survives
+both scale-outs (i.e., the bar's low hit sl_T and sl_mid but the
+strategy's "round 50% of remaining" logic left enough shares to
+trigger the next cut). In practice, SL_HARD fires on:
+- The bar after the second SL_SCALE if the price has dropped far
+  enough to also hit sl_F.
+- A bar that gaps down past sl_F without ever touching sl_T or
+  sl_mid (rare on HOSE due to ±7% daily limit).
+
+#### TIME_STOP — giving up on a stalled loser
+
+Fires when `bars_held ≥ max_holding_bars` AND `close < entry_price`.
+The default is `max_holding_bars=0` (off), so this event is rare
+in the backtest.
+
+When enabled, the intent is: "if a position has been open for N
+bars and is still underwater, the breakout thesis is wrong — exit
+and free up capital for the next signal."
+
+**The check is `close < entry_price`**, not "still in the original
+base range". A position that's been up 20% then dropped back to
+-2% is NOT a time stop (it should hit the trail first). Only
+positions that never made it to tier 1 trigger this.
+
+#### DIVIDEND — passive income
+
+A cash dividend doesn't reduce shares but it credits the
+`cumulative_pnl` directly. The position is still held.
+
+```
+bar.date in dividend_per_share and remaining > 0:
+  income = remaining × cash_div
+  cumulative_pnl += income
+  DIVIDEND fill recorded with kind="DIVIDEND"
+  shares = remaining (unchanged, but the fill is "informational")
+```
+
+HOSE blue chips typically pay 1-2 dividends per year at 5-15%
+cash yield. A position held for 6 months in a dividend-paying
+stock gets ~3-5% of its notional value added to the P&L.
+
+#### EXHAUST — backtest ran out of data
+
+The simulator only knows about historical bars. When it reaches
+the last bar without all shares being sold, it force-closes at
+the last close.
+
+```
+for bar in bars_after:    ← iterates until bars_after is exhausted
+    ...
+    if remaining ≤ 0: break
+# Loop ends with remaining > 0 (no more bars)
+EXHAUST fires at last_bar.close
+exit_reason = "EXHAUST"
+```
+
+**Important**: in live trading, this would NOT happen — the
+position stays open. The backtest treats EXHAUST as a soft
+"position was still open at the end of the test window" marker.
+
+In the equity curve, EXHAUST trades contribute their MTM (last
+close - entry) at the time the backtest ends, which is captured
+by the "open positions" section in the Performance tab.
+
+### Exit reason classification
+
+The `exit_reason` field of a trade is the `kind` of the LAST
+non-dividend fill. So:
+
+- A trade that closed entirely on a single TRAIL → `exit_reason="TRAIL"`
+- A trade that took 3 TIERs and then a TRAIL → `exit_reason="TRAIL"`
+- A trade that took 1 TIER and then had a stop-out → `exit_reason="SL_HARD"` (or `SL_SCALE` if the last fill was a partial cut)
+- A trade that closed via EXHAUST → `exit_reason="EXHAUST"`
+- A trade that closed via TIME_STOP → `exit_reason="TIME_STOP"`
+
+DIVIDEND is never an exit reason — it's always in the middle of
+a trade.
+
+### Cooldown after a stop
+
+After a `SL_HARD` or `SL_SCALE` exit, the same ticker is blocked
+for `cooldown_bars_after_stop` (default 5) trading days. This
+prevents the strategy from re-entering a falling knife right after
+getting stopped out.
+
+During cooldown, signals for that ticker are skipped. The
+cooldown ends after N bars, regardless of how the price moves
+(no test of "price has stabilized"). This is a deliberate
+conservative choice — better to miss a small rebound than to
+catch a continued decline.
 
 ### Field reference per fill
 
 ```
 date          Bar date (when the event happened)
 kind          ENTRY / TIER / TRAIL / SL_SCALE / SL_HARD / TIME_STOP / DIVIDEND / EXHAUST
-price         The fill price (for ENTRY = entry, for TIER = tier price, for SL = stop price)
-shares        Signed: positive for buys, negative for sells
-              (TIER/TRAIL/SL events are all sells, so shares < 0)
-pnl_delta     Realized P&L for this fill (VND)
-cumulative_pnl  Sum of all pnl_delta values up to and including this fill
-remaining     Shares still held after this fill
-note          Human-readable description, e.g. "Buy 3,100 @ 62,678"
+price         The fill price:
+                ENTRY   = entry_price
+                TIER    = tier_price (entry × tier_multiplier)
+                TRAIL   = bar.close (where the trail fired)
+                SL_*    = the stop level that was hit
+                DIVIDEND = the cash dividend per share
+                EXHAUST = last close
+shares        Signed: positive for buys (ENTRY), negative for sells
+              (everything else). The sign tells you the trade direction
+              on this fill.
+pnl_delta     Realized P&L for this fill, in VND.
+                ENTRY   = 0 (you haven't realized anything yet)
+                TIER    = (tier_price - entry_price) × shares_sold
+                TRAIL   = (close - entry_price) × shares_sold
+                SL_*    = (stop_price - entry_price) × shares_sold (negative)
+                DIVIDEND = dividend_per_share × remaining_shares
+                EXHAUST = (last_close - entry_price) × remaining_shares
+cumulative_pnl  Sum of all pnl_delta values up to and including this fill.
+                Starts at 0, can go positive (winners) or negative (losers).
+remaining     Shares still held after this fill.
+                ENTRY → entry shares
+                TIER → 70% (or 90% if tier 1, etc.) of pre-fill remaining
+                SL_SCALE → 50% of pre-fill remaining
+                TRAIL / SL_HARD / TIME_STOP / EXHAUST → 0
+note          Human-readable description, e.g.
+                ENTRY: "Buy 3,100 @ 62,678"
+                TIER: "Tier 2: sell 30% @ 112,500" (filled by the executor)
+                SL_SCALE: "Stop scale-out @ 90,000 (sl_T)"
 ```
 
 ### Color coding in the dashboard
@@ -235,7 +498,28 @@ The deal-detail modal uses color-coded chips for each `kind`:
 - **DIVIDEND** (cyan) — passive income
 - **EXHAUST** (gray) — backtest ran out of data
 
-### Example: a complete trade timeline
+### Reading the timeline
+
+The deal-detail modal shows the fills table with these columns:
+`Date | Event | Price | Shares | Δ PnL | Cum PnL | Remaining | Δ Days | Note`
+
+A few tips for reading it:
+
+1. **The `cumulative_pnl` column** is the running total. For a
+   winning trade, it climbs steadily. For a losing trade, it
+   goes negative and gets more negative.
+2. **The `Δ Days` column** shows calendar days since the previous
+   event. Big gaps (e.g. `+62d`) mean the position sat idle
+   without any event firing — either the price was steady, or
+   the strategy was waiting for a tier that never came.
+3. **The `remaining` column** counts down for SELL events
+   (TIER, TRAIL, SL_*, TIME_STOP, EXHAUST) and stays constant
+   for ENTRY and DIVIDEND. When it hits 0, the trade is closed.
+4. **The `Note` column** is most useful for distinguishing SL_T
+   cuts from SL_mid cuts when both happen in quick succession
+   (they look identical otherwise).
+
+### Example 1: a losing trade (blown stops)
 
 ```
 VCB_2026-05-19 — entry 2026-05-19, exit 2026-08-13 (53 trading days held)
@@ -258,6 +542,73 @@ Exit reason: EXHAUST (backtest ran out of data with 43 shares left)
 The strategy correctly bled the position from 3,100 → 1 → 1 share
 over 39 days as the price kept grinding lower. The 13 SL_SCALE
 events each cut 50% of remaining, exactly as designed.
+
+### Example 2: a winning trade (tiers + trail)
+
+```
+GEE_2025-08-15 — entry 2025-08-15, exit 2025-11-12 (60 trading days held)
+
+2025-08-15   ENTRY     19,200  +  7,800  pnl=        0      cum=          0
+2025-08-25   TIER      20,400  -    780  pnl=   +936,000  cum=   +936,000   (tier 1: +6.3%)
+                                              ↑ trail active now (floor=20,400)
+2025-09-08   TIER      21,600  -  2,106  pnl= +5,054,400  cum= +5,990,400   (tier 2: +12.5%)
+2025-09-22   TIER      23,232  -  1,474  pnl= +6,233,272  cum= +12,223,672  (tier 3: +21.0%)
+2025-10-10   TIER      25,536  -    343  pnl= +2,175,142  cum= +14,398,814  (tier 4: +33.0%)
+2025-10-30   TIER      28,032  -    309  pnl= +2,734,005  cum= +17,132,819  (tier 5: +46.0%)
+2025-11-12   TRAIL     32,400  -  2,788  pnl= +36,801,600 cum= +53,934,419  (trail hit)
+
+Total realized PnL: +53,934,419 VND  (+36.0% on the original 150M VND notional)
+Exit reason: TRAIL
+```
+
+Notice:
+- **5 tiers fired** before the trail. The price went from 19,200
+  to 32,400 (+69%) over 60 days.
+- **Each tier locked in more profit**. The early tiers sold at
+  small gains; the trail exited at the peak.
+- **The trail fired at 32,400**, well above tier 5 (28,032). This
+  means the price reached a peak above 32,400 / 0.90 = 36,000
+  (so 10% trail from peak = 32,400) and then pulled back.
+
+### Example 3: a mixed trade (tier then stop)
+
+```
+MSN_2025-03-04 — entry 2025-03-04, exit 2025-03-23 (14 trading days held)
+
+2025-03-04   ENTRY     73,500  +  4,000  pnl=        0      cum=          0
+2025-03-11   TIER      78,140  -    400  pnl= +1,856,000  cum= +1,856,000   (tier 1: +6.3%)
+                                              ↑ trail active (floor=78,140)
+2025-03-17   TRAIL?    No, price kept going up
+2025-03-19   TRAIL?    No, peak = 80,200, threshold = 72,180, close = 76,500
+2025-03-23   TRAIL     78,300  -  3,600  pnl= +17,280,000 cum= +19,136,000  (trail fired)
+
+Total realized PnL: +19,136,000 VND  (+6.5% on the original 294M VND notional)
+Exit reason: TRAIL
+```
+
+This trade went sideways for 2 weeks, hit tier 1 quickly, but
+never reached tier 2. The trail exited at a small profit.
+
+### Edge cases and gotchas
+
+- **Same-bar events**: A bar can fire multiple events in one day
+  (e.g., a gap-down bar can hit all three stops at once). The
+  executor processes them in priority order.
+- **Tier cascade**: A gap-up bar can fire multiple tiers in
+  one day. The `while tier_idx < len(signal.tiers)` loop in the
+  executor handles this.
+- **T+2.5 settlement**: If `t_plus_n_bars=3` is set, the first
+  3 bars of a trade skip exit logic entirely. The trade can be
+  opened but cannot be closed (except via EXHAUST). This models
+  Vietnam's T+2.5 settlement cycle.
+- **Dividend during settlement**: Even in the T+2.5 lock-up
+  period, dividends are still credited.
+- **Cooldown after stop**: After SL_HARD or SL_SCALE exit, the
+  same ticker is blocked for `cooldown_bars_after_stop` (default
+  5) trading days.
+- **EXHAUST on the latest data**: This is normal at the end of
+  the backtest window. The position is "still open" from the
+  strategy's perspective — the backtest just ran out of data.
 
 ## Layout
 
