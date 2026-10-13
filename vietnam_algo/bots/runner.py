@@ -1038,6 +1038,27 @@ def _buy_settled_by_t2(buy_source_date: str, today_iso: str) -> bool:
     return today >= settlement_date
 
 
+def _buy_filled_and_matches_sl(buy: Any, sl_quantity: int) -> bool:
+    """Return True if the BUY is filled AND the filled quantity
+    matches the SL quantity (so the SL has shares to actually sell).
+
+    Skips SLs whose underlying BUY never filled (expired / cancelled
+    / rejected), and SLs whose quantity doesn't match the actual
+    filled BUY (e.g. the BUY was re-priced at a different size, or
+    we re-entered a smaller position). The point: don't retry
+    SLs that DNSE will reject for non-T+2 reasons.
+    """
+    if buy.status != "filled":
+        return False
+    fill_qty = 0
+    if isinstance(buy.lastDetail, dict):
+        try:
+            fill_qty = int(buy.lastDetail.get("filledQuantity") or 0)
+        except (TypeError, ValueError):
+            fill_qty = 0
+    return fill_qty == sl_quantity and fill_qty > 0
+
+
 def retry_t2_settlement_sl_orders(
     client: "DnseClient",
     account_no: str,
@@ -1122,19 +1143,41 @@ def retry_t2_settlement_sl_orders(
         if not _buy_settled_by_t2(buy.sourceDate or "", today_iso):
             summary["t2_pending"] += 1
             continue
-        # T+2 cleared — eligible for retry.
+        # T+2 cleared — but the BUY must have actually filled for
+        # the SL to be valid. SLs whose BUY expired/cancelled
+        # have no shares to sell; re-submitting them would
+        # always fail with TRADE_QUANTITY_NOT_ENOUGH (and that's
+        # the bug we're trying to avoid confusing the operator
+        # about).
+        if not _buy_filled_and_matches_sl(buy, item.quantity):
+            continue
+        # T+2 cleared AND the BUY actually filled at the matching
+        # qty — eligible for retry.
         summary["t2_due"] += 1
         candidates.append((item, buy))
 
     if not candidates:
         return summary
 
-    # Resolve the cash package id per symbol. We try the
-    # explicit override first, then ask DNSE via the client.
-    # Falls back to 0 (cash) if both fail — the operator can
-    # inspect the rejected row.
+    # Build DnseOrder records. Use a fresh sourceOrderId so
+    # the re-submit isn't dedup'd against the original
+    # rejected entry (which has the same key).
+    #
+    # The loan package id is preserved from the original SL
+    # order — the same broker account, the same cash vs
+    # margin package. The original SL was rejected purely
+    # for the T+2 settlement timing, NOT for any
+    # account/package issue, so we replay it with the same
+    # parameters. If the original ledger row has no
+    # loanPackageId (e.g. an older schema), we fall back
+    # to looking up the cash pkg via DNSE, then to 0
+    # (which DNSE rejects — the operator should investigate).
+    import hashlib as _hl
     cash_pkg_cache: dict[str, int] = dict(loan_package_id_by_symbol or {})
-    def _resolve_cash_pkg(sym: str) -> int:
+
+    def _resolve_pkg(sym: str, original_pkg: int) -> int:
+        if original_pkg:
+            return int(original_pkg)
         if sym in cash_pkg_cache:
             return cash_pkg_cache[sym]
         try:
@@ -1144,10 +1187,6 @@ def retry_t2_settlement_sl_orders(
         cash_pkg_cache[sym] = int(pkg or 0)
         return cash_pkg_cache[sym]
 
-    # Build DnseOrder records. Use a fresh sourceOrderId so
-    # the re-submit isn't dedup'd against the original
-    # rejected entry (which has the same key).
-    import hashlib as _hl
     orders_to_resubmit: list[DnseOrder] = []
     for sl, buy in candidates:
         new_source_id = int(
@@ -1156,10 +1195,15 @@ def retry_t2_settlement_sl_orders(
             ).hexdigest()[:12],
             16,
         )
-        cash_pkg = _resolve_cash_pkg(sl.symbol)
+        # The original ledger row has loanPackageId in lastDetail.
+        # Extract it; fall back to live lookup.
+        original_pkg = 0
+        if isinstance(sl.lastDetail, dict):
+            original_pkg = int(sl.lastDetail.get("loanPackageId") or 0)
+        pkg = _resolve_pkg(sl.symbol, original_pkg)
         orders_to_resubmit.append(DnseOrder(
             symbol=sl.symbol, side=sl.side, quantity=sl.quantity, price=sl.price,
-            loanPackageId=cash_pkg, orderType="LO",
+            loanPackageId=pkg, orderType="LO",
             sourceOrderId=new_source_id, sourceDate=today_iso,
             reason=f"{sl.reason} [t2-retry from {sl.sourceDate}]",
         ))

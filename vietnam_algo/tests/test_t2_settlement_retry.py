@@ -95,20 +95,27 @@ def _make_sl_buy_pair(
     buy_date: str = "2026-10-13",
     sl_rejected: bool = True,
     sl_reject_error: str = "HTTP 400 TRADE_QUANTITY_NOT_ENOUGH",
+    buy_quantity: int = 200,
+    sl_quantity: int = 200,
+    buy_status: str = "filled",
 ) -> list[LedgerOrder]:
     """Build a BUY + rejected SL pair (typical T+2 scenario)."""
+    last_detail: dict | None = None
+    if buy_status == "filled":
+        last_detail = {"filledQuantity": buy_quantity, "orderStatus": "Filled"}
     return [
         LedgerOrder(
             runId=buy_date, sourceOrderId=11111, sourceDate=buy_date,
-            symbol=symbol, side="NB", quantity=200, price=31000,
+            symbol=symbol, side="NB", quantity=buy_quantity, price=31000,
             reason=f"autofin_buy:deal#{deal_id}:nav30pct:Khuyến nghị đầu tư",
-            status="filled", dnseOrderId="dnse-buy-1",
+            status=buy_status, dnseOrderId="dnse-buy-1",
             createdAt=f"{buy_date}T03:00:00Z",
             updatedAt=f"{buy_date}T03:00:00Z",
+            lastDetail=last_detail,
         ),
         LedgerOrder(
             runId=buy_date, sourceOrderId=22222, sourceDate=buy_date,
-            symbol=symbol, side="NS", quantity=200, price=27900,
+            symbol=symbol, side="NS", quantity=sl_quantity, price=27900,
             reason=f"autofin_sl:deal#{deal_id}:27900",
             status="rejected" if sl_rejected else "submitted",
             error=sl_reject_error,
@@ -309,6 +316,120 @@ def test_retry_records_4xx_rejection_on_resubmit(tmp_path) -> None:
     assert summary["resubmitted"] == 0
     assert len(summary["resubmit_errors"]) == 1
     assert "INVALID_PRICE" in summary["resubmit_errors"][0]
+
+
+def test_retry_skips_sl_when_buy_never_filled(tmp_path) -> None:
+    """SL whose BUY never filled (expired/cancelled) is NOT retried.
+
+    Reproduces the 2026-10-12 ABB saga: the BUY at 17,500 expired
+    at EOD, the BUY at 17,700 filled. The original SL at 15,750
+    (10% below 17,500) was tied to the expired BUY and rejected.
+    There's no reason to retry it — we never held those shares.
+    """
+    items = [
+        # The original BUY that expired (no fill).
+        LedgerOrder(
+            runId="2026-10-12", sourceOrderId=11111, sourceDate="2026-10-12",
+            symbol="ABB", side="NB", quantity=100, price=17500,
+            reason="autofin_buy:deal#1789344000:ABB:nav30pct:Khuyến nghị đầu tư",
+            status="expired", dnseOrderId="dnse-buy-1",
+            createdAt="2026-10-12T09:00:00Z",
+            updatedAt="2026-10-12T15:00:00Z",
+        ),
+        # The SL that was rejected with T+2 error.
+        LedgerOrder(
+            runId="2026-10-12", sourceOrderId=22222, sourceDate="2026-10-12",
+            symbol="ABB", side="NS", quantity=100, price=15750,
+            reason="autofin_user_sl:deal#1789344000:ABB:10%:15750",
+            status="rejected",
+            error="HTTP 400 TRADE_QUANTITY_NOT_ENOUGH",
+            createdAt="2026-10-12T09:00:00Z",
+            updatedAt="2026-10-12T09:00:00Z",
+        ),
+    ]
+    _seed_ledger(tmp_path, items)
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    # T+2 cleared but BUY never filled → don't retry.
+    assert summary["t2_blocked"] == 1
+    assert summary["t2_due"] == 0
+    assert summary["resubmitted"] == 0
+
+
+def test_retry_skips_sl_when_buy_qty_mismatch(tmp_path) -> None:
+    """SL with qty != filled qty is NOT retried.
+
+    Reproduces a re-priced scenario: BUY 100 filled, then we
+    added 200 more via a new BUY (now 300 held). The original
+    SL was for 100. Re-submitting it would SELL 100 of our 300
+    shares, but the SL is meant to exit the WHOLE position
+    (or a different qty). The autofin strategy should re-plan
+    the SL with the correct size; the retry shouldn't try to
+    fix that here.
+    """
+    items = [
+        LedgerOrder(
+            runId="2026-10-13", sourceOrderId=11111, sourceDate="2026-10-13",
+            symbol="BAF", side="NB", quantity=200, price=31000,
+            reason="autofin_buy:deal#1785888000:BAF:nav30pct:Khuyến nghị đầu tư",
+            status="filled", dnseOrderId="dnse-buy-1",
+            createdAt="2026-10-13T09:00:00Z",
+            updatedAt="2026-10-13T09:00:00Z",
+            lastDetail={"filledQuantity": 200, "orderStatus": "Filled"},
+        ),
+        # SL for 200 shares — matches the BUY. Should be retried.
+        LedgerOrder(
+            runId="2026-10-13", sourceOrderId=22222, sourceDate="2026-10-13",
+            symbol="BAF", side="NS", quantity=200, price=28080,
+            reason="autofin_user_sl:deal#1785888000:BAF:10%:28080",
+            status="rejected",
+            error="HTTP 400 TRADE_QUANTITY_NOT_ENOUGH",
+            createdAt="2026-10-13T09:00:00Z",
+            updatedAt="2026-10-13T09:00:00Z",
+        ),
+        # SL for 500 shares — qty mismatch with the BUY.
+        LedgerOrder(
+            runId="2026-10-13", sourceOrderId=33333, sourceDate="2026-10-13",
+            symbol="BAF", side="NS", quantity=500, price=28080,
+            reason="autofin_user_sl:deal#1785888000:BAF:10%:28080",
+            status="rejected",
+            error="HTTP 400 TRADE_QUANTITY_NOT_ENOUGH",
+            createdAt="2026-10-13T09:00:00Z",
+            updatedAt="2026-10-13T09:00:00Z",
+        ),
+    ]
+    _seed_ledger(tmp_path, items)
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    # Only the qty-matching SL is retried.
+    assert summary["t2_blocked"] == 2
+    assert summary["t2_due"] == 1
+    assert summary["resubmitted"] == 1
+
+
+def test_retry_includes_settled_today(tmp_path) -> None:
+    """T+2 settlement on day 2 (inclusive) is allowed.
+
+    If BUY was on 2026-10-13 and today is 2026-10-15 (2 days
+    later), the BUY is settled and the SL is retried. We allow
+    the retry on day 2 to be safe (Vietnam's T+2 rule says
+    "after 2 trading days", which can be the same day for
+    some calendar configurations).
+    """
+    _seed_ledger(tmp_path, _make_sl_buy_pair(buy_date="2026-10-13"))
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["t2_due"] == 1
+    assert summary["resubmitted"] == 1
 
 
 # -----------------------------------------------------------------------------
