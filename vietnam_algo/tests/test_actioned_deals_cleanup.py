@@ -269,3 +269,147 @@ def test_order_ledger_unreadable_falls_back_gracefully(tmp_path, monkeypatch) ->
         {"1789344000:ABB"}, {}, tmp_path,
     )
     assert "1789344000:ABB" in result
+
+
+# -----------------------------------------------------------------------------
+# Dry-run pollution guard (2026-10-13)
+#
+# The planning step sets ``_our_qty`` from the planned order quantity
+# even when the order never actually fills. So a state file might have
+# ``our_deals["1785888000:BAF"]["_our_qty"] = 200`` from a previous
+# planning pass whose BUY order was later cancelled. The cleanup must
+# reset _our_qty to 0 in that case, otherwise:
+#   1. the deal is treated as "held" (held_dids includes it)
+#   2. the deal is therefore kept in actioned
+#   3. the strategy filters it out as "already actioned"
+#   4. we never re-plan the entry
+# -----------------------------------------------------------------------------
+
+
+def test_cancelled_order_with_stale_our_qty_resets_to_zero(tmp_path) -> None:
+    """_our_qty=200 but the latest order is cancelled → reset qty, release deal.
+
+    Reproduces the 2026-10-13 10:52 ICT incident: BAF BUY 200 was
+    planned, ``_our_qty`` was set to 200, then DNSE cancelled the
+    order. Without the dry-run pollution guard, the cleanup kept
+    BAF in actioned (because ``_our_qty > 0``) and the next mid-day
+    poll never re-planned the entry.
+    """
+    did = "1785888000:BAF"
+    _write_ledger(tmp_path, [_ledger_order(did, "cancelled", symbol="BAF")])
+    our_deals = {did: {"_our_qty": 200, "_state": "planned"}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    # Cleanup released the deal from actioned.
+    assert did not in result
+    # The dry-run pollution guard reset _our_qty to 0 in place.
+    assert our_deals[did]["_our_qty"] == 0
+
+
+def test_rejected_order_with_stale_our_qty_resets_to_zero(tmp_path) -> None:
+    """Same as above but the order was rejected, not cancelled."""
+    did = "1786492800:HDB"
+    _write_ledger(tmp_path, [_ledger_order(did, "rejected", symbol="HDB")])
+    our_deals = {did: {"_our_qty": 100}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did not in result
+    assert our_deals[did]["_our_qty"] == 0
+
+
+def test_expired_order_with_stale_our_qty_resets_to_zero(tmp_path) -> None:
+    """Same as above but the order expired at EOD."""
+    did = "1786579200:TLG"
+    _write_ledger(tmp_path, [_ledger_order(did, "expired", symbol="TLG")])
+    our_deals = {did: {"_our_qty": 100}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did not in result
+    assert our_deals[did]["_our_qty"] == 0
+
+
+def test_filled_order_with_our_qty_preserved(tmp_path) -> None:
+    """_our_qty=100 + status=filled → qty preserved, deal stays actioned.
+
+    Filled is a terminal state BUT we DID receive the shares, so
+    the dry-run pollution guard must NOT reset _our_qty to 0 here.
+    Re-entering a held position is forbidden by the "current_qty > 0"
+    check in ``_plan_orders_for_new_positions`` and would be a
+    double-buy.
+    """
+    did = "1789344000:ABB"
+    _write_ledger(tmp_path, [_ledger_order(did, "filled", symbol="ABB")])
+    our_deals = {did: {"_our_qty": 100}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    # Filled + held → keep actioned.
+    assert did in result
+    # _our_qty preserved (we actually own the shares).
+    assert our_deals[did]["_our_qty"] == 100
+
+
+def test_open_order_with_our_qty_preserved(tmp_path) -> None:
+    """_our_qty=200 + status=open → qty preserved, deal stays actioned.
+
+    Open means the order is still in flight. We don't know if it
+    will fill, so the planning step's _our_qty value is kept. The
+    deal stays actioned so the strategy doesn't issue a duplicate.
+    """
+    did = "1785888000:BAF"
+    _write_ledger(tmp_path, [_ledger_order(did, "open", symbol="BAF")])
+    our_deals = {did: {"_our_qty": 200}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did in result
+    assert our_deals[did]["_our_qty"] == 200
+
+
+def test_cancelled_with_stale_our_qty_in_mixed_actioned_set(tmp_path) -> None:
+    """Mixed: ABB held (filled), BAF stale (cancelled + _our_qty=200).
+
+    The cleanup should release BAF from actioned (and reset its qty)
+    while keeping ABB in actioned (and preserving its qty).
+    """
+    abb_did = "1789344000:ABB"
+    baf_did = "1785888000:BAF"
+    _write_ledger(tmp_path, [
+        _ledger_order(abb_did, "filled", symbol="ABB"),
+        _ledger_order(baf_did, "cancelled", symbol="BAF"),
+    ])
+    our_deals = {
+        abb_did: {"_our_qty": 100},  # actually held
+        baf_did: {"_our_qty": 200},  # stale: BUY was cancelled
+    }
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {abb_did, baf_did}, our_deals, tmp_path,
+    )
+    # ABB kept (held + filled), BAF released (cancelled + no actual position).
+    assert abb_did in result
+    assert baf_did not in result
+    # Qty preserved for ABB, reset for BAF.
+    assert our_deals[abb_did]["_our_qty"] == 100
+    assert our_deals[baf_did]["_our_qty"] == 0
+
+
+def test_dry_run_status_with_stale_our_qty_resets_to_zero(tmp_path) -> None:
+    """Status="dry_run" (planning-only simulation) also resets _our_qty.
+
+    The dry-run path uses status="dry_run" to mark orders that were
+    simulated but never submitted. Even though it's "terminal" in
+    the ledger sense, the order never actually filled, so _our_qty
+    must be reset.
+    """
+    did = "1786492800:ABC"
+    _write_ledger(tmp_path, [_ledger_order(did, "dry_run", symbol="ABC")])
+    our_deals = {did: {"_our_qty": 100}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did not in result
+    assert our_deals[did]["_our_qty"] == 0
+

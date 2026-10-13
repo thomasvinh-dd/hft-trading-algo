@@ -2258,18 +2258,18 @@ class AutofinSignalAdapter(StrategyAdapter):
         in flight. The caller should always call this even if the
         ledger doesn't exist yet (first-run) — it's a no-op in that
         case.
+
+        Side effect: when ``our_deals[did]["_our_qty"]`` is > 0 but the
+        latest order for that deal is terminal-without-fill, the qty
+        is reset to 0 in place. This is the "dry-run pollution" guard
+        — the planning step sets ``_our_qty`` from the planned order
+        even when the order never actually fills (e.g. cancelled or
+        rejected). Without this reset, the cleanup would keep the
+        deal actioned and we'd never re-plan the entry.
         """
         if not actioned:
             return actioned
-        # 1. Determine which deals we still hold (qty > 0). These
-        #    are always actioned — re-entering a held position is
-        #    forbidden by the "current_qty > 0" check in
-        #    _plan_orders_for_new_positions.
-        held_dids: set[str] = {
-            did for did, sig in our_deals.items()
-            if int(sig.get("_our_qty", 0) or 0) > 0
-        }
-        # 2. Build deal_id -> latest-order-status from the order
+        # 1. Build deal_id -> latest-order-status from the order
         #    ledger. The latest order is the one with the most recent
         #    updatedAt (or createdAt as fallback). For each deal we
         #    only care about the latest status, not the full history.
@@ -2296,6 +2296,26 @@ class AutofinSignalAdapter(StrategyAdapter):
             if k.endswith("_ts"):
                 continue
             latest_status_by_did[k] = v
+        # 2. Determine which deals we still hold. ``_our_qty`` is
+        #    trusted ONLY if the latest order is non-terminal or
+        #    filled. If the latest order is terminal-without-fill,
+        #    we never actually received the shares — reset qty to 0.
+        held_dids: set[str] = set()
+        for did, sig in our_deals.items():
+            qty = int(sig.get("_our_qty", 0) or 0)
+            if qty <= 0:
+                continue
+            status = latest_status_by_did.get(did, "")
+            if status and status in {"cancelled", "rejected", "expired", "closed", "dry_run", "skipped"}:
+                # Latest order is terminal without fill. The
+                # "dry-run pollution" case: the planning step set
+                # _our_qty from the planned order, but the order
+                # never filled. Reset to 0 so the deal is no longer
+                # treated as held, and the next cleanup step can
+                # release it from actioned.
+                sig["_our_qty"] = 0
+                continue
+            held_dids.add(did)
         # 3. Prune: keep the deal only if we hold it OR the latest
         #    order is non-terminal (open / partial / submitting /
         #    unknown / prepared) or filled. Terminal-without-fill
