@@ -1018,24 +1018,50 @@ def _extract_deal_id_from_reason(reason: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _buy_settled_by_t2(buy_source_date: str, today_iso: str) -> bool:
-    """Return True if the BUY's T+2 settlement has cleared by today.
+def _buy_settled_by_t2(
+    buy_source_date: str,
+    today_iso: str,
+    now_time: "_time | None" = None,
+) -> bool:
+    """Return True if the BUY's T+2.5 settlement has cleared.
 
-    Conservative: 2 calendar days. If the BUY was placed on Day 0,
-    settlement is on Day 2. We allow the retry on Day 2 and
-    beyond. (A finer implementation would use trading days, but
-    Vietnam's holiday calendar adds complexity; over-retrying
-    one day late is the safer choice than under-retrying and
-    leaving the user unprotected.)
+    Vietnam's settlement cycle is T+2.5 (the 2026-10-13 update
+    from the user: "vn stock market using t+2.5"). The BUY
+    at T+0 settles by T+2.5, meaning the SELL order for the
+    position is accepted starting from 12:00 PM (noon) on
+    T+2. So:
+      - If today is buy_date + 3 or more: settled (T+3 onward).
+      - If today is buy_date + 2 and current time >= 12:00:
+        settled (T+2.5 reached).
+      - If today is buy_date + 2 and current time < 12:00: NOT
+        settled yet — wait until noon.
+      - If today is buy_date + 1 or earlier: NOT settled.
+
+    The half-day logic is important: empirically, DNSE rejected
+    the simulated T+2 retry on 2026-10-15 (Thu, 2 calendar days
+    after the 10/13 BUY) with TRADE_QUANTITY_NOT_ENOUGH, even
+    though the buyer's local clock said "T+2 cleared". The
+    settlement is the half-day-later T+2.5.
+
+    When ``now_time`` is None, we assume it's already past noon
+    (the conservative default — over-retrying one half-day is
+    safer than under-retrying and leaving the user unprotected).
     """
-    from datetime import date as _date, timedelta as _td
+    from datetime import date as _date, time as _time
     try:
         buy_date = _date.fromisoformat(buy_source_date)
         today = _date.fromisoformat(today_iso)
     except ValueError:
         return False
-    settlement_date = buy_date + _td(days=2)
-    return today >= settlement_date
+    days_diff = (today - buy_date).days
+    if days_diff >= 3:
+        return True
+    if days_diff == 2:
+        cutoff = _time(12, 0)
+        if now_time is None:
+            return True  # assume past noon
+        return now_time >= cutoff
+    return False
 
 
 def _buy_filled_and_matches_sl(buy: Any, sl_quantity: int) -> bool:
@@ -1065,21 +1091,28 @@ def retry_t2_settlement_sl_orders(
     trading_token: str,
     data_dir: "Path",
     today_iso: str,
+    now_time: "_time | None" = None,
     loan_package_id_by_symbol: dict[str, int] | None = None,
 ) -> dict:
-    """Re-submit SL SELL orders that were rejected due to T+2 settlement.
+    """Re-submit SL SELL orders that were rejected due to T+2.5 settlement.
 
     Returns a summary dict for the operator::
 
         {
             "scanned": int,         # total SL SELLs in the ledger
             "t2_blocked": int,      # SL SELLs rejected with T+2 error
-            "t2_pending": int,      # T+2 not yet cleared (too soon)
-            "t2_due": int,          # T+2 cleared, eligible for retry
+            "t2_pending": int,      # T+2.5 not yet cleared (too soon)
+            "t2_due": int,          # T+2.5 cleared, eligible for retry
             "resubmitted": int,     # actually re-submitted this call
             "resubmit_dnse_ids": [str],  # dnseOrderIds of re-submitted SLs
             "resubmit_errors": [str],    # any 4xx/5xx messages from re-submit
         }
+
+    ``now_time`` is the current time-of-day (datetime.time). When
+    None, the function assumes it's already past 12:00 PM (the
+    T+2.5 cutoff). Pass the real time when calling from a loop
+    that runs before noon — the function will then correctly hold
+    off the retry until the half-day-later cutoff.
 
     The function is best-effort: errors in scanning or re-submit
     are caught and recorded but do not raise. The ledger is
@@ -1140,10 +1173,10 @@ def retry_t2_settlement_sl_orders(
             # No matching BUY found — the BUY is also rejected/never
             # placed, so there's nothing to SELL. Skip.
             continue
-        if not _buy_settled_by_t2(buy.sourceDate or "", today_iso):
+        if not _buy_settled_by_t2(buy.sourceDate or "", today_iso, now_time=now_time):
             summary["t2_pending"] += 1
             continue
-        # T+2 cleared — but the BUY must have actually filled for
+        # T+2.5 cleared — but the BUY must have actually filled for
         # the SL to be valid. SLs whose BUY expired/cancelled
         # have no shares to sell; re-submitting them would
         # always fail with TRADE_QUANTITY_NOT_ENOUGH (and that's
@@ -1151,7 +1184,7 @@ def retry_t2_settlement_sl_orders(
         # about).
         if not _buy_filled_and_matches_sl(buy, item.quantity):
             continue
-        # T+2 cleared AND the BUY actually filled at the matching
+        # T+2.5 cleared AND the BUY actually filled at the matching
         # qty — eligible for retry.
         summary["t2_due"] += 1
         candidates.append((item, buy))
@@ -2459,6 +2492,7 @@ def run_auto_bot(
                         trading_token=token,
                         data_dir=engine_config.dataDir,
                         today_iso=today,
+                        now_time=now.time(),
                         loan_package_id_by_symbol=None,
                     )
                     if t2_summary.get("t2_blocked") or t2_summary.get("resubmit_errors"):
@@ -2637,6 +2671,7 @@ def run_auto_bot(
                                 trading_token=token,
                                 data_dir=engine_config.dataDir,
                                 today_iso=today,
+                                now_time=now.time(),
                                 loan_package_id_by_symbol=None,
                             )
                             if t2_summary.get("resubmitted") or t2_summary.get("resubmit_errors"):

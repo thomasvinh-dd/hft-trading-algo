@@ -1,24 +1,30 @@
 """Tests for ``vietnam_algo.bots.runner.retry_t2_settlement_sl_orders``.
 
-The T+2 settlement problem: when the autofin adapter plans a BUY
-+ SL in the same submit batch, the SL is always rejected on
-T+0 and T+1 because the BUY hasn't settled yet. DNSE returns
-HTTP 400 ``TRADE_QUANTITY_NOT_ENOUGH`` for those SELLs. Without
-this retry job, the user has to manually re-place the SL once
-T+2 clears.
+The T+2.5 settlement problem: when the autofin adapter plans a
+BUY + SL in the same submit batch, the SL is always rejected
+on T+0 and T+1 because the BUY hasn't settled yet. DNSE
+returns HTTP 400 ``TRADE_QUANTITY_NOT_ENOUGH`` for those
+SELLs. Vietnam's settlement is T+2.5 (the user-confirmed
+2026-10-13 update: "vn stock market using t+2.5") — the
+settlement completes at 12:00 PM on T+2. Without this retry
+job, the user has to manually re-place the SL after T+2.5
+clears.
 
 The retry function scans the order ledger for SL SELLs
-rejected with the T+2 error, checks if the underlying BUY is
-at least 2 calendar days old, and re-submits the SL.
+rejected with the T+2 error, checks if the underlying BUY
+is at least 2.5 calendar days old (with a noon cutoff on
+T+2), and re-submits the SL.
 """
 from __future__ import annotations
 
+import datetime
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -66,22 +72,52 @@ def test_extract_deal_id_from_reason_handles_all_prefixes() -> None:
     assert _extract_deal_id_from_reason("deal#12345:BAF:more:stuff") == "12345:BAF"
 
 
-def test_buy_settled_by_t2_uses_2_calendar_days() -> None:
-    """T+2 = BUY date + 2 days, inclusive of the settlement date."""
+def test_buy_settled_by_t2_uses_2_5_calendar_days_with_noon_cutoff() -> None:
+    """T+2.5: settled from 12:00 PM on T+2, or any time on T+3+.
+
+    The 2026-10-13 user update: "vn stock market using t+2.5".
+    The half-day matters: DNSE rejects the SELL on T+2 morning
+    (e.g. 10:00 ICT) even though 2 calendar days have passed.
+    """
+    from datetime import time as _time
     # BUY on day 0, today is day 0 → not settled.
     assert not _buy_settled_by_t2("2026-10-13", "2026-10-13")
     # BUY on day 0, today is day 1 → not settled.
     assert not _buy_settled_by_t2("2026-10-13", "2026-10-14")
-    # BUY on day 0, today is day 2 → settled.
-    assert _buy_settled_by_t2("2026-10-13", "2026-10-15")
+    # BUY on day 0, today is day 2 BEFORE noon → NOT settled.
+    assert not _buy_settled_by_t2("2026-10-13", "2026-10-15", now_time=_time(10, 0))
+    # BUY on day 0, today is day 2 AT noon → settled.
+    assert _buy_settled_by_t2("2026-10-13", "2026-10-15", now_time=_time(12, 0))
+    # BUY on day 0, today is day 2 AFTER noon → settled.
+    assert _buy_settled_by_t2("2026-10-13", "2026-10-15", now_time=_time(14, 30))
+    # BUY on day 0, today is day 3 → settled (any time).
+    assert _buy_settled_by_t2("2026-10-13", "2026-10-16", now_time=_time(0, 0))
     # BUY on day 0, today is day 5 → settled.
-    assert _buy_settled_by_t2("2026-10-13", "2026-10-18")
+    assert _buy_settled_by_t2("2026-10-13", "2026-10-18", now_time=_time(9, 0))
+
+
+def test_buy_settled_by_t2_assumes_past_noon_when_time_omitted() -> None:
+    """When ``now_time`` is None, we assume past noon (conservative default).
+
+    The bot's main loop is set to call retry_t2_settlement_sl_orders
+    on every cycle (60s). If the call happens to fire before noon
+    on T+2, we don't want to spam DNSE with a known-pending SL.
+    But when ``now_time`` is omitted (e.g. the unit test), the
+    function should assume it's safe to retry.
+    """
+    # T+2 with no time → assumed past noon → settled.
+    assert _buy_settled_by_t2("2026-10-13", "2026-10-15", now_time=None)
+    # T+1 → still not settled (the time check doesn't help here).
+    assert not _buy_settled_by_t2("2026-10-13", "2026-10-14", now_time=None)
 
 
 def test_buy_settled_by_t2_handles_bad_dates() -> None:
     """Invalid date strings → False (don't re-submit on garbage input)."""
+    from datetime import time as _time
     assert not _buy_settled_by_t2("not-a-date", "2026-10-15")
     assert not _buy_settled_by_t2("2026-10-13", "garbage")
+    # Time-typed inputs are validated by the type checker; we don't
+    # try to handle non-time values here.
 
 
 # -----------------------------------------------------------------------------
@@ -141,6 +177,7 @@ def test_retry_resubmits_sl_when_t2_cleared(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["t2_blocked"] == 1
     assert summary["t2_due"] == 1
@@ -188,6 +225,7 @@ def test_retry_skips_non_t2_rejections(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["t2_blocked"] == 0
     assert summary["t2_due"] == 0
@@ -202,6 +240,7 @@ def test_retry_skips_filled_or_open_sls(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["scanned"] == 0
     assert summary["resubmitted"] == 0
@@ -213,6 +252,7 @@ def test_retry_handles_no_ledger(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["scanned"] == 0
     assert summary["resubmitted"] == 0
@@ -235,6 +275,7 @@ def test_retry_skips_sl_with_no_matching_buy(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["t2_blocked"] == 1
     assert summary["t2_due"] == 0
@@ -250,6 +291,7 @@ def test_retry_resubmits_multiple_sls(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["t2_due"] == 2
     assert summary["resubmitted"] == 2
@@ -295,6 +337,7 @@ def test_retry_uses_dnse_cash_package_lookup(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["resubmitted"] == 1
     client.get_cash_loan_package_id.assert_called_with("0003937868", "ABB")
@@ -311,6 +354,7 @@ def test_retry_records_4xx_rejection_on_resubmit(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["t2_due"] == 1
     assert summary["resubmitted"] == 0
@@ -352,6 +396,7 @@ def test_retry_skips_sl_when_buy_never_filled(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     # T+2 cleared but BUY never filled → don't retry.
     assert summary["t2_blocked"] == 1
@@ -406,6 +451,7 @@ def test_retry_skips_sl_when_buy_qty_mismatch(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     # Only the qty-matching SL is retried.
     assert summary["t2_blocked"] == 2
@@ -427,6 +473,7 @@ def test_retry_includes_settled_today(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
+        now_time=datetime.time(14, 30),
     )
     assert summary["t2_due"] == 1
     assert summary["resubmitted"] == 1
