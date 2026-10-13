@@ -2801,7 +2801,16 @@ def run_auto_bot(
                 )
                 _stamp.parent.mkdir(parents=True, exist_ok=True)
                 from datetime import datetime as _dt2, timezone as _tz2
-                _stamp_payload = _dt2.now(tz=_tz2).isoformat()
+                # 2026-10-13 bug: the original ``tz=_tz2`` passed the
+                # ``timezone`` class instead of an instance, raising
+                # ``TypeError: tzinfo argument must be None or of a
+                # tzinfo subclass, not type 'type'``. The correct call
+                # is ``_dt2.now(tz=timezone.utc)`` — we want the UTC
+                # zone, not the local zone. The downstream consumers
+                # (momentum bot, dashboard) parse this as an ISO-8601
+                # string and rely on the trailing ``+00:00`` to know
+                # the stamp is UTC.
+                _stamp_payload = _dt2.now(tz=_tz2.utc).isoformat()
                 _stamp_err: Exception | None = None
                 for _stamp_attempt in range(2):
                     try:

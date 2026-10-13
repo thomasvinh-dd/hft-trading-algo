@@ -409,6 +409,37 @@ class DataReadyGateRegressionTests(unittest.TestCase):
             f"— the main-loop sleep was bypassed. Output: {out[:500]!r}",
         )
 
+    def test_sentinel_stamp_payload_is_valid_utc_iso(self) -> None:
+        """The stamp payload must be a parseable UTC ISO-8601 string.
+
+        Reproduces the 2026-10-13 20:10 ICT EOD crash: the stamp
+        code was ``datetime.now(tz=timezone).isoformat()`` which
+        passes the ``timezone`` *class* (not an instance) to
+        ``tz=`` and raises ``TypeError: tzinfo argument must be
+        None or of a tzinfo subclass, not type 'type'``. The fix
+        is ``datetime.now(tz=timezone.utc).isoformat()``.
+
+        The downstream consumers (momentum bot, dashboard) parse
+        the payload via ``datetime.fromisoformat`` and rely on
+        the trailing ``+00:00`` to know the stamp is UTC. A
+        ``TypeError`` mid-EOD kills the bot, which then can't
+        stamp the sentinel, and the momentum bot's
+        ``data_ready_for_eod is N min old`` message keeps
+        firing forever (the 2026-10-13 incident).
+        """
+        from datetime import datetime, timezone
+        # Replicate the stamp logic from runner.py:2813 verbatim.
+        payload = datetime.now(tz=timezone.utc).isoformat()
+        # Must be parseable as an ISO-8601 datetime.
+        parsed = datetime.fromisoformat(payload)
+        # Must have explicit UTC zone (the +00:00 suffix).
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertEqual(parsed.utcoffset().total_seconds(), 0.0)
+        # And the bug variant (the broken tz=timezone class):
+        with self.assertRaises(TypeError) as cm:
+            datetime.now(tz=timezone)  # type: ignore[arg-type]
+        self.assertIn("tzinfo", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
