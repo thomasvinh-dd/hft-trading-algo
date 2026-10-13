@@ -28,6 +28,8 @@ These tests pin the behavior.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import sys
 import json
 from pathlib import Path
@@ -412,4 +414,114 @@ def test_dry_run_status_with_stale_our_qty_resets_to_zero(tmp_path) -> None:
     )
     assert did not in result
     assert our_deals[did]["_our_qty"] == 0
+
+
+# -----------------------------------------------------------------------------
+# Filled-order reconciliation (2026-10-13)
+#
+# The state file's ``_our_qty`` can drift from reality (operator
+# reset, code bug, dry-run pollution). The ledger's lastDetail is
+# the source of truth for filled quantity. The cleanup must treat
+# a deal as "held" if the latest order is ``filled`` with
+# filledQuantity > 0, even if ``_our_qty == 0`` in the state file.
+# Otherwise the deal gets released and the strategy re-plans a
+# double-buy of the same position.
+# -----------------------------------------------------------------------------
+
+
+def test_filled_order_with_zero_state_qty_is_treated_as_held(tmp_path) -> None:
+    """_our_qty=0 in state but ledger says filled+100 → reconcile to 100, hold.
+
+    Reproduces the 2026-10-13 13:18 ICT bug: ABB was filled with
+    100 shares but the state file had ``_our_qty=0`` (operator
+    reset to a clean slate earlier). The cleanup was treating
+    ``filled`` as terminal-without-fill and releasing ABB, so
+    the strategy planned a new ABB BUY 500.
+    """
+    did = "1789344000:ABB"
+    # Build a filled order with filledQuantity=100 in lastDetail.
+    filled_order = _ledger_order(did, "filled", symbol="ABB")
+    # Patch the lastDetail to have filledQuantity=100.
+    filled_order = replace(filled_order, lastDetail={"filledQuantity": 100, "orderStatus": "Filled"})
+    _write_ledger(tmp_path, [filled_order])
+    # State file says _our_qty=0 (stale/wrong).
+    our_deals = {did: {"_our_qty": 0}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    # Treated as held because the latest order is filled.
+    assert did in result
+    # _our_qty reconciled to 100 (matches the filledQuantity).
+    assert our_deals[did]["_our_qty"] == 100
+
+
+def test_filled_order_with_zero_fill_is_not_treated_as_held(tmp_path) -> None:
+    """Status=filled but filledQuantity=0 (edge case) → release deal.
+
+    A status of "filled" with filledQuantity=0 is a weird edge case
+    (DNSE shouldn't return this combo, but defensive). The cleanup
+    should NOT treat this as a held position because no shares
+    were received.
+    """
+    did = "1789344000:ABB"
+    filled_order = _ledger_order(did, "filled", symbol="ABB")
+    filled_order = replace(filled_order, lastDetail={"filledQuantity": 0, "orderStatus": "Filled"})
+    _write_ledger(tmp_path, [filled_order])
+    our_deals = {did: {"_our_qty": 0}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    # No shares were actually received → release the deal.
+    assert did not in result
+    assert our_deals[did]["_our_qty"] == 0
+
+
+def test_filled_order_with_stale_state_qty_reconciles_upward(tmp_path) -> None:
+    """State says 50 shares, ledger says 100 filled → reconcile to 100.
+
+    If the state file has a smaller _our_qty than the ledger's
+    filledQuantity, the ledger wins. The cleanup updates the
+    state file to match the truth so future cycles see the right
+    position.
+    """
+    did = "1789344000:ABB"
+    filled_order = _ledger_order(did, "filled", symbol="ABB")
+    filled_order = replace(filled_order, lastDetail={"filledQuantity": 100, "orderStatus": "Filled"})
+    _write_ledger(tmp_path, [filled_order])
+    our_deals = {did: {"_our_qty": 50}}  # stale: actually 100
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did in result
+    # State reconciled to ledger's truth.
+    assert our_deals[did]["_our_qty"] == 100
+
+
+def test_filled_order_with_correct_state_qty_no_change(tmp_path) -> None:
+    """State says 100, ledger says 100 filled → no change, deal held."""
+    did = "1789344000:ABB"
+    filled_order = _ledger_order(did, "filled", symbol="ABB")
+    filled_order = replace(filled_order, lastDetail={"filledQuantity": 100, "orderStatus": "Filled"})
+    _write_ledger(tmp_path, [filled_order])
+    our_deals = {did: {"_our_qty": 100}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did in result
+    assert our_deals[did]["_our_qty"] == 100  # unchanged
+
+
+def test_partial_fill_order_treated_as_held(tmp_path) -> None:
+    """Status=partial with filledQuantity>0 → held (partial fill)."""
+    did = "1785888000:BAF"
+    partial_order = _ledger_order(did, "partial", symbol="BAF")
+    partial_order = replace(partial_order, lastDetail={"filledQuantity": 50, "orderStatus": "Partial"})
+    _write_ledger(tmp_path, [partial_order])
+    our_deals = {did: {"_our_qty": 0}}  # state stale
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    # Partial fill → kept actioned (order still in flight).
+    assert did in result
+
 

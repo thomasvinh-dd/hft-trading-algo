@@ -2266,14 +2266,21 @@ class AutofinSignalAdapter(StrategyAdapter):
         even when the order never actually fills (e.g. cancelled or
         rejected). Without this reset, the cleanup would keep the
         deal actioned and we'd never re-plan the entry.
+
+        Terminal-with-fill detection: a status of ``filled`` means the
+        latest order DID fill some quantity — we hold the position.
+        The ``_our_qty`` in the state file may be 0 (stale) or > 0,
+        but the truth is in the ledger's ``lastDetail.filledQuantity``.
+        We always treat a deal with a filled latest order as held.
         """
         if not actioned:
             return actioned
-        # 1. Build deal_id -> latest-order-status from the order
-        #    ledger. The latest order is the one with the most recent
-        #    updatedAt (or createdAt as fallback). For each deal we
-        #    only care about the latest status, not the full history.
-        latest_by_did: dict[str, str] = {}
+        # 1. Build deal_id -> (latest-order-status, latest filled-qty)
+        #    from the order ledger. The latest order is the one with
+        #    the most recent updatedAt (or createdAt as fallback).
+        latest_status_by_did: dict[str, str] = {}
+        latest_filled_by_did: dict[str, int] = {}
+        latest_ts_by_did: dict[str, str] = {}
         try:
             ledger = load_ledger(data_dir)
         except Exception:
@@ -2285,37 +2292,48 @@ class AutofinSignalAdapter(StrategyAdapter):
                 continue
             did = m.group(1)
             ts = item.updatedAt or item.createdAt or ""
-            prev_ts = latest_by_did.get(did + "_ts", "")
+            prev_ts = latest_ts_by_did.get(did, "")
             if ts >= prev_ts:
-                latest_by_did[did + "_ts"] = ts
-                latest_by_did[did] = item.status
-        # The dict above mixed the value and the timestamp under the
-        # same key prefix; split them back out.
-        latest_status_by_did: dict[str, str] = {}
-        for k, v in latest_by_did.items():
-            if k.endswith("_ts"):
-                continue
-            latest_status_by_did[k] = v
-        # 2. Determine which deals we still hold. ``_our_qty`` is
-        #    trusted ONLY if the latest order is non-terminal or
-        #    filled. If the latest order is terminal-without-fill,
-        #    we never actually received the shares — reset qty to 0.
+                latest_ts_by_did[did] = ts
+                latest_status_by_did[did] = item.status
+                # Extract filled quantity from lastDetail.
+                filled = 0
+                if isinstance(item.lastDetail, dict):
+                    filled = int(item.lastDetail.get("filledQuantity") or 0)
+                latest_filled_by_did[did] = filled
+        # 2. Determine which deals we still hold. A deal is "held"
+        #    if EITHER ``_our_qty > 0`` (state file says we own) OR
+        #    the latest order is ``filled`` with filledQuantity > 0
+        #    (the state file may be stale — the ledger is the truth).
         held_dids: set[str] = set()
         for did, sig in our_deals.items():
             qty = int(sig.get("_our_qty", 0) or 0)
-            if qty <= 0:
-                continue
             status = latest_status_by_did.get(did, "")
-            if status and status in {"cancelled", "rejected", "expired", "closed", "dry_run", "skipped"}:
-                # Latest order is terminal without fill. The
-                # "dry-run pollution" case: the planning step set
-                # _our_qty from the planned order, but the order
-                # never filled. Reset to 0 so the deal is no longer
-                # treated as held, and the next cleanup step can
-                # release it from actioned.
-                sig["_our_qty"] = 0
-                continue
-            held_dids.add(did)
+            filled_qty = latest_filled_by_did.get(did, 0)
+            if qty > 0:
+                # State says we hold. Cross-check with the ledger:
+                # if the latest order is terminal-without-fill,
+                # this is the dry-run pollution case. Reset qty to 0
+                # and don't mark as held.
+                if status in {"cancelled", "rejected", "expired", "closed", "dry_run", "skipped"}:
+                    sig["_our_qty"] = 0
+                else:
+                    held_dids.add(did)
+                    # Reconcile upward: if the ledger says we filled
+                    # more shares than the state file claims, update
+                    # the state file to match the truth. This is the
+                    # common case after a re-price cycle that
+                    # partially filled at a higher price.
+                    if status == "filled" and filled_qty > qty:
+                        sig["_our_qty"] = filled_qty
+                    continue
+            # State says we don't hold, but the ledger might say
+            # otherwise (state is stale, the order filled but the
+            # state file was reset by some other code path).
+            if status == "filled" and filled_qty > 0:
+                held_dids.add(did)
+                # Reconcile the stale state file.
+                sig["_our_qty"] = filled_qty
         # 3. Prune: keep the deal only if we hold it OR the latest
         #    order is non-terminal (open / partial / submitting /
         #    unknown / prepared) or filled. Terminal-without-fill
@@ -2336,7 +2354,10 @@ class AutofinSignalAdapter(StrategyAdapter):
                 pruned.add(did)
                 continue
             if status in TERMINAL_LEDGER_STATUSES:
-                # Terminal without fill → release the deal.
+                # Terminal → release. (For "filled" with no qty, the
+                # above reconciliation step would have marked the
+                # deal as held; if filled_qty==0, that's a weird edge
+                # case but releasing is the safer choice.)
                 continue
             # Non-terminal: order is still in flight. Keep actioned
             # so we don't issue a duplicate while the original is
