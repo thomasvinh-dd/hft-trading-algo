@@ -934,11 +934,16 @@ def _submit_autofin_deals_to_dnse(
     submitted_ids: list[str] = []
     skipped_existing = 0
     unknown = 0
+    rejected = 0
     for r in results:
         status = str(r.get("status", ""))
-        # 2026-10-13: debug aid for "0/0/0 of N planned" mystery
-        if status not in ("submitted", "skipped_existing_ledger", "unknown"):
-            print(f"[submit] unexpected status: {status!r} for {r.get('order', {}).get('symbol', '?')}: {str(r)[:200]}")
+        if status == "rejected":
+            # 2026-10-13: 4xx DNSE errors land here (was
+            # "unknown" before — that blocked all subsequent
+            # submits via ``unsafe_existing_orders``). The
+            # submit itself succeeded (DNSE responded), it
+            # just declined the order.
+            rejected += 1
         if status == "submitted":
             dnse_id = r.get("detail", {}).get("id") if isinstance(r.get("detail"), dict) else None
             if not dnse_id:
@@ -957,9 +962,241 @@ def _submit_autofin_deals_to_dnse(
         "submitted": submitted_ids,
         "skipped_existing": skipped_existing,
         "unknown": unknown,
+        "rejected": rejected,
         "total": len(orders),
         "out_of_zone": out_of_zone,
     }
+
+
+# 2026-10-13: T+2 settlement SL retry
+#
+# Vietnam T+2 settlement: a SELL order for shares that were
+# bought today (T) cannot be placed until T+2 (two calendar
+# days later). DNSE rejects the SELL with HTTP 400
+# ``TRADE_QUANTITY_NOT_ENOUGH`` until the BUY has settled.
+#
+# The autofin adapter plans BUY + SL in the same submit batch,
+# so the SL is always rejected on T+0 and T+1. Without this
+# retry, the user has to manually place the SL on T+2 (or
+# wait for the autofin strategy to re-plan the exit, which
+# only happens when autofin publishes a TP step).
+#
+# ``retry_t2_settlement_sl_orders`` scans the ledger for SL
+# SELL orders rejected with TRADE_QUANTITY_NOT_ENOUGH, checks
+# if the underlying BUY has settled (BUY.sourceDate + 2
+# calendar days <= today), and re-submits the SL. Called
+# from the bot's start-of-day cycle and on every mid-day
+# cycle.
+_T2_REJECT_CODES = ("TRADE_QUANTITY_NOT_ENOUGH",)
+
+
+def _is_t2_rejection(error: str) -> bool:
+    """Return True if the error indicates a T+2 settlement block.
+
+    DNSE returns ``TRADE_QUANTITY_NOT_ENOUGH`` (HTTP 400) when
+    the account doesn't yet have the shares to sell — most
+    commonly because the BUY from T-0 / T-1 hasn't settled.
+    T+2 settlement clears this for T-2+ BUYs.
+    """
+    if not error:
+        return False
+    return any(code in error for code in _T2_REJECT_CODES)
+
+
+def _extract_deal_id_from_reason(reason: str) -> str | None:
+    """Pull the ``deal#NNNNNNNNNN:SYM`` token from a reason string.
+
+    Examples (autofin emits these via the strategy):
+      - ``autofin_buy:deal#1785888000:BAF:nav30pct:Khuyến nghị đầu tư``
+      - ``autofin_sl:deal#1785888000:BAF:27900``
+      - ``autofin_user_sl:deal#1789344000:ABB:10%:15930``
+    """
+    if not reason:
+        return None
+    import re as _re
+    m = _re.search(r"deal#(\d+:[A-Z]+)", reason)
+    return m.group(1) if m else None
+
+
+def _buy_settled_by_t2(buy_source_date: str, today_iso: str) -> bool:
+    """Return True if the BUY's T+2 settlement has cleared by today.
+
+    Conservative: 2 calendar days. If the BUY was placed on Day 0,
+    settlement is on Day 2. We allow the retry on Day 2 and
+    beyond. (A finer implementation would use trading days, but
+    Vietnam's holiday calendar adds complexity; over-retrying
+    one day late is the safer choice than under-retrying and
+    leaving the user unprotected.)
+    """
+    from datetime import date as _date, timedelta as _td
+    try:
+        buy_date = _date.fromisoformat(buy_source_date)
+        today = _date.fromisoformat(today_iso)
+    except ValueError:
+        return False
+    settlement_date = buy_date + _td(days=2)
+    return today >= settlement_date
+
+
+def retry_t2_settlement_sl_orders(
+    client: "DnseClient",
+    account_no: str,
+    trading_token: str,
+    data_dir: "Path",
+    today_iso: str,
+    loan_package_id_by_symbol: dict[str, int] | None = None,
+) -> dict:
+    """Re-submit SL SELL orders that were rejected due to T+2 settlement.
+
+    Returns a summary dict for the operator::
+
+        {
+            "scanned": int,         # total SL SELLs in the ledger
+            "t2_blocked": int,      # SL SELLs rejected with T+2 error
+            "t2_pending": int,      # T+2 not yet cleared (too soon)
+            "t2_due": int,          # T+2 cleared, eligible for retry
+            "resubmitted": int,     # actually re-submitted this call
+            "resubmit_dnse_ids": [str],  # dnseOrderIds of re-submitted SLs
+            "resubmit_errors": [str],    # any 4xx/5xx messages from re-submit
+        }
+
+    The function is best-effort: errors in scanning or re-submit
+    are caught and recorded but do not raise. The ledger is
+    only updated by ``execute_orders_with_ledger`` (called
+    internally for the re-submits), so the bot's order monitor
+    will pick up the new SL entries on its next poll.
+    """
+    from vietnam_algo.libs.order_ledger import load_ledger
+    from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
+    from vietnam_algo.libs.trading_engine import DnseOrder
+
+    summary: dict[str, Any] = {
+        "scanned": 0,
+        "t2_blocked": 0,
+        "t2_pending": 0,
+        "t2_due": 0,
+        "resubmitted": 0,
+        "resubmit_dnse_ids": [],
+        "resubmit_errors": [],
+    }
+
+    try:
+        ledger = load_ledger(data_dir)
+    except Exception as exc:
+        summary["resubmit_errors"].append(f"load_ledger failed: {exc}")
+        return summary
+
+    # Index BUY orders by deal_id (latest BUY wins; we use the
+    # most recent BUY for the settlement date check).
+    buy_by_did: dict[str, Any] = {}
+    for item in ledger.values():
+        if item.side != "NB":
+            continue
+        did = _extract_deal_id_from_reason(item.reason or "")
+        if not did:
+            continue
+        # Keep the latest (most recent updatedAt) BUY per deal.
+        prev = buy_by_did.get(did)
+        if prev is None or (item.updatedAt or "") > (prev.updatedAt or ""):
+            buy_by_did[did] = item
+
+    # Scan SL SELL orders in the rejected set.
+    candidates: list[tuple[Any, Any]] = []  # (sl_order, buy_order)
+    for item in ledger.values():
+        if item.side != "NS":
+            continue
+        if item.status != "rejected":
+            continue
+        if not _is_t2_rejection(item.error or ""):
+            continue
+        summary["t2_blocked"] += 1
+        summary["scanned"] += 1
+        did = _extract_deal_id_from_reason(item.reason or "")
+        if not did:
+            continue
+        buy = buy_by_did.get(did)
+        if buy is None:
+            # No matching BUY found — the BUY is also rejected/never
+            # placed, so there's nothing to SELL. Skip.
+            continue
+        if not _buy_settled_by_t2(buy.sourceDate or "", today_iso):
+            summary["t2_pending"] += 1
+            continue
+        # T+2 cleared — eligible for retry.
+        summary["t2_due"] += 1
+        candidates.append((item, buy))
+
+    if not candidates:
+        return summary
+
+    # Resolve the cash package id per symbol. We try the
+    # explicit override first, then ask DNSE via the client.
+    # Falls back to 0 (cash) if both fail — the operator can
+    # inspect the rejected row.
+    cash_pkg_cache: dict[str, int] = dict(loan_package_id_by_symbol or {})
+    def _resolve_cash_pkg(sym: str) -> int:
+        if sym in cash_pkg_cache:
+            return cash_pkg_cache[sym]
+        try:
+            pkg = client.get_cash_loan_package_id(account_no, sym)
+        except Exception:
+            pkg = 0
+        cash_pkg_cache[sym] = int(pkg or 0)
+        return cash_pkg_cache[sym]
+
+    # Build DnseOrder records. Use a fresh sourceOrderId so
+    # the re-submit isn't dedup'd against the original
+    # rejected entry (which has the same key).
+    import hashlib as _hl
+    orders_to_resubmit: list[DnseOrder] = []
+    for sl, buy in candidates:
+        new_source_id = int(
+            _hl.sha1(
+                f"t2-retry|{today_iso}|{sl.symbol}|{sl.price}|{sl.quantity}|{sl.reason}".encode()
+            ).hexdigest()[:12],
+            16,
+        )
+        cash_pkg = _resolve_cash_pkg(sl.symbol)
+        orders_to_resubmit.append(DnseOrder(
+            symbol=sl.symbol, side=sl.side, quantity=sl.quantity, price=sl.price,
+            loanPackageId=cash_pkg, orderType="LO",
+            sourceOrderId=new_source_id, sourceDate=today_iso,
+            reason=f"{sl.reason} [t2-retry from {sl.sourceDate}]",
+        ))
+
+    try:
+        results, _reconciliation, _complete = execute_orders_with_ledger(
+            client=client,
+            account_no=account_no,
+            trading_token=trading_token,
+            orders=orders_to_resubmit,
+            data_dir=data_dir,
+            run_id=today_iso,
+        )
+    except Exception as exc:
+        summary["resubmit_errors"].append(f"execute_orders_with_ledger: {exc}")
+        return summary
+
+    for r in results:
+        status = str(r.get("status", ""))
+        order = r.get("order")
+        sym = getattr(order, "symbol", "?") if order is not None else "?"
+        if status == "submitted":
+            summary["resubmitted"] += 1
+            detail = r.get("detail") or {}
+            dnse_id = detail.get("id") if isinstance(detail, dict) else None
+            if dnse_id:
+                summary["resubmit_dnse_ids"].append(str(dnse_id))
+        elif status == "rejected":
+            err = str(r.get("error", ""))
+            summary["resubmit_errors"].append(f"{sym}: {err[:120]}")
+        elif status == "skipped_existing_ledger":
+            summary["resubmit_errors"].append(
+                f"{sym}: dedup'd against existing ledger entry"
+            )
+        else:
+            summary["resubmit_errors"].append(f"{sym}: unexpected status {status!r}")
+    return summary
 
 
 def _build_portfolio_snapshot(
@@ -2160,6 +2397,53 @@ def run_auto_bot(
             state.startOfDayDate = today
             save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
+            # 2026-10-13: T+2 settlement SL retry. Vietnam's T+2
+            # settlement blocks SELL orders until 2 calendar days
+            # after the BUY. The autofin adapter plans BUY + SL
+            # together, so the SL is rejected on T+0 / T+1 with
+            # HTTP 400 TRADE_QUANTITY_NOT_ENOUGH. Now that the
+            # start-of-day has fired for today, scan the ledger
+            # for any SL SELLs that were T+2-blocked and the
+            # corresponding BUY is now settled (>=2 days old),
+            # then re-submit them. Runs at SOD so the SL is in
+            # place before the trading session starts.
+            if live_submit and token and client is not None:
+                try:
+                    t2_summary = retry_t2_settlement_sl_orders(
+                        client=client,
+                        account_no=account_no,
+                        trading_token=token,
+                        data_dir=engine_config.dataDir,
+                        today_iso=today,
+                        loan_package_id_by_symbol=None,
+                    )
+                    if t2_summary.get("t2_blocked") or t2_summary.get("resubmit_errors"):
+                        print(
+                            f"[{now.isoformat()}] t2-sl-retry: "
+                            f"scanned={t2_summary['scanned']} "
+                            f"blocked={t2_summary['t2_blocked']} "
+                            f"pending={t2_summary['t2_pending']} "
+                            f"due={t2_summary['t2_due']} "
+                            f"resubmitted={t2_summary['resubmitted']} "
+                            f"errors={len(t2_summary['resubmit_errors'])}"
+                        )
+                    if t2_summary.get("resubmitted"):
+                        notify(
+                            "\n".join([
+                                "🔁 Vietnam Algo: T+2 SL retry (start-of-day)",
+                                f"resubmitted: {t2_summary['resubmitted']}",
+                                f"dnseOrderIds: {t2_summary['resubmit_dnse_ids']}",
+                                f"still pending: {t2_summary['t2_pending']}",
+                            ])
+                        )
+                    if t2_summary.get("resubmit_errors"):
+                        notify(
+                            "⚠️ Vietnam Algo: T+2 SL retry errors:\n"
+                            + "\n".join(t2_summary["resubmit_errors"][:5])
+                        )
+                except Exception as exc:
+                    print(f"[{now.isoformat()}] t2-sl-retry crashed: {type(exc).__name__}: {str(exc)[:200]}")
+
         if should_poll_strategy(
             now,
             _read_strategy_last_poll(engine_config.dataDir, strategy_name),
@@ -2295,6 +2579,37 @@ def run_auto_bot(
                                 ])
                             )
                             print(f"[{now.isoformat()}] mid-day submit failed: {exc}")
+                    # 2026-10-13: T+2 SL retry on every mid-day cycle.
+                    # The start-of-day retry catches most cases, but
+                    # BUYs placed mid-day (e.g. 10:00 ICT) won't
+                    # have their SL retried at next-day's SOD
+                    # because the BUY was today, not yesterday.
+                    # A daily mid-day check is the safe cadence.
+                    if live_submit and token and client is not None:
+                        try:
+                            t2_summary = retry_t2_settlement_sl_orders(
+                                client=client,
+                                account_no=account_no,
+                                trading_token=token,
+                                data_dir=engine_config.dataDir,
+                                today_iso=today,
+                                loan_package_id_by_symbol=None,
+                            )
+                            if t2_summary.get("resubmitted") or t2_summary.get("resubmit_errors"):
+                                print(
+                                    f"[{now.isoformat()}] t2-sl-retry (mid-day): "
+                                    f"resubmitted={t2_summary['resubmitted']} "
+                                    f"pending={t2_summary['t2_pending']} "
+                                    f"errors={len(t2_summary['resubmit_errors'])}"
+                                )
+                                if t2_summary.get("resubmitted"):
+                                    notify(
+                                        "🔁 Vietnam Algo: T+2 SL retry (mid-day)\n"
+                                        f"resubmitted: {t2_summary['resubmitted']}\n"
+                                        f"dnseOrderIds: {t2_summary['resubmit_dnse_ids']}"
+                                    )
+                        except Exception as exc:
+                            print(f"[{now.isoformat()}] t2-sl-retry mid-day crashed: {type(exc).__name__}: {str(exc)[:200]}")
                     # Mid-day polls also need to apply the planned orders
                     # to the dry-run state immediately. Without this,
                     # the JSON is overwritten with [] on the next poll

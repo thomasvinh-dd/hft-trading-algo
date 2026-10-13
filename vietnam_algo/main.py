@@ -1824,7 +1824,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"\nsubmit result: "
                     f"{len(submit_result['submitted'])} submitted, "
                     f"{submit_result['skipped_existing']} skipped-existing, "
-                    f"{submit_result['unknown']} unknown "
+                    f"{submit_result['unknown']} unknown, "
+                    f"{submit_result.get('rejected', 0)} rejected "
                     f"(of {submit_result['total']} planned)"
                 )
                 if submit_result.get("submitted"):

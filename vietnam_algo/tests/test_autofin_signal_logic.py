@@ -1034,7 +1034,14 @@ def test_decide_orders_keeps_closed_deals_in_state_with_zero_qty():
         our_positions={}, nav=1_000_000_000,
     )
     assert "1786492800:TRC" in our_deals1
-    assert our_deals1["1786492800:TRC"]["_our_qty"] > 0
+    # 2026-10-13 dry-run-pollution fix: the planning step no longer
+    # sets ``_our_qty`` from the planned order quantity. The
+    # ``_load_state`` cleanup is the source of truth — it reconciles
+    # ``_our_qty`` against the ledger's filledQuantity on the next
+    # cycle. In a unit test there's no ledger, so ``_our_qty``
+    # stays at the setdefault(0). We only verify the deal is in
+    # the dict (the dedup signal for the next cycle).
+    assert our_deals1["1786492800:TRC"]["_our_qty"] == 0
     # Second call: autofin keeps the deal in holding (so the close
     # planner won't emit a full_close). State must be preserved
     # unchanged so the dedup keeps working.

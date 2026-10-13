@@ -1855,6 +1855,45 @@ def _format_per_action_message(deal: dict[str, Any], ts: str) -> str:
     return deals
 
 
+# 2026-10-13: helper for the dry-run pollution fix. The dedup
+# ``already_planned_symbols`` is built from held positions in the
+# state file, but the planning step no longer pre-populates
+# ``_our_qty`` (that caused dry-run pollution — see the comment
+# at the planning site). To prevent re-planning an in-flight
+# order whose ``_our_qty`` is still 0 in the state, we read the
+# ledger and add symbols that have an order in
+# {submitting, submitted, open, partial} status. The status
+# ``cancelled``, ``rejected``, ``expired`` are NOT included —
+# those are re-planable, see the cleanup at _load_state.
+_INFLIGHT_LEDGER_STATUSES = frozenset({
+    "submitting", "submitted", "open", "partial",
+})
+
+
+def _collect_in_flight_symbols(
+    base_set: set[str] | None,
+    data_dir: Path,
+) -> set[str]:
+    """Return ``base_set`` augmented with symbols that have an
+    in-flight order in the ledger.
+
+    See module docstring of the 2026-10-13 dry-run pollution
+    fix for context. The function is best-effort: a load failure
+    is treated as "no in-flight symbols" so the caller doesn't
+    fail the cycle.
+    """
+    result = set(base_set) if base_set else set()
+    try:
+        from vietnam_algo.libs.order_ledger import load_ledger as _load_ledger
+        _inflight_ledger = _load_ledger(data_dir)
+    except Exception:
+        return result
+    for _item in _inflight_ledger.values():
+        if _item.status in _INFLIGHT_LEDGER_STATUSES and _item.symbol:
+            result.add(_item.symbol.upper())
+    return result
+
+
 def decide_orders(
     *,
     holding: list[dict[str, Any]],
@@ -2102,7 +2141,30 @@ def decide_orders(
     new_our_deals: dict[str, dict[str, Any]] = {
         did: dict(sig) for did, sig in our_deals.items()
     }
-    # for each new BUY we issue, add the deal + track qty
+    # for each new BUY we issue, add the deal but DO NOT pre-populate
+    # ``_our_qty`` from the planned order. The 2026-10-13 dry-run
+    # pollution fix: the planning step was setting ``_our_qty`` to
+    # the planned order quantity even when the submit had not yet
+    # happened (or never would, in dry-run mode). This made the
+    # state file claim we held N shares that we never received.
+    # If the bot crashed between the planning step and the next
+    # cycle's cleanup, the polluted state persisted across
+    # restarts, causing the cleanup to skip the deal (because
+    # ``_our_qty > 0`` looked like a real holding) and the
+    # strategy to refuse to re-plan the entry.
+    #
+    # The cleanup at ``_load_state`` is the source of truth for
+    # ``_our_qty``: it reads the order ledger and reconciles the
+    # held qty against the latest order's filledQuantity (or
+    # resets to 0 if the order is terminal-without-fill). The
+    # order monitor updates the ledger on every DNSE poll. So the
+    # next call to ``generate_orders`` sees the correct ``_our_qty``
+    # — we don't need to set it during planning.
+    #
+    # For the same-cycle dedup (``already_planned_symbols``), we
+    # rely on the *cleanup-correct* ``_our_qty`` (held positions
+    # from the ledger) plus the in-flight ledger orders
+    # (constructed in the caller). See generate_orders().
     for s in selected:
         did = _deal_id(s.raw)
         if not did:
@@ -2110,14 +2172,8 @@ def decide_orders(
         if did not in new_our_deals:
             new_our_deals[did] = dict(s.raw)
         new_our_deals[did].setdefault("_our_qty", 0)
-        for o in new_orders:
-            if (
-                o["symbol"] == s.symbol
-                and o["side"] == "NB"
-                and "tp:" not in o["reason"]
-                and "sl:" not in o["reason"]
-            ):
-                new_our_deals[did]["_our_qty"] = o["quantity"]
+        # Intentionally do NOT set ``_our_qty`` from the planned
+        # order quantity. See the comment above.
     # for each close, mark the deal closed (qty=0) but KEEP it in the
     # dict so we can detect re-entry attempts later. Previously we
     # popped it, but autofin's suggest endpoint keeps returning the
@@ -3195,17 +3251,53 @@ class AutofinSignalAdapter(StrategyAdapter):
 
         # 5e. Compute the set of symbols we already have planned entries
         # for (used to skip duplicate BUY emissions on consecutive EOD
-        # cycles, especially in dry-run mode where DNSE returns empty
-        # positions even though we've "planned" entries from prior cycles).
+        # Cycles, especially in dry-run mode where DNSE returns empty
+        # positions even though we've "planned" entries from prior cycles.
         # Per user feedback (2026-09-09): previously the bot double-bought
         # the same deal on consecutive days because it only consulted DNSE
         # for "do I already have this position" — and DNSE is empty in
         # dry-run mode.
+        #
+        # 2026-10-13 dry-run-pollution fix: previously this set was
+        # built from ``_our_qty > 0`` ONLY, which was set by the
+        # planning step from the *planned* order quantity (even
+        # before the order was submitted). In dry-run mode there's
+        # no submit, so the state file would claim we held N shares
+        # that never existed. The dedup still worked (because the
+        # pollution was consistent), but a bot crash + restart
+        # between the planning step and the cleanup would persist
+        # the pollution across restarts and break the cleanup.
+        #
+        # Now we dedup from three sources:
+        #  1. Held positions in the state file (``_our_qty > 0``,
+        #     which the cleanup at _load_state just reconciled
+        #     against the ledger — so this IS the held count).
+        #  2. In-flight orders in the ledger (submitting, submitted,
+        #     open, partial) — these are orders we've already sent
+        #     to DNSE but haven't filled yet. We don't want to
+        #     re-plan a duplicate while the original is working
+        #     through the exchange.
+        #  3. Symbols marked "closed" via a recent SELL (closed_dids
+        #     is populated at the end of the previous cycle, but
+        #     those deals are already handled in actioned_deals).
         already_planned_symbols: set[str] = {
             str(sig.get("symbol") or "").strip().upper()
             for sig in self._our_deals.values()
             if int(sig.get("_our_qty", 0) or 0) > 0
         }
+        # Source 2: in-flight ledger orders. Best-effort: a load
+        # failure here is non-fatal (we'd just re-plan, which the
+        # execute_orders_with_ledger dedup would catch via the
+        # ledger key).
+        try:
+            already_planned_symbols = _collect_in_flight_symbols(
+                already_planned_symbols, config.dataDir,
+            )
+        except Exception:
+            # Best-effort: a load failure here is non-fatal (we'd
+            # just re-plan, which the execute_orders_with_ledger
+            # dedup would catch via the ledger key).
+            pass
 
         # 6-9. Delegate to the pure decision function. This is the same
         # function the daily-replay backtest calls.

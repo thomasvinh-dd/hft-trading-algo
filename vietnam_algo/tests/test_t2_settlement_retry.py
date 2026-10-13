@@ -1,0 +1,323 @@
+"""Tests for ``vietnam_algo.bots.runner.retry_t2_settlement_sl_orders``.
+
+The T+2 settlement problem: when the autofin adapter plans a BUY
++ SL in the same submit batch, the SL is always rejected on
+T+0 and T+1 because the BUY hasn't settled yet. DNSE returns
+HTTP 400 ``TRADE_QUANTITY_NOT_ENOUGH`` for those SELLs. Without
+this retry job, the user has to manually re-place the SL once
+T+2 clears.
+
+The retry function scans the order ledger for SL SELLs
+rejected with the T+2 error, checks if the underlying BUY is
+at least 2 calendar days old, and re-submits the SL.
+"""
+from __future__ import annotations
+
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from vietnam_algo.bots import runner as runner_mod
+from vietnam_algo.bots.runner import (
+    _buy_settled_by_t2,
+    _extract_deal_id_from_reason,
+    _is_t2_rejection,
+    retry_t2_settlement_sl_orders,
+)
+from vietnam_algo.libs.order_ledger import LedgerOrder, save_ledger
+from vietnam_algo.libs.trading_engine import DnseOrder
+
+
+# -----------------------------------------------------------------------------
+# Helper-function tests
+# -----------------------------------------------------------------------------
+
+
+def test_is_t2_rejection_matches_trade_quantity_not_enough() -> None:
+    assert _is_t2_rejection('HTTP 400 {"code":"TRADE_QUANTITY_NOT_ENOUGH"}')
+    assert _is_t2_rejection('TRADE_QUANTITY_NOT_ENOUGH deal not found')
+
+
+def test_is_t2_rejection_ignores_unrelated_errors() -> None:
+    assert not _is_t2_rejection("")
+    assert not _is_t2_rejection("HTTP 500 INTERNAL_SERVER_ERROR")
+    assert not _is_t2_rejection("HTTP 400 INVALID_PRICE")
+
+
+def test_extract_deal_id_from_reason_handles_all_prefixes() -> None:
+    """autofin emits 3 reason prefixes; all carry ``deal#NNNN:SYM``."""
+    assert _extract_deal_id_from_reason(
+        "autofin_buy:deal#1785888000:BAF:nav30pct:Khuyến nghị"
+    ) == "1785888000:BAF"
+    assert _extract_deal_id_from_reason(
+        "autofin_sl:deal#1785888000:BAF:27900"
+    ) == "1785888000:BAF"
+    assert _extract_deal_id_from_reason(
+        "autofin_user_sl:deal#1789344000:ABB:10%:15930"
+    ) == "1789344000:ABB"
+    # Edge cases.
+    assert _extract_deal_id_from_reason("") is None
+    assert _extract_deal_id_from_reason("no deal here") is None
+    assert _extract_deal_id_from_reason("deal#12345:BAF:more:stuff") == "12345:BAF"
+
+
+def test_buy_settled_by_t2_uses_2_calendar_days() -> None:
+    """T+2 = BUY date + 2 days, inclusive of the settlement date."""
+    # BUY on day 0, today is day 0 → not settled.
+    assert not _buy_settled_by_t2("2026-10-13", "2026-10-13")
+    # BUY on day 0, today is day 1 → not settled.
+    assert not _buy_settled_by_t2("2026-10-13", "2026-10-14")
+    # BUY on day 0, today is day 2 → settled.
+    assert _buy_settled_by_t2("2026-10-13", "2026-10-15")
+    # BUY on day 0, today is day 5 → settled.
+    assert _buy_settled_by_t2("2026-10-13", "2026-10-18")
+
+
+def test_buy_settled_by_t2_handles_bad_dates() -> None:
+    """Invalid date strings → False (don't re-submit on garbage input)."""
+    assert not _buy_settled_by_t2("not-a-date", "2026-10-15")
+    assert not _buy_settled_by_t2("2026-10-13", "garbage")
+
+
+# -----------------------------------------------------------------------------
+# retry_t2_settlement_sl_orders end-to-end tests
+# -----------------------------------------------------------------------------
+
+
+def _make_sl_buy_pair(
+    symbol: str = "BAF",
+    deal_id: str = "1785888000:BAF",
+    buy_date: str = "2026-10-13",
+    sl_rejected: bool = True,
+    sl_reject_error: str = "HTTP 400 TRADE_QUANTITY_NOT_ENOUGH",
+) -> list[LedgerOrder]:
+    """Build a BUY + rejected SL pair (typical T+2 scenario)."""
+    return [
+        LedgerOrder(
+            runId=buy_date, sourceOrderId=11111, sourceDate=buy_date,
+            symbol=symbol, side="NB", quantity=200, price=31000,
+            reason=f"autofin_buy:deal#{deal_id}:nav30pct:Khuyến nghị đầu tư",
+            status="filled", dnseOrderId="dnse-buy-1",
+            createdAt=f"{buy_date}T03:00:00Z",
+            updatedAt=f"{buy_date}T03:00:00Z",
+        ),
+        LedgerOrder(
+            runId=buy_date, sourceOrderId=22222, sourceDate=buy_date,
+            symbol=symbol, side="NS", quantity=200, price=27900,
+            reason=f"autofin_sl:deal#{deal_id}:27900",
+            status="rejected" if sl_rejected else "submitted",
+            error=sl_reject_error,
+            dnseOrderId="dnse-sl-1",
+            createdAt=f"{buy_date}T03:00:00Z",
+            updatedAt=f"{buy_date}T03:00:00Z",
+        ),
+    ]
+
+
+def _make_client() -> MagicMock:
+    client = MagicMock()
+    client.get_cash_loan_package_id.return_value = 1036
+    client.place_stock_order.return_value = {"id": "dnse-new-sl"}
+    client.order_detail.return_value = {"id": "dnse-new-sl", "orderStatus": "New"}
+    return client
+
+
+def test_retry_resubmits_sl_when_t2_cleared(tmp_path) -> None:
+    """BUY 2 days ago + SL rejected with T+2 error → SL is re-submitted."""
+    _seed_ledger(tmp_path, _make_sl_buy_pair(buy_date="2026-10-13"))
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["t2_blocked"] == 1
+    assert summary["t2_due"] == 1
+    assert summary["t2_pending"] == 0
+    assert summary["resubmitted"] == 1
+    assert summary["resubmit_dnse_ids"] == ["dnse-new-sl"]
+
+
+def test_retry_holds_off_when_t2_not_yet_cleared(tmp_path) -> None:
+    """BUY today + SL rejected → T+2 not cleared, don't re-submit yet."""
+    _seed_ledger(tmp_path, _make_sl_buy_pair(buy_date="2026-10-13"))
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-13",  # same day as BUY
+    )
+    assert summary["t2_blocked"] == 1
+    assert summary["t2_pending"] == 1
+    assert summary["t2_due"] == 0
+    assert summary["resubmitted"] == 0
+    # place_stock_order was NOT called.
+    assert not client.place_stock_order.called
+
+
+def test_retry_holds_off_1_day_after_buy(tmp_path) -> None:
+    """BUY 1 day ago (T+1) → still blocked, don't re-submit."""
+    _seed_ledger(tmp_path, _make_sl_buy_pair(buy_date="2026-10-13"))
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-14",
+    )
+    assert summary["t2_pending"] == 1
+    assert summary["t2_due"] == 0
+    assert summary["resubmitted"] == 0
+
+
+def test_retry_skips_non_t2_rejections(tmp_path) -> None:
+    """SL rejected for a non-T+2 reason (e.g. INVALID_PRICE) is NOT retried."""
+    pair = _make_sl_buy_pair(
+        sl_reject_error="HTTP 400 INVALID_PRICE code XYZ",
+    )
+    _seed_ledger(tmp_path, pair)
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["t2_blocked"] == 0
+    assert summary["t2_due"] == 0
+    assert summary["resubmitted"] == 0
+
+
+def test_retry_skips_filled_or_open_sls(tmp_path) -> None:
+    """SLs that are not 'rejected' are not eligible for retry."""
+    pair = _make_sl_buy_pair(sl_rejected=False)
+    _seed_ledger(tmp_path, pair)
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["scanned"] == 0
+    assert summary["resubmitted"] == 0
+
+
+def test_retry_handles_no_ledger(tmp_path) -> None:
+    """Empty ledger → empty summary, no errors."""
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["scanned"] == 0
+    assert summary["resubmitted"] == 0
+    assert summary["resubmit_errors"] == []
+
+
+def test_retry_skips_sl_with_no_matching_buy(tmp_path) -> None:
+    """An SL SELL whose BUY is not in the ledger is skipped (orphan)."""
+    orphan_sl = LedgerOrder(
+        runId="2026-10-13", sourceOrderId=99999, sourceDate="2026-10-13",
+        symbol="ZZZ", side="NS", quantity=100, price=5000,
+        reason="autofin_sl:deal#9999999999:ZZZ:5000",
+        status="rejected",
+        error="HTTP 400 TRADE_QUANTITY_NOT_ENOUGH",
+        createdAt="2026-10-13T09:00:00Z",
+        updatedAt="2026-10-13T09:00:00Z",
+    )
+    _seed_ledger(tmp_path, [orphan_sl])
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["t2_blocked"] == 1
+    assert summary["t2_due"] == 0
+    assert summary["resubmitted"] == 0
+
+
+def test_retry_resubmits_multiple_sls(tmp_path) -> None:
+    """Multiple T+2-cleared SLs are all re-submitted in one call."""
+    baf = _make_sl_buy_pair(symbol="BAF", deal_id="1785888000:BAF", buy_date="2026-10-13")
+    abb = _make_sl_buy_pair(symbol="ABB", deal_id="1789344000:ABB", buy_date="2026-10-13")
+    _seed_ledger(tmp_path, baf + abb)
+    client = _make_client()
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["t2_due"] == 2
+    assert summary["resubmitted"] == 2
+    # place_stock_order was called twice.
+    assert client.place_stock_order.call_count == 2
+
+
+def test_retry_uses_latest_buy_for_settlement_date(tmp_path) -> None:
+    """If the same deal has multiple BUYs, the latest one determines T+2.
+
+    Reproduces a re-priced order: BUY 1 was placed on day 0,
+    cancelled, BUY 2 was placed on day 1 (different price, same
+    deal_id). The SL was rejected. T+2 should be measured from
+    BUY 2's date, not BUY 1's.
+    """
+    pair = _make_sl_buy_pair(buy_date="2026-10-13")
+    # Add an earlier BUY at a different price for the same deal.
+    pair.insert(0, LedgerOrder(
+        runId="2026-10-12", sourceOrderId=11110, sourceDate="2026-10-12",
+        symbol="BAF", side="NB", quantity=200, price=30500,
+        reason="autofin_buy:deal#1785888000:BAF:nav30pct:Khuyến nghị đầu tư",
+        status="cancelled", dnseOrderId="dnse-buy-0",
+        createdAt="2026-10-12T09:00:00Z",
+        updatedAt="2026-10-12T09:00:00Z",
+    ))
+    _seed_ledger(tmp_path, pair)
+    client = _make_client()
+    # Today is day 1 from the latest BUY → still pending.
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-14",
+    )
+    assert summary["t2_due"] == 0
+    assert summary["t2_pending"] == 1
+    assert summary["resubmitted"] == 0
+
+
+def test_retry_uses_dnse_cash_package_lookup(tmp_path) -> None:
+    """The function asks DNSE for the cash package id per symbol."""
+    _seed_ledger(tmp_path, _make_sl_buy_pair(symbol="ABB"))
+    client = _make_client()
+    client.get_cash_loan_package_id.return_value = 1036
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["resubmitted"] == 1
+    client.get_cash_loan_package_id.assert_called_with("0003937868", "ABB")
+
+
+def test_retry_records_4xx_rejection_on_resubmit(tmp_path) -> None:
+    """If the re-submit fails with a new 4xx, it's marked 'rejected' (not 'unknown')."""
+    _seed_ledger(tmp_path, _make_sl_buy_pair())
+    client = MagicMock()
+    client.get_cash_loan_package_id.return_value = 1036
+    client.place_stock_order.side_effect = RuntimeError(
+        'HTTP 400 INVALID_PRICE_FOR_SYMBOL'
+    )
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-15",
+    )
+    assert summary["t2_due"] == 1
+    assert summary["resubmitted"] == 0
+    assert len(summary["resubmit_errors"]) == 1
+    assert "INVALID_PRICE" in summary["resubmit_errors"][0]
+
+
+# -----------------------------------------------------------------------------
+# helpers
+# -----------------------------------------------------------------------------
+
+
+def _seed_ledger(tmp_path: Path, items: list[LedgerOrder]) -> None:
+    save_ledger(
+        {f"{i.runId}:{i.sourceOrderId}:{i.symbol}:{i.side}": i for i in items},
+        tmp_path,
+    )
