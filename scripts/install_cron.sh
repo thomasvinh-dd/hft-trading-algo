@@ -98,9 +98,19 @@ case "${1:-}" in
     --print)
         echo "# vietnam-algo cron entries for $PROJECT_DIR"
         cat <<EOF
-# 2026-10-13: see install_cron.sh header for why CRON_TZ=UTC matters.
+# 2026-10-14: see install_cron.sh header for why CRON_TZ=UTC
+# MUST be the first non-comment line.
 CRON_TZ=UTC
+0 23 * * * /root/hft-trading-algo/scripts/backup_postgres.sh >> /var/log/hft-postgres-backup.log 2>&1
+# Darvas Box Telegram bot — daily signal scan + EOD report
+# Uses darvas_box_strategy/data/bot.env (independent from autofin bot)
+# 09:00 ICT (02:00 UTC) — pre-market signal scan
+0 2 * * 1-5  cd $PROJECT_DIR && set -a && . $PROJECT_DIR/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=$PROJECT_DIR python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> $LOG_DIR/darvas_signals.log 2>&1
+# 16:00 ICT (09:00 UTC) — end-of-day backtest report
+0 9 * * 1-5  cd $PROJECT_DIR && set -a && . $PROJECT_DIR/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=$PROJECT_DIR python3 -u -m darvas_box_strategy.bot.cli send-report >> $LOG_DIR/darvas_report.log 2>&1
+# 08:30 ICT (01:30 UTC) — DNSE email OTP → trading token
 30 1 * * 1-5 cd $PROJECT_DIR && $_env_sources && PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-get-otp >> $LOG_DIR/get_otp.log 2>&1
+# 15:15 ICT (08:15 UTC) — common_sync (post-close price + CA refresh)
 15 8 * * 1-5 cd $PROJECT_DIR && $_env_sources && DNSE_PROXY_HTTP_URL="" PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-common-sync --force >> $LOG_DIR/common_sync.log 2>&1
 */5 * * * * $_watchdog
 EOF
@@ -118,13 +128,30 @@ esac
 mkdir -p "$LOG_DIR"
 existing="$(crontab -l 2>/dev/null || true)"
 filtered="$(printf '%s\n' "$existing" | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum' || true)"
+# CRON_TZ=UTC MUST be the very first non-comment line of the
+# crontab for vixie-cron 3.0pl1 to honor it. Setting it
+# later in the file (e.g. after a backup entry) is silently
+# ignored — the cron daemon falls back to /etc/timezone.
+# On this VPS that means CEST (UTC+2), so the 15 8 entry
+# fires at 08:15 CEST = 06:15 UTC = 13:15 ICT (mid-day)
+# instead of the intended 15:15 ICT (post-close).
 new_entries="$(cat <<EOF
-# 2026-10-13: force the cron daemon to interpret the times below in
-# UTC. Without this, on hosts where /etc/timezone is set to
-# Europe/Berlin or America/New_York, the entries fire at the local
-# time and the 15:15-ICT intent becomes 13:15-ICT (or worse).
+# 2026-10-14: pin the crontab to UTC. Without this, the
+# entries below fire at the system-local time (CEST on
+# this VPS), which is 2 hours off the intended ICT time.
+# CRON_TZ MUST be the first non-comment line for vixie-cron
+# 3.0pl1-184ubuntu2 to honor it.
 CRON_TZ=UTC
+0 23 * * * /root/hft-trading-algo/scripts/backup_postgres.sh >> /var/log/hft-postgres-backup.log 2>&1
+# Darvas Box Telegram bot — daily signal scan + EOD report
+# Uses darvas_box_strategy/data/bot.env (independent from autofin bot)
+# 09:00 ICT (02:00 UTC) — pre-market signal scan
+0 2 * * 1-5  cd $PROJECT_DIR && set -a && . $PROJECT_DIR/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=$PROJECT_DIR python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> $LOG_DIR/darvas_signals.log 2>&1
+# 16:00 ICT (09:00 UTC) — end-of-day backtest report
+0 9 * * 1-5  cd $PROJECT_DIR && set -a && . $PROJECT_DIR/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=$PROJECT_DIR python3 -u -m darvas_box_strategy.bot.cli send-report >> $LOG_DIR/darvas_report.log 2>&1
+# 08:30 ICT (01:30 UTC) — DNSE email OTP → trading token
 30 1 * * 1-5 cd $PROJECT_DIR && $_env_sources && PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-get-otp >> $LOG_DIR/get_otp.log 2>&1
+# 15:15 ICT (08:15 UTC) — common_sync (post-close price + CA refresh)
 15 8 * * 1-5 cd $PROJECT_DIR && $_env_sources && DNSE_PROXY_HTTP_URL="" PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-common-sync --force >> $LOG_DIR/common_sync.log 2>&1
 */5 * * * * $_watchdog
 EOF
