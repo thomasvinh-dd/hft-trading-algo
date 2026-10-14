@@ -39,6 +39,7 @@ from vietnam_algo.libs.notifier import (
 from vietnam_algo.libs.order_ledger import (
     LedgerOrder,
     TERMINAL_LEDGER_STATUSES,
+    filled_quantity,
     load_ledger,
     save_ledger,
     normalize_ledger_status,
@@ -1104,12 +1105,11 @@ def _buy_filled_and_matches_sl(buy: Any, sl_quantity: int) -> bool:
     """
     if buy.status != "filled":
         return False
-    fill_qty = 0
-    if isinstance(buy.lastDetail, dict):
-        try:
-            fill_qty = int(buy.lastDetail.get("filledQuantity") or 0)
-        except (TypeError, ValueError):
-            fill_qty = 0
+    # DNSE wire field is ``fillQuantity`` (no "-ed"); the helper
+    # falls back through ``filledQuantity`` and ``matchedQuantity``
+    # too. Reading the wrong field silently returned 0 for every
+    # fill — see the 2026-10-13 fix that added the helper.
+    fill_qty = filled_quantity(buy.lastDetail)
     return fill_qty == sl_quantity and fill_qty > 0
 
 
@@ -1921,14 +1921,17 @@ def _monitor_order_statuses(
             # orders that complete a position are also excluded because
             # we don't want to re-open a closed position.
             #
-            # ``filledQuantity`` is on ``detail`` (the DNSE response),
+            # ``fillQuantity`` is on ``detail`` (the DNSE response),
             # not on ``LedgerOrder`` itself. If the order filled any
             # quantity before being cancelled/rejected/expired, the
             # strategy already owns those shares and re-planning could
-            # double-buy; skip the force_replan in that case.
-            _fill_qty = 0
-            if isinstance(detail, dict):
-                _fill_qty = int(detail.get("filledQuantity") or 0)
+            # double-buy; skip the force_replan in that case. The
+            # helper reads ``fillQuantity`` first (DNSE's actual
+            # wire field), then falls back to ``filledQuantity`` /
+            # ``matchedQuantity`` for older payloads. Reading the
+            # wrong field silently returned 0 for every partial fill
+            # — see the 2026-10-13 fix.
+            _fill_qty = filled_quantity(detail)
             if (
                 new_status in {"cancelled", "rejected", "expired"}
                 and _fill_qty == 0

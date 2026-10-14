@@ -221,6 +221,43 @@ def normalize_ledger_status(status: str) -> str:
     return "unknown"
 
 
+def filled_quantity(detail: dict[str, Any] | None) -> int:
+    """Extract the filled quantity from a DNSE order-detail payload.
+
+    The 2026-10-13 fix: DNSE's order-detail response uses ``fillQuantity``
+    (camelCase, no "-ed" suffix — e.g. ``"fillQuantity": 200`` for a
+    200-share fill). The earlier code looked for ``filledQuantity``
+    (with the "-ed" suffix that we'd see in some other systems), which
+    silently returned 0 for every order on the books. The downstream
+    consumer (autofin's ``_prune_terminal_unfilled_deals``) then
+    reconciled ``_our_qty`` to 0 for every held deal, even though
+    the position was real and live on DNSE — the autofin bot thought
+    we held nothing and re-planned duplicate BUYs on every cycle.
+
+    Search order is "fillQuantity" first (the actual DNSE wire field),
+    then "filledQuantity" (the older name we used to check), then
+    "matchedQuantity" (another valid DNSE field for cross-check).
+    Falls back to 0 when none of the fields are present or the
+    detail is not a dict.
+
+    Returns an int ≥ 0. Coerces non-numeric values via ``int()`` so
+    a string like ``"200"`` is handled gracefully.
+    """
+    if not isinstance(detail, dict):
+        return 0
+    for key in ("fillQuantity", "filledQuantity", "matchedQuantity"):
+        val = detail.get(key)
+        if val is None or val == "":
+            continue
+        try:
+            qty = int(val)
+        except (TypeError, ValueError):
+            continue
+        if qty >= 0:
+            return qty
+    return 0
+
+
 def dnse_order_id(response: dict[str, Any] | list[Any] | None) -> str:
     if isinstance(response, dict):
         for key in ("orderId", "id", "orderNo"):

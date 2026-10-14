@@ -47,19 +47,23 @@ def _ledger_order(
     status: str,
     updated_at: str = "2026-10-12T08:00:00Z",
     symbol: str = "ABB",
+    side: str = "NB",
+    quantity: int = 100,
+    created_at: str = "2026-10-12T07:00:00Z",
+    source_order_id: int = 12345,
 ) -> LedgerOrder:
     return LedgerOrder(
         runId="2026-10-12",
-        sourceOrderId=12345,
+        sourceOrderId=source_order_id,
         sourceDate="2026-10-12",
         symbol=symbol,
-        side="NB",
-        quantity=100,
+        side=side,
+        quantity=quantity,
         price=17500,
         reason=f"autofin_buy:deal#{deal_id}:nav30pct:Khuyến nghị đầu tư",
         status=status,
         dnseOrderId=f"dnse-{deal_id}",
-        createdAt="2026-10-12T07:00:00Z",
+        createdAt=created_at,
         updatedAt=updated_at,
     )
 
@@ -523,5 +527,228 @@ def test_partial_fill_order_treated_as_held(tmp_path) -> None:
     )
     # Partial fill → kept actioned (order still in flight).
     assert did in result
+
+
+# -----------------------------------------------------------------------------
+# Latest-order vs latest-FILLED-order distinction (2026-10-13 13:30 ICT fix)
+#
+# The original cleanup logic used "the latest order" (by updatedAt)
+# as the sole source of truth for whether we still hold the
+# position. That was wrong for live-submit mode where the operator
+# might submit a duplicate BUY and then cancel it manually via
+# DNSE — the latest order is now a cancelled BUY, but the
+# previous filled BUY is still a real, held position.
+#
+# Reproduces: on 2026-10-13, ABB BUY 100 filled (dnseId 133161),
+# then the bot placed a duplicate ABB BUY 500 (dnseId 277951) due
+# to the openQuantity parser bug, and the operator cancelled the
+# duplicate via DNSE at 2026-10-13 07:06 ICT. The latest order
+# for the ABB deal is now the cancelled BUY 500; the cleanup was
+# seeing "cancelled" and resetting ``_our_qty`` to 0 even though
+# we really did hold 100 ABB from the original fill.
+#
+# The fix: when the latest order is terminal-without-fill, look
+# at the latest FILLED BUY's fillQty — if it's > 0, the position
+# is still real.
+# -----------------------------------------------------------------------------
+
+
+def test_cancelled_duplicate_buy_does_not_zero_held_position(tmp_path) -> None:
+    """Filled BUY 100 + later cancelled BUY 500 → still hold 100.
+
+    Mirrors the ABB incident on 2026-10-13 13:30 ICT.
+    """
+    did = "1789344000:ABB"
+    # Original BUY 100 — filled.
+    filled_buy = _ledger_order(
+        did, "filled", symbol="ABB", side="NB",
+        quantity=100,
+        created_at="2026-10-13T03:11:23Z",
+        updated_at="2026-10-13T03:11:23Z",
+        source_order_id=12345,
+    )
+    filled_buy = replace(
+        filled_buy,
+        lastDetail={"fillQuantity": 100, "orderStatus": "Filled", "price": 17400.0},
+    )
+    # Operator-cancelled duplicate BUY 500 (later updatedAt).
+    cancelled_dup = _ledger_order(
+        did, "cancelled", symbol="ABB", side="NB",
+        quantity=500,
+        created_at="2026-10-13T07:06:19Z",
+        updated_at="2026-10-13T07:06:19Z",
+        source_order_id=12346,
+    )
+    cancelled_dup = replace(
+        cancelled_dup,
+        lastDetail={"fillQuantity": 0, "leaveQuantity": 0, "canceledQuantity": 500, "orderStatus": "Cancelled"},
+    )
+    _write_ledger(tmp_path, [filled_buy, cancelled_dup])
+    # State file says _our_qty=100 (we really do hold 100 ABB).
+    our_deals = {did: {"_our_qty": 100, "symbol": "ABB"}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    # Without the fix, the latest order (cancelled) would zero _our_qty
+    # and the deal would be released, even though we really hold 100.
+    # With the fix, the latest filled BUY is still the filled BUY 100,
+    # so _our_qty stays 100 and the deal stays held.
+    assert did in result
+    assert our_deals[did]["_our_qty"] == 100
+
+
+def test_cancelled_duplicate_reconciles_state_from_fill(tmp_path) -> None:
+    """Filled BUY 100 + cancelled duplicate → state reconciles to 100 from fill.
+
+    Mirrors the case where the state file was reset (e.g. a
+    previous dry-run cycle wrote _our_qty=0) but the ledger has
+    the original fill. Without the fix, the cleanup would treat
+    the latest order (cancelled) as "no fill" and release the
+    deal. With the fix, the latest FILLED BUY (filled 100)
+    triggers an upward reconciliation.
+    """
+    did = "1789344000:ABB"
+    filled_buy = _ledger_order(
+        did, "filled", symbol="ABB", side="NB",
+        quantity=100,
+        created_at="2026-10-13T03:11:23Z",
+        updated_at="2026-10-13T03:11:23Z",
+        source_order_id=12347,
+    )
+    filled_buy = replace(
+        filled_buy,
+        lastDetail={"fillQuantity": 100, "orderStatus": "Filled", "price": 17400.0},
+    )
+    cancelled_dup = _ledger_order(
+        did, "cancelled", symbol="ABB", side="NB",
+        quantity=500,
+        created_at="2026-10-13T07:06:19Z",
+        updated_at="2026-10-13T07:06:19Z",
+        source_order_id=12348,
+    )
+    cancelled_dup = replace(
+        cancelled_dup,
+        lastDetail={"fillQuantity": 0, "leaveQuantity": 0, "canceledQuantity": 500, "orderStatus": "Cancelled"},
+    )
+    _write_ledger(tmp_path, [filled_buy, cancelled_dup])
+    # State is stale/reset to 0.
+    our_deals = {did: {"_our_qty": 0, "symbol": "ABB"}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    # Without the fix: latest order is cancelled → release. With the
+    # fix: latest filled BUY is 100 → reconcile upward + hold.
+    assert did in result
+    assert our_deals[did]["_our_qty"] == 100
+
+
+def test_rejected_duplicate_does_not_zero_held_position(tmp_path) -> None:
+    """Filled BUY 200 + later rejected BUY (e.g. T+2 issue) → still hold 200.
+
+    Reproduces the BAF case on 2026-10-13: the bot placed BAF
+    BUY 200 (filled 200), then the T+2-blocked SL SELL 200 was
+    rejected (not the BUY). The latest order for the BAF deal
+    might be the rejected SL or a subsequent cancelled re-attempt;
+    either way, the filled BUY 200 is the source of truth.
+    """
+    did = "1785888000:BAF"
+    filled_buy = _ledger_order(
+        did, "filled", symbol="BAF", side="NB",
+        quantity=200,
+        created_at="2026-10-13T06:58:44Z",
+        updated_at="2026-10-13T06:58:44Z",
+        source_order_id=12349,
+    )
+    filled_buy = replace(
+        filled_buy,
+        lastDetail={"fillQuantity": 200, "orderStatus": "Filled", "price": 31200.0},
+    )
+    # Operator-cancelled duplicate BUY (later).
+    cancelled_dup = _ledger_order(
+        did, "cancelled", symbol="BAF", side="NB",
+        quantity=200,
+        created_at="2026-10-13T09:00:00Z",
+        updated_at="2026-10-13T09:00:00Z",
+        source_order_id=12350,
+    )
+    cancelled_dup = replace(
+        cancelled_dup,
+        lastDetail={"fillQuantity": 0, "leaveQuantity": 0, "canceledQuantity": 200, "orderStatus": "Cancelled"},
+    )
+    _write_ledger(tmp_path, [filled_buy, cancelled_dup])
+    our_deals = {did: {"_our_qty": 200, "symbol": "BAF"}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did in result
+    assert our_deals[did]["_our_qty"] == 200
+
+
+def test_cancelled_with_no_filled_buy_releases(tmp_path) -> None:
+    """Cancelled BUY (no prior fill) → release. (The genuine pollution case.)"""
+    did = "1789344000:ABB"
+    cancelled_only = _ledger_order(
+        did, "cancelled", symbol="ABB", side="NB",
+        quantity=100,
+        created_at="2026-10-13T07:00:00Z",
+        updated_at="2026-10-13T07:00:00Z",
+        source_order_id=12351,
+    )
+    cancelled_only = replace(
+        cancelled_only,
+        lastDetail={"fillQuantity": 0, "leaveQuantity": 0, "canceledQuantity": 100, "orderStatus": "Cancelled"},
+    )
+    _write_ledger(tmp_path, [cancelled_only])
+    # State says we hold (pollution from a bot crash mid-cycle).
+    our_deals = {did: {"_our_qty": 100, "symbol": "ABB"}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    # No filled BUY anywhere → release the deal.
+    assert did not in result
+    assert our_deals[did]["_our_qty"] == 0
+
+
+def test_dnse_actual_fillQuantity_field_with_cancelled_duplicate(tmp_path) -> None:
+    """Regression: the 2026-10-13 13:30 ICT incident end-to-end.
+
+    State file says _our_qty=0 (operator reset, or never written
+    for this deal). Ledger has the original fill (DNSE
+    fillQuantity=100, no "-ed") and a later cancelled duplicate.
+    The cleanup must reconcile to 100 and keep the deal held —
+    NOT release it back to the planning pool (which would cause
+    a duplicate ABB BUY on the next cycle).
+    """
+    did = "1789344000:ABB"
+    # The DNSE wire format: fillQuantity (no "-ed").
+    filled_buy = _ledger_order(
+        did, "filled", symbol="ABB", side="NB",
+        quantity=100,
+        created_at="2026-10-13T03:11:23Z",
+        updated_at="2026-10-13T03:11:23Z",
+        source_order_id=12352,
+    )
+    filled_buy = replace(
+        filled_buy,
+        lastDetail={"fillQuantity": 100, "orderStatus": "Filled", "price": 17400.0},
+    )
+    cancelled_dup = _ledger_order(
+        did, "cancelled", symbol="ABB", side="NB",
+        quantity=500,
+        created_at="2026-10-13T07:06:19Z",
+        updated_at="2026-10-13T07:06:19Z",
+        source_order_id=12353,
+    )
+    cancelled_dup = replace(
+        cancelled_dup,
+        lastDetail={"fillQuantity": 0, "leaveQuantity": 0, "canceledQuantity": 500, "orderStatus": "Cancelled"},
+    )
+    _write_ledger(tmp_path, [filled_buy, cancelled_dup])
+    our_deals = {did: {"_our_qty": 0, "symbol": "ABB"}}
+    result = AutofinSignalAdapter._prune_terminal_unfilled_deals(
+        {did}, our_deals, tmp_path,
+    )
+    assert did in result
+    assert our_deals[did]["_our_qty"] == 100
 
 

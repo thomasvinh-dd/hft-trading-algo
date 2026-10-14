@@ -46,7 +46,11 @@ from vietnam_algo.libs.autofin_signals import (
 from vietnam_algo.libs.config import StrategyConfig
 from vietnam_algo.libs.daily_engine import EngineConfig
 from vietnam_algo.libs.notifier import notify
-from vietnam_algo.libs.order_ledger import TERMINAL_LEDGER_STATUSES, load_ledger
+from vietnam_algo.libs.order_ledger import (
+    TERMINAL_LEDGER_STATUSES,
+    filled_quantity,
+    load_ledger,
+)
 from vietnam_algo.libs.portfolio import build_portfolio_snapshot
 
 from .base import StrategyAdapter
@@ -2155,7 +2159,7 @@ def decide_orders(
     #
     # The cleanup at ``_load_state`` is the source of truth for
     # ``_our_qty``: it reads the order ledger and reconciles the
-    # held qty against the latest order's filledQuantity (or
+    # held qty against the latest order's fillQuantity (or
     # resets to 0 if the order is terminal-without-fill). The
     # order monitor updates the ledger on every DNSE poll. So the
     # next call to ``generate_orders`` sees the correct ``_our_qty``
@@ -2326,7 +2330,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         Terminal-with-fill detection: a status of ``filled`` means the
         latest order DID fill some quantity — we hold the position.
         The ``_our_qty`` in the state file may be 0 (stale) or > 0,
-        but the truth is in the ledger's ``lastDetail.filledQuantity``.
+        but the truth is in the ledger's ``lastDetail.fillQuantity``.
         We always treat a deal with a filled latest order as held.
         """
         if not actioned:
@@ -2334,9 +2338,34 @@ class AutofinSignalAdapter(StrategyAdapter):
         # 1. Build deal_id -> (latest-order-status, latest filled-qty)
         #    from the order ledger. The latest order is the one with
         #    the most recent updatedAt (or createdAt as fallback).
+        #
+        # 2026-10-13 fix: also track the latest FILLED BUY's fillQty
+        # separately. The "latest order by timestamp" approach was
+        # wrong for live-submit mode where the user might
+        # accidentally submit a duplicate BUY that gets cancelled
+        # (e.g. the 2026-10-13 06:58 ICT ABB BUY 500 incident — the
+        # bot placed a duplicate because the openQuantity parser
+        # missed the holding; the user manually cancelled the
+        # duplicate via DNSE). The latest order for the ABB deal
+        # is now the cancelled BUY 500, not the original filled
+        # BUY 100 — but the position is real (we still hold 100
+        # ABB from the original fill). The cleanup was reading the
+        # latest order's status, seeing "cancelled", and resetting
+        # ``_our_qty`` to 0 even though we really did fill 100
+        # shares from an earlier order. The fix: when the latest
+        # order is terminal-without-fill, look at the latest
+        # FILLED order for the same deal — if THAT one had a fill,
+        # the position is still real.
         latest_status_by_did: dict[str, str] = {}
         latest_filled_by_did: dict[str, int] = {}
         latest_ts_by_did: dict[str, str] = {}
+        # 2026-10-13: latest filled BUY for each deal, by timestamp.
+        # We track this separately from ``latest_filled_by_did``
+        # (which is keyed to the latest ORDER, not the latest
+        # FILLED order) so a cancelled re-attempt doesn't overwrite
+        # the real fill evidence.
+        latest_filled_buy_qty_by_did: dict[str, int] = {}
+        latest_filled_buy_ts_by_did: dict[str, str] = {}
         try:
             ledger = load_ledger(data_dir)
         except Exception:
@@ -2348,31 +2377,60 @@ class AutofinSignalAdapter(StrategyAdapter):
                 continue
             did = m.group(1)
             ts = item.updatedAt or item.createdAt or ""
+            # Extract filled quantity from lastDetail. The DNSE
+            # wire format uses ``fillQuantity`` (no "-ed" suffix);
+            # ``filled_quantity`` falls back through the older
+            # names too. Reading the wrong field silently returned
+            # 0 for every fill — see the 2026-10-13 fix that
+            # added the helper. Without that, ``_our_qty`` was
+            # reconciled to 0 even for live held positions.
+            this_filled = filled_quantity(item.lastDetail)
             prev_ts = latest_ts_by_did.get(did, "")
             if ts >= prev_ts:
                 latest_ts_by_did[did] = ts
                 latest_status_by_did[did] = item.status
-                # Extract filled quantity from lastDetail.
-                filled = 0
-                if isinstance(item.lastDetail, dict):
-                    filled = int(item.lastDetail.get("filledQuantity") or 0)
-                latest_filled_by_did[did] = filled
+                latest_filled_by_did[did] = this_filled
+            # Track the latest filled BUY separately. A filled
+            # SELL closes the position; a filled BUY opens it.
+            # We only want the "is there an open position from a
+            # previous BUY" signal here, not the latest order's
+            # fill count (which might be from a SELL or from a
+            # cancelled duplicate BUY).
+            if item.status == "filled" and this_filled > 0:
+                buy_ts = latest_filled_buy_ts_by_did.get(did, "")
+                if ts >= buy_ts:
+                    latest_filled_buy_ts_by_did[did] = ts
+                    latest_filled_buy_qty_by_did[did] = this_filled
         # 2. Determine which deals we still hold. A deal is "held"
         #    if EITHER ``_our_qty > 0`` (state file says we own) OR
-        #    the latest order is ``filled`` with filledQuantity > 0
+        #    the latest order is ``filled`` with fillQuantity > 0
         #    (the state file may be stale — the ledger is the truth).
         held_dids: set[str] = set()
         for did, sig in our_deals.items():
             qty = int(sig.get("_our_qty", 0) or 0)
             status = latest_status_by_did.get(did, "")
             filled_qty = latest_filled_by_did.get(did, 0)
+            latest_filled_buy_qty = latest_filled_buy_qty_by_did.get(did, 0)
             if qty > 0:
-                # State says we hold. Cross-check with the ledger:
-                # if the latest order is terminal-without-fill,
-                # this is the dry-run pollution case. Reset qty to 0
-                # and don't mark as held.
+                # State says we hold. Cross-check with the ledger.
                 if status in {"cancelled", "rejected", "expired", "closed", "dry_run", "skipped"}:
-                    sig["_our_qty"] = 0
+                    # Latest order is terminal-without-fill. But
+                    # that's not the whole story: a cancelled
+                    # re-attempt (e.g. duplicate BUY that the
+                    # operator manually cancelled via DNSE) doesn't
+                    # undo a previous fill. If the latest FILLED
+                    # BUY for this deal had a fill, the position
+                    # is still real — keep _our_qty as-is (or
+                    # reconcile upward if the fill was larger
+                    # than the state-file claim).
+                    if latest_filled_buy_qty > 0:
+                        held_dids.add(did)
+                        if latest_filled_buy_qty > qty:
+                            sig["_our_qty"] = latest_filled_buy_qty
+                    else:
+                        # No filled BUY on the books — this is the
+                        # genuine dry-run pollution case. Reset.
+                        sig["_our_qty"] = 0
                 else:
                     held_dids.add(did)
                     # Reconcile upward: if the ledger says we filled
@@ -2390,6 +2448,20 @@ class AutofinSignalAdapter(StrategyAdapter):
                 held_dids.add(did)
                 # Reconcile the stale state file.
                 sig["_our_qty"] = filled_qty
+            elif latest_filled_buy_qty > 0:
+                # 2026-10-13: the latest order is something other
+                # than "filled" (e.g. cancelled duplicate), but a
+                # previous BUY for the same deal did fill. Reconcile
+                # the state file to that fill and mark the deal
+                # as held. This is the case the duplicate-BUY
+                # incident surfaced: state says _our_qty=0 because
+                # the original code was looking at the latest order
+                # (cancelled BUY 500) instead of the latest FILLED
+                # order (filled BUY 100). We really do hold those
+                # 100 shares — the cancellation only voided the
+                # second attempt.
+                held_dids.add(did)
+                sig["_our_qty"] = latest_filled_buy_qty
         # 3. Prune: keep the deal only if we hold it OR the latest
         #    order is non-terminal (open / partial / submitting /
         #    unknown / prepared) or filled. Terminal-without-fill

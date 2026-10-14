@@ -79,7 +79,7 @@ nohup env DNSE_API_KEY="$DNSE_API_KEY" \
     AUTOFIN_LIVE_QUOTE_GATE="${AUTOFIN_LIVE_QUOTE_GATE:-1}" \
     python3 -u -m vietnam_algo.main auto-trading-bot \
         --account-no 0003937868 --loan-package-id 1775 \
-        --sleep-seconds 60 --update-symbols --update-prices --strategy autofin_signal \
+        --sleep-seconds 60 --no-sync-data --strategy autofin_signal \
         --live-submit \
     > "$LOG_DIR/autofin.log" 2>&1 &
 disown
