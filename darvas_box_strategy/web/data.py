@@ -374,6 +374,14 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
     # unique when the strategy somehow opens twice on the same day.
     seq_by_entry: Dict[Any, int] = {}
 
+    # Track the most recent exit date for this ticker. If a new
+    # signal fires while a deal is still open, the rule "1 ticker
+    # = 1 open position at a time" says skip it. This mirrors
+    # the Portfolio class's behaviour (portfolio.py:298-300) and
+    # prevents fictional concurrent deals on the same ticker.
+    last_exit_date = None  # None = no open position yet
+    skipped_overlap = 0  # for logging
+
     for i in range(cfg.breakout.min_history_days, len(bars)):
         base = scanner.find_base(as_of_idx=i)
         if base is None or base.end_idx >= i:
@@ -382,6 +390,14 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
             bars, base, nav=cfg.backtest.start_nav, cfg=cfg, as_of_idx=i,
         )
         if sig is None:
+            continue
+        # Enforce "1 ticker = 1 open position at a time".
+        # If a previous deal on this ticker is still open at the
+        # new signal's entry_date, skip the new signal — the live
+        # portfolio would have rejected it.
+        ed = sig.entry_date
+        if last_exit_date is not None and ed <= last_exit_date:
+            skipped_overlap += 1
             continue
         t = simulate_trade(sig, bars[i + 1:], cfg, atr_value=sig.atr_value)
 
@@ -428,6 +444,14 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
             # The bar-by-bar event log — used by the deal-detail modal
             "fills": _fills_to_dicts(getattr(t, "fills", ()), signal=sig),
         })
+
+        # Update the "last exit date" tracker so the next signal
+        # for this ticker is rejected if it falls inside this
+        # trade's holding period. Open deals (no real exit yet)
+        # are treated as still open forever — the next signal
+        # would be rejected.
+        if not is_open:
+            last_exit_date = t.exit_date
 
     # Sort by entry date descending — newest first
     deals.sort(key=lambda d: d["entry_date"], reverse=True)

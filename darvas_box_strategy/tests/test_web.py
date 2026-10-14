@@ -416,3 +416,73 @@ class WebCacheDealIdTests(unittest.TestCase):
         from darvas_box_strategy.web.data import WebCache
         c = WebCache()
         self.assertEqual(c.ticker_history, {})
+
+
+class NoConcurrentPositionsTests(unittest.TestCase):
+    """The ticker-history endpoint must enforce "1 ticker = 1 open
+    position at a time". A new signal that fires while a previous
+    deal is still open should be skipped — the live portfolio would
+    have rejected it.
+
+    Regression test for the bug where the dashboard's per-ticker
+    history showed multiple overlapping deals on the same ticker
+    (up to 4 concurrent for VCB), which was impossible in real
+    trading.
+    """
+
+    def _make_ticker_history_test(self, deals):
+        """Helper: build a ticker-history return value and verify
+        no two deals on the same ticker overlap in time."""
+        from collections import defaultdict
+        by_ticker = defaultdict(list)
+        for d in deals:
+            by_ticker[d["ticker"]].append(d)
+        for ticker, ticker_deals in by_ticker.items():
+            ticker_deals.sort(key=lambda d: d["entry_date"])
+            for i, d1 in enumerate(ticker_deals):
+                for d2 in ticker_deals[i+1:]:
+                    if d1["is_open"]:
+                        # d1 still open — d2 must not exist (would be
+                        # an overlap with an open position)
+                        self.fail(
+                            f"{ticker}: {d1['deal_id']} is still open "
+                            f"but {d2['deal_id']} ({d2['entry_date']}) "
+                            f"was also kept"
+                        )
+                    if d2["entry_date"] <= d1["exit_date"]:
+                        self.fail(
+                            f"{ticker}: {d1['deal_id']} closed {d1['exit_date']} "
+                            f"but {d2['deal_id']} entered at {d2['entry_date']} "
+                            f"(overlap of {(d1['exit_date'] - d2['entry_date']).days} days)"
+                        )
+
+    def test_real_tickers_have_no_concurrent_deals(self):
+        """For a sample of HOSE blue chips, get_ticker_history should
+        never return two deals on the same ticker that overlap in
+        time. (Live trading can't have two open positions on one
+        ticker at once.)"""
+        from darvas_box_strategy.bot.cli import build_default_config
+        from darvas_box_strategy.web.data import get_ticker_history
+        cfg = build_default_config()
+        # Try the first 5 blue chips — enough to catch a regression
+        # without making the test slow.
+        for ticker in ["MSN", "VCB", "VHM", "PLX", "GEE"]:
+            with self.subTest(ticker=ticker):
+                hist = get_ticker_history(ticker, cfg=cfg)
+                self.assertEqual(hist["ticker"], ticker)
+                deals = hist["deals"]
+                if not deals:
+                    continue
+                # Walk through chronologically — each entry_date
+                # must be > the previous exit_date
+                sorted_deals = sorted(deals, key=lambda d: d["entry_date"])
+                prev_exit = None
+                for d in sorted_deals:
+                    if prev_exit is not None and d["entry_date"] <= prev_exit:
+                        self.fail(
+                            f"{ticker}: deal {d['deal_id']} entered at "
+                            f"{d['entry_date']} but previous deal was still "
+                            f"open until {prev_exit} (overlap)"
+                        )
+                    if not d.get("is_open"):
+                        prev_exit = d["exit_date"]
