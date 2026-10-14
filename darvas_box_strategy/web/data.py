@@ -334,7 +334,9 @@ def _fills_to_dicts(fills, signal=None) -> List[Dict[str, Any]]:
                 "shares": int(f.shares) if f.kind != "DIVIDEND" else 0,
                 "pnl_delta": pnl_delta,
                 "cumulative_pnl": running_pnl,
-                "remaining": 0,  # not tracked in old format
+                # Remaining is now tracked on the FillEvent itself
+                # (was hardcoded to 0 before the executor fix).
+                "remaining": int(getattr(f, "remaining", 0)),
                 "note": "",
             }
         out.append(d)

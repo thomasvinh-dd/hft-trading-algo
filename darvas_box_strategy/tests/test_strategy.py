@@ -195,10 +195,12 @@ class SignalGeneratorTests(unittest.TestCase):
 
 class ExecutorTests(unittest.TestCase):
     def _cfg(self):
+        # Disable T+2.5 for tests that assume immediate exit allowed.
+        # Production default (t_plus_n_bars=3) is on for VN realism.
         return StrategyConfig(
             base=BaseConfig(),
             breakout=BreakoutConfig(),
-            exits=ExitsConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0),
             trailing=TrailingConfig(),
             backtest=BacktestConfig(start_nav=1_000_000_000, cost_bps=0.0),
         )
@@ -305,7 +307,7 @@ class ExecutorTests(unittest.TestCase):
         cfg = StrategyConfig(
             base=BaseConfig(),
             breakout=BreakoutConfig(),
-            exits=ExitsConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0),  # disable T+2.5 for this test
             trailing=TrailingConfig(
                 trail_mode="atr", trail_atr_mult=10.0,  # very wide trail
                 trail_floor_lock_profit=True,
@@ -1183,6 +1185,154 @@ class BarsHeldTests(unittest.TestCase):
         # Exit should be TIME_STOP on bar 5 → bars_held = 5
         self.assertEqual(result.exit_reason, "TIME_STOP")
         self.assertEqual(result.bars_held, 5)
+
+
+class PartialSellsBoardLotTests(unittest.TestCase):
+    """Partial sells (TIER, SL_SCALE) must round to 100-share board
+    lots. HOSE doesn't allow trading fractional lots, and stranding
+    <100 shares would prevent the strategy from ever fully closing
+    the position.
+
+    Regression test for the bug where positions could have
+    remaining shares of 1, 50, etc. — impossible in real trading.
+    """
+
+    def _run_sl_scale_until_done(self, sig, bars_after, cfg):
+        """Run simulate_trade and return all fill events."""
+        from darvas_box_strategy.darvas.executor import simulate_trade
+        result = simulate_trade(sig, bars_after, cfg)
+        return result.fills
+
+    def test_sl_scale_uses_100_share_multiples(self):
+        """Each SL_SCALE cut should be a multiple of 100 shares,
+        and 'remaining' should never be a non-zero non-multiple."""
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.signal_generator import Signal
+
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(require_ma200=False, require_close_above_ma=0),
+            exits=ExitsConfig(
+                # Disable tiers so SL_SCALE is the only exit
+                tiers=(),
+                sl_T_pct=0.10, sl_F_pct=0.18,
+                scale_out_pct_at_sl_T=0.5,
+                scale_out_pct_at_midpoint=0.5,
+                t_plus_n_bars=0,
+            ),
+            trailing=TrailingConfig(trail_from_peak_pct=0.99),  # never trails
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(
+                start_nav=1e9, cost_bps=0.0, board_lot=100,
+                size_low=0.15, size_high=0.30,
+            ),
+        )
+        # Entry at 10,000 with 1,000 shares (1,000 = 10 lots)
+        # sl_T = 9,000, sl_mid = 8,600, sl_F = 8,200
+        # All bars at sl_T — should fire repeatedly
+        # First cut: 500, remaining 500
+        # Second cut: 250 → rounded to 200, remaining 300
+        # Third cut: 150 → rounded to 100, remaining 200
+        # Fourth cut: 100, remaining 100
+        # Fifth cut: 50 → rounded to 0 → since remaining-cut < lot, sell all 100
+        # Then SL_HARD fires on the next bar.
+        # All cuts and remaining values must be multiples of 100.
+        base = Base(ticker="X", base_low=9800, base_high=10000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10000.0, base=base, sl_F=8200, sl_T=9000,
+            tiers=(), conviction="low", size_pct=0.15,
+            shares=1000, max_volume=99999, bars_remaining=10,
+        )
+        # 8 bars all at 8500 (between sl_T and sl_mid)
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3 + i).isoformat(), open=10_000, high=9_500,
+                     low=8_500, close=8_500, volume=100_000)
+            for i in range(8)
+        ]
+        fills = self._run_sl_scale_until_done(sig, bars_after, cfg)
+        # Every fill's shares (except DIVIDEND) must be a multiple of 100
+        for f in fills:
+            sh = f.shares
+            self.assertEqual(sh % 100, 0,
+                f"Fill on {f.date} has {sh} shares — not a multiple of 100")
+            rem = f.remaining if hasattr(f, "remaining") else None
+            if rem is not None and rem != 0:
+                self.assertEqual(rem % 100, 0,
+                    f"Fill on {f.date} leaves {rem} remaining — not a multiple of 100")
+
+
+class VNMarketSettlementDefaultTests(unittest.TestCase):
+    """The default config should enforce T+2.5 settlement.
+
+    This is the VN market rule: a buy cannot be sold for the first
+    2.5 trading days. In bar-count terms: skip the first 2 bars,
+    allow exit on bar 3.
+
+    This test guards against accidental rollback to t_plus_n_bars=0.
+    """
+
+    def test_default_t_plus_n_bars_is_3(self):
+        from darvas_box_strategy.darvas.config import ExitsConfig, StrategyConfig
+        # The dataclass default
+        self.assertEqual(ExitsConfig().t_plus_n_bars, 3)
+        # The full default config from bot.cli
+        from darvas_box_strategy.bot.cli import build_default_config
+        cfg = build_default_config()
+        self.assertEqual(cfg.exits.t_plus_n_bars, 3)
+
+    def test_default_tier_can_only_fire_on_bar_3_or_later(self):
+        """Even a TIER on bar 1 should be suppressed by default."""
+        from datetime import date
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.executor import simulate_trade
+        from darvas_box_strategy.bot.cli import build_default_config
+
+        # Use the production default config (T+2.5 on)
+        cfg = build_default_config()
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base,
+            sl_F=8_200, sl_T=9_000,
+            tiers=((1.063, 0.10), (1.125, 0.30), (1.21, 0.30)),
+            conviction="low", size_pct=0.15,
+            shares=1_000, max_volume=99_999, bars_remaining=10,
+        )
+        # 4 bars: T+1, T+2, T+3, T+4
+        # T+1 and T+2: locked (in_settlement), no exits
+        # T+3: unlocked; TIER1 at 10630 should fire (high=15000)
+        # T+4: TRAIL or TIER2 etc.
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3).isoformat(), open=10_000, high=15_000,
+                     low=9_900, close=14_000, volume=100_000),  # T+1
+            PriceBar(time=date(2026, 1, 4).isoformat(), open=14_000, high=15_000,
+                     low=13_900, close=14_500, volume=100_000),  # T+2
+            PriceBar(time=date(2026, 1, 5).isoformat(), open=14_500, high=15_000,
+                     low=14_400, close=14_800, volume=100_000),  # T+3
+        ]
+        result = simulate_trade(sig, bars_after, cfg)
+        # The TIER1 should fire on T+3, not T+1.
+        tier_dates = [f.date for f in result.fills if f.kind == "TIER"]
+        for d in tier_dates:
+            self.assertGreaterEqual(
+                d, date(2026, 1, 5),
+                f"TIER fired on {d} but T+2.5 should suppress exits until T+3"
+            )
 
 
 if __name__ == "__main__":

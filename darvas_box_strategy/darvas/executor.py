@@ -19,6 +19,7 @@ class FillEvent:
     fraction_of_pos: float
     cumulative_proceeds: float
     realized_pnl: float = 0.0
+    remaining: int = 0  # shares still held after this fill (was 0 by default; see _fills_to_dicts)
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 date=bar.date, kind="DIVIDEND", level=cash_div, shares=remaining,
                 proceeds=income, fraction_of_pos=0.0,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=income,
+                remaining=remaining,  # dividend doesn't change share count
             ))
 
         if in_settlement:
@@ -140,6 +142,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 date=bar.date, kind="TIME_STOP", level=effective_close, shares=remaining,
                 proceeds=proceeds - cost, fraction_of_pos=1.0,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
+                remaining=0,  # closing everything
             ))
             remaining = 0
             break
@@ -163,6 +166,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                     date=bar.date, kind="TRAIL", level=effective_close, shares=remaining,
                     proceeds=proceeds - cost, fraction_of_pos=1.0,
                     cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
+                    remaining=0,  # closing everything
                 ))
                 remaining = 0
                 break
@@ -172,7 +176,11 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             tier_price = signal.entry_price * mult
             if bar.high < tier_price:
                 break
-            tier_shares = max(int(remaining * pct), 0)
+            # Round the tier cut DOWN to the nearest board lot
+            # (HOSE rule: shares traded in 100-share multiples).
+            tier_shares = (int(remaining * pct) // lot) * lot
+            # If rounding leaves < 1 lot remaining, sell all
+            # (don't strand fractional lots).
             if remaining - tier_shares < lot:
                 tier_shares = remaining
             if tier_shares <= 0:
@@ -188,6 +196,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 date=bar.date, kind="TIER", level=tier_price, shares=tier_shares,
                 proceeds=proceeds - cost, fraction_of_pos=pct,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
+                remaining=remaining,
             ))
             if tier_idx == trail_cfg.activation_tier_idx:
                 trailing_active = True
@@ -199,8 +208,11 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             break
 
         if bar.low <= sl_T:
-            cut = max(int(remaining * exits_cfg.scale_out_pct_at_sl_T), 0)
-            if cut <= 0:
+            # Round DOWN to the nearest board lot (HOSE rule).
+            cut = (int(remaining * exits_cfg.scale_out_pct_at_sl_T) // lot) * lot
+            # If rounding leaves < 1 lot, sell all remaining
+            # (otherwise the strategy would be stuck with <100 shares).
+            if cut <= 0 or remaining - cut < lot:
                 cut = remaining
             proceeds = cut * sl_T
             pnl = (sl_T - signal.entry_price) * cut
@@ -212,13 +224,15 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 date=bar.date, kind="SL_SCALE", level=sl_T, shares=cut,
                 proceeds=proceeds - cost, fraction_of_pos=exits_cfg.scale_out_pct_at_sl_T,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
+                remaining=remaining,
             ))
             if remaining <= 0:
                 break
 
         if bar.low <= sl_mid and remaining > 0:
-            cut = max(int(remaining * exits_cfg.scale_out_pct_at_midpoint), 0)
-            if cut <= 0:
+            # Same board-lot rounding for the mid-stop scale-out.
+            cut = (int(remaining * exits_cfg.scale_out_pct_at_midpoint) // lot) * lot
+            if cut <= 0 or remaining - cut < lot:
                 cut = remaining
             proceeds = cut * sl_mid
             pnl = (sl_mid - signal.entry_price) * cut
@@ -230,6 +244,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 date=bar.date, kind="SL_SCALE", level=sl_mid, shares=cut,
                 proceeds=proceeds - cost, fraction_of_pos=exits_cfg.scale_out_pct_at_midpoint,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
+                remaining=remaining,
             ))
             if remaining <= 0:
                 break
@@ -244,6 +259,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 date=bar.date, kind="SL_HARD", level=sl_F, shares=remaining,
                 proceeds=proceeds - cost, fraction_of_pos=1.0,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
+                remaining=0,  # closing everything
             ))
             remaining = 0
             break
@@ -262,6 +278,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             date=last_bar.date, kind="EXHAUST", level=effective_close, shares=remaining,
             proceeds=proceeds - cost, fraction_of_pos=1.0,
             cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
+            remaining=0,  # closing everything
         ))
         remaining = 0
         exit_reason = "EXHAUST"

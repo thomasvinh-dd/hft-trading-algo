@@ -90,9 +90,10 @@ class ExitsConfig:
     sl_T_pct: float = 0.10   # partial-cut stop at 10% below entry
     sl_F_pct: float = 0.18   # hard stop at 18% below entry
     use_entry_anchored_stops: bool = True  # True = fixed % from entry; False = legacy base-anchored
-    t_plus_n_bars: int = 0  # settlement delay: skip first N-1 bars for exit logic.
-                            # VN market is T+2.5 (3 trading days), so set to 3 for
-                            # realistic settlement modeling. 0 = off (legacy, optimistic).
+    t_plus_n_bars: int = 3  # settlement delay: skip first N-1 bars for exit logic.
+                            # VN market is T+2.5 (3 trading days), so 3 means
+                            # the first 2 bars are locked, exits allowed on bar 3.
+                            # 0 = off (legacy, optimistic).
 
 
 @dataclass(frozen=True)

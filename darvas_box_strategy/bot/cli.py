@@ -69,6 +69,7 @@ def build_default_config() -> StrategyConfig:
             sl_T_pct=0.10,        # 10% partial stop from entry
             sl_F_pct=0.18,        # 18% hard stop from entry
             use_entry_anchored_stops=True,  # CRITICAL: not the ancient base
+            t_plus_n_bars=3,      # T+2.5 settlement: skip first 2 bars, exit on bar 3
         ),
         trailing=TrailingConfig(trail_mode="pct", trail_from_peak_pct=0.10),
         universe=UniverseConfig(min_avg_value_20d=1.0e9, min_price=5_000.0, max_price=200_000.0),
