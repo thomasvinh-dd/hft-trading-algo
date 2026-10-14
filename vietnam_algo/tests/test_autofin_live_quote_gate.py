@@ -291,15 +291,105 @@ def test_live_gate_lets_through_when_ask_within_tolerance(
     assert captured["orders"][0].price == 14100
 
 
-def test_live_gate_does_not_check_partial_close_or_full_close(
+def test_sell_orders_fetch_live_bid_for_market_price_override(
     monkeypatch, in_continuous_session,
 ):
-    """SELL orders bypass the live gate entirely (no get_latest_quote call)."""
+    """SELL orders fetch the live best-bid (not bypassed) so they fill
+    immediately at market instead of resting at autofin's recomment
+    price (which can be above the bid in a falling market).
+
+    2026-10-13 user feedback: when autofin publishes a SELL signal
+    (TP / reduce / SL / full-close), the bot should SELL at the
+    current market price so the order always fills. The previous
+    behavior of using autofin's recomment price risked the SELL
+    resting above the book when the market dropped, with the
+    3% re-pricer ceiling then abandoning the order before it
+    could fill.
+    """
+    captured: dict = {}
+    _patch_executor(monkeypatch, captured)
+
+    # The live-quote lookup IS expected now (SELL uses best-bid).
+    def _q_quote(symbol: str) -> dict:
+        # G1 board with bid=14000 (slightly below the 14500 signal
+        # price the planning step used). The SELL should be re-priced
+        # to 14000 * 0.99 = 13860 by default, ensuring immediate fill.
+        return {"quotes": [
+            {"boardId": "G1",
+             "bid": [{"price": 14.0, "quantity": 100}],
+             "offer": [{"price": 14.1, "quantity": 100}]},
+        ]}
+
+    client = _make_client(quote_factory=_q_quote)
+    deals = [
+        _make_deal(
+            "ABW", price=14500, side="NS", quantity=100, action="partial_close",
+        ),
+    ]
+    result = _submit_autofin_deals_to_dnse(
+        deals,
+        account_no="0003937868",
+        loan_package_id=1775,
+        trading_token="tok",
+        client=client,
+        data_dir=Path("/tmp"),
+        trade_date="2026-10-08",
+    )
+    assert len(result["submitted"]) == 1
+    assert result["out_of_zone"] == []
+    # The SELL fetched a live quote to compute the market price.
+    assert client.get_latest_quote.call_count == 1
+    # The submitted SELL price should be best-bid (14000) × 0.99
+    # = 13860, NOT the planning signal price of 14500.
+    submitted = captured["orders"][0]
+    assert submitted.side == "NS"
+    assert submitted.price == 13860
+
+
+def test_sell_orders_fall_back_to_signal_price_on_quote_failure(
+    monkeypatch, in_continuous_session,
+):
+    """If ``get_latest_quote`` raises during the SELL bid lookup, fall
+    back to autofin's recomment price (don't block the SELL)."""
+    captured: dict = {}
+    _patch_executor(monkeypatch, captured)
+
+    def _q_fail(symbol: str) -> dict:
+        raise RuntimeError("DNSE timeout")
+
+    client = _make_client(quote_factory=_q_fail)
+    deals = [
+        _make_deal(
+            "ABW", price=14500, side="NS", quantity=100, action="partial_close",
+        ),
+    ]
+    result = _submit_autofin_deals_to_dnse(
+        deals,
+        account_no="0003937868",
+        loan_package_id=1775,
+        trading_token="tok",
+        client=client,
+        data_dir=Path("/tmp"),
+        trade_date="2026-10-08",
+    )
+    assert len(result["submitted"]) == 1
+    # No bid available → use the planning signal price (14500).
+    submitted = captured["orders"][0]
+    assert submitted.side == "NS"
+    assert submitted.price == 14500
+
+
+def test_sell_at_market_disabled_by_env(
+    monkeypatch, in_continuous_session,
+):
+    """Setting AUTOFIN_SELL_AT_MARKET=0 reverts to using autofin's
+    recomment price (the pre-2026-10-13 behavior)."""
+    monkeypatch.setenv("AUTOFIN_SELL_AT_MARKET", "0")
     captured: dict = {}
     _patch_executor(monkeypatch, captured)
 
     def _q_should_not_be_called(symbol: str) -> dict:
-        raise AssertionError("get_latest_quote should NOT be called for SELL orders")
+        raise AssertionError("get_latest_quote should NOT be called when AUTOFIN_SELL_AT_MARKET=0")
 
     client = _make_client(quote_factory=_q_should_not_be_called)
     deals = [
@@ -317,8 +407,9 @@ def test_live_gate_does_not_check_partial_close_or_full_close(
         trade_date="2026-10-08",
     )
     assert len(result["submitted"]) == 1
-    assert result["out_of_zone"] == []
-    assert client.get_latest_quote.call_count == 0
+    submitted = captured["orders"][0]
+    # Pre-fix behavior: signal price used as-is.
+    assert submitted.price == 14500
 
 
 def test_live_gate_graceful_degradation_on_api_failure(

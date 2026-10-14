@@ -898,8 +898,61 @@ def _submit_autofin_deals_to_dnse(
                 price = 0
             elif signal_price <= 0:
                 continue
-            else:
-                price = signal_price
+            # 2026-10-13: SELL orders (NS) are submitted at the LIVE
+            # best-bid, not autofin's recomment price. Per user
+            # feedback: when autofin publishes a SELL signal
+            # (TP/reduce/SL/full-close), the bot should sell at
+            # the current market price so the order always fills —
+            # otherwise a falling market can leave the SELL resting
+            # above the book (e.g. autofin suggests TP @ 15,000 but
+            # the bid has dropped to 14,500; the LO @ 15,000 won't
+            # fill, and the 3% re-pricer ceiling then abandons it
+            # below 14,550, missing the exit entirely). Setting
+            # price = best_bid (or best_bid * sell_bid_discount_pct
+            # — a 1% safety margin against the bid ticking down
+            # between quote-fetch and submit) makes the SELL
+            # marketable: it crosses against the best-bid buyer
+            # and fills immediately.
+            #
+            # Falls back to the signal_price (autofin's suggested
+            # TP/SL price) when the live quote is unavailable, so
+            # network blips don't block the SELL.
+            sell_price = signal_price  # default
+            # Env-var kill switch: setting AUTOFIN_SELL_AT_MARKET=0
+            # reverts to the pre-2026-10-13 behavior (use autofin's
+            # recomment price, no live-bid override). Default enabled.
+            if (
+                side == "NS"
+                and not is_auction
+                and os.environ.get("AUTOFIN_SELL_AT_MARKET", "1") != "0"
+            ):
+                try:
+                    quote = client.get_latest_quote(sym)
+                except Exception as exc:
+                    print(
+                        f"[autofin_sell_at_market] {sym}: get_latest_quote "
+                        f"failed ({type(exc).__name__}: {str(exc)[:200]}); "
+                        f"falling back to signal_price={signal_price}"
+                    )
+                else:
+                    bid = _extract_best_bid_in_vnd(quote)
+                    if bid and bid > 0:
+                        sell_bid_discount_pct = float(
+                            os.environ.get("AUTOFIN_SELL_BID_DISCOUNT_PCT", "0.99")
+                        )
+                        sell_price = int(round(bid * sell_bid_discount_pct))
+                        print(
+                            f"[autofin_sell_at_market] {sym} SELL price "
+                            f"override: signal={signal_price} → "
+                            f"bid={bid:,.0f} VND × "
+                            f"{sell_bid_discount_pct:.0%} = {sell_price:,.0f} "
+                            f"VND (ensures immediate fill at market)"
+                        )
+            if not is_auction:
+                # SELL-at-market override (if it ran) takes precedence
+                # over the signal price. For BUY orders the live-quote
+                # path doesn't fire, so this is a no-op.
+                price = sell_price
             # 2026-10-12: cash-package id is REQUIRED and per-symbol.
             # Look it up via DNSE's ``loan-packages`` endpoint; falls
             # back to ``loan_package_id_by_symbol`` then to the launch
