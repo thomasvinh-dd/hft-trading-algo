@@ -157,8 +157,26 @@ def build_portfolio_snapshot(
         if quantity <= 0:
             continue
         avg_price = _float(_first_field(row, (
-            "avgPrice", "averagePrice", "costPrice", "costBasisPrice",
-            "costBasis", "avgCost",
+            # 2026-10-14: prefer ``breakEvenPrice`` over
+            # ``costPrice`` so the P&L matches the DNSE app.
+            # ``costPrice`` is the raw average buy price; the
+            # buyer fee (~15 bps on Vietnamese exchanges) is
+            # NOT in it. ``breakEvenPrice`` = cost + accumulated
+            # fees = the price at which the position would
+            # actually break even. The DNSE app and the
+            # positions API both report this. Using
+            # ``costPrice`` understated the P&L by 24-50 VND
+            # per share (e.g. ABB 100 @ 17,700 cost vs.
+            # 17,724.4 break-even → P&L off by 2,400 VND per
+            # 100 shares). The user spotted the discrepancy
+            # on 2026-10-14 14:00 ICT: DNSE app showed ABB
+            # avg=17,724, bot showed 17,700 → -12,426 VND on
+            # the app vs -10,000 VND on the bot. The fix:
+            # read breakEvenPrice first, fall back to the
+            # legacy ``costPrice``/``avgPrice`` aliases for
+            # older payloads.
+            "breakEvenPrice", "avgPrice", "averagePrice",
+            "costPrice", "costBasisPrice", "costBasis", "avgCost",
         )))
         # 2026-10-13: market price resolution (units + source).
         #

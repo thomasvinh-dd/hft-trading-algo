@@ -322,3 +322,94 @@ def test_real_baf_abf_portfolio_pnl_correct() -> None:
     assert snap["totals"]["stockValue"] == expected_stock
     expected_pnl = 10000 + (-10000)
     assert snap["totals"]["totalUnrealizedPnl"] == expected_pnl
+
+
+# -----------------------------------------------------------------------------
+# breakEvenPrice preference (2026-10-14 fix)
+#
+# DNSE returns TWO cost fields on /accounts/{acc}/positions:
+#   - costPrice       : raw average buy price (no fees)
+#   - breakEvenPrice  : cost + accumulated fees (the true break-even)
+#
+# The DNSE app and the positions API both report breakEvenPrice as
+# the "avg cost" — using costPrice understates the P&L by 15 bps
+# worth of fees per share. The user spotted the discrepancy on
+# 2026-10-14 14:00 ICT: DNSE app showed ABB avg=17,724 and
+# uPnL=-12,426 VND, the bot showed 17,700 and -10,000 VND.
+# These tests pin the fix (read breakEvenPrice first).
+# -----------------------------------------------------------------------------
+
+
+def test_break_even_price_used_when_present() -> None:
+    """breakEvenPrice (with fees) wins over costPrice (raw average)."""
+    payload = {
+        "positions": [
+            {
+                "symbol": "ABB", "openQuantity": 100,
+                "accumulateQuantity": 100, "closedQuantity": 0,
+                "costPrice": 17700, "marketPrice": 17600,
+                "breakEvenPrice": 17724.4,
+            }
+        ]
+    }
+    client = _stub_client(positions_payload=payload, latest_quote=None)
+    snap = build_portfolio_snapshot(client, "0003937868")
+    pos = snap["positions"][0]
+    # breakEvenPrice wins.
+    assert pos["avgPrice"] == pytest.approx(17724.4, abs=0.01)
+    # P&L = (17600 - 17724.4) * 100 = -12,440 VND ≈ -0.70%
+    assert pos["unrealizedPnl"] == pytest.approx(-12440, abs=1.0)
+    assert pos["unrealizedPnlPct"] == pytest.approx(-0.7018, abs=0.01)
+
+
+def test_legacy_cost_price_still_supported() -> None:
+    """Older payloads (no breakEvenPrice) fall back to costPrice."""
+    payload = {
+        "positions": [
+            {
+                "symbol": "ABB", "openQuantity": 100,
+                "accumulateQuantity": 100, "closedQuantity": 0,
+                "costPrice": 17700, "marketPrice": 17600,
+                # No breakEvenPrice — legacy DNSE response shape
+            }
+        ]
+    }
+    client = _stub_client(positions_payload=payload, latest_quote=None)
+    snap = build_portfolio_snapshot(client, "0003937868")
+    pos = snap["positions"][0]
+    assert pos["avgPrice"] == 17700
+    assert pos["unrealizedPnl"] == -10000
+
+
+def test_break_even_price_matches_dnse_app_for_abb_2026_10_14() -> None:
+    """Regression: ABB avg 17,724.4, mkt 17,600, uPnL -12,440 VND (-0.70%).
+
+    Reproduces the 2026-10-14 14:00 ICT user audit: the bot was
+    reporting ABB avg=17,700 (raw costPrice) and uPnL=-10,000
+    VND (-0.56%), but the DNSE app showed avg=17,724.4 and
+    uPnL=-12,426 VND (-0.71%). Root cause: costPrice excludes
+    the buy fee (~15 bps = ~24 VND per share at 17,700), so
+    using it understated both the avg cost and the P&L. The
+    fix prefers breakEvenPrice so the bot's P&L matches the
+    DNSE app to the đồng.
+    """
+    payload = {
+        "positions": [
+            {
+                "symbol": "ABB", "openQuantity": 100,
+                "accumulateQuantity": 100, "closedQuantity": 0,
+                "costPrice": 17700, "marketPrice": 17600,
+                "breakEvenPrice": 17724.4,
+            }
+        ]
+    }
+    client = _stub_client(positions_payload=payload, latest_quote=None)
+    snap = build_portfolio_snapshot(client, "0003937868")
+    pos = snap["positions"][0]
+    assert pos["avgPrice"] == pytest.approx(17724.4, abs=0.01)
+    # (17600 - 17724.4) * 100 = -12,440 VND (DNSE rounds to 12,426
+    # in the app; the difference is rounding-to-display vs raw math).
+    assert pos["unrealizedPnl"] == pytest.approx(-12440, abs=1.0)
+    # -0.70 %  (DNSE app shows -0.71 % — difference is rounding)
+    assert pos["unrealizedPnlPct"] < -0.70
+    assert pos["unrealizedPnlPct"] > -0.72
