@@ -25,21 +25,44 @@ os.environ.setdefault("DNSE_ACCOUNT_NO", "0003937868")
 os.environ.setdefault("DNSE_PROXY_HTTP_URL", "")
 os.environ.setdefault("PYTHONPATH", str(PROJECT_ROOT))
 
-# Set up env
+# Set up env (DNSE secrets only; the Telegram env is loaded PER
+# STRATEGY below so the EOD message routes to the right chat).
 import os as _os
 _os.environ.setdefault("DNSE_PROXY_HTTP_URL", "")
-for env_file in [
-    PROJECT_ROOT / "vietnam_algo/env/.env.dnse-secrets",
-    PROJECT_ROOT / "vietnam_algo/env/.env.telegram",
-    PROJECT_ROOT / "vietnam_algo/env/.env.autofin-signal",
-]:
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
+_dnse_env = PROJECT_ROOT / "vietnam_algo/env/.env.dnse-secrets"
+try:
+    if _dnse_env.exists():
+        for line in _dnse_env.read_text().splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
             _os.environ.setdefault(k.strip(), v.strip())
+except OSError:
+    # Permission denied during tests, etc — skip.
+    pass
+
+
+def _load_telegram_env_for_strategy(strategy_name: str) -> str:
+    """Override TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in os.environ
+    with the values from the per-strategy env file. Mirrors the
+    override in scripts/launch_*.sh.
+
+    Returns the path of the env file that was loaded (for logging).
+    """
+    if strategy_name == "autofin_signal":
+        env_path = PROJECT_ROOT / "vietnam_algo/env/.env.telegram-autofin"
+    else:
+        # momentum + any other strategy
+        env_path = PROJECT_ROOT / "vietnam_algo/env/.env.telegram"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ[k.strip()] = v.strip()
+    return str(env_path)
 
 
 def force_eod(strategy_name: str) -> int:
@@ -73,6 +96,20 @@ def force_eod(strategy_name: str) -> int:
         liveDirName=live_dir_name,
     )
     strat_cfg = StrategyConfig(initialCash=100_000_000)
+
+    # 2. Override Telegram env for the strategy under test, so the
+    # EOD message goes to the CORRECT channel. Each bot has its own
+    # chat: .env.telegram-autofin owns the "Auto Fin Bot" channel,
+    # .env.telegram owns the momentum bot's channel. Without this
+    # override, the autofin EOD would land in the momentum chat and
+    # confuse the operator (the launch_autofin.sh script does the
+    # same override via `set -a; source .env.telegram-autofin`).
+    _telegram_env_path = _load_telegram_env_for_strategy(strategy_name)
+    print(
+        f"[force_eod] telegram env: {Path(_telegram_env_path).name} → "
+        f"chat_id={os.environ.get('TELEGRAM_CHAT_ID', '?')[:14]}…"
+    )
+
     client = DnseClient(
         api_key=os.environ["DNSE_API_KEY"],
         api_secret=os.environ["DNSE_API_SECRET"],
