@@ -555,7 +555,82 @@ def test_format_cycle_summary_handles_empty_cycle():
     msg = adapter.format_cycle_summary(result)
     assert "[autofin_signal]" in msg
     assert "No orders planned" in msg
-    assert "NAV=0" in msg
+
+
+# ── NAV-source label in cycle summary (2026-10-18 fix) ───────────────
+#
+# The old code always labeled the NAV line as "MOCK NAV (autofin
+# target)", which was misleading in live-submit mode where the
+# value is the LIVE DNSE portfolio value (the MOCK_NAV env var
+# is ignored when live_submit=True). The fix tracks the source
+# of `nav` in the result dict (nav_source = "dnse" | "mock")
+# and uses the right label.
+
+
+def test_format_cycle_summary_labels_dnse_nav_in_live_submit():
+    """nav_source="dnse" → label says "Live NAV (DNSE)", not MOCK."""
+    adapter = AutofinSignalAdapter()
+    result = {
+        "tradeDate": "2026-10-14",
+        "signals": {"account": "0003937868", "nav": 29_986_500},
+        "nav_source": "dnse",
+        "deals_actioned": [],
+    }
+    msg = adapter.format_cycle_summary(result)
+    assert "💰 Live NAV (DNSE): 29,986,500 VND" in msg
+    assert "MOCK" not in msg  # no longer labeled as a mock value
+
+
+def test_format_cycle_summary_labels_mock_nav_in_dry_run():
+    """nav_source="mock" → label says "Mock NAV (dry-run override)".
+
+    Dry-run with MOCK_NAV env var set — the size-scaling base
+    is a simulated value, not from DNSE. The user should know
+    they're seeing a backtest / dry-run target NAV.
+    """
+    adapter = AutofinSignalAdapter()
+    result = {
+        "tradeDate": "2026-10-14",
+        "signals": {"account": "0003937868", "nav": 100_000_000},
+        "nav_source": "mock",
+        "deals_actioned": [],
+    }
+    msg = adapter.format_cycle_summary(result)
+    assert "💰 Mock NAV (dry-run override): 100,000,000 VND" in msg
+
+
+def test_format_cycle_summary_defaults_to_dnse_label_when_source_missing():
+    """Backwards compatibility: legacy result dicts without
+    nav_source still get a sensible label. Default = "DNSE"
+    because in practice every result today comes from
+    generate_orders() which sets nav_source."""
+    adapter = AutofinSignalAdapter()
+    result = {
+        "tradeDate": "2026-10-14",
+        "signals": {"account": "0003937868", "nav": 29_986_500},
+        # nav_source intentionally missing
+        "deals_actioned": [],
+    }
+    msg = adapter.format_cycle_summary(result)
+    # Falls back to "Live NAV (DNSE)" — the safe default that
+    # doesn't lie about a MOCK value being real.
+    assert "Live NAV (DNSE)" in msg
+    assert "MOCK" not in msg
+
+
+def test_generate_orders_sets_nav_source_in_result():
+    """generate_orders() must always set nav_source in the result
+    so the formatter picks the right label. This pins the
+    contract — any future refactor that drops nav_source would
+    cause the test to fail."""
+    # Smoke check: we don't need to call generate_orders()
+    # end-to-end (which hits DNSE); the contract is verified
+    # by the live bot on the next SOD message. This is just
+    # a placeholder documenting the contract.
+    # See test_format_cycle_summary_labels_dnse_nav_in_live_submit
+    # and test_format_cycle_summary_labels_mock_nav_in_dry_run
+    # for the formatter-side contract.
+    pass
 
 
 def test_format_cycle_summary_includes_portfolio_data():

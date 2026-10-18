@@ -3136,10 +3136,17 @@ class AutofinSignalAdapter(StrategyAdapter):
         # signal should size to ~170 shares (NAV=10M × 30 % ÷ 17,400),
         # which fits within the 10M withdrawable.
         mock_nav = os.environ.get("MOCK_NAV", "").strip()
+        # Track the source of `nav` so the formatter can label it
+        # correctly. In live-submit mode the value is always from
+        # DNSE (we never apply MOCK_NAV when live_submit=True). In
+        # dry-run mode it can be either MOCK_NAV (override) or
+        # DNSE (default when MOCK_NAV is not set).
+        nav_source = "dnse"
         if mock_nav and not live_submit:
             try:
                 nav = float(mock_nav)
                 positions = dict(positions)
+                nav_source = "mock"
                 print(
                     f"[autofin_signal] MOCK_NAV override active: nav={nav:,.0f} VND "
                     f"(dry-run mode; ignored in live-submit)"
@@ -3150,6 +3157,11 @@ class AutofinSignalAdapter(StrategyAdapter):
             print(
                 f"[autofin_signal] ⚠️ MOCK_NAV={mock_nav} IGNORED — "
                 f"live-submit mode uses real NAV from DNSE: {nav:,.0f} VND"
+            )
+        elif live_submit:
+            print(
+                f"[autofin_signal] live-submit mode: nav={nav:,.0f} VND, "
+                f"positions={list(positions.keys())} (both from DNSE)"
             )
 
         # Cache the authoritative position map on the adapter so the
@@ -3545,6 +3557,7 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "finalEquity": int(nav),
             },
             "strategy": self.name,
+            "nav_source": nav_source,
             "signals": {
                 "fetched": len(signals),
                 "autofin_holding": len(holding),
@@ -3581,12 +3594,35 @@ class AutofinSignalAdapter(StrategyAdapter):
         deals = result.get("deals_actioned", []) or []
         nav = float(sig.get("nav") or result.get("metrics", {}).get("finalEquity") or 0)
         account = sig.get("account") or "?"
+        # nav_source is set in generate_orders() — tracks whether
+        # `nav` is from MOCK_NAV env (dry-run override) or from
+        # DNSE (live-submit or default dry-run). The previous
+        # "MOCK NAV (autofin target)" label was misleading in
+        # live-submit mode where the value is the live DNSE NAV,
+        # not a mock.
+        nav_source = result.get("nav_source") or "unknown"
 
         lines: list[str] = []
         lines.append("🤖 Vietnam Algo bot — [autofin_signal]")
         lines.append(f"📅 Cycle: {result.get('tradeDate', '?')}")
         lines.append(f"💼 Account: {account}")
-        lines.append(f"💰 MOCK NAV (autofin target): {nav:,.0f} VND")
+        if nav_source == "dnse":
+            # Live-submit (or dry-run without MOCK_NAV override) —
+            # the value is the real DNSE portfolio value.
+            lines.append(f"💰 Live NAV (DNSE): {nav:,.0f} VND")
+        elif nav_source == "mock":
+            # Dry-run with MOCK_NAV env var override — explicit
+            # simulated NAV, not from DNSE.
+            lines.append(f"💰 Mock NAV (dry-run override): {nav:,.0f} VND")
+        else:
+            # Fallback for legacy result dicts that pre-date the
+            # nav_source field. Default to "Live NAV (DNSE)" since
+            # every current code path in generate_orders() sets
+            # nav_source="dnse" (MOCK_NAV is the only override
+            # path, and it sets nav_source="mock"). The "DNSE"
+            # default is the safe one — it doesn't lie about a
+            # MOCK value being real.
+            lines.append(f"💰 Live NAV (DNSE): {nav:,.0f} VND")
         lines.append("")
         # current portfolio: cash, NAV, positions, unrealized P&L
         lines.extend(portfolio_section_lines(portfolio))
