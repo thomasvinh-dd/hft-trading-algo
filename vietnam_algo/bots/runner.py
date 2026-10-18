@@ -2452,8 +2452,16 @@ def run_auto_bot(
             # on sentinel existence — common_sync refuses to stamp on
             # bad sync days, so a stale sentinel means genuine data
             # trouble, and waiting until the next 13:15 cron is OK.
+            #
+            # 2026-10-18: in LIVE-SUBMIT mode the bot fetches prices
+            # and portfolio data directly from DNSE, so the local
+            # price files are not used for the SOD briefing either.
+            # Bypass the sentinel check when live_submit=True for
+            # the same reason as the EOD path (autofin_signal.py
+            # uses build_portfolio_snapshot() and get_latest_quote()
+            # to read DNSE live, not the disk-cached prices).
             data_ready = True
-            if not engine_config.syncData:
+            if not engine_config.syncData and not live_submit:
                 try:
                     _ready = engine_config.dataDir / engine_config.liveDirName / "data_ready_for_eod"
                     if not _ready.exists():
@@ -2856,10 +2864,22 @@ def run_auto_bot(
                     print(f"[{now.isoformat()}] mid-day poll failed: {exc}")
 
         if should_run_eod(now, state.eodDate, schedule, holidays):
-            # When this bot doesn't own data sync, wait for the data-
-            # sync owner (autofin) to finish refreshing prices + CA
-            # before we proceed. We poll for a sentinel file
-            # ``data_ready_for_eod`` written by the owner.
+            # When this bot doesn't own data sync AND is in dry-run
+            # mode, wait for the data-sync owner to finish refreshing
+            # prices + CA before we proceed. We poll for a sentinel
+            # file ``data_ready_for_eod`` written by the owner.
+            #
+            # 2026-10-18: in LIVE-SUBMIT mode the bot fetches prices
+            # and portfolio data directly from DNSE (see
+            # autofin_signal.py:3108 and portfolio.py:120), so the
+            # local price files are not used for sizing or P&L. The
+            # sentinel check is irrelevant — and worse, it can block
+            # the EOD indefinitely when the sentinel is stale (the
+            # 2026-10-13 to 2026-10-18 incidents where the cron
+            # timezone bug kept the sentinel >60 min old, so the
+            # autofin bot's EOD never fired for 3 days even though it
+            # could have read fresh prices from DNSE). Bypass the
+            # check entirely when live_submit=True.
             #
             # 2026-10-08 fix: the previous code only SKIPPED on
             # ABSENT sentinel; for a STALE sentinel it just printed a
@@ -2873,7 +2893,7 @@ def run_auto_bot(
             # cycle because state.eodDate is unchanged until EOD
             # actually completes.
             data_ready = True
-            if not engine_config.syncData:
+            if not engine_config.syncData and not live_submit:
                 try:
                     from datetime import datetime as _dt, timezone as _tz
                     def _utc_now() -> _dt:

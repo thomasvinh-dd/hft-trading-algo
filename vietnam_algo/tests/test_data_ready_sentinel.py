@@ -164,6 +164,40 @@ class StaleSentinelGateTests(unittest.TestCase):
             "stale prices in the momentum EOD report).",
         )
 
+    def test_runner_eod_gate_bypasses_sentinel_in_live_submit(self) -> None:
+        """2026-10-18: in LIVE-SUBMIT mode the bot fetches prices and
+        portfolio data directly from DNSE, so the local
+        ``data_ready_for_eod`` sentinel is irrelevant. The
+        ``if not engine_config.syncData:`` gate must ALSO check
+        ``and not live_submit`` so live-submit runs the EOD
+        regardless of sentinel age.
+
+        Reproduces the 2026-10-13 to 2026-10-18 incident: the
+        autofin bot was stuck in live-submit mode with a stale
+        sentinel (cron timezone bug) and the EOD never fired for
+        3 days. With the fix, the EOD runs and posts the
+        Telegram summary even when the sentinel is hours old.
+        """
+        from vietnam_algo.bots import runner
+        src = Path(runner.__file__).read_text()
+        # The EOD gate should check BOTH !syncData AND !live_submit.
+        eod_marker = "if not engine_config.syncData and not live_submit:"
+        eod_idx = src.find(eod_marker)
+        self.assertGreater(
+            eod_idx, 0,
+            "EOD gate must include 'and not live_submit' — live-submit "
+            "bots fetch data from DNSE and shouldn't block on the "
+            "local sentinel (2026-10-18 fix)",
+        )
+        # The SOD gate should have the same check.
+        sod_marker = "if not engine_config.syncData and not live_submit:"
+        sod_idx = src.find(sod_marker, eod_idx + 1)
+        self.assertGreater(
+            sod_idx, 0,
+            "SOD gate must also include 'and not live_submit' — same "
+            "rationale as the EOD gate (2026-10-18 fix)",
+        )
+
     def test_runner_stale_branch_sets_data_ready_false(self) -> None:
         """The runner's stale branch must set ``data_ready = False``
         so the ``if not data_ready: continue`` actually fires. The
