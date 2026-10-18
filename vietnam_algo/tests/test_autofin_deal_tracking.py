@@ -242,22 +242,83 @@ def test_partial_close_uses_tpF_in_thousands_when_small():
 
 
 def test_partial_close_capital_protect_uses_pct():
-    """'bảo toàn vốn 28.57%' → sell 28.57% of current."""
+    """2026-10-18: 'bảo toàn vốn X%' means autofin claims the
+    position is up X% P&L — SELL ALL REMAINING QTY at the
+    suggested price to lock in the profit. (The old code
+    incorrectly sold X% of the qty, which was the wrong read.)
+    """
     our_deals = {
         "333:HSL": {"symbol": "HSL", "_our_qty": 700, "_last_numberOfProfit": 3},
     }
     autofin_holding = [{
         "_id": 333, "symbol": "HSL", "numberOfProfit": 4,
-        "lastRecomment": "🛡️ Chốt lãi 28.57 % bảo toàn vốn",
+        "lastRecomment": "🛡️ Chốt lãi 28.57 % bảo toàn vốn tại 16,000",
         "tP_F": 0,
     }]
     rows = _plan_partial_close_orders(our_deals, autofin_holding)
     assert len(rows) == 1
     r = rows[0]
-    # 700 * 0.2857 = 200.0 (within rounding)
-    assert r["quantity"] in (200, 100)  # rounded to lots of 100
-    assert r["price"] == 0  # no price, no tP_F → market
+    # Full close — sell all 700 (rounded down to 700 since 700 is
+    # already an exact multiple of the 100-share board lot).
+    assert r["quantity"] == 700
+    # Price comes from the "tại P" suffix in the recomment.
+    assert r["price"] == 16000
+    # The kind is ``full_close`` (not ``partial_close``) because
+    # the action is to exit the entire position.
+    assert r["kind"] == "full_close"
     assert "capital_protect" in r["reason"]
+
+
+def test_partial_close_capital_protect_full_close_with_tai_price():
+    """User's 2026-10-18 example: "🛡️ Chốt lãi 22.22 % bảo
+    toàn vốn tại 13,700". autofin says the position is up
+    22.22% and suggests exiting at 13,700. The bot must SELL
+    ALL remaining qty at exactly 13,700 — not sell 22.22% of
+    the qty."""
+    our_deals = {
+        "555:QNS": {"symbol": "QNS", "_our_qty": 1000, "_last_numberOfProfit": 0},
+    }
+    autofin_holding = [{
+        "_id": 555, "symbol": "QNS", "numberOfProfit": 1,
+        "lastRecomment": "🛡️ Chốt lãi 22.22 % bảo toàn vốn tại 13,700",
+        "tP_F": 0,
+    }]
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert len(rows) == 1
+    r = rows[0]
+    # Full close: all 1000 shares (board-lot aligned).
+    assert r["quantity"] == 1000
+    # Exact price from the recomment.
+    assert r["price"] == 13700
+    # Reasoning: capital_protect → exit to protect the +22.22%.
+    assert "capital_protect" in r["reason"]
+    # fraction tracking must reflect the full close (1.0) so
+    # the next cycle doesn't re-fire on the same recomment.
+    assert our_deals["555:QNS"]["_last_partial_fraction"] == 1.0
+
+
+def test_partial_close_capital_protect_no_tai_price_uses_market():
+    """When the recomment has no "tại P" suffix, capital_protect
+    still SELLs ALL but at the live best-bid (no tP_F fallback
+    since capital_protect is a NEW action type that autofin
+    only publishes with an explicit price)."""
+    our_deals = {
+        "777:AAA": {"symbol": "AAA", "_our_qty": 500, "_last_numberOfProfit": 0},
+    }
+    autofin_holding = [{
+        "_id": 777, "symbol": "AAA", "numberOfProfit": 1,
+        # No "tại P" suffix — autofin published only the headline.
+        "lastRecomment": "🛡️ Chốt lãi 5.0 % bảo toàn vốn",
+        "tP_F": 0,
+    }]
+    rows = _plan_partial_close_orders(our_deals, autofin_holding)
+    assert len(rows) == 1
+    r = rows[0]
+    # Full close.
+    assert r["quantity"] == 500
+    # No "tại P" and no tP_F → price=0 (live submit overrides to best_bid).
+    assert r["price"] == 0
+    assert r["kind"] == "full_close"
 
 
 def test_partial_close_skips_when_numberOfProfit_unchanged():

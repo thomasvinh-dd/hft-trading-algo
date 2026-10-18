@@ -1456,11 +1456,51 @@ def _plan_partial_close_orders(
                 )
             delta = int(our_qty * fraction)
         elif action.action == "capital_protect":
-            # action.percent is in % (e.g. 28.57) → convert to fraction
-            delta = int(our_qty * action.percent / 100)
-            # Mirror the tp/reduce branch's fraction tracking so the
-            # fraction-change detection covers capital_protect too.
-            fraction = float(action.percent) / 100.0
+            # IMPORTANT (2026-10-18 user feedback): the "X %" in
+            # ``Chốt lãi X % bảo toàn vốn tại P`` is the P&L
+            # percentage, NOT the qty fraction. autofin is saying:
+            # "the position is currently up X% — sell at price P
+            # to lock in that X% profit and protect capital."
+            # The previous implementation sold X% of the qty,
+            # which is the wrong read.
+            #
+            # Correct semantics: SELL ALL REMAINING QTY at the
+            # suggested ``tại P`` price. The action is a full
+            # close. (Compare with take_profit_lap / reduce_lap
+            # where the X% IS a qty fraction — different action
+            # types use different semantics.)
+            #
+            # Sanity check: implied_pnl_pct from buy_price should
+            # roughly match action.percent. If they diverge by
+            # more than 5% the price is stale (autofin's quote
+            # moved since the recomment was published); log a
+            # warning but still issue the order at the suggested
+            # price (operator can override via
+            # AUTOFIN_CAPITAL_PROTECT_REQUIRE_MATCH=1 if they
+            # want a strict guard).
+            buy_price = float(
+                sig.get("buyPrice")
+                or sig.get("entryPrice")
+                or sig.get("avgPrice")
+                or sig.get("costPrice")
+                or 0
+            )
+            if buy_price > 0 and action.price > 0:
+                implied_pnl_pct = (action.price - buy_price) / buy_price * 100.0
+                if abs(implied_pnl_pct - action.percent) > 5.0:
+                    print(
+                        f"[autofin_signal] {symbol}: capital_protect "
+                        f"sanity check diverges — autofin claims "
+                        f"{action.percent:.2f}% P&L but suggested "
+                        f"price {action.price:,.0f} implies "
+                        f"{implied_pnl_pct:.2f}% from buy price "
+                        f"{buy_price:,.0f}. Recomment text: {rec[:80]!r}"
+                    )
+            # Full close at the suggested price. fraction=1.0 keeps
+            # the _last_partial_fraction dedup consistent (a re-fire
+            # would only happen if a NEW recomment is published).
+            delta = our_qty
+            fraction = 1.0
         else:
             continue
 
@@ -1483,12 +1523,19 @@ def _plan_partial_close_orders(
                 tp_f *= 1000
             price = int(round(tp_f)) if tp_f > 0 else 0
 
+        # ``capital_protect`` is a full close (sell all remaining),
+        # so its ``kind`` differs from a regular partial_close. The
+        # downstream apply / order-ledger code path treats both the
+        # same way (SELL at the suggested price), but the Telegram
+        # summary and operator logs read better when the action
+        # type matches the semantics.
+        order_kind = "full_close" if action.action == "capital_protect" else "partial_close"
         rows.append({
             "symbol": sig.get("symbol", "?"),
             "side": "NS",
             "price": price,
             "quantity": delta,
-            "kind": "partial_close",
+            "kind": order_kind,
             "reason": (
                 f"autofin_partial:deal#{did}:{action.action}:"
                 f"lap{action.lap}:pct{int(round(action.percent * 100))}:{rec[:60]}"
