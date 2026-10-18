@@ -117,10 +117,15 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             cash_div = dividend_per_share[bar.date]
             income = remaining * cash_div
             cumulative_pnl += income
+            # DIVIDEND doesn't change share count — shares=0 in the
+            # signed convention (entry=+, sell=-, dividend=0).
+            # The "remaining" field shows the position size.
             cumulative_proceeds += income
             dividend_income += income
+            # DIVIDEND is informational (no share change). shares=0 in
+            # the signed convention.
             fills.append(FillEvent(
-                date=bar.date, kind="DIVIDEND", level=cash_div, shares=remaining,
+                date=bar.date, kind="DIVIDEND", level=cash_div, shares=0,
                 proceeds=income, fraction_of_pos=0.0,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=income,
                 remaining=remaining,  # dividend doesn't change share count
@@ -139,7 +144,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             cumulative_proceeds += proceeds - cost
             cumulative_pnl += pnl - cost
             fills.append(FillEvent(
-                date=bar.date, kind="TIME_STOP", level=effective_close, shares=remaining,
+                date=bar.date, kind="TIME_STOP", level=effective_close, shares=-remaining,
                 proceeds=proceeds - cost, fraction_of_pos=1.0,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
                 remaining=0,  # closing everything
@@ -163,7 +168,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 cumulative_proceeds += proceeds - cost
                 cumulative_pnl += pnl - cost
                 fills.append(FillEvent(
-                    date=bar.date, kind="TRAIL", level=effective_close, shares=remaining,
+                    date=bar.date, kind="TRAIL", level=effective_close, shares=-remaining,
                     proceeds=proceeds - cost, fraction_of_pos=1.0,
                     cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
                     remaining=0,  # closing everything
@@ -193,7 +198,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             cumulative_pnl += pnl - cost
             remaining -= tier_shares
             fills.append(FillEvent(
-                date=bar.date, kind="TIER", level=tier_price, shares=tier_shares,
+                date=bar.date, kind="TIER", level=tier_price, shares=-tier_shares,
                 proceeds=proceeds - cost, fraction_of_pos=pct,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
                 remaining=remaining,
@@ -221,7 +226,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             cumulative_pnl += pnl - cost
             remaining -= cut
             fills.append(FillEvent(
-                date=bar.date, kind="SL_SCALE", level=sl_T, shares=cut,
+                date=bar.date, kind="SL_SCALE", level=sl_T, shares=-cut,
                 proceeds=proceeds - cost, fraction_of_pos=exits_cfg.scale_out_pct_at_sl_T,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
                 remaining=remaining,
@@ -241,7 +246,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             cumulative_pnl += pnl - cost
             remaining -= cut
             fills.append(FillEvent(
-                date=bar.date, kind="SL_SCALE", level=sl_mid, shares=cut,
+                date=bar.date, kind="SL_SCALE", level=sl_mid, shares=-cut,
                 proceeds=proceeds - cost, fraction_of_pos=exits_cfg.scale_out_pct_at_midpoint,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
                 remaining=remaining,
@@ -256,7 +261,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             cumulative_proceeds += proceeds - cost
             cumulative_pnl += pnl - cost
             fills.append(FillEvent(
-                date=bar.date, kind="SL_HARD", level=sl_F, shares=remaining,
+                date=bar.date, kind="SL_HARD", level=sl_F, shares=-remaining,
                 proceeds=proceeds - cost, fraction_of_pos=1.0,
                 cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
                 remaining=0,  # closing everything
@@ -275,7 +280,7 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
         cumulative_proceeds += proceeds - cost
         cumulative_pnl += pnl - cost
         fills.append(FillEvent(
-            date=last_bar.date, kind="EXHAUST", level=effective_close, shares=remaining,
+            date=last_bar.date, kind="EXHAUST", level=effective_close, shares=-remaining,
             proceeds=proceeds - cost, fraction_of_pos=1.0,
             cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
             remaining=0,  # closing everything

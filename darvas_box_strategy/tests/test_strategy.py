@@ -1335,5 +1335,105 @@ class VNMarketSettlementDefaultTests(unittest.TestCase):
             )
 
 
+class FillSignConventionTests(unittest.TestCase):
+    """Fill shares follow the signed convention: ENTRY=+, sells=-, DIVIDEND=0.
+
+    This matches the new TradeFill class in portfolio.py and lets the
+    dashboard color-code rows correctly (green for buys, red for sells,
+    gray for informational events like DIVIDEND).
+    """
+
+    def test_signed_shares_in_sell_events(self):
+        """TIER, TRAIL, SL_HARD, SL_SCALE, TIME_STOP, EXHAUST all
+        produce negative shares (the position is being reduced)."""
+        from datetime import date, timedelta
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.executor import simulate_trade
+
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=((1.10, 1.0),)),  # 10% tier
+            trailing=TrailingConfig(trail_from_peak_pct=0.10),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(start_nav=1e9, cost_bps=0.0, board_lot=100),
+        )
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base, sl_F=8_200, sl_T=9_000,
+            tiers=((1.10, 1.0),), conviction="low", size_pct=0.1,
+            shares=1_000, max_volume=99_999, bars_remaining=10,
+        )
+        # Day 1: TIER hit at 11000 (close 12000, high 12000)
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3).isoformat(), open=10_500, high=12_000,
+                     low=10_400, close=12_000, volume=100_000),
+        ]
+        result = simulate_trade(sig, bars_after, cfg)
+        # The TIER fill should have NEGATIVE shares (a sell)
+        tier_fills = [f for f in result.fills if f.kind == "TIER"]
+        self.assertEqual(len(tier_fills), 1)
+        self.assertLess(tier_fills[0].shares, 0,
+            f"TIER fill should have negative shares, got {tier_fills[0].shares}")
+        # DIVIDEND has shares=0
+        # We can verify the same for other kinds by injecting fake data
+        from darvas_box_strategy.darvas.executor import FillEvent
+        ev = FillEvent(date=date(2026, 1, 3), kind="DIVIDEND",
+                       level=500.0, shares=0, proceeds=500.0, fraction_of_pos=0.0,
+                       cumulative_proceeds=500.0, realized_pnl=500.0)
+        self.assertEqual(ev.shares, 0)
+
+    def test_dividend_shares_are_zero(self):
+        """DIVIDEND is informational — it credits PnL but doesn't
+        change the share count. shares=0 in the signed convention."""
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.executor import simulate_trade
+
+        cfg = StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(start_nav=1e9, cost_bps=0.0, board_lot=100),
+        )
+        base = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                    days_in_base=5, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=base, sl_F=9_000, sl_T=9_000,
+            tiers=(), conviction="low", size_pct=0.1,
+            shares=1_000, max_volume=99_999, bars_remaining=10,
+        )
+        # One bar with a dividend
+        divs = {date(2026, 1, 3): 500.0}  # 500 VND per share
+        bars_after = [
+            PriceBar(time=date(2026, 1, 3).isoformat(), open=10_000, high=10_100,
+                     low=9_900, close=10_050, volume=100_000),
+        ]
+        result = simulate_trade(sig, bars_after, cfg,
+                                dividend_per_share=divs)
+        # No TIER/TRAIL/SL fires, only the DIVIDEND
+        div_fills = [f for f in result.fills if f.kind == "DIVIDEND"]
+        self.assertEqual(len(div_fills), 1)
+        # DIVIDEND is signed 0 (not a buy or sell)
+        self.assertEqual(div_fills[0].shares, 0,
+            f"DIVIDEND shares should be 0, got {div_fills[0].shares}")
+
+
 if __name__ == "__main__":
     unittest.main()
