@@ -131,19 +131,109 @@ def test_parse_instruments_keeps_upx_for_upcom_stocks() -> None:
     See QNS incident 2026-09-19: bot reported 50,100 VND but the
     real Sep 18 close was 49,800 VND because the QNS price file
     had never been refreshed past Sep 17.
+
+    2026-10-21 incident (MST): the prior filter excluded ``STX``
+    thinking it was ETFs, but the live DNSE response labelled
+    303 ordinary HNX equities (e.g. MST, NTP) as ``STX`` post the
+    HOSE/HNX/HCM exchange merger. The filter dropped them ALL,
+    the ``build_liquid_universe`` then had no MST metadata, the
+    backtest consequently held 9,500 MST shares forever (no SELL
+    exit generated), and the bot reported ``count: 0`` orders
+    every EOD. We now keep STX too. The universe's downstream
+    ``is_excluded_symbol(prefix)`` (``E1`` for ETFs, ``FU`` for
+    futures, ``FUE`` for fund units) still strips instruments
+    like ``E1VFVN30`` before they reach the liquid universe.
     """
     raw = {
         "data": [
             {"symbol": "QNS", "marketId": "UPX", "shortName": "Đường Quảng Ngãi"},
             {"symbol": "VGT", "marketId": "UPX"},
             {"symbol": "VCB", "marketId": "STO"},
+            {"symbol": "MST", "marketId": "STX"},  # HNX equity (Q3 2026)
+            {"symbol": "NTP", "marketId": "STX"},  # HNX-30 constituent
             {"symbol": "VN30F1M", "marketId": "DVX"},  # derivatives: skip
-            {"symbol": "E1VFVN30", "marketId": "STX"},  # ETF: skip
+            {"symbol": "E1VFVN30", "marketId": "STX"},  # ETF: passed-through, filtered later
             {"symbol": "BAB118001", "marketId": "HCX"},  # bond: skip
         ]
     }
     out = parse_instruments(raw)
-    assert [it["symbol"] for it in out] == ["QNS", "VGT", "VCB"]
+    assert [it["symbol"] for it in out] == [
+        "QNS", "VGT", "VCB", "MST", "NTP", "E1VFVN30",
+    ]
+
+
+def test_parse_instruments_keeps_stx_for_hnx_equities() -> None:
+    """2026-10-21 incident (MST): DNSE labels ordinary HNX equities
+    (MST, NTP) with ``marketId="STX"`` post the HOSE/HNX/HCM exchange
+    merger. The prior filter excluded ``STX`` thinking it was ETFs,
+    but the live DNSE response showed 303 HNX symbols as ``STX`` —
+    the filter dropped them ALL, the universe had no MST metadata,
+    and the backtest consequently held MST forever without an exit.
+    This test pins that MST/NTP survive ``parse_instruments`` so the
+    downstream ``build_liquid_universe`` can include them.
+    """
+    raw = {
+        "data": [
+            {"symbol": "MST", "marketId": "STX", "name": "CTCP Đầu tư MST"},
+            {"symbol": "NTP", "marketId": "STX", "name": "CTCP Nhựa Thiếu niên Tiền Phong"},
+            # ETFs and bond are filtered later by is_excluded_symbol
+            # (prefixes: 'E1', 'FU', 'FUE') in build_liquid_universe,
+            # so they survive parse_instruments but get dropped
+            # before reaching the liquid universe.
+            {"symbol": "E1VFVN30", "marketId": "STX"},
+            {"symbol": "FUEMAV30", "marketId": "STX"},
+            {"symbol": "VCB", "marketId": "STO"},
+            {"symbol": "VN30F1M", "marketId": "DVX"},
+        ]
+    }
+    out = parse_instruments(raw)
+    symbols = [it["symbol"] for it in out]
+    # MST and NTP MUST be in the output (regression guard).
+    assert "MST" in symbols, (
+        "MST (HNX stock labelled as STX) was dropped from "
+        "parse_instruments — the backtest cannot plan MST exits "
+        "without this symbol in the universe."
+    )
+    assert "NTP" in symbols, (
+        "NTP (HNX-30 constituent labelled as STX) was dropped — "
+        "same bug as MST."
+    )
+    # Derivatives STO/MST are kept.
+    assert "VCB" in symbols
+    # DVX derivatives dropped.
+    assert "VN30F1M" not in symbols
+
+
+def test_parse_symbols_maps_stx_to_hnx_exchange_code() -> None:
+    """``parse_symbols`` translates DNSE's ``marketId`` into a
+    StockSymbol ``exchangeCode`` value that's accepted by the
+    universe filter (``DEFAULT_EXCHANGES = {"HOSE", "HNX", "UPCOM",
+    "STO", "UPX"}``). STX (HNX equities post-merger) must map to
+    "HNX" so the universe build accepts the parsed symbol. Without
+    this mapping, MST would have ``exchangeCode="STX"`` and be
+    filtered out by ``is_excluded_symbol`` (which only excludes by
+    ticker prefix, not by market label — but the universe's
+    ``allowed_exchanges`` check at libs/universe.py:118 would drop
+    it because "STX" ∉ DEFAULT_EXCHANGES).
+    """
+    from vietnam_algo.libs.data import parse_symbols
+    raw = {
+        "data": [
+            {"symbol": "MST", "marketId": "STX", "name": "MST"},
+            {"symbol": "VCB", "marketId": "STO", "name": "VCB"},
+            {"symbol": "QNS", "marketId": "UPX", "name": "QNS"},
+        ]
+    }
+    syms, _ = parse_symbols(raw)
+    by_ticker = {s.ticker: s.exchangeCode for s in syms}
+    assert by_ticker["MST"] == "HNX", (
+        f"MST (marketId=STX) must be tagged exchangeCode=HNX, got "
+        f"{by_ticker['MST']!r}. With the wrong code the universe "
+        f"filter at libs/universe.py:118 drops MST (STX ∉ "
+        f"DEFAULT_EXCHANGES)."
+    )
+    assert by_ticker["VCB"] == "STO"
+    assert by_ticker["QNS"] == "UPX"
 
 
 def test_data_parse_price_bars_converts_kvnd_to_vnd() -> None:

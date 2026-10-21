@@ -257,18 +257,21 @@ def parse_instruments(payload: Any) -> list[dict[str, Any]]:
         # DNSE markets:
         #   STO = HOSE + HNX stocks   (securityGroupId="ST")
         #   UPX = UPCoM stocks        (securityGroupId="ST")
-        #   STX = ETFs                (securityGroupId="ST" but listed
-        #         alongside warrants; we currently exclude to avoid
-        #         bloating the symbols list with non-equity cash
-        #         instruments)
+        #   STX = HNX stocks           (Da Nang/Hai Phong/HCM Stock
+        #         Exchange post-merger; DNSE labels HOSE+lots-of-listed
+        #         HNX names as STO, but a meaningful chunk of HNX-only
+        #         names (e.g. MST, NTP) come back as STX).
         #   DVX = derivatives / futures
         #   HCX = bonds / covered warrants
-        # We keep STO + UPX so the universe covers all 3 real-world
-        # Vietnamese exchanges. See 2026-09-19 incident where QNS
-        # (UPCoM, marketId="UPX") was dropped from the symbols list
-        # and the price file never refreshed, leaving the bot with
-        # yesterday's close.
-        if market and market not in ("STO", "UPX"):
+        # 2026-10-21 incident (MST): the prior filter excluded STX
+        # thinking it was ETFs, but the live DNSE response labelled
+        # 303 ordinary HNX equities as STX. The filter dropped them
+        # all, the universe's ``build_liquid_universe`` then had no
+        # MST metadata, the backtest consequently held 9,500 MST
+        # shares forever (no SELL exit ever generated), and the dry-
+        # run bot reported ``count: 0`` orders every EOD. We now
+        # keep STX so HNX equities are part of the universe.
+        if market and market not in ("STO", "UPX", "STX"):
             continue
         out.append(
             {

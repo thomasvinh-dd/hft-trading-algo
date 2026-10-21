@@ -84,10 +84,16 @@ def parse_symbols(payload: Any) -> tuple[list[StockSymbol], dict[str, Any]]:
     onto the legacy StockSymbol shape and leave the rest as None:
       - ticker      ← symbol
       - companyName ← name (fallback: shortName)
-      - exchangeCode← marketId ("STO" for HOSE/HNX stocks, "UPX" for
-        UPCoM). DNSE does not distinguish HOSE vs HNX in this field;
-        a per-symbol ``/price/{sym}/secdef`` call would, but we skip
-        it to keep the daily sync at one API call per symbol.
+      - exchangeCode← mapped_marketId. DNSE returns ``marketId`` in
+        {"STO", "UPX", "STX", "DVX", "HCX"}. STO covers HOSE
+        equities; UPX covers UPCoM; STX covers HNX equities (DNSE
+        post-merger labelling — verified 2026-10-21 with MST and NTP
+        which DNSE returns as STX but are listed on the HNX exchange
+        and included in the HNX-30 index). We map STO/STX → HOSE/HNX
+        respectively so the universe filter (``DEFAULT_EXCHANGES =
+        {"HOSE", "HNX", "UPCOM", "STO", "UPX"}``) accepts the
+        resulting ``exchangeCode``. ``DVX`` and ``HCX`` (derivatives,
+        bonds, warrants) are filtered upstream by ``parse_instruments``.
       - sectorName  ← None (DNSE's public API does not expose
         ICB/sector classification).
       - The numeric fields (closePrice / volume / marketCap / …)
@@ -110,13 +116,20 @@ def parse_symbols(payload: Any) -> tuple[list[StockSymbol], dict[str, Any]]:
                 mid = item.get("marketId") or item.get("market")
                 if sym and mid:
                     market_by_symbol[str(sym).upper()] = str(mid)
+    # DNSE → StockSymbol exchangeCode mapping. "STX" is DNSE's label
+    # for HNX-equities post the HOSE/HNX/HCM merger; map to "HNX".
+    # "STO" stays as-is so existing universe filters that key off
+    # "STO" keep working (universe DEFAULT_EXCHANGES includes both
+    # "STO" and "HNX"). "UPX" stays as-is for UPCoM.
+    MARKET_TO_EXCHANGE = {"STO": "STO", "STX": "HNX", "UPX": "UPX"}
     symbols: list[StockSymbol] = []
     for row in rows:
         ticker = str(row.get("symbol") or "").strip().upper()
         if not ticker:
             continue
         name = row.get("name") or row.get("shortName")
-        exchange = market_by_symbol.get(ticker, "STO")
+        raw_market = market_by_symbol.get(ticker, "STO")
+        exchange = MARKET_TO_EXCHANGE.get(raw_market, raw_market)
         symbols.append(
             StockSymbol(
                 ticker=ticker,
