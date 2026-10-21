@@ -3294,6 +3294,65 @@ def run_auto_bot(
                 else:
                     eod_msg = eod_summary_message(result, portfolio=portfolio_snap)
                 notify(eod_msg)
+                # 2026-10-21 incident (MST): the backtest routinely
+                # produced ``count: 0`` orders when the price-feed /
+                # universe was stale (e.g., MST's price file was 67+
+                # days old, so the backtest never reached 2026-10-21
+                # to plan a SELL). Pre-fix, the operator saw the
+                # routine "No orders today" line and assumed the bot
+                # was healthy — meanwhile the dry-run state held a
+                # 9,500-share MST position it couldn't reprice.
+                # We now emit a dedicated header line in the EOD
+                # summary whenever the strategy emitted 0 orders
+                # BUT still holds positions in dry-run state whose
+                # latest price file is stale. This pins the silent
+                # staleness to the operator's daily report instead of
+                # relying on a separate ``dataStaleAlertSentDate``
+                # path that only fires once per day.
+                if (
+                    isinstance(result, dict)
+                    and result.get("count", 0) == 0
+                    and not live_submit
+                    and portfolio_snap is not None
+                ):
+                    held = portfolio_snap.get("positions") or []
+                    held_symbols = sorted(
+                        {p.get("symbol", "") for p in held if p.get("symbol")}
+                    )
+                    if held_symbols:
+                        try:
+                            stale_held_now = freshness.get(
+                                "stale_held_positions"
+                            ) or []
+                        except (NameError, UnboundLocalError):
+                            stale_held_now = []
+                        stale_names = sorted(
+                            {h.get("symbol") for h in stale_held_now}
+                        )
+                        if stale_names:
+                            # Only the intersection with currently-held
+                            # positions is actionable.
+                            held_stale_now = sorted(
+                                set(held_symbols) & set(stale_names)
+                            )
+                            if held_stale_now:
+                                _alert_lines: list[str] = [
+                                    "⚠️ Vietnam Algo: EOD emitted 0 orders "
+                                    "but you STILL HOLD stale-priced positions:",
+                                    f"  date: {today}",
+                                    "  stale + held (action required):",
+                                ]
+                                for sym in held_stale_now[:10]:
+                                    _alert_lines.append(f"    • {sym}")
+                                if len(held_stale_now) > 10:
+                                    _alert_lines.append(
+                                        f"    + {len(held_stale_now) - 10} more"
+                                    )
+                                _alert_lines.append(
+                                    "  fix: refresh the price file via "
+                                    "vietnam_algo.libs.data.sync_prices_incremental"
+                                )
+                                notify("\n".join(_alert_lines))
                 _emit_cycle(
                     _db, strategy_name or engine_config.strategy or "?",
                     "eod",
@@ -3393,6 +3452,46 @@ def run_auto_bot(
                             parts.append(
                                 f"oldest sample: {freshness['oldest_sample_symbol']}"
                             )
+                    # 2026-10-21 incident (MST): when the freshness
+                    # sample is fresh but a HELD POSITION is stale,
+                    # operators need to know which symbol + its
+                    # price-file mtime / last-bar date so they can
+                    # decide whether to (a) refresh the price file
+                    # manually, or (b) close the position because
+                    # repricing requires it. Without this list, the
+                    # ``fresh: False`` alert just says "median is
+                    # stale" — the operator has to grep the dry-run
+                    # state to find which position is at risk.
+                    stale_held = freshness.get("stale_held_positions") or []
+                    if stale_held:
+                        parts.append("")
+                        parts.append(
+                            f"stale HELD POSITIONS (action required "
+                            f"if still open today, count={len(stale_held)}):"
+                        )
+                        for entry in stale_held[:10]:
+                            sym = entry.get("symbol", "?")
+                            reason = entry.get("reason")
+                            last_bar = entry.get("last_bar_date")
+                            td_age = entry.get("age_trading_days")
+                            cd_age = entry.get("age_calendar_days")
+                            extras: list[str] = []
+                            if reason == "no_price_file":
+                                extras.append("NO PRICE FILE")
+                            else:
+                                if last_bar:
+                                    extras.append(f"last bar: {last_bar}")
+                                if td_age is not None:
+                                    extras.append(
+                                        f"{td_age} trading-days old"
+                                    )
+                                if cd_age is not None:
+                                    extras.append(
+                                        f"{cd_age} calendar-days old"
+                                    )
+                            parts.append(f"  • {sym} — " + ", ".join(extras))
+                        if len(stale_held) > 10:
+                            parts.append(f"  + {len(stale_held) - 10} more")
                     if "error" in freshness:
                         parts.append(f"probe error: {freshness['error']}")
                     notify("\n".join(parts))

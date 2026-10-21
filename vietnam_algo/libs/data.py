@@ -592,6 +592,11 @@ def get_market_data_freshness(
     data_dir: Path = DEFAULT_DATA_DIR,
     sample_symbols: tuple[str, ...] = ("HPG", "VHM", "FPT", "VIC", "HDB"),
     now: datetime | None = None,
+    *,
+    include_held_positions: bool = True,
+    held_position_strategies: tuple[str, ...] = (
+        "momentum", "autofin_signal",
+    ),
 ) -> dict[str, Any]:
     """Return market-data freshness signals for alert/health-check use.
 
@@ -613,6 +618,15 @@ def get_market_data_freshness(
         including weekends).
       - ``oldest_sample_symbol``: str | None — symbol with the oldest
         latest bar (None if no sample data).
+      - ``held_position_count``: int — number of held-position symbols
+        added to the sample (0 when ``include_held_positions=False``).
+      - ``held_positions``: list[str] — sorted list of held-position
+        symbols added to the sample.
+      - ``stale_held_positions``: list[dict] — held-position symbols
+        whose last bar is older than 2 trading days; each entry has
+        ``symbol``, ``last_bar_date``, ``age_trading_days``, and
+        ``age_calendar_days``. Empty when all held positions are
+        fresh. Always empty when ``include_held_positions=False``.
       - ``fresh``: bool — ``True`` iff sentinel_age_hours <= 25 AND
         median_latest_bar_age_days <= 2.0.
 
@@ -627,6 +641,16 @@ def get_market_data_freshness(
     the bot heartbeat block (see ``libs/notifier.py`` and
     ``jobs/common_sync.py``).
 
+    2026-10-21 incident (MST): the dry-run state held 9,500 MST
+    shares but the fixed 5-symbol sample never included MST, so
+    ``fresh: True`` was reported even though the position's
+    price file was 67+ calendar days stale. With
+    ``include_held_positions=True`` (default), the function now
+    unions the fixed sample with each strategy's dry-run state's
+    ``positions`` keys, surfaces ``stale_held_positions`` as a
+    dedicated list, and recomputes the median age over the union
+    so a stale held position bumps the alert correctly.
+
     ``now`` is injectable for tests; defaults to ``datetime.now(UTC)``.
     """
     from .market_calendar import load_market_holidays, trading_dates_between
@@ -638,12 +662,66 @@ def get_market_data_freshness(
         "sentinel_age_hours": None,
         "sentinel_mtime": None,
         "sample_size": 0,
-        "sample_total": len(sample_symbols),
+        "sample_total": 0,
+        "held_position_count": 0,
+        "held_positions": [],
+        "stale_held_positions": [],
         "median_latest_bar_age_days": None,
         "median_latest_bar_age_calendar_days": None,
         "oldest_sample_symbol": None,
         "fresh": False,
     }
+    # 2026-10-21 incident (MST): the dry-run state held 9,500 MST
+    # shares but the 5-symbol freshness sample never included MST.
+    # Result: ``fresh: True`` was returned even though MST's price
+    # file was 67+ calendar days stale, and operators got no
+    # Telegram alert. We now union the fixed sample with any symbols
+    # held in the dry-run state for ``held_position_strategies`` so
+    # a held-but-stale position trips the freshness check. Off by
+    # default in tests; on by default everywhere else (the
+    # explicit ``include_held_positions=False`` kwarg is mainly
+    # for tests that don't want to depend on dry-run state files).
+    held_symbols: list[str] = []
+    if include_held_positions:
+        try:
+            from .dry_run_state import _state_path as _dry_state_path
+        except ImportError:
+            _dry_state_path = None  # type: ignore[assignment]
+        if _dry_state_path is not None:
+            for strat in held_position_strategies:
+                sp = _dry_state_path(data_dir, strat)
+                if not sp.exists():
+                    continue
+                try:
+                    payload = json.loads(sp.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                positions = (
+                    payload.get("positions", {}) if isinstance(payload, dict) else {}
+                )
+                if not isinstance(positions, dict):
+                    continue
+                for sym, p in positions.items():
+                    qty = 0
+                    if isinstance(p, dict):
+                        try:
+                            qty = int(p.get("quantity", 0) or 0)
+                        except (TypeError, ValueError):
+                            qty = 0
+                    if qty > 0 and sym:
+                        held_symbols.append(str(sym).upper())
+    # Build the full sample by unioning the fixed sample with held
+    # positions, preserving order, deduped, upper-cased.
+    seen: set[str] = set()
+    full_sample: list[str] = []
+    for sym in list(sample_symbols) + held_symbols:
+        su = str(sym).upper()
+        if su and su not in seen:
+            seen.add(su)
+            full_sample.append(su)
+    result["sample_total"] = len(full_sample)
+    result["held_position_count"] = len(held_symbols)
+    result["held_positions"] = sorted(set(held_symbols))
     sentinel_path = data_dir / "live" / "data_ready_for_eod"
     if sentinel_path.exists():
         mtime = datetime.fromtimestamp(sentinel_path.stat().st_mtime, tz=UTC)
@@ -659,7 +737,12 @@ def get_market_data_freshness(
     holidays = load_market_holidays(data_dir)
     ages_trading_days: list[tuple[str, float]] = []
     ages_calendar_days: list[tuple[str, float]] = []
-    for sym in sample_symbols:
+    # Per-symbol staleness record so we can populate
+    # ``stale_held_positions`` after the loop. Threshold 2.0
+    # trading days matches the existing ``bars_fresh`` gate.
+    FRESHNESS_THRESHOLD_TRADING_DAYS = 2.0
+    per_symbol_age: dict[str, dict[str, Any]] = {}
+    for sym in full_sample:
         path = data_dir / "prices" / f"{sym}.json"
         if not path.exists():
             continue
@@ -704,7 +787,46 @@ def get_market_data_freshness(
         calendar_age = (now - last_dt).total_seconds() / 86400.0
         ages_trading_days.append((sym, trading_age))
         ages_calendar_days.append((sym, calendar_age))
+        per_symbol_age[sym] = {
+            "symbol": sym,
+            "last_bar_date": last_date_str,
+            "age_trading_days": trading_age,
+            "age_calendar_days": round(calendar_age, 2),
+        }
     if ages_trading_days:
+        result["sample_size"] = len(ages_trading_days)
+        median_age = statistics.median(a for _, a in ages_trading_days)
+        result["median_latest_bar_age_days"] = round(median_age, 2)
+        # Keep the calendar-days median around for the alert text so
+        # the operator can see the raw gap ("Friday close on
+        # Monday = 3 calendar days, 1 trading day").
+        cal_median = statistics.median(a for _, a in ages_calendar_days)
+        result["median_latest_bar_age_calendar_days"] = round(cal_median, 2)
+        result["oldest_sample_symbol"] = max(ages_trading_days, key=lambda x: x[1])[0]
+        # Per-symbol staleness for the HELD-POSITION subset. We only
+        # flag held positions so the alert text is actionable
+        # ("MST is stale, you can't reprice it" is actionable;
+        # "HPG is stale, we didn't include it in today's plan"
+        # is not — the plan doesn't depend on HPG's stale data).
+        for sym in result["held_positions"]:
+            sym_upper = str(sym).upper()
+            record = per_symbol_age.get(sym_upper)
+            if record is None:
+                # No price file on disk for this symbol at all.
+                # Treat as stale (infinite age).
+                result["stale_held_positions"].append({
+                    "symbol": sym_upper,
+                    "last_bar_date": None,
+                    "age_trading_days": None,
+                    "age_calendar_days": None,
+                    "reason": "no_price_file",
+                })
+                continue
+            if (
+                record["age_trading_days"] is not None
+                and record["age_trading_days"] > FRESHNESS_THRESHOLD_TRADING_DAYS
+            ):
+                result["stale_held_positions"].append(record)
         result["sample_size"] = len(ages_trading_days)
         median_age = statistics.median(a for _, a in ages_trading_days)
         result["median_latest_bar_age_days"] = round(median_age, 2)
@@ -721,7 +843,15 @@ def get_market_data_freshness(
         result["median_latest_bar_age_days"] is not None
         and result["median_latest_bar_age_days"] <= 2.0
     )
-    result["fresh"] = bool(sentinel_fresh and bars_fresh)
+    # 2026-10-21 incident (MST): the median-based check above uses the
+    # WHOLE sample (fixed + held). When the fixed sample is fresh but
+    # a held position is stale, the median can still be <= 2.0 and
+    # ``bars_fresh`` would be True — masking the actionable held-
+    # position staleness. We now require BOTH: the median freshness
+    # AND no stale held positions, so any stale held symbol trips
+    # ``fresh: False`` and routes through the Telegram alert.
+    stale_held = bool(result["stale_held_positions"])
+    result["fresh"] = bool(sentinel_fresh and bars_fresh and not stale_held)
     return result
 
 

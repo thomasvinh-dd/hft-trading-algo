@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -249,6 +250,197 @@ class SyncPricesIncrementalErrorReportingTests(unittest.TestCase):
         self.assertEqual(len(errors), 3)
         for sym, err in errors:
             self.assertIn("upstream down", err)
+
+
+class HeldPositionFreshnessTest(unittest.TestCase):
+    """2026-10-21 incident (MST): the dry-run state held 9,500 MST
+    shares but the fixed 5-symbol freshness sample never included
+    MST, so ``fresh: True`` was reported even though MST's price
+    file was 67+ calendar days stale. The fix unions the sample
+    with held positions from the dry-run state and surfaces
+    ``stale_held_positions`` separately so the operator gets a
+    targeted Telegram alert.
+
+    These tests exercise the ``include_held_positions=True``
+    default path through ``get_market_data_freshness``.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="freshness-held-"))
+        from vietnam_algo.libs import dry_run_state as drs
+        self._state_path_module = drs
+        self._tmp_live = self.tmp / "live"
+        self._tmp_live.mkdir(parents=True, exist_ok=True)
+        # /prices directory for sample price files
+        (self.tmp / "prices").mkdir(exist_ok=True)
+        # sentinel file (used for sentinel_age_hours)
+        sentinel = self.tmp / "live" / "data_ready_for_eod"
+        sentinel.write_text("ok", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_dry_run_state(self, strategy: str, positions: dict) -> None:
+        """Write a per-strategy dry-run state file with the given
+        ``positions`` dict, mimicking what `_apply_dry_run_fills`
+        would persist after a successful BUY."""
+        sp = self._state_path_module._state_path(self.tmp, strategy)
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "initial_nav": 100_000_000.0,
+            "cash": 50_000_000.0,
+            "realized_pnl": 0.0,
+            "closed_trades": [],
+            "applied_keys": [],
+            "positions": positions,
+            "created_at": "2026-08-01T00:00:00+00:00",
+            "updated_at": "2026-08-01T00:00:00+00:00",
+        }
+        sp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _price_file_with_last_date(self, symbol: str, last_date_iso: str) -> None:
+        """Write a synthetic price file with a single bar at
+        ``last_date_iso`` so the freshness check can compute ages."""
+        from datetime import date as _date
+        path = self.tmp / "prices" / f"{symbol}.json"
+        bar_date = _date.fromisoformat(last_date_iso)
+        path.write_text(
+            json.dumps(
+                {
+                    "source": "test",
+                    "fetchedAt": "2026-08-01T00:00:00Z",
+                    "count": 1,
+                    "symbol": symbol,
+                    "items": [
+                        {
+                            "time": last_date_iso,
+                            "open": 100.0,
+                            "high": 100.0,
+                            "low": 100.0,
+                            "close": 100.0,
+                            "volume": 0.0,
+                        }
+                    ],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def test_held_stale_position_flags_stale_held(self) -> None:
+        """2026-10-21 MST scenario: MST is held but its price file
+        is 30 trading days stale. The fixed 5-symbol sample is
+        fresh. Pre-fix: ``fresh: True`` was returned and the
+        staleness was invisible. Post-fix: ``stale_held_positions``
+        lists MST and ``fresh: False`` is returned (median is bumped
+        by the stale held position)."""
+        from vietnam_algo.libs.schedule import vietnam_now
+        # Dry-run state holds 9,500 MST (the actual incident numbers).
+        self._write_dry_run_state(
+            "momentum",
+            {"MST": {"symbol": "MST", "quantity": 9500, "avg_price": 10410.4}},
+        )
+        # MST's price file is 30 calendar days old (last bar mid-Sep).
+        old = (datetime.now(UTC) - timedelta(days=30)).date().isoformat()
+        self._price_file_with_last_date("MST", old)
+        # Fixed sample is fully fresh (today).
+        today = datetime.now(UTC).date().isoformat()
+        for s in ("HPG", "VHM", "FPT", "VIC", "HDB"):
+            self._price_file_with_last_date(s, today)
+        # Now run the freshness check.
+        r = get_market_data_freshness(
+            self.tmp, now=vietnam_now(),
+            held_position_strategies=("momentum",),
+        )
+        # Held positions are surfaced.
+        self.assertEqual(r["held_position_count"], 1)
+        self.assertEqual(r["held_positions"], ["MST"])
+        # MST is in stale_held_positions (no_price_file=None, but
+        # here we have a 30-day-old file → flagged as stale).
+        self.assertEqual(len(r["stale_held_positions"]), 1)
+        stale = r["stale_held_positions"][0]
+        self.assertEqual(stale["symbol"], "MST")
+        self.assertGreater(stale["age_trading_days"], 2.0)
+        # The overall fresh flag must be False now (stale held should
+        # trip the median > 2.0 check, AND we explicitly flip it).
+        self.assertFalse(r["fresh"])
+        # Oldest sample symbol should be MST, not HPG.
+        self.assertEqual(r["oldest_sample_symbol"], "MST")
+
+    def test_held_fresh_position_does_not_flag(self) -> None:
+        """If a held position's price file is fresh (today), the
+        check returns ``stale_held_positions=[]`` and ``fresh: True``
+        — the inclusion of held positions must not introduce false
+        positives."""
+        from vietnam_algo.libs.schedule import vietnam_now
+        self._write_dry_run_state(
+            "momentum",
+            {"HPG": {"symbol": "HPG", "quantity": 1000, "avg_price": 25000}},
+        )
+        # HPG's price file is fresh today.
+        today = datetime.now(UTC).date().isoformat()
+        self._price_file_with_last_date("HPG", today)
+        for s in ("VHM", "FPT", "VIC", "HDB"):
+            self._price_file_with_last_date(s, today)
+        r = get_market_data_freshness(
+            self.tmp, now=vietnam_now(),
+            held_position_strategies=("momentum",),
+        )
+        # HPG is in held_positions but its bar is fresh today.
+        self.assertEqual(r["held_position_count"], 1)
+        self.assertEqual(r["held_positions"], ["HPG"])
+        self.assertEqual(r["stale_held_positions"], [])
+        self.assertTrue(r["fresh"])
+
+    def test_held_position_no_price_file(self) -> None:
+        """When a held symbol has NO price file on disk at all, it
+        is reported as stale with ``reason='no_price_file'`` so the
+        operator knows to add the symbol to the price-sync universe.
+        """
+        from vietnam_algo.libs.schedule import vietnam_now
+        # Held MST but no data/prices/MST.json exists.
+        self._write_dry_run_state(
+            "autofin_signal",
+            {"MST": {"symbol": "MST", "quantity": 100, "avg_price": 9300}},
+        )
+        today_iso = datetime.now(UTC).date().isoformat()
+        for s in ("HPG", "VHM", "FPT", "VIC", "HDB"):
+            self._price_file_with_last_date(s, today_iso)
+        r = get_market_data_freshness(
+            self.tmp, now=vietnam_now(),
+            held_position_strategies=("autofin_signal",),
+        )
+        self.assertEqual(r["held_positions"], ["MST"])
+        # No price file → flagged as stale with reason='no_price_file'.
+        self.assertEqual(len(r["stale_held_positions"]), 1)
+        self.assertEqual(r["stale_held_positions"][0]["reason"], "no_price_file")
+
+    def test_include_held_positions_false(self) -> None:
+        """Operators can opt out of the held-position inclusion via
+        ``include_held_positions=False`` (used by some unit tests
+        that don't want to depend on dry-run state files)."""
+        from vietnam_algo.libs.schedule import vietnam_now
+        # Held MST (would normally be flagged).
+        self._write_dry_run_state(
+            "momentum",
+            {"MST": {"symbol": "MST", "quantity": 9500, "avg_price": 10410.4}},
+        )
+        old = (datetime.now(UTC) - timedelta(days=30)).date().isoformat()
+        self._price_file_with_last_date("MST", old)
+        today = datetime.now(UTC).date().isoformat()
+        for s in ("HPG", "VHM", "FPT", "VIC", "HDB"):
+            self._price_file_with_last_date(s, today)
+        r = get_market_data_freshness(
+            self.tmp, now=vietnam_now(),
+            include_held_positions=False,
+        )
+        # Held positions are ignored.
+        self.assertEqual(r["held_position_count"], 0)
+        self.assertEqual(r["held_positions"], [])
+        self.assertEqual(r["stale_held_positions"], [])
+        self.assertEqual(r["sample_total"], 5)
+        # MST is NOT in the sample because we opted out.
 
 
 if __name__ == "__main__":
