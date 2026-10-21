@@ -1230,6 +1230,59 @@ def _parse_vnd(s: str) -> float:
     return float(s.replace(".", "").replace(",", "").strip() or "0")
 
 
+# Tag used by ``_plan_partial_close_orders`` to recognise partial
+# closes that carry an explicit ``tại <price>`` suffix. Used in
+# ``_augment_orphan_deals`` to pick a richer recomment from
+# ``hisRecomment[len-1]`` (the full HTML-stripped version) when
+# the top-level ``lastRecomment`` is the SHORT headline and
+# lacks the price.
+_TAI_KEYWORDS = ("tại", "tai")
+
+
+def _mentions_tai(text: str) -> bool:
+    """True if ``text`` contains an explicit ``tại <price>`` keyword.
+
+    Used by the orphan augment path to detect whether the SHORT
+    ``lastRecomment`` headline carries the actionable price (e.g.
+    ``🛡️ Chốt lãi -1.75 % bảo toàn vốn tại 30,950``) or whether
+    we need to fall back to ``hisRecomment[len-1]``.
+    """
+    if not text:
+        return False
+    t = text.lower()
+    return any(kw in t for kw in _TAI_KEYWORDS)
+
+
+# Simple HTML tag stripper — autofin stores historical
+# recomments as HTML fragments (e.g.
+# ``<div style="…"><p>[BAF] 🛡️ Chốt lãi -1.75 % bảo toàn vốn tại 30,950</p></div>``)
+# inside ``/signal-deals`` 's ``hisRecomment`` list. We strip
+# the tags + the ``<p>`` newline artifacts before passing the
+# text to ``_parse_partial_close``.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_ENTITY_RE = re.compile(r"&[a-zA-Z#0-9]+;")
+_P_TAG_RE = re.compile(r"</?p\s*>", re.IGNORECASE)
+
+
+def _strip_html(s: str) -> str:
+    """Convert an autofin HTML recomment fragment into plain text.
+
+    Autofin wraps ``<p>`` lines inside ``<div>`` containers:
+    ``<div …><p>[BAF] 🛡️ Chốt lãi -1.75 % bảo toàn vốn tại 30,950</p><p>Nắm giữ: 51 ngày</p></div>``.
+    We strip both the ``<div>``/``<p>`` outer shell AND any
+    inline tags (``<br>``, ``<strong>``, etc.), normalize the
+    ``<p>`` boundaries to spaces, and unescape common HTML
+    entities (``&amp;``, ``&nbsp;``). Multiple spaces collapse
+    to a single ``" "``.
+    """
+    if not s:
+        return ""
+    out = _P_TAG_RE.sub(" ", _HTML_TAG_RE.sub("", s))
+    out = _HTML_ENTITY_RE.sub(" ", out)
+    return " ".join(out.split()).strip()
+
+
+
 def _parse_percent(s: str) -> float:
     """Parse '28.57' → 28.57 (Vietnamese percent uses '.' as decimal)."""
     return float(s.replace(",", "").strip() or "0")
@@ -3187,9 +3240,32 @@ class AutofinSignalAdapter(StrategyAdapter):
                 ),
                 deals[0],  # fallback: most recent for this sym
             )
+            # 2026-10-21 BAF fix: ``lastRecomment`` is the SHORT
+            # headline (e.g. ``🛡️ Chốt lãi -1.75 % bảo toàn vốn``)
+            # while the FULL text including ``tại P`` (e.g.
+            # ``🛡️ Chốt lãi -1.75 % bảo toàn vốn tại 30,950``)
+            # lives in ``hisRecomment[len-1]`` (latest). When the
+            # short version lacks a parseable price/tai keyword,
+            # fall back to the most-recent ``hisRecomment`` row to
+            # get the actionable ``tại <price>`` detail. Without
+            # this, ``_parse_partial_close`` returns ``price=0``
+            # and the order is submitted without a price (the
+            # SELL-at-market override in the runner covers this,
+            # but operators lose the autofin-suggested price as
+            # the audit anchor).
             last_rec = str(
                 match.get("lastRecomment", "") or ""
             ).strip()
+            if last_rec and not _mentions_tai(last_rec):
+                # Build candidate from the latest hisRecomment
+                # (HTML-stripped) and prefer it when it carries
+                # the ``tại`` price.
+                hr = match.get("hisRecomment") or []
+                if isinstance(hr, list) and hr:
+                    cand = _strip_html(hr[-1] or "")
+                    cand = cand.strip()
+                    if cand and _mentions_tai(cand):
+                        last_rec = cand
             if not last_rec:
                 continue
             seen_orphan_symbols.add(sym)

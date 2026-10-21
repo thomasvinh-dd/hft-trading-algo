@@ -565,6 +565,50 @@ def _extract_best_ask_in_vnd(quote: object) -> int | None:
     return int(round(v * 1000.0))
 
 
+def _hose_price_tick(price_vnd: int) -> int:
+    """Return the HOSE tick size for a stock price, in VND.
+
+    Per HOSE market rules, the minimum price increment depends on
+    the absolute price level::
+
+        <  10,000 VND →  10 VND
+        10,000-49,950  →  50 VND
+        >= 50,000 VND → 100 VND
+
+    Anything outside HOSE (e.g. HNX, UPCOM) uses a 100-VND tick by
+    default — DNSE rejects prices that don't respect the board's
+    increment with HTTP 400 ``INVALID_PRICE_LOT``. Without this
+    helper the SELL-at-market override (which prices a SELL at
+    ``best_bid × 0.99``) frequently lands on a multiple of 10 but
+    not 50/100, so the order is rejected on the first attempt.
+
+    2026-10-21 BAF incident: the autofin-recommended BAF exit at
+    30,950 produced ``sell_price = round(30950 × 0.99) = 30640``,
+    which is a multiple of 10 but NOT of 50. DNSE responded
+    ``{"code":"INVALID_PRICE_LOT","message":"Invalid price lot"}``
+    and the SELL never reached the exchange. With this helper
+    the price is rounded DOWN to the nearest tick (30,600) so it
+    always executes (down-rounded but the SELL is marketable;
+    the 1% ``AUTOFIN_SELL_BID_DISCOUNT_PCT`` already gives a
+    buffer for the bid to tick down).
+    """
+    p = int(price_vnd)
+    if p <= 0:
+        return 0
+    if p < 10_000:
+        tick = 10
+    elif p < 50_000:
+        tick = 50
+    else:
+        tick = 100
+    # Round DOWN to the nearest tick so the SELL crosses at or
+    # BELOW the best-bid — this guarantees an immediate fill at
+    # market. (Rounding up could leave the order resting above
+    # the book if the bid ticks between the quote fetch and the
+    # submit.)
+    return p - (p % tick)
+
+
 def _extract_best_bid_in_vnd(quote: object) -> int | None:
     """Extract the best-bid price (in absolute VND) from a DNSE
     ``/price/{sym}/quotes/latest`` response.
@@ -896,7 +940,24 @@ def _submit_autofin_deals_to_dnse(
             if is_auction:
                 # Will be re-evaluated after we know the market
                 price = 0
-            elif signal_price <= 0:
+            # 2026-10-21 BAF fix: when ``signal_price`` is 0 AND
+            # this is a SELL, the bot MUST still submit (the SELL
+            # at-market override below fills in the live bid). The
+            # previous ``elif signal_price <= 0: continue`` gate
+            # silently dropped any SELL without an explicit price,
+            # which broke the BAF capital_protect recomment path
+            # — autofin's ``/signal-deals`` top-level
+            # ``lastRecomment`` field carries only the SHORT version
+            # (e.g. ``🛡️ Chốt lãi -1.75 % bảo toàn vốn``); the
+            # ``tại P`` price lives in ``hisRecomment[0]`` HTML and
+            # was never propagated to the order's price field. The
+            # SELL-at-market path below takes care of pricing the
+            # order against the live best-bid, so price=0 is a
+            # valid input for a SELL and must NOT be dropped here.
+            # BUY orders (NB) with no price still make no sense
+            # outside auction — a BUY @ 0 would buy at any price —
+            # so the gate remains in place for NB.
+            elif signal_price <= 0 and side == "NB":
                 continue
             # 2026-10-13: SELL orders (NS) are submitted at the LIVE
             # best-bid, not autofin's recomment price. Per user
@@ -940,12 +1001,18 @@ def _submit_autofin_deals_to_dnse(
                         sell_bid_discount_pct = float(
                             os.environ.get("AUTOFIN_SELL_BID_DISCOUNT_PCT", "0.99")
                         )
-                        sell_price = int(round(bid * sell_bid_discount_pct))
+                        raw_sell_price = int(round(bid * sell_bid_discount_pct))
+                        # 2026-10-21 BAF: round to the HOSE price tick
+                        # so DNSE doesn't reject with
+                        # ``INVALID_PRICE_LOT``. See ``_hose_price_tick``
+                        # for the rule table.
+                        sell_price = _hose_price_tick(raw_sell_price)
                         print(
                             f"[autofin_sell_at_market] {sym} SELL price "
                             f"override: signal={signal_price} → "
                             f"bid={bid:,.0f} VND × "
-                            f"{sell_bid_discount_pct:.0%} = {sell_price:,.0f} "
+                            f"{sell_bid_discount_pct:.0%} = {raw_sell_price:,.0f} "
+                            f"VND → tick-rounded={sell_price:,.0f} "
                             f"VND (ensures immediate fill at market)"
                         )
             if not is_auction:
@@ -2177,6 +2244,20 @@ def run_auto_bot(
         now = vietnam_now()
         today = local_date(now)
         state = load_state(engine_config.dataDir, strategy_name=strategy_name)
+        token: str | None = None
+        # 2026-10-21 BAF incident: ``token`` is normally assigned by
+        # ``ensure_fresh_trading_token`` inside the
+        # ``should_submit_orders`` block, but ``should_poll_strategy``
+        # also reads it to gate live submission of mid-day partial
+        # closes. When the SOD/EOD block is skipped (e.g. first cycle
+        # of a fresh bot instance, before any daily-token refresh
+        # has run), ``token`` was unbound — referencing it in the
+        # poll path raised ``UnboundLocalError`` and silently
+        # dropped a freshly-detected partial-close SELL on the
+        # floor. Initialise to an empty string at the top of each
+        # loop so the submit gate ``if ... and token`` evaluates
+        # cleanly (the empty string is falsy, so we still skip
+        # submission when no token has been issued yet).
 
         # Order-status monitor — runs every cycle (~60s). Polls DNSE for
         # status of every non-terminal order in the ledger; sends a
@@ -2682,6 +2763,38 @@ def run_auto_bot(
                     # close, new entry, full close) — see
                     # AutofinSignalAdapter._notify_new_orders.
                     print(f"[{now.isoformat()}] poll result: {poll_result.get('count', 0)} orders planned")
+                    # 2026-10-21 BAF incident: the mid-day poll
+                    # path used to gate on ``and token``, but the
+                    # trading token is normally populated only inside
+                    # the ``should_submit_orders`` block — which fires
+                    # once per day at SOD. Outside that window
+                    # ``token`` was None (the UnboundLocalError fix
+                    # above masks the absence by initialising it to
+                    # ``None``), so mid-day partial-close SELLs were
+                    # silently skipped. Re-hydrate from the shared
+                    # cron-written token file before this check —
+                    # ``load_shared_trading_token`` reads
+                    # ``data/live/dnse_trading_token.json`` which the
+                    # ``get_otp`` cron @ 08:30 ICT refreshes daily.
+                    if live_submit and not token:
+                        try:
+                            shared = load_shared_trading_token(
+                                engine_config.dataDir,
+                            )
+                            if shared and shared.get("token"):
+                                token = str(shared["token"])
+                                print(
+                                    f"[{now.isoformat()}] mid-day "
+                                    f"poll hydrated trading token from "
+                                    f"shared file (issued_at="
+                                    f"{shared.get('issued_at','?')})"
+                                )
+                        except Exception as exc:
+                            print(
+                                f"[{now.isoformat()}] mid-day poll "
+                                f"token hydrate failed: "
+                                f"{type(exc).__name__}: {str(exc)[:200]}"
+                            )
                     # Live mode: actually submit the planned orders to
                     # DNSE via execute_orders_with_ledger. We do this
                     # BEFORE the dry-run apply so the dry-run state

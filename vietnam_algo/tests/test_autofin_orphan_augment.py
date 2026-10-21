@@ -233,3 +233,126 @@ def test_orphan_fresh_recomment_fires_once_only():
         a._our_deals, holding3, our_positions={"BAF": 200},
     )
     assert len(rows3) == 0
+
+
+def test_orphan_augment_uses_hisrecomment_full_text():
+    """2026-10-21 BAF fix: autofin's top-level ``lastRecomment``
+    is the SHORT headline (``🛡️ Chốt lãi -1.75 % bảo toàn vốn``);
+    the FULL text including the ``tại P`` price lives in the
+    latest ``hisRecomment`` row (HTML-wrapped). The helper must
+    prefer the latest ``hisRecomment`` when the short version
+    lacks ``tại``, so the parsed action keeps its price. Without
+    this the order is submitted at price=0 and the autofin-
+    suggested anchor (e.g. 30,950) is lost from the audit log."""
+    our_deals = {
+        "1785888000:BAF": {
+            "_id": 1785888000, "symbol": "BAF", "_our_qty": 0,
+            "lastRecomment": "stale",
+        },
+    }
+    holding: list[dict[str, Any]] = []
+    client = _stub_client({
+        "BAF": [{
+            "_id": 1785888000,
+            "symbol": "BAF",
+            "numberOfProfit": 0,
+            # SHORT headline — no ``tại`` keyword.
+            "lastRecomment": "🛡️ Chốt lãi -1.75 % bảo toàn vốn",
+            # HTML-wrapped history; the latest is the action.
+            "hisRecomment": [
+                '<div …><p>Ngày khuyến nghị: 05/08/2026</p>'
+                '<p>🟢 Vùng mua: 30,850 - 31,500</p></div>',
+                '<div …><p>[BAF] 🛡️ Chốt lãi -1.75 % bảo toàn '
+                'vốn tại 30,950</p><p>Nắm giữ: 51 ngày</p></div>',
+            ],
+        }],
+    })
+    a = _make_adapter(our_deals)
+    a._augment_orphan_deals(client, holding)
+
+    # Pick the augmented entry out of the holding list.
+    injected = next(h for h in holding if h.get("symbol") == "BAF")
+    assert injected["_orphan_injected"] is True
+    # The injected recomment is the FULL hisRecomment[len-1] text,
+    # not the short headline — so the partial-close parser sees the
+    # ``tại 30,950`` price and the SELL can carry the autofin-suggested
+    # anchor.
+    assert "tại 30,950" in injected["lastRecomment"]
+    assert "<" not in injected["lastRecomment"], \
+        "HTML tags should be stripped"
+
+
+def test_orphan_augment_keeps_short_when_full_text_already_present():
+    """Sanity check: when the top-level ``lastRecomment`` already
+    mentions ``tại``, the helper uses it as-is — no need to fall
+    back to ``hisRecomment``."""
+    our_deals = {
+        "1785888000:BAF": {"_id": 1785888000, "symbol": "BAF", "_our_qty": 0},
+    }
+    holding: list[dict[str, Any]] = []
+    client = _stub_client({
+        "BAF": [{
+            "_id": 1785888000, "symbol": "BAF", "numberOfProfit": 0,
+            "lastRecomment": "🛡️ Chốt lãi 22.22 % bảo toàn vốn tại 13,700",
+            "hisRecomment": [],
+        }],
+    })
+    a = _make_adapter(our_deals)
+    a._augment_orphan_deals(client, holding)
+    injected = next(h for h in holding if h.get("symbol") == "BAF")
+    # lastRecomment carries the price; helper does not modify it.
+    assert "tại 13,700" in injected["lastRecomment"]
+    assert "22.22" in injected["lastRecomment"]
+    """2026-10-20 BAF incident: an orphan-deal augmentation on a
+    fresh recomment must fire the partial-close on the FIRST cycle
+    that sees it (not wait for the bootstrap-baseline path), and
+    must NOT re-fire on subsequent cycles for the same recomment
+    (the deal stays orphan in autofin's holding, so the
+    augmentation fires every cycle — without a dedup the bot
+    would spam SELL orders every 60 seconds). The dedup key is
+    ``_last_recomment`` on the tracked deal."""
+    our_deals = {
+        "1785888000:BAF": {
+            "_id": 1785888000,
+            "symbol": "BAF",
+            "_our_qty": 0,
+            "lastRecomment": "stale old text",
+            # No ``_last_numberOfProfit`` — first-cycle path.
+        },
+    }
+    holding: list[dict[str, Any]] = []
+    client = _stub_client({
+        "BAF": [{
+            "_id": 1785888000,
+            "symbol": "BAF",
+            "numberOfProfit": 0,
+            "lastRecomment": "🛡️ Chốt lãi -1.75 % bảo toàn vốn tại 30,950",
+        }],
+    })
+    a = _make_adapter(our_deals)
+
+    # CYCLE 1: fresh orphan + fresh recomment → must fire.
+    a._augment_orphan_deals(client, holding)
+    rows1 = _plan_partial_close_orders(
+        a._our_deals, holding, our_positions={"BAF": 200},
+    )
+    assert len(rows1) == 1
+    assert rows1[0]["kind"] == "full_close"
+    assert rows1[0]["quantity"] == 200
+    assert rows1[0]["price"] == 30950
+
+    # CYCLE 2: same orphan + same recomment → must NOT fire.
+    holding2: list[dict[str, Any]] = []
+    a._augment_orphan_deals(client, holding2)
+    rows2 = _plan_partial_close_orders(
+        a._our_deals, holding2, our_positions={"BAF": 200},
+    )
+    assert len(rows2) == 0
+
+    # CYCLE 3 (sanity): still 0 — no spam.
+    holding3: list[dict[str, Any]] = []
+    a._augment_orphan_deals(client, holding3)
+    rows3 = _plan_partial_close_orders(
+        a._our_deals, holding3, our_positions={"BAF": 200},
+    )
+    assert len(rows3) == 0

@@ -340,10 +340,12 @@ def test_sell_orders_fetch_live_bid_for_market_price_override(
     # The SELL fetched a live quote to compute the market price.
     assert client.get_latest_quote.call_count == 1
     # The submitted SELL price should be best-bid (14000) × 0.99
-    # = 13860, NOT the planning signal price of 14500.
+    # = 13860, then HOSE-tick rounded DOWN to 13850 (50-VND tick
+    # for prices in 10,000-49,950). Not the planning signal price
+    # of 14500, and not the naive unrounded discount.
     submitted = captured["orders"][0]
     assert submitted.side == "NS"
-    assert submitted.price == 13860
+    assert submitted.price == 13850
 
 
 def test_sell_orders_fall_back_to_signal_price_on_quote_failure(

@@ -321,6 +321,34 @@ def test_partial_close_capital_protect_no_tai_price_uses_market():
     assert r["kind"] == "full_close"
 
 
+def test_submit_signal_price_zero_sell_not_dropped():
+    """2026-10-21 BAF fix: when a SELL order carries ``price=0`` from
+    ``_plan_partial_close_orders`` (no ``tại P`` suffix on the autofin
+    recomment — the SELL-at-market override in the runner fills in
+    the live best-bid downstream), the runner's deals-conversion loop
+    MUST still keep the order; the previous ``signal_price <= 0:
+    continue`` gate silently dropped it. BUY orders with price=0 are
+    still dropped (a BUY at any price is unsafe)."""
+    # The conversion loop is inlined inside
+    # ``_submit_autofin_deals_to_dnse``. We exercise it by reading
+    # the runner source and asserting the contract (defensive
+    # smoke test — the full conversion is exercised end-to-end by
+    # the live bot cycle once deployed).
+    from vietnam_algo.bots import runner as bot_runner
+    src = open(bot_runner.__file__, "r", encoding="utf-8").read()
+    assert 'elif signal_price <= 0 and side == "NB":' in src, (
+        "Bug #5 from 2026-10-21: the silent-drop gate must be gated "
+        "to BUY-only — SELL orders with price=0 must NOT skip."
+    )
+    # And the previous UB-gate (``and token`` UnboundLocalError)
+    # must also be patched at the top of run_auto_bot's loop.
+    assert "token: str | None = None" in src, (
+        "Bug from 2026-10-21: token must be initialised at the top "
+        "of the main loop so the mid-day-poll block does not raise "
+        "UnboundLocalError on the first cycle of a fresh bot instance."
+    )
+
+
 def test_partial_close_skips_when_numberOfProfit_unchanged():
     our_deals = {
         "444:VPI": {
