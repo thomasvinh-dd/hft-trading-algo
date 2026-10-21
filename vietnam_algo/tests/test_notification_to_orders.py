@@ -18,6 +18,7 @@ from vietnam_algo.libs.autofin_signals import AutofinNotification, parse_notific
 from vietnam_algo.algos.autofin_signal import (
     _event_to_partial_orders,
     _is_trading_event,
+    _parse_partial_close,
 )
 
 
@@ -83,16 +84,29 @@ class EventToPartialOrdersTests(unittest.TestCase):
         self.assertEqual(_event_to_partial_orders(ev.title, ev.body, our), [])
 
     def test_capital_protect_event(self):
-        """🛡️ Chốt lãi X % → SELL X% of position."""
+        """🛡️ Chốt lãi X % bảo toàn vốn tại P → SELL ALL at the
+        suggested price.
+
+        2026-10-18 user feedback (re-confirmed 2026-10-20 against
+        BAF): the X% in this recomment is the P&L PERCENTAGE, NOT
+        a qty fraction. ``Chốt lãi 28.57 % bảo toàn vốn tại
+        15,000`` means "the position is up 28.57% — sell everything
+        at 15,000 to lock in the profit." This mirrors the
+        ``_plan_partial_close_orders`` semantics; the notification
+        path and the EOD path must agree.
+        """
         body = "[HII] 🛡️ Chốt lãi 28.57 % bảo toàn vốn tại 15,000"
         ev = _event(body=body, tags=("SIGNAL", "TRADINGSTOP", "TAK"))
         our = _our_deal("HII", qty=1600)
         orders = _event_to_partial_orders(ev.title, ev.body, our)
         self.assertEqual(len(orders), 1)
         sell = orders[0]
-        # 28.57% of 1600 = 457. Rounded down to 100-lots = 400.
+        # Full close — sell all 1,600 (already board-lot aligned).
         self.assertEqual(sell["price"], 15000)
-        self.assertEqual(sell["quantity"], 400)
+        self.assertEqual(sell["quantity"], 1600)
+        # ``kind`` is ``full_close`` (consistent with the EOD-path
+        # decision in ``_plan_partial_close_orders``).
+        self.assertEqual(sell["kind"], "full_close")
 
     def test_reduce_event(self):
         """⚠️ Hạ 50 % → SELL 50% of position (round-up to board lot)."""
@@ -130,6 +144,31 @@ class EventToPartialOrdersTests(unittest.TestCase):
         our = _our_deal("HII", qty=1600)
         # _parse_partial_close returns "take_profit_lap" with price=0 → skipped.
         self.assertEqual(_event_to_partial_orders(ev.title, ev.body, our), [])
+
+    def test_capital_protect_event_negative_pnl_full_close(self):
+        """2026-10-20 BAF incident: 'Chốt lãi -1.75 % bảo toàn vốn
+        tại 30,950' (NEGATIVE P&L) must still be recognised as a
+        full-close SELL at the suggested price. The previous
+        regex ``[\\d,\\.]+`` did not accept the leading ``-``, so
+        the parser returned 'unknown' and the order was silently
+        dropped. The action semantics ('sell all at P') are
+        identical regardless of P&L sign."""
+        body = "[BAF] 🛡️ Chốt lãi -1.75 % bảo toàn vốn tại 30,950\nNắm giữ: 51 ngày"
+        ev = _event(body=body, tags=("SIGNAL", "TRADINGTIME", "TRAILINGSTOP"))
+        our = _our_deal("BAF", qty=200)
+        orders = _event_to_partial_orders(ev.title, ev.body, our)
+        self.assertEqual(len(orders), 1)
+        sell = orders[0]
+        # Full close at the suggested price (NOT 200 × 0.0175 = 3.5 → 0 lots).
+        self.assertEqual(sell["quantity"], 200)
+        self.assertEqual(sell["price"], 30950)
+        self.assertEqual(sell["kind"], "full_close")
+        # ``percent`` is a tiny fraction stored on the action object
+        # (sanity check the parser kept the negative sign).
+        action = _parse_partial_close(body)
+        self.assertEqual(action.action, "capital_protect")
+        self.assertAlmostEqual(action.percent, -1.75, places=2)
+        self.assertEqual(action.price, 30950)
 
 
 class NotificationTagClassifierTests(unittest.TestCase):

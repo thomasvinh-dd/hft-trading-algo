@@ -1209,7 +1209,14 @@ _PARTIAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         r"Hạ\s+([\d,\.]+)\s*%\s*t[ỷỉy]?\s*trọng\s+lần\s*(\d+)",
         re.IGNORECASE,
     ), "reduce_lap"),
-    (re.compile(r"Chốt lãi\s*([\d,\.]+)\s*%\s*bảo toàn vốn", re.IGNORECASE), "capital_protect"),
+    # 2026-10-20 incident (BAF): autofin publishes a NEGATIVE P&L
+    # percent when the position is underwater (e.g. "🛡️ Chốt lãi
+    # -1.75 % bảo toàn vốn tại 30,950" after a small drop from the
+    # buy price). The X% here is still the P&L percent, not a qty
+    # fraction — accept an optional leading ``-`` so the parser
+    # recognises the action type. The action semantics ("sell all
+    # at the suggested price") are identical regardless of sign.
+    (re.compile(r"Chốt lãi\s*([-]?[\d,\.]+)\s*%\s*bảo toàn vốn", re.IGNORECASE), "capital_protect"),
     (re.compile(r"Đóng DEAL", re.IGNORECASE), "full_close"),
 )
 
@@ -1366,7 +1373,32 @@ def _plan_partial_close_orders(
         cur_nP = int(h.get("numberOfProfit") or 0)
         last_nP = int(sig.get("_last_numberOfProfit", -1))
         last_rec = str(sig.get("_last_recomment") or "")
-        if last_nP < 0:
+        # 2026-10-20 BAF incident: when an orphan deal is freshly
+        # injected (``_orphan_injected=True``) we have NEVER seen
+        # this recomment before — bypass the bootstrap baseline-
+        # building path AND the ``nP_changed / recomment_changed``
+        # guard below. Without this the bot records
+        # ``_last_numberOfProfit=cur_nP`` + ``_last_recomment`` on
+        # the first cycle and then never re-fires because
+        # subsequent cycles see the same ``cur_nP`` and the same
+        # recomment text.
+        #
+        # IMPORTANT: ``is_orphan_fresh`` is also gated on the
+        # recomment being ACTUALLY DIFFERENT from what the bot
+        # last fired on. The orphan-injection fires on every cycle
+        # (the deal is still missing from autofin /signal-static-
+        # holding), so without the ``rec != last_rec`` check we'd
+        # re-fire the same partial-close every 60s until autofin
+        # returns the deal to its holding list. ``_last_recomment``
+        # is set after each fire (line 1575-1576) so ``last_rec``
+        # reflects the most recent FIRED recomment, not the most
+        # recent seen recomment.
+        is_orphan_fresh = bool(h.get("_orphan_injected")) and \
+            action.action in (
+                "capital_protect", "take_profit_lap", "reduce_lap",
+            ) and \
+            rec != last_rec
+        if last_nP < 0 and not is_orphan_fresh:
             sig["_last_numberOfProfit"] = cur_nP
             sig["_last_recomment"] = rec
             continue
@@ -1392,6 +1424,14 @@ def _plan_partial_close_orders(
         #       one we last sold at.
         nP_changed = cur_nP > last_nP
         recomment_changed = bool(rec) and rec != last_rec
+        # Orphan-fresh deals: force nP_changed=True so the
+        # ``nP_changed or recomment_changed or fraction_changed``
+        # gate below is satisfied. The fresh recomment is itself
+        # a fire trigger even when nP and recomment match a prior
+        # cycle (because for the orphan there WAS no prior cycle).
+        # See the bootstrap bypass above for the full rationale.
+        if is_orphan_fresh:
+            nP_changed = True
         fraction_changed = False
         if (
             not (nP_changed or recomment_changed)
@@ -1640,7 +1680,18 @@ def _event_to_partial_orders(
         else:
             delta = our_qty // 3
     elif action.action == "capital_protect":
-        delta = int(our_qty * action.percent / 100)
+        # IMPORTANT (2026-10-18 user feedback; re-confirmed 2026-10-20
+        # against BAF notification): the "X %" in
+        # ``Chốt lãi X % bảo toàn vốn tại P`` is the P&L PERCENTAGE
+        # (may be NEGATIVE when the position is underwater), NOT the
+        # qty fraction. autofin is telling us the current P&L and
+        # suggesting an exit price; the bot must SELL ALL REMAINING
+        # QTY at the suggested price to lock in that P&L. This
+        # mirrors the fix in ``_plan_partial_close_orders`` and
+        # ensures the notification-driven mid-day path agrees with
+        # the EOD-driven path. Without this, -1.75 % × 200 shares
+        # rounds to 0 lots → empty list → signal silently dropped.
+        delta = our_qty
     else:
         return []
 
@@ -1652,12 +1703,18 @@ def _event_to_partial_orders(
     if price <= 0:
         return []
 
+    # ``capital_protect`` is a full close (sell all remaining) — keep
+    # the ``kind`` consistent with the EOD-path decision in
+    # ``_plan_partial_close_orders`` so the apply loop, dedup table,
+    # and Telegram summary all treat it the same way.
+    order_kind = "full_close" if action.action == "capital_protect" else "partial_close"
+
     return [{
         "symbol": symbol,
         "side": "NS",
         "price": price,
         "quantity": delta,
-        "kind": "partial_close",
+        "kind": order_kind,
         "reason": (
             f"autofin_partial_event:{our_match_id}:{action.action}:"
             f"lap{action.lap}:pct{int(round(action.percent * 100))}:"
@@ -3050,6 +3107,111 @@ class AutofinSignalAdapter(StrategyAdapter):
                 print(f"[autofin_signal] per-order notify failed: {exc}")
             self._notified_order_keys |= keys
 
+    def _augment_orphan_deals(
+        self,
+        client: "AutofinClient",
+        holding: list[dict[str, Any]],
+    ) -> None:
+        """Augment ``holding`` with synthetic entries for deals in
+        ``self._our_deals`` whose ``_id`` is missing from autofin's
+        /signal-static-holding response.
+
+        Background (2026-10-20 BAF incident): autofin's
+        ``/signal-static-holding`` endpoint drops active deals when
+        an operator manually closes them in the autofin UI, BUT
+        autofin's automation continues to publish recomments for
+        those deals via ``/signal-deals``. Without this augmentation,
+        ``_plan_partial_close_orders`` does
+        ``if did not in autofin_by_id: continue`` for the orphan
+        deals, the partial-close path emits zero orders, and the
+        bot reports ``0 orders planned`` to Telegram.
+
+        Mechanism: for every ``did`` in ``self._our_deals`` that is
+        NOT in the current ``holding`` snapshot, fetch
+        ``/signal-deals?symbol=<sym>``, pick the row matching the
+        canonical ``_id``, and append a synthetic holding entry
+        carrying the fresh ``lastRecomment`` + ``numberOfProfit``.
+        The synthetic entry is tagged ``_orphan_injected: True`` so
+        downstream code can distinguish it from real
+        /signal-static-holding rows.
+
+        Args:
+            client: a live ``AutofinClient`` (already authenticated).
+            holding: the list of holding dicts fetched from
+                /signal-static-holding; this function MUTATES it
+                in place by appending synthetic entries. Order
+                matters only for dedup / display, not for
+                correctness.
+        """
+        holding_dids = {_deal_id(h) for h in holding if _deal_id(h)}
+        orphan_dids = [
+            did for did in self._our_deals if did not in holding_dids
+        ]
+        if not orphan_dids:
+            return
+        seen_orphan_symbols: set[str] = set()
+        for did in orphan_dids:
+            sig = self._our_deals.get(did) or {}
+            sym = str(sig.get("symbol", "") or "")
+            if not sym or sym in seen_orphan_symbols:
+                continue
+            # The downstream ``_plan_partial_close_orders`` already
+            # gates on ``our_positions.get(symbol, 0) > 0`` (line
+            # 1429), so stale ``_our_qty`` here is fine — the
+            # orphan-injected recomment just gives the partial-
+            # close path something to evaluate. If we genuinely
+            # don't hold this symbol on DNSE any more, the
+            # downstream guard skips it cleanly.
+            try:
+                deals = client.fetch_deals(symbol=sym, page_size=10)
+            except Exception as exc:
+                print(
+                    f"[autofin_signal] orphan fetch_deals({sym}) "
+                    f"failed: {exc}"
+                )
+                continue
+            if not deals:
+                continue
+            # Match by canonical ``_id`` — the /signal-deals
+            # endpoint may return several deals for the same
+            # symbol (different windows). ``_id`` is the deal's
+            # open-time Unix-ts, so it's stable across pages.
+            try:
+                want_id = int(str(did).split(":", 1)[0])
+            except ValueError:
+                want_id = 0
+            match = next(
+                (
+                    d for d in deals
+                    if int(d.get("_id", 0) or 0) == want_id
+                ),
+                deals[0],  # fallback: most recent for this sym
+            )
+            last_rec = str(
+                match.get("lastRecomment", "") or ""
+            ).strip()
+            if not last_rec:
+                continue
+            seen_orphan_symbols.add(sym)
+            holding.append({
+                "_id": want_id,
+                "symbol": sym,
+                "numberOfProfit": int(
+                    match.get("numberOfProfit", 0) or 0
+                ),
+                "lastRecomment": last_rec,
+                "_orphan_injected": True,
+            })
+            # Repair the cached recomment on our tracked deal
+            # too so subsequent cycles see the latest text even
+            # if the orphan path doesn't fire again.
+            sig["lastRecomment"] = last_rec
+            print(
+                f"[autofin_signal] orphan deal {did} ({sym}) "
+                f"augmented with fresh recomment from "
+                f"/signal-deals: {last_rec[:80]!r}"
+            )
+
     def generate_orders(
         self,
         config: EngineConfig,
@@ -3152,6 +3314,23 @@ class AutofinSignalAdapter(StrategyAdapter):
             did = _deal_id(h)
             if did:
                 autofin_fractions[did] = frac
+        # 4c. ORPHAN DEAL AUGMENTATION (2026-10-20 BAF incident):
+        # /signal-static-holding sometimes drops deals that we still
+        # hold on DNSE — typically when an operator manually closes
+        # the deal in the autofin UI (autofin's automation re-publishes
+        # recomments via /signal-deals but the deal is no longer in
+        # the "active holding" list). Without this block the partial-
+        # close path silently skips any ``our_deals`` entry whose
+        # ``_id`` is missing from ``holding``, because
+        # ``_plan_partial_close_orders`` does
+        # ``if did not in autofin_by_id: continue``. The BAF example
+        # on 2026-10-20: we held 200 BAF, autofin published
+        # "🛡️ Chốt lãi -1.75 % bảo toàn vốn tại 30,950" via the
+        # notification stream AND /signal-deals?symbol=BAF, but
+        # BAF was not in /signal-static-holding → bot reported
+        # "0 orders planned" and never placed the SELL. See
+        # ``_augment_orphan_deals`` for the full mechanism.
+        self._augment_orphan_deals(client, holding)
         # 5. fetch our current DNSE positions for sizing
         try:
             from vietnam_algo.libs.dnse.client import DnseClient
