@@ -1241,6 +1241,7 @@ def retry_t2_settlement_sl_orders(
     today_iso: str,
     now_time: "_time | None" = None,
     loan_package_id_by_symbol: dict[str, int] | None = None,
+    loan_package_id: int = 0,
 ) -> dict:
     """Re-submit SL SELL orders that were rejected due to T+2.5 settlement.
 
@@ -1267,6 +1268,17 @@ def retry_t2_settlement_sl_orders(
     only updated by ``execute_orders_with_ledger`` (called
     internally for the re-submits), so the bot's order monitor
     will pick up the new SL entries on its next poll.
+
+    ``loan_package_id`` (2026-10-22) is the launcher's
+    ``--loan-package-id`` default. It is used as the FALLBACK when
+    ``get_cash_loan_package_id`` can't find a ``type == "N"`` (cash)
+    package for the symbol — which happens for every HOSE/HNX symbol
+    (BAF, TLG, ...) because DNSE tags their cash package ("GD Tiền
+    mặt", id 1775) with ``type="M"`` not ``type="N"``. Without this
+    fallback the retry submits ``loanPackageId=0``, which DNSE rejects
+    with ``HTTP 400 INVALID_INPUT loanPackageId is required`` — the
+    exact error the operator reported on 2026-10-22 after 9 days of
+    the same daily failure.
     """
     from vietnam_algo.libs.order_ledger import load_ledger
     from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
@@ -1280,6 +1292,7 @@ def retry_t2_settlement_sl_orders(
         "resubmitted": 0,
         "resubmit_dnse_ids": [],
         "resubmit_errors": [],
+        "pkg_lookup_errors": [],
     }
 
     try:
@@ -1351,10 +1364,35 @@ def retry_t2_settlement_sl_orders(
     # account/package issue, so we replay it with the same
     # parameters. If the original ledger row has no
     # loanPackageId (e.g. an older schema), we fall back
-    # to looking up the cash pkg via DNSE, then to 0
-    # (which DNSE rejects — the operator should investigate).
+    # to looking up the cash pkg via DNSE.
+    #
+    # 2026-10-22 fix (T+2 SL retry loanPackageId=0 bug): when the
+    # original ledger row's ``lastDetail`` is ``None`` (which is the
+    # case for every DNSE 4xx rejection — ``place_stock_order``
+    # raises before the order detail can be fetched, so the ledger
+    # records ``lastDetail=None``), we cannot recover the original
+    # ``loanPackageId``. The DNSE live lookup then hits the
+    # ``get_cash_loan_package_id`` ``type == "N"`` filter, which
+    # finds NOTHING for HOSE/HNX symbols like BAF and TLG because
+    # DNSE tags their cash package ("GD Tiền mặt", id=1775) with
+    # ``type="M"`` rather than ``type="N"``. ABB (UPCoM) is the
+    # only case where DNSE returns ``type="N"``.
+    #
+    # Result: ``_resolve_pkg`` caught the RuntimeError and returned
+    # ``0``, so the retry submitted ``loanPackageId=0`` — which DNSE
+    # rejects with ``HTTP 400 INVALID_INPUT loanPackageId is
+    # required``. The retry failed every cycle for days (the daily
+    # Telegram "T+2 SL retry errors" alert the operator reported on
+    # 2026-10-22).
+    #
+    # Fix: mirror the main submit path's ``_resolve_cash_pkg`` (see
+    # line ~871) — on lookup failure, fall back to the launcher's
+    # ``--loan-package-id`` (1775, which IS the correct "GD Tiền mặt"
+    # cash id for BAF/TLG), never ``0``.
     import hashlib as _hl
     cash_pkg_cache: dict[str, int] = dict(loan_package_id_by_symbol or {})
+    pkg_lookup_errors: list[str] = []
+    fallback_pkg_id = int(loan_package_id or 0)
 
     def _resolve_pkg(sym: str, original_pkg: int) -> int:
         if original_pkg:
@@ -1363,8 +1401,13 @@ def retry_t2_settlement_sl_orders(
             return cash_pkg_cache[sym]
         try:
             pkg = client.get_cash_loan_package_id(account_no, sym)
-        except Exception:
-            pkg = 0
+        except Exception as exc:
+            # Record the lookup failure for the operator-visible error
+            # list, then fall back to the launch-script default.
+            # NEVER return 0 — DNSE rejects 0 with
+            # "loanPackageId is required" and the retry never lands.
+            pkg_lookup_errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:160]}")
+            pkg = fallback_pkg_id
         cash_pkg_cache[sym] = int(pkg or 0)
         return cash_pkg_cache[sym]
 
@@ -1388,6 +1431,13 @@ def retry_t2_settlement_sl_orders(
             sourceOrderId=new_source_id, sourceDate=today_iso,
             reason=f"{sl.reason} [t2-retry from {sl.sourceDate}]",
         ))
+
+    # Surface the package-lookup failures to the operator (they are
+    # NOT fatal — we fell back to ``loan_package_id`` — but they
+    # explain WHY the fallback was needed and would show up as
+    # "we used the launcher default because DNSE doesn't tag a
+    # cash package for this symbol").
+    summary["pkg_lookup_errors"] = list(pkg_lookup_errors)
 
     try:
         results, _reconciliation, _complete = execute_orders_with_ledger(
@@ -2696,6 +2746,7 @@ def run_auto_bot(
                         today_iso=today,
                         now_time=now.time(),
                         loan_package_id_by_symbol=None,
+                        loan_package_id=loan_package_id,
                     )
                     if t2_summary.get("t2_blocked") or t2_summary.get("resubmit_errors"):
                         print(
@@ -2915,6 +2966,7 @@ def run_auto_bot(
                                 today_iso=today,
                                 now_time=now.time(),
                                 loan_package_id_by_symbol=None,
+                                loan_package_id=loan_package_id,
                             )
                             if t2_summary.get("resubmitted") or t2_summary.get("resubmit_errors"):
                                 print(

@@ -8,6 +8,7 @@ import os
 import secrets
 import socket
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +18,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 _PROXY_OPENER: urllib.request.OpenerDirector | None = None
+
+# Account-wide default cash ("GD Tiền mặt") loan package id for
+# HOSE/HNX symbols on account 0003937868. Verified 2026-10-22: DNSE
+# returns it for BAF/TLG as ``{"id": 1775, "type": "M", "name": "GD
+# Tiền mặt"}`` — i.e. the cash package is tagged ``type="M"`` rather
+# than the documented ``type="N"``, so a naive type filter misses it.
+# Used as the LAST-RESORT id in ``get_cash_loan_package_id`` only when
+# the name-based match also fails.
+DEFAULT_CASH_LOAN_PACKAGE_ID = 1775
 
 
 def configure_http_proxy_from_env() -> bool:
@@ -441,14 +451,44 @@ class DnseClient:
         "no value" not as "no package". The only valid values are
         the package ids returned by ``get_loan_packages``.
 
-        The cash package is the one with ``type == "N"`` (normal /
-        spot). For margin trades the user picks the ``type == "M"``
-        package, but the autofin bot does not use margin so the
-        runner only needs the cash id.
+        The cash package is normally the one with ``type == "N"``
+        (normal / spot). **But DNSE does not apply that consistently
+        across symbols.** Verified 2026-10-22 against account
+        ``0003937868``:
 
-        Returns the int id (e.g. ``1036`` for ABB on account
-        ``0003937868``). Raises ``RuntimeError`` if no cash package
-        is found, or if the DNSE call fails.
+        ==========  ==========================================
+        symbol      packages DNSE returns
+        ==========  ==========================================
+        ABB (UPCoM)  ``[{id: 1036, type: "N"}]``
+        BAF (HOSE)   ``[{id: 1775, type: "M", name: "GD Tiền mặt"},
+                        {id: 1769, type: "M", name: "RocketX"}]``
+        TLG (HOSE)   same shape as BAF
+        ==========  ==========================================
+
+        So for HOSE/HNX symbols the *cash* package exists but DNSE
+        tags it ``type="M"`` instead of ``"N"``. A naive
+        ``type == "N"`` filter therefore finds nothing for BAF/TLG
+        and raises, which in the T+2-SL-retry path (before the
+        2026-10-22 fix) degraded to ``loanPackageId=0`` and produced
+        a ``HTTP 400 loanPackageId is required`` on every retry.
+
+        Resolution order:
+          1. ``type == "N"`` (the documented cash/spot marker).
+          2. Name match on ``name == "GD Tiền mặt"`` (literally
+             "cash account") — this is how BAF/TLG expose their
+             cash package. Matched accent-insensitively so encoding
+             differences between the API response and our source
+             don't break it.
+          3. Name substring match on the unaccented ``"tien mat"``
+             — covers other cash-package spellings such as
+             ``"GD Tiền mặt HOSE"``.
+          4. Fall back to the well-known account-wide cash package
+             id (1775) when it appears in the list.
+
+        Raises ``RuntimeError`` if none of the above yields a
+        candidate, or if the DNSE call itself fails. Callers are
+        expected to have their own last-resort fallback (the
+        runner uses the launcher's ``--loan-package-id``).
         """
         response = self.get_loan_packages(account_no, market_type=market_type, symbol=symbol)
         nested = response.get("loanPackages") if isinstance(response, dict) else None
@@ -457,14 +497,41 @@ class DnseClient:
                 f"DNSE returned no loan packages for {symbol} on "
                 f"account {account_no}: {response!r}"
             )
-        for pkg in nested:
-            if isinstance(pkg, dict) and pkg.get("type") == "N":
-                pkg_id = pkg.get("id")
-                if pkg_id is not None:
-                    return int(pkg_id)
+        pkgs = [p for p in nested if isinstance(p, dict) and p.get("id") is not None]
+
+        # Step 1 — the documented cash marker.
+        for pkg in pkgs:
+            if pkg.get("type") == "N":
+                return int(pkg["id"])
+
+        # Steps 2/3 — DNSE tags HOSE/HNX cash packages as type="M"
+        # but still names them "GD Tiền mặt" ("cash account"). Match
+        # on the name, accent-insensitively.
+        def _norm(value: object) -> str:
+            text = str(value or "").strip().lower()
+            for ch in ("đ", "Đ"):
+                text = text.replace(ch, "d")
+            decomposed = unicodedata.normalize("NFD", text)
+            return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+        for pkg in pkgs:
+            if _norm(pkg.get("name")) == "gd tien mat":
+                return int(pkg["id"])
+        for pkg in pkgs:
+            if "tien mat" in _norm(pkg.get("name")):
+                return int(pkg["id"])
+
+        # Step 4 — the account-wide default cash package. Only accept
+        # it when the list doesn't offer anything better, so we never
+        # prefer a package DNSE clearly didn't offer for this symbol.
+        for pkg in pkgs:
+            if int(pkg["id"]) == DEFAULT_CASH_LOAN_PACKAGE_ID:
+                return int(pkg["id"])
+
         raise RuntimeError(
             f"DNSE returned loan packages for {symbol} but none has "
-            f"type='N' (cash): {[p.get('type') for p in nested]}"
+            f"type='N' (cash) or a 'GD Tiền mặt' name: "
+            f"{[{'id': p.get('id'), 'type': p.get('type'), 'name': p.get('name')} for p in pkgs]}"
         )
 
     def list_loan_packages(self, account_no: str, market_type: str = "STOCK", symbol: str | None = None) -> list[dict[str, Any]]:
