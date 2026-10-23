@@ -162,11 +162,21 @@ def _make_sl_buy_pair(
     ]
 
 
-def _make_client() -> MagicMock:
+def _make_client(positions: list[dict] | None = None) -> MagicMock:
     client = MagicMock()
     client.get_cash_loan_package_id.return_value = 1036
     client.place_stock_order.return_value = {"id": "dnse-new-sl"}
     client.order_detail.return_value = {"id": "dnse-new-sl", "orderStatus": "New"}
+    # 2026-10-23: the T+2 retry now checks LIVE positions before
+    # re-submitting, so a MagicMock's auto-attribute (which iterates
+    # as an empty sequence → "holding 0") would make every candidate
+    # look dead. Default to holding enough of whatever the test seeds.
+    client.get_positions.return_value = {
+        "positions": positions if positions is not None else [
+            {"symbol": "BAF", "quantity": 200},
+            {"symbol": "ABB", "quantity": 200},
+        ]
+    }
     return client
 
 
@@ -348,6 +358,9 @@ def test_retry_records_4xx_rejection_on_resubmit(tmp_path) -> None:
     _seed_ledger(tmp_path, _make_sl_buy_pair())
     client = MagicMock()
     client.get_cash_loan_package_id.return_value = 1036
+    client.get_positions.return_value = {
+        "positions": [{"symbol": "BAF", "quantity": 200}],
+    }
     client.place_stock_order.side_effect = RuntimeError(
         'HTTP 400 INVALID_PRICE_FOR_SYMBOL'
     )
@@ -402,6 +415,196 @@ def test_retry_skips_sl_when_buy_never_filled(tmp_path) -> None:
     assert summary["t2_blocked"] == 1
     assert summary["t2_due"] == 0
     assert summary["resubmitted"] == 0
+
+
+def test_retry_reads_dnse_tradequantity_field(tmp_path) -> None:
+    """2026-10-23: DNSE's ``/positions`` rows have NO ``quantity``
+    key — the live payload uses ``tradeQuantity`` / ``openQuantity``
+    (verified on account 0003937868: ABB → tradeQuantity=100,
+    openQuantity=100). A parser reading only ``quantity`` gets
+    ``None`` → ``0`` and would mark a LIVE holding as flat,
+    silently dropping the protective stop.
+
+    This test uses the exact payload shape DNSE returns so the
+    field-name handling can't regress.
+    """
+    _seed_ledger(tmp_path, _make_sl_buy_pair(
+        symbol="ABB", buy_date="2026-10-13",
+        buy_quantity=100, sl_quantity=100,
+    ))
+    client = _make_client(positions=[{
+        # Real DNSE shape — note: no "quantity" key at all.
+        "id": 2912385,
+        "marketType": "STOCK",
+        "symbol": "ABB",
+        "accountNo": "0003937868",
+        "status": "OPEN",
+        "loanPackageId": 1036,
+        "side": "NB",
+        "accumulateQuantity": 100,
+        "tradeQuantity": 100,
+        "closedQuantity": 0,
+        "openQuantity": 100,
+        "costPrice": 17700,
+        "marketPrice": 17700,
+    }])
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-23",
+        now_time=datetime.time(14, 30),
+    )
+    # We hold 100 ABB and the SL wants 100 → retry must proceed.
+    assert summary["stale_no_position"] == 0, (
+        summary["stale_details"]
+    )
+    assert summary["t2_due"] == 1
+    assert summary["resubmitted"] == 1
+
+
+def test_retry_skips_sl_when_position_already_closed(tmp_path) -> None:
+    """2026-10-23 BAF incident: the BUY filled and T+2.5 cleared, but
+    the position was liquidated by another path (the autofin
+    capital_protect exit sold all 200 BAF on 2026-10-21). Every
+    subsequent retry is guaranteed to fail with
+    ``TRADE_QUANTITY_NOT_ENOUGH / deal not found`` — forever.
+
+    The retry must consult LIVE positions and drop the SL (counted
+    under ``stale_no_position``) rather than re-submitting it every
+    hour. This is what made the Telegram alert repeat 4 identical
+    failures per cycle on 2026-10-23 (errors climbed 8 → 10 → 12
+    → 14 → 16) while the ledger grew to 19 dead rows.
+    """
+    _seed_ledger(tmp_path, _make_sl_buy_pair(symbol="BAF", buy_date="2026-10-13"))
+    # BAF is flat — no live position.
+    client = _make_client(positions=[])
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-23",
+        now_time=datetime.time(14, 30),
+    )
+    assert summary["t2_blocked"] == 1
+    # Not due for retry — the position is gone.
+    assert summary["t2_due"] == 0
+    assert summary["stale_no_position"] == 1
+    assert summary["resubmitted"] == 0
+    assert summary["resubmit_errors"] == []
+    assert "BAF" in summary["stale_details"][0]
+    assert "already closed" in summary["stale_details"][0]
+    # Crucially: no DNSE order call at all.
+    client.place_stock_order.assert_not_called()
+
+
+def test_retry_skips_sl_when_held_qty_below_sl_qty(tmp_path) -> None:
+    """Partial liquidation: we hold fewer shares than the SL asks
+    for, so the SL can never fill in full. Drop it as stale."""
+    _seed_ledger(tmp_path, _make_sl_buy_pair(symbol="BAF", buy_date="2026-10-13"))
+    # Only 100 left of the 200 the SL wants to sell.
+    client = _make_client(positions=[{"symbol": "BAF", "quantity": 100}])
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-23",
+        now_time=datetime.time(14, 30),
+    )
+    assert summary["t2_due"] == 0
+    assert summary["stale_no_position"] == 1
+    assert summary["resubmitted"] == 0
+    client.place_stock_order.assert_not_called()
+
+
+def test_retry_proceeds_when_position_lookup_fails(tmp_path) -> None:
+    """A transient DNSE outage on the positions call must NOT be
+    read as "position closed" — that would silently disable the
+    protective stop exactly when we can least afford it. When the
+    lookup raises we fall back to the previous behaviour (retry)."""
+    _seed_ledger(tmp_path, _make_sl_buy_pair(symbol="BAF", buy_date="2026-10-13"))
+    client = _make_client(positions=[{"symbol": "BAF", "quantity": 200}])
+    client.get_positions.side_effect = RuntimeError("DNSE timeout")
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-23",
+        now_time=datetime.time(14, 30),
+    )
+    # Lookup unavailable → treated as "unknown", so we still retry.
+    assert summary["stale_no_position"] == 0
+    assert summary["t2_due"] == 1
+    assert summary["resubmitted"] == 1
+
+
+def test_retry_source_order_id_is_stable_across_retries(tmp_path) -> None:
+    """2026-10-23: the retry appended another ``[t2-retry from …]``
+    marker to an ALREADY-retried order's reason AND hashed that
+    growing string into ``sourceOrderId``. Every hourly cycle
+    therefore minted a fresh id, the ledger dedup
+    (run_id, sourceOrderId, symbol, side) never matched, and the
+    bot re-submitted the same dead SL forever — the user saw the
+    reason string grow ``[t2-retry] [t2-retry] [t2-retry]`` and the
+    error counter climb by 2 every cycle.
+
+    The regression is directly observable in the WRITTEN ledger:
+    running the retry twice in a row must leave exactly ONE retried
+    row, because the second pass is dedup'd on the stable id.
+    """
+    items = _make_sl_buy_pair(symbol="BAF", buy_date="2026-10-13")
+    # Pretend the SL was already retried once: its reason carries a
+    # provenance marker from a previous pass.
+    items[1] = LedgerOrder(**{
+        **items[1].__dict__,
+        "reason": "autofin_sl:deal#1785888000:BAF:27900 "
+                  "[t2-retry from 2026-10-13]",
+    })
+    _seed_ledger(tmp_path, items)
+
+    client = _make_client(positions=[{"symbol": "BAF", "quantity": 200}])
+
+    from vietnam_algo.libs.order_ledger import load_ledger
+    before_rows = len(load_ledger(tmp_path))
+
+    # First pass — writes a retried row into the ledger.
+    retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-23",
+        now_time=datetime.time(14, 30),
+    )
+    after_first = load_ledger(tmp_path)
+    assert len(after_first) == before_rows + 1, (
+        f"first pass: ledger went {before_rows} -> {len(after_first)}"
+    )
+    retried_first = [
+        o for o in after_first.values()
+        if o.runId == "2026-10-23" and o.side == "NS"
+    ]
+    assert len(retried_first) == 1
+    first_id = retried_first[0].sourceOrderId
+    # The written reason must carry exactly ONE marker, not two.
+    assert retried_first[0].reason.count("[t2-retry from") == 1, (
+        retried_first[0].reason
+    )
+
+    # Second pass — must be dedup'd (no new row, no new DNSE call).
+    client.place_stock_order.reset_mock()
+    summary2 = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-23",
+        now_time=datetime.time(14, 30),
+    )
+    after_second = load_ledger(tmp_path)
+    assert len(after_second) == len(after_first), (
+        f"second pass grew the ledger {len(after_first)} -> "
+        f"{len(after_second)} — the sourceOrderId is not stable across "
+        f"passes, so dedup never matches and the SL is re-submitted "
+        f"forever."
+    )
+    retried_second = [
+        o for o in after_second.values()
+        if o.runId == "2026-10-23" and o.side == "NS"
+    ]
+    assert len(retried_second) == 1
+    assert retried_second[0].sourceOrderId == first_id
+    # The newly-written retried row is now ``open`` (not ``rejected``)
+    # with the SAME id, so any further pass finds it already handled
+    # rather than minting a third variant.
+    assert retried_second[0].status == "open"
+    client.place_stock_order.assert_not_called()
 
 
 def test_retry_skips_sl_when_buy_qty_mismatch(tmp_path) -> None:

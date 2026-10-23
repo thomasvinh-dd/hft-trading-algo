@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import os
+import re
 import urllib.request
 import csv as _csv
 import json as _json
@@ -1138,6 +1139,15 @@ def _submit_autofin_deals_to_dnse(
 # cycle.
 _T2_REJECT_CODES = ("TRADE_QUANTITY_NOT_ENOUGH",)
 
+# 2026-10-23: matches the ``[t2-retry from <date>]`` provenance
+# marker that ``retry_t2_settlement_sl_orders`` appends to each
+# retried order's reason. Stripped before deriving the retry's
+# ``sourceOrderId`` so an already-retried order hashes to the SAME
+# id on the next pass (otherwise the ledger dedup never matches
+# and the bot re-submits the same dead SL every hour — see the
+# function's docstring).
+_T2_RETRY_MARKER_RE = re.compile(r"\s*\[t2-retry from [^\]]+\]")
+
 
 def _is_t2_rejection(error: str) -> bool:
     """Return True if the error indicates a T+2 settlement block.
@@ -1289,11 +1299,78 @@ def retry_t2_settlement_sl_orders(
         "t2_blocked": 0,
         "t2_pending": 0,
         "t2_due": 0,
+        "stale_no_position": 0,
+        "stale_details": [],
         "resubmitted": 0,
         "resubmit_dnse_ids": [],
         "resubmit_errors": [],
         "pkg_lookup_errors": [],
     }
+
+    # Cache of symbol -> held qty so a position appearing multiple
+    # times in the ledger (several SL variants per deal) only costs
+    # ONE DNSE positions call per retry pass.
+    _live_pos_cache: dict[str, int | None] = {}
+
+    def _fetch_live_position_qty(cli, acct: str, sym: str) -> int | None:
+        """Return the live DNSE position qty for ``sym``, or ``None``
+        when the lookup is unavailable.
+
+        ``None`` means "don't know" — the caller must then fall back
+        to the historical behaviour (attempt the retry) rather than
+        assume the position is gone. Only a successful lookup that
+        returns 0 (or fewer shares than the SL asks for) is treated
+        as proof the SL is dead.
+        """
+        if sym in _live_pos_cache:
+            return _live_pos_cache[sym]
+        result: int | None = None
+        try:
+            raw = cli.get_positions(acct)
+            # DNSE returns ``{"positions": [...]}`` (verified live
+            # 2026-10-23); older/alternate shapes return a bare list
+            # or ``{"data": [...]}``. Accept all three.
+            if isinstance(raw, list):
+                rows = raw
+            elif isinstance(raw, dict):
+                rows = (
+                    raw.get("positions")
+                    or raw.get("data")
+                    or []
+                )
+            else:
+                rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("symbol") or "").upper() != sym.upper():
+                    continue
+                # 2026-10-23: DNSE's /positions rows do NOT carry a
+                # ``quantity`` key — the live payload uses
+                # ``tradeQuantity`` (net held) and ``openQuantity``.
+                # Reading ``quantity`` yielded None → 0 and would
+                # mark EVERY held position as flat, silently
+                # disabling the protective stop on a live holding.
+                # Verified against account 0003937868:
+                #   ABB → tradeQuantity=100, openQuantity=100
+                #   TLG → tradeQuantity=100, openQuantity=100
+                raw_qty = None
+                for field in ("tradeQuantity", "openQuantity", "quantity"):
+                    if row.get(field) is not None:
+                        raw_qty = row.get(field)
+                        break
+                try:
+                    result = int(float(raw_qty or 0))
+                except (TypeError, ValueError):
+                    result = 0
+                break
+            else:
+                # Symbol absent from the positions list == flat.
+                result = 0
+        except Exception:
+            result = None
+        _live_pos_cache[sym] = result
+        return result
 
     try:
         ledger = load_ledger(data_dir)
@@ -1345,8 +1422,37 @@ def retry_t2_settlement_sl_orders(
         # about).
         if not _buy_filled_and_matches_sl(buy, item.quantity):
             continue
+        # 2026-10-23 fix (retry loop on a sold-out position): the
+        # gate above only proves the BUY filled — it says nothing
+        # about whether we STILL HOLD those shares today. Once the
+        # position was sold by another path (e.g. the 2026-10-21
+        # autofin capital_protect exit that liquidated all 200 BAF),
+        # every subsequent retry is guaranteed to fail with
+        # ``TRADE_QUANTITY_NOT_ENOUGH / deal not found``, forever.
+        #
+        # We saw exactly that on 2026-10-23: 19 rejected BAF/ABB SL
+        # rows in the ledger, all T+2-blocked from 2026-10-13, with
+        # ZERO BAF remaining on the DNSE account. The bot faithfully
+        # re-submitted the dead SL every hour and the Telegram alert
+        # repeated 4 identical failures per cycle.
+        #
+        # Fix: query live positions once per call and drop any
+        # candidate whose held qty is 0 (or less than the SL qty).
+        # The SL is then recorded as stale in the summary instead of
+        # being retried forever. Requires a live DNSE call; if the
+        # lookup fails we keep the previous behaviour (retry) so a
+        # transient outage doesn't silently disable protection.
+        held = _fetch_live_position_qty(client, account_no, item.symbol)
+        if held is not None and held < int(item.quantity or 0):
+            summary["stale_no_position"] += 1
+            summary["stale_details"].append(
+                f"{item.symbol}: SL {int(item.quantity or 0)} @ {item.price:,.0f} "
+                f"but holding {held} — position already closed, "
+                f"skipping T+2 retry"
+            )
+            continue
         # T+2.5 cleared AND the BUY actually filled at the matching
-        # qty — eligible for retry.
+        # qty AND we still hold the shares — eligible for retry.
         summary["t2_due"] += 1
         candidates.append((item, buy))
 
@@ -1413,9 +1519,33 @@ def retry_t2_settlement_sl_orders(
 
     orders_to_resubmit: list[DnseOrder] = []
     for sl, buy in candidates:
+        # 2026-10-23 fix (unbounded retry loop): strip any
+        # ``[t2-retry from ...]`` markers already appended by a
+        # PREVIOUS retry before deriving the sourceOrderId and the
+        # new reason.
+        #
+        # Before this fix both derivations used ``sl.reason`` verbatim,
+        # and the retry itself appended another marker to it. So each
+        # hourly cycle produced:
+        #   run 1: "autofin_sl:deal#X:27900"                       → id A
+        #   run 2: "autofin_sl:deal#X:27900 [t2-retry from 10-13]" → id B
+        #   run 3: "... [t2-retry from 10-13] [t2-retry from 10-13]" → id C
+        # Because ``new_source_id`` hashed the growing reason string,
+        # the ledger dedup key (run_id, sourceOrderId, symbol, side)
+        # NEVER matched a previous attempt, so the bot re-submitted
+        # the same dead SL every hour forever. The user saw the
+        # error counter climb 8 → 10 → 12 → 14 → 16 across
+        # 2026-10-23's cycles, and the Telegram alert repeated the
+        # same 4 failures every hour.
+        #
+        # Normalising to the BASE reason makes the id stable for a
+        # given (symbol, price, quantity, today) so the ledger dedup
+        # suppresses the second and later attempts.
+        base_reason = _T2_RETRY_MARKER_RE.sub("", sl.reason or "").strip()
+
         new_source_id = int(
             _hl.sha1(
-                f"t2-retry|{today_iso}|{sl.symbol}|{sl.price}|{sl.quantity}|{sl.reason}".encode()
+                f"t2-retry|{today_iso}|{sl.symbol}|{sl.price}|{sl.quantity}|{base_reason}".encode()
             ).hexdigest()[:12],
             16,
         )
@@ -1429,7 +1559,7 @@ def retry_t2_settlement_sl_orders(
             symbol=sl.symbol, side=sl.side, quantity=sl.quantity, price=sl.price,
             loanPackageId=pkg, orderType="LO",
             sourceOrderId=new_source_id, sourceDate=today_iso,
-            reason=f"{sl.reason} [t2-retry from {sl.sourceDate}]",
+            reason=f"{base_reason} [t2-retry from {sl.sourceDate}]",
         ))
 
     # Surface the package-lookup failures to the operator (they are
@@ -2772,6 +2902,17 @@ def run_auto_bot(
                             "⚠️ Vietnam Algo: T+2 SL retry errors:\n"
                             + "\n".join(t2_summary["resubmit_errors"][:5])
                         )
+                    # 2026-10-23: tell the operator when an SL was
+                    # dropped because we no longer hold the shares,
+                    # so a dead protective order doesn't silently
+                    # vanish from the report.
+                    if t2_summary.get("stale_no_position"):
+                        notify(
+                            "ℹ️ Vietnam Algo: T+2 SL retry skipped "
+                            f"{t2_summary['stale_no_position']} order(s) — "
+                            "position already closed (no shares to protect):\n"
+                            + "\n".join(t2_summary["stale_details"][:5])
+                        )
                 except Exception as exc:
                     print(f"[{now.isoformat()}] t2-sl-retry crashed: {type(exc).__name__}: {str(exc)[:200]}")
 
@@ -2973,6 +3114,7 @@ def run_auto_bot(
                                     f"[{now.isoformat()}] t2-sl-retry (mid-day): "
                                     f"resubmitted={t2_summary['resubmitted']} "
                                     f"pending={t2_summary['t2_pending']} "
+                                    f"stale_no_position={t2_summary.get('stale_no_position', 0)} "
                                     f"errors={len(t2_summary['resubmit_errors'])}"
                                 )
                                 if t2_summary.get("resubmitted"):
