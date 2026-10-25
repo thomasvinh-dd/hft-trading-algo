@@ -374,19 +374,27 @@ def heartbeat_message(
                 cal_age = freshness.get(
                     "median_latest_bar_age_calendar_days",
                 )
-            # Trading-day age is the freshness gate (so a Friday close
-            # on a Monday morning isn't flagged). Calendar-day age is
-            # shown in the alert text for context — that's what most
-            # operators intuit. 2026-09-19 user feedback: "the day
-            # before is weekend so we can not say that the data is
-            # stale, we only compare with trading day not holiday".
-            if cal_age is not None and abs(cal_age - median_age) > 0.01:
-                bits.append(
-                    f"sample-bar-median={median_age}d-trading "
-                    f"({cal_age}d-cal)"
-                )
+                # Trading-day age is the freshness gate (so a Friday close
+                # on a Monday morning isn't flagged). Calendar-day age is
+                # shown in the alert text for context — that's what most
+                # operators intuit. 2026-09-19 user feedback: "the day
+                # before is weekend so we can not say that the data is
+                # stale, we only compare with trading day not holiday".
+                if cal_age is not None and abs(cal_age - median_age) > 0.01:
+                    bits.append(
+                        f"sample-bar-median={median_age}d-trading "
+                        f"({cal_age}d-cal)"
+                    )
+                else:
+                    bits.append(f"sample-bar-median={median_age}d")
             else:
-                bits.append(f"sample-bar-median={median_age}d")
+                # No sample bars at all (e.g. every sample price file
+                # missing). Don't reference ``cal_age``/``median_age``
+                # — they were never bound. Pre-fix this was an
+                # UnboundLocalError that broke the whole heartbeat
+                # message on the exact shape where the sentinel was
+                # stale but no bar data was available.
+                bits.append("sample-bar-median=unknown")
             if freshness.get("oldest_sample_symbol"):
                 bits.append(f"oldest={freshness['oldest_sample_symbol']}")
             if "error" in freshness:
