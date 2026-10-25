@@ -60,14 +60,21 @@ class MarketDataFreshnessTests(unittest.TestCase):
         self.assertLess(out["median_latest_bar_age_days"], 2.0)
 
     def test_stale_when_sentinel_old(self) -> None:
-        # Sentinel 30h old
-        self._write_sentinel(datetime.now(tz=UTC) - timedelta(hours=30))
+        # Sentinel 30h old. Since the 2026-10-25 fix the gate counts
+        # TRADING days, so 30 wall-clock hours may still be only 1
+        # trading day (weekend) → fresh. To exercise the stale path we
+        # need a sentinel that is 3+ TRADING days old, which is what
+        # "the sync cron hasn't run for 3 sessions" looks like.
+        # 5 calendar days back spans 3 trading days (weekend
+        # excluded) — comfortably over the 2-day threshold.
+        self._write_sentinel(datetime.now(tz=UTC) - timedelta(days=5))
         today = datetime.now(tz=UTC).date().isoformat()
         for sym in ("HPG", "VHM"):
             _write_price_file(self.tmp, sym, [{"time": today, "close": 100.0}])
         out = get_market_data_freshness(self.tmp)
         self.assertFalse(out["fresh"])
         self.assertGreater(out["sentinel_age_hours"], 25.0)
+        self.assertGreater(out["sentinel_age_trading_days"], 2.0)
 
     def test_stale_when_sample_bars_old(self) -> None:
         # Sentinel fresh, but sample bars are 5 calendar days old.
@@ -81,8 +88,10 @@ class MarketDataFreshnessTests(unittest.TestCase):
         out = get_market_data_freshness(self.tmp)
         self.assertFalse(out["fresh"])
         self.assertGreater(out["median_latest_bar_age_days"], 2.0)
-        # All tied — just verify it picks one of them
-        self.assertIn(out["oldest_sample_symbol"], {"HPG", "VHM", "FPT", "VIC", "HDB"})
+        # All symbols have the SAME age → no meaningful "oldest"
+        # (2026-10-25 fix). An arbitrary tie-break winner would read
+        # as "this ticker is broken" when nothing is wrong.
+        self.assertIsNone(out["oldest_sample_symbol"])
 
     def test_freshness_uses_trading_days_not_calendar_days(self) -> None:
         """User feedback 2026-09-19: "the day before is weekend
@@ -181,6 +190,177 @@ class MarketDataFreshnessTests(unittest.TestCase):
         self.assertEqual(out["sample_size"], 0)
         self.assertIsNone(out["median_latest_bar_age_days"])
         # Without any sample bar info we can't claim fresh.
+        self.assertFalse(out["fresh"])
+
+
+class SentinelTradingDayAgeTests(unittest.TestCase):
+    """Regression test for the 2026-10-25 false-STALE alert.
+
+    Incident: on Sunday 2026-10-25 (a weekend) the momentum bot
+    sent a "market data STALE" Telegram alert reading:
+
+        data_ready_for_eod age: 43.0h (threshold 25h)
+        sample latest-bar median age: 0 trading-days (2.15 calendar-days)
+        oldest sample: HPG
+
+    Two separate bugs:
+
+    1. The sentinel gate compared RAW WALL-CLOCK HOURS against a 25h
+       threshold. The sentinel was stamped Friday 2026-10-23 15:30
+       ICT; by Sunday 22:45 ICT it was 43h old — but ZERO trading
+       days had elapsed (Sat/Sun are non-trading). Commit c6d09ac had
+       already converted the BAR-age gate to trading days but left the
+       sentinel gate on raw hours, so every weekend produced a false
+       alert.
+
+    2. "oldest sample: HPG" was an arbitrary tie-break winner. All
+       five sample symbols had identical age (0 trading-days), so
+       ``max()`` returned whichever was first in the tuple — reading
+       as "HPG is broken" when nothing was wrong. HPG's last bar was
+       2026-10-23, the latest trading close, same as every other
+       symbol.
+
+    The fix: gate the sentinel on TRADING days (weekends + Vietnamese
+    holidays excluded), and only report ``oldest_sample_symbol`` when
+    there's an actual age spread.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path("/tmp/opencode/sentinel_td_test")
+        import shutil
+        if self.tmp.exists():
+            shutil.rmtree(self.tmp)
+        self.tmp.mkdir(parents=True, exist_ok=True)
+        (self.tmp / "live").mkdir(exist_ok=True)
+        (self.tmp / "prices").mkdir(exist_ok=True)
+
+    def _ict_to_utc(self, d: str, hh: int = 13, mm: int = 0) -> datetime:
+        """Build a UTC datetime from an ICT date string."""
+        y, m, day = (int(x) for x in d.split("-"))
+        return datetime(y, m, day, hh - 7, mm, tzinfo=UTC)
+
+    def _write_sentinel_at(self, when_utc: datetime) -> None:
+        sentinel = self.tmp / "live" / "data_ready_for_eod"
+        sentinel.write_text(when_utc.isoformat())
+        os.utime(sentinel, (when_utc.timestamp(), when_utc.timestamp()))
+
+    def _write_friday_bars(self) -> None:
+        """All sample symbols carry Friday 2026-10-23's close."""
+        for sym in ("HPG", "VHM", "FPT", "VIC", "HDB"):
+            _write_price_file(self.tmp, sym, [
+                {"time": "2026-10-22", "close": 20900.0},
+                {"time": "2026-10-23", "close": 20950.0},
+            ])
+
+    def test_weekend_sentinel_is_fresh(self) -> None:
+        """Friday-stamped sentinel on Sunday evening = FRESH.
+
+        This is the exact 2026-10-25 incident: sentinel stamped
+        Friday 2026-10-23 15:30 ICT (08:30 UTC), probe at Sunday
+        2026-10-25 22:45 ICT (15:45 UTC) → 43h wall-clock but ZERO
+        trading days elapsed.
+        """
+        self._write_sentinel_at(self._ict_to_utc("2026-10-23", 15, 30))
+        self._write_friday_bars()
+        out = get_market_data_freshness(
+            self.tmp, now=self._ict_to_utc("2026-10-25", 22, 45)
+        )
+        # Raw wall-clock age is > 25h — that's what tripped the alert.
+        self.assertGreater(out["sentinel_age_hours"], 25.0)
+        # But no trading day elapsed since the Friday stamp.
+        self.assertEqual(out["sentinel_age_trading_days"], 0.0)
+        # Bars are Friday's close → 0 trading-days old.
+        self.assertEqual(out["median_latest_bar_age_days"], 0.0)
+        # ...so the whole thing is FRESH. No false alert.
+        self.assertTrue(
+            out["fresh"],
+            f"Weekend must not trip the stale gate: {out}",
+        )
+
+    def test_monday_morning_sentinel_is_fresh(self) -> None:
+        """Friday stamp → Monday 09:00 ICT = 1 trading day = fresh.
+
+        Monday 09:00 ICT is BEFORE the 13:15 ICT common_sync cron
+        fires, so the sentinel is still Friday's stamp. Pre-fix this
+        was 65h old → false STALE alert every Monday morning.
+        """
+        self._write_sentinel_at(self._ict_to_utc("2026-10-23", 15, 30))
+        self._write_friday_bars()
+        out = get_market_data_freshness(
+            self.tmp, now=self._ict_to_utc("2026-10-26", 9, 0)
+        )
+        self.assertGreater(out["sentinel_age_hours"], 25.0)
+        self.assertEqual(out["sentinel_age_trading_days"], 1.0)
+        self.assertTrue(out["fresh"], f"Monday morning must be fresh: {out}")
+
+    def test_tuesday_sentinel_trips_after_missed_session(self) -> None:
+        """Friday stamp → Tuesday = 2 trading days → still fresh (<= 2).
+
+        Wednesday = 3 trading days → STALE. The gate has to actually
+        catch a missed trading session, not just weekends.
+        """
+        self._write_sentinel_at(self._ict_to_utc("2026-10-23", 15, 30))
+        self._write_friday_bars()
+        # Tuesday 2026-10-27 → 2 trading days (Mon 26th, Tue 27th)
+        out = get_market_data_freshness(
+            self.tmp, now=self._ict_to_utc("2026-10-27", 10, 0)
+        )
+        self.assertEqual(out["sentinel_age_trading_days"], 2.0)
+        # Bars are still Friday's → 2 trading-days old → fresh.
+        self.assertTrue(out["fresh"], f"Tuesday should still be fresh: {out}")
+        # Wednesday 2026-10-28 → 3 trading days for the sentinel AND
+        # for the bars → STALE.
+        out = get_market_data_freshness(
+            self.tmp, now=self._ict_to_utc("2026-10-28", 10, 0)
+        )
+        self.assertEqual(out["sentinel_age_trading_days"], 3.0)
+        self.assertEqual(out["median_latest_bar_age_days"], 3.0)
+        self.assertFalse(
+            out["fresh"],
+            f"Wednesday must trip the stale gate: {out}",
+        )
+
+    def test_oldest_sample_symbol_omitted_when_all_tied(self) -> None:
+        """When every sample symbol has the same age, report NO
+        'oldest sample' — an arbitrary tie-break winner reads as
+        'this ticker is broken' (2026-10-25: "oldest sample: HPG"
+        when HPG was perfectly fresh)."""
+        self._write_sentinel_at(self._ict_to_utc("2026-10-23", 15, 30))
+        self._write_friday_bars()
+        out = get_market_data_freshness(
+            self.tmp, now=self._ict_to_utc("2026-10-25", 22, 45)
+        )
+        self.assertEqual(out["sample_size"], 5)
+        self.assertIsNone(
+            out["oldest_sample_symbol"],
+            f"All-tied sample must not name an 'oldest' symbol: {out}",
+        )
+
+    def test_oldest_sample_symbol_reported_when_real_spread(self) -> None:
+        """When one symbol IS genuinely older, it must be named."""
+        self._write_sentinel_at(self._ict_to_utc("2026-10-23", 15, 30))
+        for sym in ("HPG", "VHM", "FPT", "VIC", "HDB"):
+            _write_price_file(self.tmp, sym, [
+                {"time": "2026-10-23", "close": 20950.0},
+            ])
+        # HPG lags by one trading day.
+        _write_price_file(self.tmp, "HPG", [
+            {"time": "2026-10-22", "close": 20900.0},
+        ])
+        out = get_market_data_freshness(
+            self.tmp, now=self._ict_to_utc("2026-10-26", 10, 0)
+        )
+        self.assertEqual(
+            out["oldest_sample_symbol"], "HPG",
+            f"A genuine age spread must still name the symbol: {out}",
+        )
+
+    def test_missing_sentinel_has_no_trading_day_age(self) -> None:
+        """No sentinel → no trading-day age (and still not fresh)."""
+        out = get_market_data_freshness(self.tmp)
+        self.assertFalse(out["sentinel_exists"])
+        self.assertIsNone(out["sentinel_age_hours"])
+        self.assertIsNone(out["sentinel_age_trading_days"])
         self.assertFalse(out["fresh"])
 
 

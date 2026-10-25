@@ -359,7 +359,14 @@ def heartbeat_message(
             lines.append("data: fresh")
         elif fresh is False:
             bits = []
-            if sentinel_age is not None:
+            sentinel_td = freshness.get("sentinel_age_trading_days")
+            if sentinel_td is not None:
+                # 2026-10-25: trading-day age is the gate (weekends
+                # don't count). Raw hours shown alongside for context.
+                bits.append(f"sentinel={sentinel_td}d-trading")
+                if sentinel_age is not None:
+                    bits.append(f"({sentinel_age}h-wall)")
+            elif sentinel_age is not None:
                 bits.append(f"sentinel={sentinel_age}h")
             elif sentinel_mtime is None and not freshness.get("sentinel_exists"):
                 bits.append("sentinel=MISSING")

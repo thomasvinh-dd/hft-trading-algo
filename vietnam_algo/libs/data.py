@@ -617,7 +617,14 @@ def get_market_data_freshness(
       - ``sentinel_exists``: bool — does ``data/live/data_ready_for_eod``
         exist?
       - ``sentinel_age_hours``: float | None — age of the sentinel file
-        in hours (None if missing). Computed as ``now - mtime``.
+        in hours (None if missing). Computed as ``now - mtime``. This is
+        the raw wall-clock age — it grows over weekends even when no
+        trading session was missed, so the freshness GATE uses
+        ``sentinel_age_trading_days`` instead.
+      - ``sentinel_age_trading_days``: float | None — number of trading
+        days between the sentinel's ICT date and today (weekends +
+        Vietnamese holidays excluded). None if the sentinel is missing.
+        This is the freshness gate (2026-10-25 fix).
       - ``sentinel_mtime``: str | None — ISO8601 UTC mtime (None if missing).
       - ``sample_size``: int — number of sample symbols actually found on
         disk.
@@ -630,7 +637,11 @@ def get_market_data_freshness(
         (used for the alert text so the operator understands the gap
         including weekends).
       - ``oldest_sample_symbol``: str | None — symbol with the oldest
-        latest bar (None if no sample data).
+        latest bar. None when all sample symbols have the SAME age
+        (the normal case) — reporting an arbitrary tie-break winner
+        reads as "this symbol is broken" when nothing is wrong
+        (2026-10-25 incident: "oldest sample: HPG" on a Sunday when
+        every symbol had 0 trading-days of age).
       - ``held_position_count``: int — number of held-position symbols
         added to the sample (0 when ``include_held_positions=False``).
       - ``held_positions``: list[str] — sorted list of held-position
@@ -640,8 +651,9 @@ def get_market_data_freshness(
         ``symbol``, ``last_bar_date``, ``age_trading_days``, and
         ``age_calendar_days``. Empty when all held positions are
         fresh. Always empty when ``include_held_positions=False``.
-      - ``fresh``: bool — ``True`` iff sentinel_age_hours <= 25 AND
-        median_latest_bar_age_days <= 2.0.
+      - ``fresh``: bool — ``True`` iff the sentinel's trading-day age
+        <= 2 AND median_latest_bar_age_days <= 2.0 AND there are no
+        stale held positions.
 
     Bar age is measured in **trading days**, not calendar days.
     Vietnamese markets close on weekends and Vietnamese public
@@ -673,6 +685,7 @@ def get_market_data_freshness(
     result: dict[str, Any] = {
         "sentinel_exists": False,
         "sentinel_age_hours": None,
+        "sentinel_age_trading_days": None,
         "sentinel_mtime": None,
         "sample_size": 0,
         "sample_total": 0,
@@ -736,9 +749,11 @@ def get_market_data_freshness(
     result["held_position_count"] = len(held_symbols)
     result["held_positions"] = sorted(set(held_symbols))
     sentinel_path = data_dir / "live" / "data_ready_for_eod"
+    sentinel_mtime_dt: datetime | None = None
     if sentinel_path.exists():
         mtime = datetime.fromtimestamp(sentinel_path.stat().st_mtime, tz=UTC)
         age_seconds = (now - mtime).total_seconds()
+        sentinel_mtime_dt = mtime
         result["sentinel_exists"] = True
         result["sentinel_age_hours"] = round(age_seconds / 3600.0, 2)
         result["sentinel_mtime"] = mtime.isoformat()
@@ -748,6 +763,34 @@ def get_market_data_freshness(
     from .schedule import VIETNAM_TZ, local_date
     today_ict = local_date(now)
     holidays = load_market_holidays(data_dir)
+    # Sentinel age in TRADING days.
+    #
+    # 2026-10-25 incident: the sentinel freshness gate used raw
+    # wall-clock hours (``<= 25.0``) while the bar-age gate had
+    # already been converted to trading days by commit c6d09ac. Over
+    # a weekend that means the sentinel naturally ages 48-72h with
+    # ZERO trading days elapsed — so every Sunday evening (and every
+    # Monday morning, before the 13:15 ICT common_sync cron fires)
+    # the operator got a false "market data STALE" alert even though
+    # every price bar was the latest close.
+    #
+    # Fix: count trading days between the sentinel's ICT date and
+    # today, the same way bar age is counted. The sentinel is stamped
+    # by common_sync right after a successful price sync, so its
+    # trading-day age tracks "how many trading sessions have passed
+    # since we last refreshed prices" — exactly the question the
+    # freshness gate wants to ask.
+    if sentinel_mtime_dt is not None:
+        sentinel_ict_date = sentinel_mtime_dt.astimezone(VIETNAM_TZ).date().isoformat()
+        if sentinel_ict_date >= today_ict:
+            result["sentinel_age_trading_days"] = 0.0
+        else:
+            _tdays = trading_dates_between(sentinel_ict_date, today_ict, holidays)
+            # ``trading_dates_between`` is inclusive on both ends.
+            # Subtract the sentinel's own date (it counts as 1) so
+            # "stamped today" = 0 and "stamped yesterday (a trading
+            # day)" = 1.
+            result["sentinel_age_trading_days"] = float(max(0, len(_tdays) - 1))
     ages_trading_days: list[tuple[str, float]] = []
     ages_calendar_days: list[tuple[str, float]] = []
     # Per-symbol staleness record so we can populate
@@ -840,18 +883,45 @@ def get_market_data_freshness(
                 and record["age_trading_days"] > FRESHNESS_THRESHOLD_TRADING_DAYS
             ):
                 result["stale_held_positions"].append(record)
-        result["sample_size"] = len(ages_trading_days)
-        median_age = statistics.median(a for _, a in ages_trading_days)
-        result["median_latest_bar_age_days"] = round(median_age, 2)
-        # Keep the calendar-days median around for the alert text so
-        # the operator can see the raw gap ("Friday close on
-        # Monday = 3 calendar days, 1 trading day").
-        cal_median = statistics.median(a for _, a in ages_calendar_days)
-        result["median_latest_bar_age_calendar_days"] = round(cal_median, 2)
-        result["oldest_sample_symbol"] = max(ages_trading_days, key=lambda x: x[1])[0]
-    sentinel_fresh = (
-        result["sentinel_age_hours"] is not None and result["sentinel_age_hours"] <= 25.0
-    )
+    # "oldest sample" is only meaningful when there's an actual
+    # spread. When every sample symbol has the same age (the normal
+    # case — all 5 quote the same session's close), ``max()`` would
+    # return whichever symbol happens to be first in the tuple, which
+    # reads as "HPG is the problem" when nothing is wrong.
+    # 2026-10-25 incident: the operator got "oldest sample: HPG" on
+    # a Sunday when all five symbols had 0 trading-days of age. Only
+    # report the symbol when it is strictly older than the rest.
+    if ages_trading_days:
+        _max_age = max(a for _, a in ages_trading_days)
+        _min_age = min(a for _, a in ages_trading_days)
+        if _max_age > _min_age:
+            result["oldest_sample_symbol"] = max(
+                ages_trading_days, key=lambda x: x[1]
+            )[0]
+        else:
+            result["oldest_sample_symbol"] = None
+    # Sentinel freshness gate — TRADING days, not wall-clock hours.
+    #
+    # 2026-10-25 incident: this used to be a raw-hour comparison
+    # (``sentinel_age_hours <= 25.0``). Over a weekend the sentinel
+    # naturally ages 48-72h with ZERO trading days elapsed, so every
+    # Sunday evening produced a false "market data STALE" alert even
+    # though every price bar was the latest close. We now compare
+    # the sentinel's trading-day age (computed above) against the
+    # same 2-trading-day bar threshold, so a Friday-stamped sentinel
+    # stays fresh through the weekend and only trips once a real
+    # trading session has been missed.
+    #
+    # We keep the raw-hour check as a fallback for the case where
+    # the trading-day age couldn't be computed.
+    _sentinel_td = result.get("sentinel_age_trading_days")
+    if _sentinel_td is not None:
+        sentinel_fresh = _sentinel_td <= 2.0
+    else:
+        sentinel_fresh = (
+            result["sentinel_age_hours"] is not None
+            and result["sentinel_age_hours"] <= 25.0
+        )
     bars_fresh = (
         result["median_latest_bar_age_days"] is not None
         and result["median_latest_bar_age_days"] <= 2.0
