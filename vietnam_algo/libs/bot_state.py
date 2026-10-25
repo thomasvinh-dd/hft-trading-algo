@@ -10,6 +10,16 @@ from .data import DEFAULT_DATA_DIR, read_json, write_json
 class AutoBotState:
     tokenDate: str | None = None
     tokenExpiry: str | None = None  # ISO8601 UTC; parsed from JWT `exp`
+    # 2026-10-25: exact issuance timestamp of the trading token.
+    #
+    # DNSE rotated to UUID tokens (no parseable JWT ``exp``) in
+    # Aug 2026, so the only way to tell whether a token is still
+    # valid is to know WHEN it was issued. ``tokenDate`` (a plain
+    # YYYY-MM-DD) is only day-resolution — treating midnight UTC as
+    # the issuance time makes a token look up to 24h old when it is
+    # really minutes old. This field carries the precise timestamp
+    # written by the 08:30-ICT ``run-get-otp`` cron.
+    tokenIssuedAt: str | None = None
     orderSubmitDate: str | None = None
     eodDate: str | None = None
     corporateActionDate: str | None = None
@@ -52,6 +62,7 @@ def load_state(data_dir: Path = DEFAULT_DATA_DIR, strategy_name: str = "") -> Au
     return AutoBotState(
         tokenDate=payload.get("tokenDate"),
         tokenExpiry=payload.get("tokenExpiry"),
+        tokenIssuedAt=payload.get("tokenIssuedAt"),
         orderSubmitDate=payload.get("orderSubmitDate"),
         eodDate=payload.get("eodDate"),
         corporateActionDate=payload.get("corporateActionDate"),

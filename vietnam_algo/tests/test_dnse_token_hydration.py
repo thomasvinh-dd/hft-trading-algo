@@ -234,6 +234,54 @@ def test_missing_shared_file_is_handled(tmp_path: Path) -> None:
     assert _hydrate_shared_token_into_state(state, tmp_path) is False
 
 
+def test_state_roundtrips_token_issued_at(tmp_path: Path) -> None:
+    """``tokenIssuedAt`` must survive a save/load cycle.
+
+    DNSE tokens are UUIDs with no JWT ``exp``, so the issuance
+    timestamp is the ONLY way to judge freshness. If it is not
+    persisted, a restarted bot has to fall back to the day-resolution
+    ``tokenDate`` and may judge a minutes-old token as up to 24h old.
+    """
+    from vietnam_algo.libs.bot_state import load_state, save_state
+
+    issued = _fresh_issued_at().isoformat()
+    state = SimpleNamespace(
+        tradingToken="uuid-token",
+        tokenExpiry=None,
+        tokenDate=_fresh_issued_at().date().isoformat(),
+        tokenIssuedAt=issued,
+    )
+    # Use the real AutoBotState so the dataclass fields are exercised.
+    from vietnam_algo.libs.bot_state import AutoBotState
+
+    real = AutoBotState(
+        tradingToken="uuid-token",
+        tokenDate=state.tokenDate,
+        tokenIssuedAt=issued,
+    )
+    save_state(real, tmp_path)
+    loaded = load_state(tmp_path)
+    assert loaded.tokenIssuedAt == issued
+    assert loaded.tradingToken == "uuid-token"
+
+
+def test_hydration_sets_issued_at_on_real_bot_state(tmp_path: Path) -> None:
+    """The real ``AutoBotState`` must accept the ``tokenIssuedAt`` write."""
+    from vietnam_algo.libs.bot_state import AutoBotState
+
+    issued = _fresh_issued_at()
+    _write_shared_token(tmp_path, issued_at=issued, token="uuid-tok")
+    state = AutoBotState()
+    # The dataclass now declares the field, so the assignment works.
+    assert hasattr(state, "tokenIssuedAt")
+
+    ok = _hydrate_shared_token_into_state(state, tmp_path)
+
+    assert ok is True
+    assert state.tokenIssuedAt == issued.isoformat()
+    assert state.tradingToken == "uuid-tok"
+
+
 def test_hydrate_preserves_existing_token_on_failure(tmp_path: Path) -> None:
     """A stale shared file must not wipe a good in-memory token."""
     _write_shared_token(
