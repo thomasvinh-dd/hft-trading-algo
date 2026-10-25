@@ -22,6 +22,7 @@ from .market_calendar import live_trading_dates
 from .notifier import daily_generation_message, notify, submit_message, portfolio_snapshot_message
 from .order_ledger import (
     LedgerOrder,
+    TOKEN_REJECTED_STATUS,
     dnse_order_id,
     ledger_key,
     load_ledger,
@@ -511,14 +512,43 @@ def execute_orders_with_ledger(
             # ``unsafe_existing_orders``. Reclassify as "rejected"
             # (terminal) so they don't gate future cycles.
             err_text = str(exc)
+            # 2026-10-25: an INVALID_TRADING_TOKEN rejection is NOT
+            # permanent — it means the token we used was expired or
+            # rejected by DNSE, and the very SAME payload succeeds
+            # with a fresh token. Classifying it as "rejected"
+            # (terminal) permanently discards the order: the
+            # position is never entered and the reason is invisible
+            # afterwards.
+            #
+            # This is exactly what happened to the KDC BUY on
+            # 2026-10-22 (``HTTP 400 INVALID_TRADING_TOKEN``): the
+            # order was written to the ledger as "rejected", so the
+            # ledger's dedup key
+            # (run_id, sourceOrderId, symbol, side) matched on every
+            # later cycle and the order was never retried — the
+            # entry simply vanished.
+            #
+            # It must not be "unknown" either: that status is in
+            # UNSAFE_LEDGER_STATUSES, and ``unsafe_existing_orders``
+            # short-circuits the WHOLE submit run — one bad token
+            # would block every other order for that run.
+            #
+            # Hence the dedicated ``token_rejected`` status: not
+            # terminal (so the order can be retried once the token
+            # cron refreshes it) and not unsafe (so it doesn't block
+            # other orders).
+            is_token_rejection = "INVALID_TRADING_TOKEN" in err_text
             is_permanent_rejection = (
                 "HTTP 400" in err_text
                 or "HTTP 401" in err_text
                 or "HTTP 403" in err_text
                 or "HTTP 404" in err_text
                 or "HTTP 422" in err_text
-            )
-            terminal_status = "rejected" if is_permanent_rejection else "unknown"
+            ) and not is_token_rejection
+            if is_token_rejection:
+                terminal_status = TOKEN_REJECTED_STATUS
+            else:
+                terminal_status = "rejected" if is_permanent_rejection else "unknown"
             ledger[key] = LedgerOrder(**{
                 **ledger[key].__dict__,
                 "status": terminal_status,

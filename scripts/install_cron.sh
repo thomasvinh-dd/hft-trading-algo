@@ -1,52 +1,67 @@
 #!/bin/bash
-# install_cron.sh — register get_otp + common_sync jobs for one VPS
-# deployment of hft-trading-algo.
+# install_cron.sh — register the VPS cron jobs for one hft-trading-algo
+# deployment (DNSE token refresh, common sync, Darvas Box reports, Postgres
+# backup, bot watchdog).
 #
 # Usage:
 #   bash scripts/install_cron.sh [--print]
+#   bash scripts/install_cron.sh [--remove]
 #
-# If --print is passed, the cron lines are written to stdout for review
-# instead of being installed. Otherwise they're applied via ``crontab``.
+# --print   writes the cron entries to stdout for review (does not install)
+# --remove  strips the entries this script manages from the live crontab
 #
-# 2026-10-18 fix: vixie-cron 3.0pl1-184ubuntu2 (the Ubuntu/Debian
-# fork shipped on this VPS) ignores ``CRON_TZ=UTC`` at the top
-# of the crontab — it always uses the system timezone
-# (Europe/Berlin = CEST = UTC+2 in summer). All the entry hours
-# below are therefore in SYSTEM LOCAL TIME (CEST), pre-converted
-# from the intended UTC fire time so the actual ICT fire matches
-# intent. Conversion table:
+# ---------------------------------------------------------------------------
+# WHY THE ENTRIES USE A TZ GUARD INSTEAD OF FIXED HOURS
+# ---------------------------------------------------------------------------
+# 2026-10-25 incident (DST fall-back). This host is Europe/Berlin and the
+# cron daemon is vixie-cron 3.0pl1-184ubuntu2, which **ignores** a
+# ``CRON_TZ=`` assignment when it decides *when* to fire a job — see
+# ``man 5 crontab`` ("LIMITATIONS": the daemon runs every task in the
+# configured system timezone; ``TZ=`` in a crontab only affects the
+# commands, not the schedule).  The live evidence was that a
+# ``CRON_TZ=UTC`` crontab still fired at the Berlin wall-clock hour.
 #
-#   intended ICT │ intended UTC │ system-local CEST
-#   ─────────────┼──────────────┼──────────────────
-#   08:30 ICT     │ 01:30 UTC     │ 03:30 CEST
-#   09:00 ICT     │ 02:00 UTC     │ 04:00 CEST
-#   15:15 ICT     │ 08:15 UTC     │ 10:15 CEST
-#   16:00 ICT     │ 09:00 UTC     │ 11:00 CEST
+# The old entries therefore hard-coded CEST hours (03:30 for 08:30 ICT,
+# 04:00 for 09:00 ICT, ...) pre-converted from ICT.  When Berlin fell
+# back to CET on 2026-10-25 every one of those jobs silently moved one
+# hour later in ICT — worst of all the DNSE token refresh (08:30 ICT)
+# became 09:30 ICT, i.e. AFTER the 09:00 ICT start-of-day cycle it
+# exists to support.
 #
-# The 2026-10-14 fix (putting CRON_TZ=UTC at the top) was correct
-# in spirit but the daemon silently ignored it. Live evidence
-# from the syslog: 2026-10-14T08:15:01+02:00 = 06:15 UTC = 13:15
-# ICT (2 hours early) despite CRON_TZ=UTC being at the top of
-# the crontab. Switching to pre-converted local times is the
-# portable fix that works regardless of whether the cron
-# daemon honors CRON_TZ.
+# The fix makes the schedule independent of the host's UTC offset:
 #
-# Earlier comments on this script claimed the cron was running
-# in UTC; that was wrong from the start. The VPS /etc/timezone
-# has been Europe/Berlin since the host was built.
+#   * the cron *trigger* fires every hour at the target minute
+#     (e.g. ``30 * * * *`` for the 08:30 ICT token refresh), and
+#   * a *guard* inside the command accepts the run only when the wall
+#     clock in the job's own timezone (Asia/Ho_Chi_Minh for the trading
+#     jobs, UTC for the Postgres backup) equals the intended time.
 #
-# Schedule (all times ICT, converted to CEST in the crontab below):
-#   08:30 ICT  — get_otp (DNSE email OTP -> token)
+# Exactly one of the 24 hourly slots satisfies the guard, whatever the
+# host offset is — before and after either DST transition.  The weekday
+# gate is evaluated in the job's own timezone as well, so a host-local
+# DOW field can never shift a job onto the wrong trading day.
+#
+# Intended fire times (unchanged intent, now offset-independent):
+#
+#   08:30 ICT  — get_otp (DNSE email OTP -> trading token)
 #   09:00 ICT  — Darvas Box pre-market signal scan
-#   15:15 ICT  — common_sync --post (post-close CA + prices)
-#   16:00 ICT  — Darvas Box end-of-day backtest report
-#   */5       — bot watchdog (restart dead autofin/momentum)
+#   15:15 ICT  — common_sync --force (post-close CA + prices)
+#   16:00 ICT  — Darvas Box end-of-day report
+#   23:00 UTC  — Postgres backup
+#   */5        — bot watchdog (restart dead autofin/momentum)
+#
+# The 08:30-ICT price sync is intentionally NOT cron'd here because
+# update_dataset takes ~25 min for 1500+ symbols; running it as a
+# separate cron entry just before market open would block the 09:00 ICT
+# start-of-day briefings. Instead, the auto-trading-bot's EOD path
+# (15:45 ICT) carries out the closing refresh when the cron job
+# above re-stamps the sentinel just after.
 #
 # To inspect existing entries:   crontab -l | grep vietnam_algo
-# To remove:                     bash scripts/install_cron.sh --remove
 set -e
 PROJECT_DIR="${PROJECT_DIR:-/root/hft-trading-algo}"
 LOG_DIR="${LOG_DIR:-/root/logs}"
+ICT_TZ="Asia/Ho_Chi_Minh"
 
 # Source env files in a way that survives the cron environment.
 # Cron runs each command with a near-empty environment, so
@@ -103,30 +118,96 @@ _env_sources='set -a && . '"$PROJECT_DIR"'/vietnam_algo/env/.env.dnse-secrets &&
 # future tweak to launcher behaviour is picked up automatically.
 _watchdog='pgrep -f "[a]uto-trading-bot.*--strategy autofin_signal" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: autofin bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/scripts/launch_autofin.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1); pgrep -f "[a]uto-trading-bot.*--strategy momentum" >/dev/null 2>&1 || (echo "[$(date -Iseconds)] watchdog: momentum bot down, relaunching" >> '"$LOG_DIR"'/bot_watchdog.log && bash '"$PROJECT_DIR"'/scripts/launch_momentum.sh >> '"$LOG_DIR"'/bot_watchdog.log 2>&1)'
 
+# ---------------------------------------------------------------------------
+# Guard helpers
+# ---------------------------------------------------------------------------
+# A crontab field treats "%" specially (it is turned into a newline), so the
+# "%H"/"%M"/"%u" in the date format strings MUST be backslash-escaped in the
+# crontab file.  cron strips the backslash before handing the command to
+# /bin/sh, which then sees a plain "%H:%M".
+#
+#   _guard_ict "08:30"  ->  weekday + wall-clock gate in Asia/Ho_Chi_Minh
+#   _guard_utc "23:00"  ->  wall-clock gate in UTC (no weekday gate)
+_guard_ict() {
+    printf '[ "$(TZ=%s date +\\%%u)" -le 5 ] && [ "$(TZ=%s date +\\%%H:\\%%M)" = "%s" ] && ' \
+        "$ICT_TZ" "$ICT_TZ" "$1"
+}
+_guard_utc() {
+    printf '[ "$(TZ=UTC date +\\%%H:\\%%M)" = "%s" ] && ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Job definitions
+# ---------------------------------------------------------------------------
+# Each entry is "<schedule> <guard><command>".  The schedule's hour field
+# is "*" on purpose: the guard — not the hour — decides when the job runs.
+_mk_get_otp() {
+    printf '30 * * * * %s cd %s && %s && PYTHONPATH=%s python3 -u -m vietnam_algo.main run-get-otp >> %s/get_otp.log 2>&1\n' \
+        "$(_guard_ict 08:30)" "$PROJECT_DIR" "$_env_sources" "$PROJECT_DIR" "$LOG_DIR"
+}
+_mk_common_sync() {
+    printf '15 * * * * %s cd %s && %s && DNSE_PROXY_HTTP_URL="" PYTHONPATH=%s python3 -u -m vietnam_algo.main run-common-sync --force >> %s/common_sync.log 2>&1\n' \
+        "$(_guard_ict 15:15)" "$PROJECT_DIR" "$_env_sources" "$PROJECT_DIR" "$LOG_DIR"
+}
+_mk_darvas_scan() {
+    printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> %s/darvas_signals.log 2>&1\n' \
+        "$(_guard_ict 09:00)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+}
+_mk_darvas_report() {
+    printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli send-report >> %s/darvas_report.log 2>&1\n' \
+        "$(_guard_ict 16:00)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+}
+_mk_pg_backup() {
+    printf '0 * * * * %s%s/scripts/backup_postgres.sh >> /var/log/hft-postgres-backup.log 2>&1\n' \
+        "$(_guard_utc 23:00)" "$PROJECT_DIR"
+}
+_mk_watchdog() {
+    printf '*/5 * * * * %s\n' "$_watchdog"
+}
+
+_mk_entries() {
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$(_mk_pg_backup)" \
+        "$(_mk_darvas_scan)" \
+        "$(_mk_darvas_report)" \
+        "$(_mk_get_otp)" \
+        "$(_mk_common_sync)" \
+        "$(_mk_watchdog)"
+}
+
+# ---------------------------------------------------------------------------
+# Install / remove
+# ---------------------------------------------------------------------------
+# The filter must match EVERY line this script owns, otherwise re-running the
+# installer appends duplicates.  That is exactly how the 2026-10-25 duplicate
+# block appeared: the old filter only knew about run-get-otp / run-common-sync
+# / the watchdog markers, so the Darvas entries and the Postgres backup were
+# appended again on every install while their old copies stayed behind.
+#
+# NOTE: this is a plain ``grep -v`` (BRE), so the alternation separator is
+# "\|".  The pattern is written as a literal here on purpose — the
+# regression test in vietnam_algo/tests/test_install_cron_watchdog_pattern.py
+# parses this literal out of the script and asserts the watchdog markers are
+# covered by it.
+_filter_managed() {
+    printf '%s\n' "$1" \
+        | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum\|scan-signals\|send-report\|backup_postgres\|CRON_TZ=' \
+        | sed '/^[[:space:]]*$/d' \
+        || true
+}
+
 case "${1:-}" in
     --print)
         echo "# vietnam-algo cron entries for $PROJECT_DIR"
-        echo "# All times are SYSTEM LOCAL TIME (CEST = UTC+2 in summer)."
-        echo "# See the script header for the ICT → CEST conversion table."
-        cat <<EOF
-CRON_TZ=UTC
-0 23 * * * /root/hft-trading-algo/scripts/backup_postgres.sh >> /var/log/hft-postgres-backup.log 2>&1
-# 09:00 ICT (04:00 CEST) — Darvas Box pre-market signal scan
-0 4 * * 1-5  cd $PROJECT_DIR && set -a && . $PROJECT_DIR/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=$PROJECT_DIR python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> $LOG_DIR/darvas_signals.log 2>&1
-# 16:00 ICT (11:00 CEST) — Darvas Box end-of-day backtest report
-0 11 * * 1-5  cd $PROJECT_DIR && set -a && . $PROJECT_DIR/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=$PROJECT_DIR python3 -u -m darvas_box_strategy.bot.cli send-report >> $LOG_DIR/darvas_report.log 2>&1
-# 08:30 ICT (03:30 CEST) — DNSE email OTP → trading token
-30 3 * * 1-5 cd $PROJECT_DIR && $_env_sources && PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-get-otp >> $LOG_DIR/get_otp.log 2>&1
-# 15:15 ICT (10:15 CEST) — common_sync (post-close price + CA refresh)
-15 10 * * 1-5 cd $PROJECT_DIR && $_env_sources && DNSE_PROXY_HTTP_URL="" PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-common-sync --force >> $LOG_DIR/common_sync.log 2>&1
-*/5 * * * * $_watchdog
-EOF
+        echo "# Offset-independent schedule: hourly trigger + wall-clock guard"
+        echo "# in the job's own timezone (ICT for trading jobs, UTC for backup)."
+        echo "# See the script header for the 2026-10-25 DST incident."
+        _mk_entries
         exit 0
         ;;
     --remove)
         existing="$(crontab -l 2>/dev/null || true)"
-        filtered="$(printf '%s\n' "$existing" | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum' || true)"
-        printf '%s\n' "$filtered" | crontab -
+        _filter_managed "$existing" | crontab -
         echo "Removed vietnam-algo cron entries (if any)."
         exit 0
         ;;
@@ -134,26 +215,9 @@ esac
 
 mkdir -p "$LOG_DIR"
 existing="$(crontab -l 2>/dev/null || true)"
-filtered="$(printf '%s\n' "$existing" | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum' || true)"
-# See the script header for why all hours below are in SYSTEM
-# LOCAL TIME (CEST = UTC+2 in summer). CRON_TZ=UTC is kept at the
-# top for documentation; vixie-cron 3.0pl1 ignores it but the
-# pre-converted hours below compensate.
-new_entries="$(cat <<EOF
-CRON_TZ=UTC
-0 23 * * * /root/hft-trading-algo/scripts/backup_postgres.sh >> /var/log/hft-postgres-backup.log 2>&1
-# 09:00 ICT (04:00 CEST) — Darvas Box pre-market signal scan
-0 4 * * 1-5  cd $PROJECT_DIR && set -a && . $PROJECT_DIR/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=$PROJECT_DIR python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> $LOG_DIR/darvas_signals.log 2>&1
-# 16:00 ICT (11:00 CEST) — Darvas Box end-of-day backtest report
-0 11 * * 1-5  cd $PROJECT_DIR && set -a && . $PROJECT_DIR/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=$PROJECT_DIR python3 -u -m darvas_box_strategy.bot.cli send-report >> $LOG_DIR/darvas_report.log 2>&1
-# 08:30 ICT (03:30 CEST) — DNSE email OTP → trading token
-30 3 * * 1-5 cd $PROJECT_DIR && $_env_sources && PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-get-otp >> $LOG_DIR/get_otp.log 2>&1
-# 15:15 ICT (10:15 CEST) — common_sync (post-close price + CA refresh)
-15 10 * * 1-5 cd $PROJECT_DIR && $_env_sources && DNSE_PROXY_HTTP_URL="" PYTHONPATH=$PROJECT_DIR python3 -u -m vietnam_algo.main run-common-sync --force >> $LOG_DIR/common_sync.log 2>&1
-*/5 * * * * $_watchdog
-EOF
-)"
+filtered="$(_filter_managed "$existing")"
+new_entries="$(_mk_entries)"
 printf '%s\n%s\n' "$filtered" "$new_entries" | crontab -
 echo "Installed."
 echo "Active vietnam-algo entries:"
-crontab -l | grep -E 'run-(get-otp|common-sync)|bot_watchdog|launch_' || true
+crontab -l | grep -E 'run-(get-otp|common-sync)|bot_watchdog|launch_|scan-signals|send-report|backup_postgres' || true

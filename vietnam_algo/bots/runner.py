@@ -155,6 +155,12 @@ def _hydrate_shared_token_into_state(state, data_dir) -> bool:
         state.tokenExpiry = shared["expires_at"]
     if hasattr(state, "tokenDate") and shared.get("date"):
         state.tokenDate = shared["date"]
+    # 2026-10-25: keep the exact issuance timestamp so
+    # ``ensure_fresh_trading_token`` can judge a DNSE UUID token
+    # (which carries no JWT ``exp``) as fresh instead of always
+    # falling through to the fragile lazy email-OTP refresh.
+    if shared.get("issued_at"):
+        state.tokenIssuedAt = shared["issued_at"]
     return True
 
 
@@ -2425,6 +2431,56 @@ def run_auto_bot(
         today = local_date(now)
         state = load_state(engine_config.dataDir, strategy_name=strategy_name)
         token: str | None = None
+        # 2026-10-25: adopt the shared trading token (written by the
+        # 08:30-ICT ``run-get-otp`` cron) into the bot state at
+        # STARTUP, not only inside the daily submit cycle.
+        #
+        # Before this, ``state.tradingToken`` stayed empty until the
+        # ``should_submit_orders`` block ran, which happens once per
+        # day at SOD. That left the live autofin bot operating with a
+        # blank token for the rest of the session and relying on the
+        # fragile lazy email-OTP refresh (see the hydration fix in
+        # the submit cycle). Hydrating at startup means the state
+        # always reflects the token we actually have, and the
+        # freshness check in ``ensure_fresh_trading_token`` can do
+        # its job from the very first cycle.
+        if live_submit:
+            try:
+                if _hydrate_shared_token_into_state(
+                    state, engine_config.dataDir,
+                ):
+                    print(
+                        f"[{now.isoformat()}] startup: adopted shared "
+                        f"DNSE trading token (issued_at="
+                        f"{getattr(state, 'tokenIssuedAt', '?')})"
+                    )
+                    # Persist it so the token survives a restart and
+                    # so the state file reflects the token we are
+                    # actually using.
+                    try:
+                        save_state(
+                            state, engine_config.dataDir,
+                            strategy_name=strategy_name,
+                        )
+                    except Exception as _exc:
+                        print(
+                            f"[{now.isoformat()}] startup: saving state "
+                            f"after token hydration failed: {_exc}"
+                        )
+                else:
+                    _sh = load_shared_trading_token(engine_config.dataDir)
+                    if _sh:
+                        print(
+                            f"[{now.isoformat()}] startup: shared DNSE "
+                            f"trading token is STALE (issued_at="
+                            f"{_sh.get('issued_at', '?')}) — the 08:30-ICT "
+                            f"get_otp cron may have missed its window"
+                        )
+            except Exception as exc:
+                print(
+                    f"[{now.isoformat()}] startup token hydration failed: "
+                    f"{type(exc).__name__}: {str(exc)[:200]}"
+                )
         # 2026-10-21 BAF incident: ``token`` is normally assigned by
         # ``ensure_fresh_trading_token`` inside the
         # ``should_submit_orders`` block, but ``should_poll_strategy``
@@ -2538,14 +2594,38 @@ def run_auto_bot(
                 notify(f"Vietnam Algo: submit cycle started\ntime: {now.isoformat()}\nliveSubmit: {live_submit}")
                 # Prefer the shared token file written by
                 # ``vietnam_algo.jobs.get_otp`` (cron @ 08:30 ICT).
-                # The hybrid lazy-refresh below only fires when the
-                # shared file is missing or stale, which is the
-                # documented degraded mode for a single-bot deployment
-                # that hasn't adopted the cron job yet.
-                if not live_submit:
-                    _hydrate_shared_token_into_state(
-                        state, engine_config.dataDir,
-                    )
+                #
+                # 2026-10-25 fix (inverted condition): the hydration
+                # was gated on ``if not live_submit`` — i.e. the
+                # shared token was only adopted in DRY-RUN mode,
+                # while the LIVE bot (the one that actually places
+                # DNSE orders) skipped it entirely and fell through
+                # to the lazy email-OTP refresh.
+                #
+                # That made the live autofin bot depend on a Gmail
+                # OTP round-trip (``trading_token_from_email`` →
+                # send-email-otp → wait 20s → poll Gmail → exchange
+                # OTP) for EVERY submit cycle. That path fails
+                # whenever the network tunnel flaps (the
+                # ``407 Proxy Authentication Required`` we saw on
+                # 2026-10-23) or the email poll races, and the
+                # resulting failure surfaced as
+                # ``HTTP 400 INVALID_TRADING_TOKEN`` on the order
+                # itself — e.g. the KDC BUY on 2026-10-22 that never
+                # reached DNSE.
+                #
+                # The cron job already writes a FRESH token to the
+                # shared file at 08:30 ICT (verified working on
+                # 2026-10-25). Adopting it in live mode is strictly
+                # more reliable than the lazy refresh, so we now
+                # hydrate in BOTH modes. ``ensure_fresh_trading_token``
+                # still runs afterwards and only refreshes lazily if
+                # the shared token is genuinely missing/stale — so
+                # this cannot regress the single-bot deployment that
+                # has no cron job.
+                _hydrate_shared_token_into_state(
+                    state, engine_config.dataDir,
+                )
                 def _refresh_and_notify(msg: str) -> None:
                     # Called from inside ensure_fresh_trading_token — keep
                     # the notify path uniform with the rest of the bot.
@@ -2837,6 +2917,59 @@ def run_auto_bot(
             state.startOfDayDate = today
             save_state(state, engine_config.dataDir, strategy_name=strategy_name)
 
+            # 2026-10-25: proactive DNSE trading-token health check.
+            #
+            # The token refresh is owned by the ``run-get-otp`` cron
+            # (08:30 ICT). If that job misses its window (DST
+            # fall-back on 2026-10-25 moved every hard-coded
+            # CEST hour one hour later; a tunnel ``407`` flapped the
+            # OTP round-trip), the token goes stale and the FIRST
+            # symptom is an order rejected with
+            # ``HTTP 400 INVALID_TRADING_TOKEN`` — the order is
+            # simply lost, with no explanation.
+            #
+            # We now check the token at the start of the trading
+            # day and alert loudly BEFORE any order is attempted,
+            # so a missed refresh is diagnosed as "the token cron
+            # didn't run" rather than "an order mysteriously
+            # failed".
+            if live_submit:
+                try:
+                    _shared = load_shared_trading_token(engine_config.dataDir)
+                    from vietnam_algo.libs.dnse.auth import is_token_fresh as _is_fresh
+                    _tok_ok = bool(
+                        _shared
+                        and _is_fresh(
+                            _shared.get("token"),
+                            issued_at=_shared.get("issued_at"),
+                        )
+                    )
+                    if not _tok_ok:
+                        _issued = (_shared or {}).get("issued_at") or "unknown"
+                        notify(
+                            "🚨 Vietnam Algo: DNSE trading token is NOT ready\n"
+                            f"account: {account_no}\n"
+                            f"shared token issued_at: {_issued}\n"
+                            "The 08:30-ICT get_otp cron may have missed its "
+                            "window. Orders placed now will be rejected with "
+                            "INVALID_TRADING_TOKEN."
+                        )
+                        print(
+                            f"[{now.isoformat()}] DNSE trading token NOT fresh "
+                            f"(issued_at={_issued}) — orders may be rejected "
+                            f"with INVALID_TRADING_TOKEN"
+                        )
+                    else:
+                        print(
+                            f"[{now.isoformat()}] DNSE trading token OK "
+                            f"(issued_at={_shared.get('issued_at')})"
+                        )
+                except Exception as exc:
+                    print(
+                        f"[{now.isoformat()}] trading-token health check "
+                        f"failed: {exc}"
+                    )
+
             # 2026-10-13: T+2 settlement SL retry. Vietnam's T+2
             # settlement blocks SELL orders until 2 calendar days
             # after the BUY. The autofin adapter plans BUY + SL
@@ -2973,13 +3106,41 @@ def run_auto_bot(
                             shared = load_shared_trading_token(
                                 engine_config.dataDir,
                             )
-                            if shared and shared.get("token"):
+                            # 2026-10-25: check FRESHNESS before adopting
+                            # the shared token. We previously took
+                            # whatever was in the file — so on a day
+                            # when the 08:30-ICT get_otp cron missed
+                            # its window (DST fall-back, tunnel 407)
+                            # the mid-day path would happily adopt the
+                            # STALE token and every submit would be
+                            # rejected with INVALID_TRADING_TOKEN.
+                            # Adopting a stale token is worse than
+                            # having no token: the latter makes the
+                            # submit path skip the order loudly, the
+                            # former makes it fail opaquely.
+                            from vietnam_algo.libs.dnse.auth import (
+                                is_token_fresh as _is_fresh,
+                            )
+                            if shared and shared.get("token") and _is_fresh(
+                                shared.get("token"),
+                                issued_at=shared.get("issued_at"),
+                            ):
                                 token = str(shared["token"])
                                 print(
                                     f"[{now.isoformat()}] mid-day "
                                     f"poll hydrated trading token from "
                                     f"shared file (issued_at="
                                     f"{shared.get('issued_at','?')})"
+                                )
+                            elif shared and shared.get("token"):
+                                print(
+                                    f"[{now.isoformat()}] mid-day poll: "
+                                    f"shared trading token is STALE "
+                                    f"(issued_at="
+                                    f"{shared.get('issued_at','?')}) — not "
+                                    f"adopting it; orders will be skipped "
+                                    f"rather than rejected with "
+                                    f"INVALID_TRADING_TOKEN"
                                 )
                         except Exception as exc:
                             print(
@@ -3608,13 +3769,29 @@ def run_auto_bot(
             if not freshness.get("fresh", False):
                 if state.dataStaleAlertSentDate != today:
                     sentinel_age = freshness.get("sentinel_age_hours")
+                    sentinel_td = freshness.get("sentinel_age_trading_days")
                     median_age = freshness.get("median_latest_bar_age_days")
                     parts = [
                         "⚠️ Vietnam Algo: market data STALE",
                         f"strategy: {strategy_name or engine_config.strategy or '?'}",
                         f"date: {today}",
                     ]
-                    if sentinel_age is not None:
+                    if sentinel_td is not None:
+                        # 2026-10-25: the freshness gate counts TRADING
+                        # days (weekends + Vietnamese holidays don't
+                        # count), so a Friday-stamped sentinel stays
+                        # fresh through the weekend. The raw wall-clock
+                        # age is still shown for context — it's what
+                        # most operators intuit when they see "43h".
+                        parts.append(
+                            f"data_ready_for_eod age: {sentinel_td} trading-days "
+                            f"(threshold 2d)"
+                        )
+                        if sentinel_age is not None:
+                            parts.append(
+                                f"data_ready_for_eod wall-clock age: {sentinel_age}h"
+                            )
+                    elif sentinel_age is not None:
                         parts.append(f"data_ready_for_eod age: {sentinel_age}h (threshold 25h)")
                     elif freshness.get("sentinel_exists") is False:
                         parts.append("data_ready_for_eod sentinel missing")

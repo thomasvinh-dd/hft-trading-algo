@@ -10,6 +10,27 @@ from .data import DEFAULT_DATA_DIR, read_json, utc_now, write_json
 TERMINAL_LEDGER_STATUSES = {"filled", "cancelled", "rejected", "expired", "closed", "dry_run", "skipped"}
 UNSAFE_LEDGER_STATUSES = {"prepared", "submitting", "submitted", "open", "partial", "unknown"}
 
+# 2026-10-25: a dedicated status for orders DNSE rejected because the
+# trading token was invalid.
+#
+# It is deliberately NEITHER terminal nor unsafe:
+#
+#   * Not TERMINAL — the ledger's dedup key
+#     (run_id, sourceOrderId, symbol, side) matches on any terminal
+#     status, so a terminal token rejection would make the order
+#     permanently un-retryable. That is exactly how the KDC BUY on
+#     2026-10-22 was silently lost (``HTTP 400
+#     INVALID_TRADING_TOKEN`` → "rejected" → never retried).
+#
+#   * Not UNSAFE — ``unsafe_existing_orders`` short-circuits the
+#     ENTIRE submit run, so an unsafe status would block every other
+#     order for that run, not just the failed one.
+#
+# With this status the order is re-attemptable on the next cycle
+# (once the token cron has refreshed the token) without wedging
+# unrelated orders.
+TOKEN_REJECTED_STATUS = "token_rejected"
+
 
 @dataclass(frozen=True)
 class LedgerOrder:

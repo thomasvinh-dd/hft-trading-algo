@@ -153,7 +153,37 @@ def ensure_fresh_trading_token(
             return token, False
         return token, False
 
-    if is_token_fresh(token):
+    # 2026-10-25 fix: consult the state's ``tokenDate``/``issued_at``
+    # so a DNSE UUID token (no parseable JWT ``exp``) can be judged
+    # fresh.
+    #
+    # Before this, ``is_token_fresh(token)`` was called WITHOUT
+    # ``issued_at``. For UUID tokens ``parse_jwt_expiry`` returns
+    # None, so ``is_token_fresh`` fell through to its final
+    # "no way to verify expiry — assume stale" branch and returned
+    # False — even for a token the 08:30-ICT cron had just written
+    # seconds ago. The bot therefore ALWAYS fell through to the
+    # lazy email-OTP refresh (send-email-otp → wait 20s → poll
+    # Gmail → exchange), which is exactly the fragile path that
+    # produced ``INVALID_TRADING_TOKEN`` when the network tunnel
+    # flapped (the 2026-10-22 KDC BUY that never reached DNSE).
+    #
+    # We derive the issuance time from the state's ``tokenDate`` (a
+    # plain YYYY-MM-DD, written by both the OTP job and the bot)
+    # and pass it down. ``is_token_fresh`` treats a UUID token as
+    # fresh while it is <12h old.
+    _issued_at = getattr(state, "tokenIssuedAt", None)
+    if not _issued_at:
+        _token_date = getattr(state, "tokenDate", None)
+        if _token_date:
+            try:
+                _issued_at = datetime.fromisoformat(
+                    str(_token_date)[:10]
+                ).replace(tzinfo=timezone.utc).isoformat()
+            except Exception:
+                _issued_at = None
+
+    if is_token_fresh(token, issued_at=_issued_at):
         return token, False
 
     # Need to refresh.
