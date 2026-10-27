@@ -1,0 +1,49 @@
+# docker-compose.yml — Postgres 16 for the trading bot data layer
+#
+# Run from the project root with ``docker compose up -d`` after editing
+# ``POSTGRES_PASSWORD`` below (or override at compose time with
+# ``POSTGRES_PASSWORD=... docker compose up -d``).
+#
+# Data volume: ``postgres-data`` named volume at
+# /var/lib/postgresql/data inside the container. Survives container
+# restarts and is bind-mountable for off-host backups.
+#
+# Health check: pg_isready every 10s; ``docker compose ps`` reports
+# "(healthy)" once Postgres is ready to accept connections.
+#
+# To inspect:   docker exec -it hft-postgres psql -U hft
+# To stop:      docker compose down            (preserves volume)
+# To wipe:      docker compose down -v         (drops the volume)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hft-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hft
+      POSTGRES_USER: hft
+      # Override at compose time:
+      #   POSTGRES_PASSWORD=... docker compose up -d
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "127.0.0.1:5432:5432"   # only on localhost; bots connect via unix socket inside the container
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/postgres/initdb.d:/docker-entrypoint-initdb.d:ro   # optional: schema SQL on first start
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hft -d hft"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=2"
+
+volumes:
+  postgres-data:
+    driver: local

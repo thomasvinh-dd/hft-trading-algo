@@ -1,0 +1,29 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Secrets / env files
+vietnam_algo/env/
+.env
+.env.*
+
+# Data — never commit (large + may contain PII)
+vietnam_algo/data/
+data/
+
+# Logs
+logs/
+*.log
+
+# Backups / runtime artifacts
+backups/
+*.pyc.bak
+
+# Secrets left at project root — DO NOT COMMIT
+dnse.txt

@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Darvas Box — Strategy Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>Darvas Box</h1>
+    <span class="subtitle">HOSE blue chips strategy dashboard</span>
+  </div>
+  <div class="header-right">
+    <span id="cache-status" class="muted">Loading…</span>
+    <button id="refresh-btn" class="btn">Refresh data</button>
+  </div>
+</header>
+
+<nav class="tab-bar" role="tablist">
+  <button class="tab-btn active" data-tab="performance" role="tab" aria-selected="true">
+    Bot Performance
+  </button>
+  <button class="tab-btn" data-tab="signals" role="tab" aria-selected="false">
+    Darvas Box — Signals &amp; Tickers
+  </button>
+</nav>
+
+<main>
+
+<!-- ============================================================== -->
+<!-- TAB 1: BOT PERFORMANCE — all P&L / equity / breakdown data     -->
+<!-- ============================================================== -->
+<section class="tab-panel active" id="tab-performance" role="tabpanel">
+
+  <section class="card kpis">
+    <div class="kpi">
+      <div class="kpi-label">Total return</div>
+      <div class="kpi-value" id="kpi-return">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">CAGR</div>
+      <div class="kpi-value" id="kpi-cagr">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Max drawdown</div>
+      <div class="kpi-value" id="kpi-mdd">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Win rate</div>
+      <div class="kpi-value" id="kpi-winrate">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Profit factor</div>
+      <div class="kpi-value" id="kpi-pf">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Trades</div>
+      <div class="kpi-value" id="kpi-trades">—</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Equity curve</h2>
+      <span class="muted" id="curve-period"></span>
+    </header>
+    <div class="chart-wrap">
+      <svg id="equity-chart" viewBox="0 0 1000 300" preserveAspectRatio="none"></svg>
+    </div>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Open positions</h2>
+      <span class="muted" id="positions-meta"></span>
+    </header>
+    <div class="table-wrap scroll">
+      <table id="positions-table">
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Entry</th>
+            <th>Last</th>
+            <th>PnL %</th>
+            <th>PnL VND</th>
+            <th>Shares</th>
+            <th>Days</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="positions-empty" class="empty hidden">No positions currently open.</p>
+  </section>
+
+  <section class="two-col">
+    <section class="card">
+      <header class="card-header"><h2>Top winners</h2></header>
+      <div class="table-wrap scroll">
+        <table id="winners-table">
+          <thead><tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>PnL VND</th><th>Exit reason</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="card">
+      <header class="card-header"><h2>Top losers</h2></header>
+      <div class="table-wrap scroll">
+        <table id="losers-table">
+          <thead><tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>PnL VND</th><th>Exit reason</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+
+  <section class="card">
+    <header class="card-header"><h2>Exit reasons</h2></header>
+    <div id="exit-reasons" class="exit-reasons"></div>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Per-ticker breakdown</h2>
+      <span class="muted">Top 10 by realized PnL</span>
+    </header>
+    <pre id="ticker-breakdown" class="pre-block"></pre>
+  </section>
+
+</section>
+
+<!-- ============================================================== -->
+<!-- TAB 2: SIGNALS + TICKERS — current signals & per-ticker data   -->
+<!-- ============================================================== -->
+<section class="tab-panel" id="tab-signals" role="tabpanel">
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Opening signals (today)</h2>
+      <span class="muted" id="signals-meta"></span>
+    </header>
+    <div class="table-wrap scroll">
+      <table id="signals-table">
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Entry</th>
+            <th>Size %</th>
+            <th>sl_T (10%)</th>
+            <th>sl_F (18%)</th>
+            <th>Conviction</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="signals-empty" class="empty hidden">No breakout signals at the latest bar.</p>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Recent signals (last 7 days)</h2>
+      <span class="muted" id="recent-meta"></span>
+    </header>
+    <div class="table-wrap scroll">
+      <table id="recent-signals-table">
+        <thead>
+          <tr>
+            <th>Signal date</th>
+            <th>Ticker</th>
+            <th>Entry</th>
+            <th>Size %</th>
+            <th>sl_T (10%)</th>
+            <th>sl_F (18%)</th>
+            <th>Conviction</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="recent-empty" class="empty hidden">No signals in the last 7 trading days.</p>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Ticker history</h2>
+      <span class="muted">Click any ticker to see all deals</span>
+    </header>
+    <div class="ticker-search">
+      <input type="text" id="ticker-search-input" placeholder="Enter ticker (e.g. VCB, HPG, FPT)…" autocomplete="off">
+      <button id="ticker-search-btn" class="btn">Load</button>
+      <span class="muted small" id="ticker-search-hint">Or click a ticker in the signals table above.</span>
+    </div>
+    <div class="ticker-quick">
+      <span class="muted small">Quick load:</span>
+      <div id="ticker-quick-buttons" class="ticker-quick-buttons"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <header class="card-header">
+      <h2>Universe overview</h2>
+      <span class="muted" id="universe-meta"></span>
+    </header>
+    <div class="table-wrap scroll">
+      <table id="universe-table">
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Trades</th>
+            <th>Win %</th>
+            <th>Realized PnL</th>
+            <th>Avg hold (d)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+</section>
+
+<footer class="muted small">
+  <p>Backtest is OOS-validated (TRAIN 2019–2022, TEST 2023–2026) on 70 HOSE blue chips.
+     Entry-anchored stops, 10% trail, 1.5× conviction sizing.
+     Data: <code id="data-period"></code></p>
+  <p>Last refresh: <span id="last-updated">—</span></p>
+</footer>
+</main>
+
+<!-- Ticker history modal: shown when a ticker cell is clicked -->
+<div id="ticker-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal">
+    <header class="modal-header">
+      <div>
+        <h2 id="modal-ticker-name">—</h2>
+        <span class="muted small" id="modal-ticker-subtitle"></span>
+      </div>
+      <button id="modal-close" class="modal-close" aria-label="Close">×</button>
+    </header>
+    <div class="modal-body">
+      <section class="kpis ticker-kpis" id="modal-summary"></section>
+      <div class="table-wrap scroll modal-table-wrap">
+        <table id="modal-deals-table">
+          <thead>
+            <tr>
+              <th>Deal ID</th>
+              <th>Entry</th>
+              <th>Entry px</th>
+              <th>Exit</th>
+              <th>Exit px</th>
+              <th>PnL %</th>
+              <th>Reason</th>
+              <th>Days</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Deal detail modal: shown when a deal_id cell is clicked -->
+<div id="deal-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal">
+    <header class="modal-header">
+      <div>
+        <h2 id="deal-modal-title">—</h2>
+        <span class="muted small" id="deal-modal-subtitle"></span>
+      </div>
+      <button id="deal-modal-close" class="modal-close" aria-label="Close">×</button>
+    </header>
+    <div class="modal-body">
+      <section class="kpis ticker-kpis" id="deal-modal-summary"></section>
+      <div class="table-wrap scroll modal-table-wrap">
+        <table id="deal-fills-table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Event</th>
+              <th>Price</th>
+              <th>Shares</th>
+              <th>Δ PnL</th>
+              <th>Cum PnL</th>
+              <th>Remaining</th>
+              <th>Δ Days</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

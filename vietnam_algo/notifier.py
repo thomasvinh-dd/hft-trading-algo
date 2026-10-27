@@ -359,7 +359,14 @@ def heartbeat_message(
             lines.append("data: fresh")
         elif fresh is False:
             bits = []
-            if sentinel_age is not None:
+            sentinel_td = freshness.get("sentinel_age_trading_days")
+            if sentinel_td is not None:
+                # 2026-10-25: trading-day age is the gate (weekends
+                # don't count). Raw hours shown alongside for context.
+                bits.append(f"sentinel={sentinel_td}d-trading")
+                if sentinel_age is not None:
+                    bits.append(f"({sentinel_age}h-wall)")
+            elif sentinel_age is not None:
                 bits.append(f"sentinel={sentinel_age}h")
             elif sentinel_mtime is None and not freshness.get("sentinel_exists"):
                 bits.append("sentinel=MISSING")
@@ -373,14 +380,6 @@ def heartbeat_message(
                 # operators intuit. 2026-09-19 user feedback: "the day
                 # before is weekend so we can not say that the data is
                 # stale, we only compare with trading day not holiday".
-                #
-                # NOTE: this block must stay INSIDE the
-                # ``if median_age is not None`` branch. When dedented,
-                # a payload with ``fresh is False`` and no median age
-                # (e.g. the sentinel is missing because the data-sync
-                # cron failed — exactly the case this alert exists to
-                # report) left ``cal_age`` unassigned and the next line
-                # raised UnboundLocalError, killing the heartbeat.
                 if cal_age is not None and abs(cal_age - median_age) > 0.01:
                     bits.append(
                         f"sample-bar-median={median_age}d-trading "
@@ -388,6 +387,14 @@ def heartbeat_message(
                     )
                 else:
                     bits.append(f"sample-bar-median={median_age}d")
+            else:
+                # No sample bars at all (e.g. every sample price file
+                # missing). Don't reference ``cal_age``/``median_age``
+                # — they were never bound. Pre-fix this was an
+                # UnboundLocalError that broke the whole heartbeat
+                # message on the exact shape where the sentinel was
+                # stale but no bar data was available.
+                bits.append("sample-bar-median=unknown")
             if freshness.get("oldest_sample_symbol"):
                 bits.append(f"oldest={freshness['oldest_sample_symbol']}")
             if "error" in freshness:
