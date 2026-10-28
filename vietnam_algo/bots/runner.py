@@ -1088,15 +1088,12 @@ def _submit_autofin_deals_to_dnse(
                     continue
                 otype = "LO"
                 price = _hose_price_tick(int(round(stop_level * 0.995))) or stop_level
-                from datetime import datetime as _dt2, timedelta as _td2
                 stop_fields = {
                     "orderCategory": "STOP",
                     "stopPrice": stop_level,
                     "conditionOperator": "<=",
                     "durationType": "GTD",
-                    "durationDateTime": (
-                        _dt2.now(vietnam_now().tzinfo) + _td2(days=30)
-                    ).isoformat(),
+                    "durationDateTime": _stop_gtd_expiry(),
                 }
             orders.append(DnseOrder(
                 symbol=sym,
@@ -1304,6 +1301,30 @@ def _is_protective_reason(reason: str | None) -> bool:
     """
     r = (reason or "").strip()
     return r.startswith(_SL_PROTECTIVE_REASON_PREFIXES)
+
+
+def _stop_gtd_expiry(days: int = 30) -> str:
+    """Return the GTD expiry for a DNSE STOP order as an ISO 8601 string.
+
+    DNSE's STOP order requires ``durationType="GTD"`` plus a
+    ``durationDateTime`` in ISO 8601. The broker's own reference
+    request uses the form::
+
+        "durationDateTime" : "2026-07-01T07:30:00.000+07:00"
+
+    i.e. MILLISECOND precision and an explicit ``+07:00`` (Vietnam
+    time) offset. Python's default ``datetime.isoformat()`` emits
+    MICROseconds (``...:00.123456+07:00``), which is still valid ISO
+    8601 but does not match the documented shape — so we ask for
+    millisecond precision explicitly.
+
+    The expiry is anchored to Vietnam wall-clock time (the broker's
+    local timezone), not the host's Europe/Berlin clock, so the
+    30-day window is the same regardless of where the bot runs.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    expiry = _dt.now(vietnam_now().tzinfo) + _td(days=int(days))
+    return expiry.isoformat(timespec="milliseconds")
 
 
 def _sl_stop_level_from_reason(reason: str | None) -> int:
@@ -1848,10 +1869,7 @@ def retry_t2_settlement_sl_orders(
         if generated_limit <= 0:
             generated_limit = stop_level
         # GTD expiry: 30 days out, ISO 8601 in Vietnam time.
-        from datetime import datetime as _dt, timedelta as _td
-        gtd_expiry = (
-            _dt.now(vietnam_now().tzinfo) + _td(days=30)
-        ).isoformat()
+        gtd_expiry = _stop_gtd_expiry()
 
         new_source_id = int(
             _hl.sha1(
