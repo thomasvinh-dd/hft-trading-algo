@@ -1154,6 +1154,22 @@ _T2_REJECT_CODES = ("TRADE_QUANTITY_NOT_ENOUGH",)
 # function's docstring).
 _T2_RETRY_MARKER_RE = re.compile(r"\s*\[t2-retry from [^\]]+\]")
 
+# 2026-10-28: recovers the intended price of an auction-planned SL.
+#
+# An SL planned during an ATO/ATC auction window is submitted with
+# price=0 (the exchange sets the fill price) and the intended price
+# survives only in the reason string:
+#
+#   autofin_user_sl:deal#1792713600:ORS:10%:14400 [session=ATO signal_price=14400]
+#
+# The T+2 retry replays it as a LIMIT order, and DNSE rejects a limit
+# order with price 0 — so without this recovery the retry fails on a
+# price error and the position stays unprotected. We prefer the
+# explicit ``signal_price=`` marker and fall back to the
+# ``:<pct>:<price>`` segment of the autofin reason.
+_SL_SIGNAL_PRICE_RE = re.compile(r"signal_price=([0-9][0-9_,]*(?:\.[0-9]+)?)")
+_SL_REASON_PRICE_RE = re.compile(r":\d+(?:\.\d+)?%?:([0-9][0-9_,]*(?:\.[0-9]+)?)")
+
 
 def _is_t2_rejection(error: str) -> bool:
     """Return True if the error indicates a T+2 settlement block.
@@ -1307,6 +1323,11 @@ def retry_t2_settlement_sl_orders(
         "t2_due": 0,
         "stale_no_position": 0,
         "stale_details": [],
+        # 2026-10-28: SLs whose price had to be recovered from the
+        # auction ``signal_price=`` marker, and SLs we could not price
+        # at all (so no limit order was placed).
+        "recovered_price": [],
+        "no_price": [],
         "resubmitted": 0,
         "resubmit_dnse_ids": [],
         "resubmit_errors": [],
@@ -1360,8 +1381,23 @@ def retry_t2_settlement_sl_orders(
                 # Verified against account 0003937868:
                 #   ABB → tradeQuantity=100, openQuantity=100
                 #   TLG → tradeQuantity=100, openQuantity=100
+                #
+                # 2026-10-28 fix: prefer ``openQuantity`` (shares we
+                # hold) over ``tradeQuantity`` (the SETTLED net
+                # quantity). The ORS position bought 2026-10-26
+                # reported ``tradeQuantity=0, openQuantity=200``
+                # because the shares had not finished settling. The
+                # old preference for ``tradeQuantity`` therefore
+                # read 0 and the T+2 retry classified the ORS SL as
+                # "position already closed" — skipping the retry for
+                # a position we DO hold, leaving it unprotected.
+                #
+                # ``openQuantity`` is the right field for "can I sell
+                # these shares": it is non-zero as soon as the BUY
+                # fills. We fall back to ``tradeQuantity`` for older
+                # payloads that lack it, and to ``quantity`` last.
                 raw_qty = None
-                for field in ("tradeQuantity", "openQuantity", "quantity"):
+                for field in ("openQuantity", "tradeQuantity", "quantity"):
                     if row.get(field) is not None:
                         raw_qty = row.get(field)
                         break
@@ -1549,9 +1585,64 @@ def retry_t2_settlement_sl_orders(
         # suppresses the second and later attempts.
         base_reason = _T2_RETRY_MARKER_RE.sub("", sl.reason or "").strip()
 
+        # 2026-10-28 fix (retrying an auction-priced SL at price 0).
+        #
+        # An SL planned during an ATO/ATC auction window is submitted
+        # with price=0 (the exchange determines the fill price) and
+        # the intended price is recorded only in the reason string:
+        #
+        #   autofin_user_sl:deal#...:ORS:10%:14400 [session=ATO signal_price=14400]
+        #
+        # The T+2 retry replays the ledger row's ``price`` — which is
+        # 0 — but as a LIMIT order (``orderType="LO"``). DNSE rejects
+        # a LO with price 0, so the retry would fail with a price
+        # error instead of succeeding once the T+2.5 settlement
+        # cleared. The position would stay UNPROTECTED.
+        #
+        # This is exactly the ORS position bought on 2026-10-26: its
+        # SL was rejected with TRADE_QUANTITY_NOT_ENOUGH (T+2), and
+        # the retry would have replayed it at price 0.
+        #
+        # Fix: recover the intended price from the ``signal_price=``
+        # marker (or the ``:<pct>:<price>`` segment of the autofin
+        # reason) and use it for the LO retry. The recovery is
+        # recorded in the summary so the operator can see it.
+        retry_price = int(sl.price or 0)
+        if retry_price <= 0:
+            _m = _SL_SIGNAL_PRICE_RE.search(base_reason)
+            if _m:
+                try:
+                    retry_price = int(float(_m.group(1).replace(",", "")))
+                except (TypeError, ValueError):
+                    retry_price = 0
+            if retry_price <= 0:
+                # Fall back to the ``:<pct>:<price>`` segment of the
+                # autofin reason, e.g.
+                # ``autofin_user_sl:deal#X:ORS:10%:14400`` -> 14400.
+                _m2 = _SL_REASON_PRICE_RE.search(base_reason)
+                if _m2:
+                    try:
+                        retry_price = int(float(_m2.group(1).replace(",", "")))
+                    except (TypeError, ValueError):
+                        retry_price = 0
+            if retry_price > 0:
+                summary["recovered_price"].append(
+                    f"{sl.symbol}: SL price 0 -> {retry_price:,.0f} "
+                    f"(recovered from the auction signal_price marker)"
+                )
+        if retry_price <= 0:
+            # No price to retry with — a limit order needs one. Skip
+            # rather than submit a doomed order; the operator is told
+            # via the summary.
+            summary["no_price"].append(
+                f"{sl.symbol}: SL has no recoverable price (ledger price 0 "
+                f"and no signal_price marker) — cannot place a limit SL"
+            )
+            continue
+
         new_source_id = int(
             _hl.sha1(
-                f"t2-retry|{today_iso}|{sl.symbol}|{sl.price}|{sl.quantity}|{base_reason}".encode()
+                f"t2-retry|{today_iso}|{sl.symbol}|{retry_price}|{sl.quantity}|{base_reason}".encode()
             ).hexdigest()[:12],
             16,
         )
@@ -1562,7 +1653,8 @@ def retry_t2_settlement_sl_orders(
             original_pkg = int(sl.lastDetail.get("loanPackageId") or 0)
         pkg = _resolve_pkg(sl.symbol, original_pkg)
         orders_to_resubmit.append(DnseOrder(
-            symbol=sl.symbol, side=sl.side, quantity=sl.quantity, price=sl.price,
+            symbol=sl.symbol, side=sl.side, quantity=sl.quantity,
+            price=retry_price,
             loanPackageId=pkg, orderType="LO",
             sourceOrderId=new_source_id, sourceDate=today_iso,
             reason=f"{base_reason} [t2-retry from {sl.sourceDate}]",
@@ -3096,6 +3188,23 @@ def run_auto_bot(
                             f"{t2_summary['stale_no_position']} order(s) — "
                             "position already closed (no shares to protect):\n"
                             + "\n".join(t2_summary["stale_details"][:5])
+                        )
+                    # 2026-10-28: report SLs whose price had to be
+                    # recovered from the auction marker, and SLs we
+                    # could not price at all (so NO protective order
+                    # was placed — the position is unprotected).
+                    if t2_summary.get("recovered_price"):
+                        notify(
+                            "ℹ️ Vietnam Algo: T+2 SL retry recovered a price\n"
+                            + "\n".join(t2_summary["recovered_price"][:5])
+                        )
+                    if t2_summary.get("no_price"):
+                        notify(
+                            "🚨 Vietnam Algo: T+2 SL retry could NOT place a "
+                            "stop-loss (no price)\n"
+                            "The position is UNPROTECTED — place the SL "
+                            "manually:\n"
+                            + "\n".join(t2_summary["no_price"][:5])
                         )
                 except Exception as exc:
                     print(f"[{now.isoformat()}] t2-sl-retry crashed: {type(exc).__name__}: {str(exc)[:200]}")
