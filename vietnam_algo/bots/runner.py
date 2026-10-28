@@ -2423,6 +2423,16 @@ def run_auto_bot(
     # iteration is skipped so ``--once`` mode still terminates
     # immediately without a phantom pre-cycle sleep.
     first_iter = True
+    # 2026-10-28: loop-scoped state for the shared-token watcher.
+    # ``_last_adopted_token_issued_at`` lets us log only when the token
+    # ACTUALLY changes (the cron writes a new token at 08:30 ICT, so
+    # we want one line, not one per minute).
+    # ``_last_stale_token_warn_min`` throttles the "token is STALE"
+    # warning to once per hour, and ``_stale_token_alert_date``
+    # ensures the Telegram alert fires at most once per ICT day.
+    _last_adopted_token_issued_at: str | None = None
+    _last_stale_token_warn_min: int | None = None
+    _stale_token_alert_date: str = ""
     while True:
         if not first_iter:
             time.sleep(sleep_seconds)
@@ -2445,40 +2455,81 @@ def run_auto_bot(
         # freshness check in ``ensure_fresh_trading_token`` can do
         # its job from the very first cycle.
         if live_submit:
+            # 2026-10-28: the shared-token hydration runs on EVERY
+            # cycle (the whole block lives inside the ``while True``
+            # loop, and ``load_state`` reloads the state each
+            # iteration). That was fine when it always succeeded —
+            # it just logged one line per minute. But when the
+            # token goes STALE it logged the same "token is STALE"
+            # warning every 60 seconds, all night: the 2026-10-27
+            # run produced 1,300+ identical lines and buried every
+            # other message.
+            #
+            # We now:
+            #   * log the STALE warning at most once per hour (and
+            #     notify Telegram once per day, so a missed 08:30-ICT
+            #     cron is visible to the operator);
+            #   * keep watching for the cron to refresh the token and
+            #     adopt it as soon as it appears — the bot recovers
+            #     on its own the next morning instead of needing a
+            #     manual restart.
             try:
                 if _hydrate_shared_token_into_state(
                     state, engine_config.dataDir,
                 ):
-                    print(
-                        f"[{now.isoformat()}] startup: adopted shared "
-                        f"DNSE trading token (issued_at="
-                        f"{getattr(state, 'tokenIssuedAt', '?')})"
-                    )
-                    # Persist it so the token survives a restart and
-                    # so the state file reflects the token we are
-                    # actually using.
-                    try:
-                        save_state(
-                            state, engine_config.dataDir,
-                            strategy_name=strategy_name,
-                        )
-                    except Exception as _exc:
+                    _adopted_at = getattr(state, "tokenIssuedAt", "?")
+                    if _adopted_at != _last_adopted_token_issued_at:
+                        _last_adopted_token_issued_at = _adopted_at
                         print(
-                            f"[{now.isoformat()}] startup: saving state "
-                            f"after token hydration failed: {_exc}"
+                            f"[{now.isoformat()}] adopted shared DNSE "
+                            f"trading token (issued_at={_adopted_at})"
                         )
+                        # Persist it so the token survives a restart
+                        # and so the state file reflects the token we
+                        # are actually using.
+                        try:
+                            save_state(
+                                state, engine_config.dataDir,
+                                strategy_name=strategy_name,
+                            )
+                        except Exception as _exc:
+                            print(
+                                f"[{now.isoformat()}] saving state after "
+                                f"token hydration failed: {_exc}"
+                            )
                 else:
                     _sh = load_shared_trading_token(engine_config.dataDir)
                     if _sh:
-                        print(
-                            f"[{now.isoformat()}] startup: shared DNSE "
-                            f"trading token is STALE (issued_at="
-                            f"{_sh.get('issued_at', '?')}) — the 08:30-ICT "
-                            f"get_otp cron may have missed its window"
-                        )
+                        _issued = str(_sh.get("issued_at") or "?")
+                        _now_min = now.hour * 60 + now.minute
+                        if (
+                            _last_stale_token_warn_min is None
+                            or _now_min - _last_stale_token_warn_min >= 60
+                        ):
+                            _last_stale_token_warn_min = _now_min
+                            print(
+                                f"[{now.isoformat()}] shared DNSE trading "
+                                f"token is STALE (issued_at={_issued}) — the "
+                                f"08:30-ICT get_otp cron may have missed its "
+                                f"window; orders will be skipped until it "
+                                f"refreshes"
+                            )
+                        # Notify at most once per ICT day so a missed
+                        # cron is visible without spamming.
+                        if _stale_token_alert_date != today:
+                            _stale_token_alert_date = today
+                            notify(
+                                "🚨 Vietnam Algo: DNSE trading token is STALE\n"
+                                f"account: {account_no}\n"
+                                f"issued_at: {_issued}\n"
+                                "The 08:30-ICT get_otp cron may have missed "
+                                "its window. Orders will be SKIPPED (not "
+                                "sent with a bad token) until the token "
+                                "refreshes."
+                            )
             except Exception as exc:
                 print(
-                    f"[{now.isoformat()}] startup token hydration failed: "
+                    f"[{now.isoformat()}] shared token hydration failed: "
                     f"{type(exc).__name__}: {str(exc)[:200]}"
                 )
         # 2026-10-21 BAF incident: ``token`` is normally assigned by

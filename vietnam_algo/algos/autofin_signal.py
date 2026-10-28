@@ -908,6 +908,28 @@ def _plan_orders_for_new_positions(
         # typically recency-sorted) can produce entries. Stops the
         # bot from chaining 5 entries across 5 signals when only the
         # top suggestion is meant to be acted on per day.
+        #
+        # 2026-10-28 fix: ``considered`` counts ENTRIES MADE, not
+        # candidates examined.
+        #
+        # It used to be incremented before any of the gates that can
+        # reject a candidate (recomment classification, price zone,
+        # cash/lot sizing, price validity). With the default
+        # ``top_n == 1`` the FIRST candidate therefore burned the only
+        # slot, and if it was then rejected the loop broke on the next
+        # iteration — so the whole day produced ZERO entries even
+        # though later candidates were in-zone and affordable.
+        #
+        # That is exactly what happened on 2026-10-27: 13 tracked
+        # buy-recommendation deals were inside their buy zones, the
+        # account held 19.4M VND cash against a 29.9M NAV (the 5%
+        # cash gate passed with room to spare), and the bot still
+        # emitted no entry at all.
+        #
+        # The gate checks still run in the same order; only the point
+        # at which a candidate counts against the top-N budget moved,
+        # so "top N" now means "act on the top N suggestions that
+        # actually qualify" — which is what the policy intends.
         if considered >= top_n:
             break
         current_qty = our_positions.get(s.symbol, 0)
@@ -920,7 +942,6 @@ def _plan_orders_for_new_positions(
         # an entry on a previous cycle.
         if already_planned_symbols and s.symbol in already_planned_symbols:
             continue
-        considered += 1
         # ----- Recomment classification (2026-09-21) -----
         # Per user feedback: pre-fix the bot fired BUY orders for ANY
         # signal in /signal-static-suggest, including deals where
@@ -1004,6 +1025,10 @@ def _plan_orders_for_new_positions(
         if target_qty <= 0:
             continue
         did = _deal_id(s.raw)
+        # 2026-10-28: the candidate has passed every gate and produced
+        # an order — only NOW does it count against the top-N budget.
+        # See the comment on ``considered`` above.
+        considered += 1
         rows.append({
             "symbol": s.symbol,
             "side": "NB",
@@ -3541,6 +3566,53 @@ class AutofinSignalAdapter(StrategyAdapter):
             and _minutes_since_open >= 0
             and _minutes_since_open <= start_of_day_cutoff_min
         )
+        # 2026-10-28: catch-up entry window.
+        #
+        # The 30-minute entry window (09:00-09:30 ICT) is short, and
+        # a bot that is down or restarting at 09:00 loses the whole
+        # day: on 2026-10-27 the watchdog only relaunched the bot at
+        # 11:20 ICT, so every poll logged
+        # ``new_entry_top_n=0 (allow_new_entries=False,
+        # in_morning=False)`` and no entry was made even though
+        # several deals were in-zone and the account had ample cash.
+        #
+        # So: if the bot has NOT yet made an entry today AND the
+        # session is still in the morning, allow a catch-up entry up
+        # to ``AUTOFIN_NEW_ENTRY_CATCHUP_MIN`` minutes after the
+        # open (default 240 = the whole morning session, up to the
+        # lunch break).
+        #
+        # This does NOT change the "one entry per day" policy: the
+        # top-N budget still limits how many entries are made, and
+        # the ``actioned_deals`` bookkeeping prevents a second entry
+        # on the same deal. It only ensures a bot outage doesn't
+        # silently cost the day.
+        catchup_min = int(
+            os.environ.get("AUTOFIN_NEW_ENTRY_CATCHUP_MIN", "240") or "240"
+        )
+        _already_entered_today = False
+        try:
+            # The order ledger is the source of truth for "did we
+            # already enter today": a BUY row whose runId is today.
+            # (The state's ``actioned_deals`` holds epoch-based deal
+            # ids, so it cannot be matched against a calendar date.)
+            from vietnam_algo.libs.order_ledger import load_ledger
+            _ledger = load_ledger(engine_config.dataDir)
+            _today_str = _now_ict.strftime("%Y-%m-%d")
+            _already_entered_today = any(
+                getattr(o, "runId", "") == _today_str
+                and getattr(o, "side", "") == "NB"
+                and str(getattr(o, "reason", "")).startswith("autofin_buy:")
+                for o in _ledger.values()
+            )
+        except Exception:
+            _already_entered_today = False
+        in_catchup = (
+            is_main_trading_phase(_now_ict, _sched)
+            and _minutes_since_open > start_of_day_cutoff_min
+            and _minutes_since_open <= max(catchup_min, start_of_day_cutoff_min)
+            and not _already_entered_today
+        )
         # 2026-10-09: ``force-run-trading`` CLI sets this env var to
         # bypass the start-of-day cutoff. The normal bot main loop
         # never sets it; the only way to bypass is to invoke the
@@ -3549,7 +3621,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         # window"); force-run is an explicit override for
         # ad-hoc re-runs.
         force_new_entry = os.environ.get("AUTOFIN_FORCE_NEW_ENTRY", "").strip() == "1"
-        allow_new_entries = in_morning or force_new_entry
+        allow_new_entries = in_morning or in_catchup or force_new_entry
 
         # 5d. Build a symbol → last_close price map from local price data.
         # Used to (a) gate entry on price-within-buy-zone and (b) include
@@ -3746,7 +3818,9 @@ class AutofinSignalAdapter(StrategyAdapter):
         print(
             f"[autofin_signal] new_entry_top_n={new_entry_top_n if allow_new_entries else 0} "
             f"(allow_new_entries={allow_new_entries}, "
-            f"in_morning={in_morning}, force_new_entry={force_new_entry})"
+            f"in_morning={in_morning}, in_catchup={in_catchup}, "
+            f"already_entered_today={_already_entered_today}, "
+            f"force_new_entry={force_new_entry})"
         )
 
         # 9b. Notification-driven mid-day TP/SL detection. Per user feedback
