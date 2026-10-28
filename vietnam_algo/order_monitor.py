@@ -177,6 +177,16 @@ def submit_and_monitor_order(
         order.price,
         order.loanPackageId,
         order.orderType,
+        # 2026-10-27: forward the native STOP fields so a protective
+        # order stays a CONDITIONAL order. Submitting it as a NORMAL
+        # limit sell would cross the book and liquidate the position
+        # immediately — the exact opposite of a stop-loss.
+        order_category=(order.orderCategory or "NORMAL").upper(),
+        stop_price=order.stopPrice or None,
+        condition_operator=order.conditionOperator or None,
+        duration_type=order.durationType or None,
+        duration_date_time=order.durationDateTime or None,
+        stop_order_price=order.stopOrderPrice or None,
     )
     events.append({"event": "submitted", "order": asdict(order), "response": response})
     order_id = str(response.get("orderId") or response.get("id") or "") if isinstance(response, dict) else ""
@@ -184,10 +194,31 @@ def submit_and_monitor_order(
         events.append({"event": "monitor_skipped", "reason": "order_id_missing"})
         return events
 
+    # 2026-10-27: a STOP order must be polled with its own category.
+    # A NORMAL detail query cannot resolve a conditional order, and
+    # the market-following replace logic below must never touch a
+    # protective order (replacing it would move the stop and cancel
+    # the protection).
+    order_category = (order.orderCategory or "NORMAL").upper()
+    is_protective = order_category == "STOP"
+
     current_order = order
     for _ in range(max_checks):
         time.sleep(check_interval_seconds)
-        detail = client.order_detail(account_no, order_id, trading_token=trading_token)
+        detail = client.order_detail(
+            account_no, order_id, trading_token=trading_token,
+            order_category=order_category,
+        )
+        if is_protective:
+            # A protective stop is NOT a market-following limit order.
+            # Observe its state and never re-price it.
+            events.append({
+                "event": "checked",
+                "orderId": order_id,
+                "detail": detail,
+                "decision": {"action": "done", "price": None, "reason": "protective_stop_order_not_repriced"},
+            })
+            break
         quote = client.latest_quote(order.symbol)
         decision = decide_reprice(current_order, detail, quote, signal_price=signal_price, max_drift_percent=max_drift_percent)
         events.append({"event": "checked", "orderId": order_id, "detail": detail, "decision": asdict(decision)})
@@ -213,12 +244,30 @@ def submit_and_monitor_order(
                 reason=current_order.reason,
             )
             events.append({"event": "replaced", "orderId": order_id, "newPrice": decision.price, "newQuantity": remaining_quantity, "response": response})
-    detail = client.order_detail(account_no, order_id, trading_token=trading_token)
+    detail = client.order_detail(
+        account_no, order_id, trading_token=trading_token,
+        order_category=order_category,
+    )
     status = order_status(detail)
     if status not in DONE_ORDER_STATUSES:
         events.append({"event": "monitor_exhausted_unfilled", "orderId": order_id, "detail": detail, "status": status or "UNKNOWN"})
     if cancel_if_unfilled:
-        if status not in DONE_ORDER_STATUSES:
+        # 2026-10-27: NEVER cancel a protective (STOP) order.
+        #
+        # ``cancel_if_unfilled`` exists to clean up a stale LIMIT
+        # order that the market ran away from. For a conditional stop
+        # that is exactly the wrong behaviour: an unfilled protective
+        # stop means the position is STILL UNPROTECTED and the stop
+        # must keep resting at the broker. Cancelling it would leave
+        # the holding naked — the precise failure this whole STOP
+        # implementation exists to prevent.
+        if is_protective:
+            events.append({
+                "event": "cancel_skipped",
+                "orderId": order_id,
+                "reason": "protective_stop_order_never_cancelled",
+            })
+        elif status not in DONE_ORDER_STATUSES:
             response = client.cancel_order(account_no, trading_token, order_id)
             events.append({"event": "cancelled_unfilled", "orderId": order_id, "detail": detail, "response": response})
     return events

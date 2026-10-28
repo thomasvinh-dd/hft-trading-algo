@@ -10,6 +10,32 @@ from .data import DEFAULT_DATA_DIR, read_json, utc_now, write_json
 TERMINAL_LEDGER_STATUSES = {"filled", "cancelled", "rejected", "expired", "closed", "dry_run", "skipped"}
 UNSAFE_LEDGER_STATUSES = {"prepared", "submitting", "submitted", "open", "partial", "unknown"}
 
+# 2026-10-28: the subset of UNSAFE_LEDGER_STATUSES that genuinely
+# makes a submit run AMBIGUOUS, and therefore worth blocking.
+#
+# ``unsafe_existing_orders`` short-circuits the ENTIRE submit run
+# (every order for that run_id), not just the ambiguous one. That is
+# the right behaviour for an order whose fate we don't know
+# ("prepared" / "submitting" / "unknown" — DNSE may or may not have
+# it, so re-submitting risks a double order).
+#
+# But "submitted" / "open" / "partial" are CONFIRMED live orders: we
+# know DNSE holds them, and the per-order dedup in
+# ``execute_orders_with_ledger`` already skips a matching
+# (sourceOrderId, symbol, side). Blocking the whole run on them means
+# one resting STOP-LOSS prevents every other order from being
+# submitted.
+#
+# That is exactly what happened on 2026-10-28: the retried ORS
+# stop-loss was correctly placed (DNSE order 216241) and recorded as
+# "open", and from then on
+# ``execute_orders_with_ledger`` returned 0 results for every
+# subsequent submit — the MSB entry could not go through.
+#
+# So: only AMBIGUOUS states block the run. A confirmed working order
+# is skipped per-order and lets the rest through.
+AMBIGUOUS_LEDGER_STATUSES = {"prepared", "submitting", "unknown"}
+
 # 2026-10-25: a dedicated status for orders DNSE rejected because the
 # trading token was invalid.
 #
@@ -57,6 +83,17 @@ class LedgerOrder:
     repriceCount: int = 0
     lastRepricedAt: str = ""
     originalPrice: int = 0
+    # 2026-10-28: DNSE order category. "NORMAL" for regular limit
+    # orders; "STOP" for conditional stop orders (the DNSE
+    # conditional-order API). ``daily_engine`` / ``trading_engine`` /
+    # ``order_monitor`` read it to decide which DNSE endpoint and
+    # query parameters to use, so the field must exist on every
+    # ledger row.
+    orderCategory: str = "NORMAL"
+    # Trigger price for a conditional stop order (0 = not a stop
+    # order). Kept alongside ``orderCategory`` so a stop order's
+    # parameters survive a ledger round-trip.
+    stopPrice: int = 0
 
 
 def ledger_path(data_dir: Path = DEFAULT_DATA_DIR) -> Path:
@@ -96,6 +133,14 @@ def load_ledger(data_dir: Path = DEFAULT_DATA_DIR) -> dict[str, LedgerOrder]:
                 repriceCount=int(row.get("repriceCount") or 0),
                 lastRepricedAt=str(row.get("lastRepricedAt") or ""),
                 originalPrice=int(row.get("originalPrice") or 0) or int(row.get("price") or 0),
+                # 2026-10-28: restore the DNSE order class + trigger
+                # level. Without this every row reloads as
+                # ``orderCategory="NORMAL"`` / ``stopPrice=0``, so a
+                # resting STOP would be polled as a NORMAL order (and
+                # could not be resolved by the broker) and the
+                # re-pricer would treat it as an ordinary limit order.
+                orderCategory=str(row.get("orderCategory") or "NORMAL").upper(),
+                stopPrice=int(row.get("stopPrice") or 0),
             )
         except (TypeError, ValueError):
             continue
@@ -298,7 +343,23 @@ def dnse_order_id(response: dict[str, Any] | list[Any] | None) -> str:
 
 
 def unsafe_existing_orders(ledger: dict[str, LedgerOrder], run_id: str) -> list[LedgerOrder]:
-    return [item for item in ledger.values() if item.runId == run_id and item.status in UNSAFE_LEDGER_STATUSES]
+    """Return the orders that make a submit run for ``run_id`` ambiguous.
+
+    Only AMBIGUOUS statuses block the run (see
+    ``AMBIGUOUS_LEDGER_STATUSES``): an order whose state we can't
+    determine might be live at DNSE, so re-submitting risks a double
+    order.
+
+    A CONFIRMED working order ("submitted" / "open" / "partial") does
+    NOT block the run — the per-order dedup in
+    ``execute_orders_with_ledger`` already skips it, and blocking the
+    whole run on it would let a single resting stop-loss prevent
+    every other order from being submitted (2026-10-28 incident).
+    """
+    return [
+        item for item in ledger.values()
+        if item.runId == run_id and item.status in AMBIGUOUS_LEDGER_STATUSES
+    ]
 
 
 def submission_complete(ledger: dict[str, LedgerOrder], run_id: str) -> bool:

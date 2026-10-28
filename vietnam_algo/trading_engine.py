@@ -47,6 +47,22 @@ class DnseOrder:
     sourceOrderId: int
     sourceDate: str
     reason: str
+    # 2026-10-27: native DNSE STOP (conditional) order support.
+    #
+    # A STOP order is a conditional instruction: the broker watches
+    # the market and, when the trigger fires, generates a NORMAL order
+    # with the parameters below. ``orderCategory`` selects the DNSE
+    # order class ("NORMAL" | "STOP"); the STOP-only fields are
+    # ignored by the client unless the category is "STOP".
+    #
+    # These are appended LAST so existing positional construction of
+    # DnseOrder keeps working unchanged.
+    orderCategory: str = "NORMAL"
+    stopPrice: int = 0
+    conditionOperator: str = ""
+    durationType: str = ""
+    durationDateTime: str = ""
+    stopOrderPrice: int = 0
 
 
 @dataclass(frozen=True)
@@ -750,6 +766,17 @@ def apply_sellable_quantity_cap(
                     sourceOrderId=order.sourceOrderId,
                     sourceDate=order.sourceDate,
                     reason=order.reason,
+                    # 2026-10-27: carry the STOP fields through the
+                    # reconstruction. Dropping them here would
+                    # silently downgrade a native conditional order
+                    # into a plain NORMAL limit order — i.e. it would
+                    # turn a protective stop into a marketable sell.
+                    orderCategory=order.orderCategory,
+                    stopPrice=order.stopPrice,
+                    conditionOperator=order.conditionOperator,
+                    durationType=order.durationType,
+                    durationDateTime=order.durationDateTime,
+                    stopOrderPrice=order.stopOrderPrice,
                 )
             )
             continue
@@ -787,6 +814,17 @@ def price_order_from_quote(
         sourceOrderId=order.sourceOrderId,
         sourceDate=order.sourceDate,
         reason=order.reason,
+        # 2026-10-27: carry the STOP fields through the
+        # reconstruction. Without them a protective STOP would
+        # silently become a NORMAL limit order on the way to the
+        # broker — and a sell limit below the market fills
+        # immediately, which is the opposite of protection.
+        orderCategory=order.orderCategory,
+        stopPrice=order.stopPrice,
+        conditionOperator=order.conditionOperator,
+        durationType=order.durationType,
+        durationDateTime=order.durationDateTime,
+        stopOrderPrice=order.stopOrderPrice,
     )
     return priced, {"symbol": order.symbol, "action": "price_changed", "reason": "initial_orderbook_price", "signalPrice": order.price, "marketPrice": market_price}
 

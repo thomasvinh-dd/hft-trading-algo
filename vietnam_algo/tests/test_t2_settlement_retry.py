@@ -494,6 +494,41 @@ def test_retry_skips_sl_when_position_already_closed(tmp_path) -> None:
     client.place_stock_order.assert_not_called()
 
 
+def test_retry_reads_openquantity_for_unsettled_shares(tmp_path) -> None:
+    """2026-10-28 ORS incident: shares bought on 2026-10-26 were not
+    yet settled on 2026-10-28, so DNSE reported::
+
+        tradeQuantity = 0     <- settled net qty (0, not settled yet)
+        openQuantity = 200    <- shares we actually hold
+
+    The old parser preferred ``tradeQuantity`` and therefore read 0,
+    so the T+2 retry classified the SL as "position already closed"
+    and SKIPPED the retry — leaving a 200-share position with no
+    stop-loss.
+
+    ``openQuantity`` is the field that answers "can I sell these
+    shares", so it must take precedence.
+    """
+    _seed_ledger(tmp_path, _make_sl_buy_pair(symbol="ORS", buy_date="2026-10-26"))
+    client = _make_client(positions=[{
+        # Real DNSE shape for a position pending settlement.
+        "symbol": "ORS",
+        "accumulateQuantity": 200,
+        "tradeQuantity": 0,
+        "closedQuantity": 0,
+        "openQuantity": 200,
+    }])
+    summary = retry_t2_settlement_sl_orders(
+        client=client, account_no="0003937868", trading_token="tok",
+        data_dir=tmp_path, today_iso="2026-10-28",
+        now_time=datetime.time(14, 30),
+    )
+    # We DO hold 200 → the SL must not be treated as stale.
+    assert summary["stale_no_position"] == 0, summary["stale_details"]
+    assert summary["t2_due"] == 1
+    assert summary["resubmitted"] == 1
+
+
 def test_retry_skips_sl_when_held_qty_below_sl_qty(tmp_path) -> None:
     """Partial liquidation: we hold fewer shares than the SL asks
     for, so the SL can never fill in full. Drop it as stale."""

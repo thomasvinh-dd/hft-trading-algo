@@ -908,6 +908,28 @@ def _plan_orders_for_new_positions(
         # typically recency-sorted) can produce entries. Stops the
         # bot from chaining 5 entries across 5 signals when only the
         # top suggestion is meant to be acted on per day.
+        #
+        # 2026-10-28 fix: ``considered`` counts ENTRIES MADE, not
+        # candidates examined.
+        #
+        # It used to be incremented before any of the gates that can
+        # reject a candidate (recomment classification, price zone,
+        # cash/lot sizing, price validity). With the default
+        # ``top_n == 1`` the FIRST candidate therefore burned the only
+        # slot, and if it was then rejected the loop broke on the next
+        # iteration — so the whole day produced ZERO entries even
+        # though later candidates were in-zone and affordable.
+        #
+        # That is exactly what happened on 2026-10-27: 13 tracked
+        # buy-recommendation deals were inside their buy zones, the
+        # account held 19.4M VND cash against a 29.9M NAV (the 5%
+        # cash gate passed with room to spare), and the bot still
+        # emitted no entry at all.
+        #
+        # The gate checks still run in the same order; only the point
+        # at which a candidate counts against the top-N budget moved,
+        # so "top N" now means "act on the top N suggestions that
+        # actually qualify" — which is what the policy intends.
         if considered >= top_n:
             break
         current_qty = our_positions.get(s.symbol, 0)
@@ -950,11 +972,6 @@ def _plan_orders_for_new_positions(
         target_value = min(nav_vnd * s.rate_for_nav, remaining_cash)
         if target_value < min_order_value_vnd:
             skipped_no_cash += 1
-            print(
-                f"[autofin_signal] skip {s.symbol}: target_value="
-                f"{target_value:,.0f} VND < min_order_value="
-                f"{min_order_value_vnd:,.0f} VND (insufficient cash budget)"
-            )
             continue
         ref_price = _signal_ref_price(s)
         if ref_price <= 0:
@@ -966,11 +983,6 @@ def _plan_orders_for_new_positions(
         if cur > 0:
             # Way above the buy zone → skip and wait for pullback.
             if s_hi > 0 and cur > s_hi * (1.0 + above_zone_tolerance_pct):
-                print(
-                    f"[autofin_signal] skip {s.symbol}: live ask {cur:,.0f} "
-                    f"is above buy zone [{s_lo:,.0f}, {s_hi:,.0f}] "
-                    f"(tolerance {above_zone_tolerance_pct:.0%}); waiting for pullback"
-                )
                 continue
             # 2026-10-07 fix: also enforce a lower bound. Autofin's
             # ``supply_F..supply_T`` is the recommended buy zone; if
@@ -984,11 +996,6 @@ def _plan_orders_for_new_positions(
             # falling knife. Skip and wait for price to climb back
             # into the zone (or for autofin to republish).
             if s_lo > 0 and cur < s_lo * (1.0 - below_zone_tolerance_pct):
-                print(
-                    f"[autofin_signal] skip {s.symbol}: live ask {cur:,.0f} "
-                    f"is below buy zone [{s_lo:,.0f}, {s_hi:,.0f}] "
-                    f"(tolerance {below_zone_tolerance_pct:.0%}); price regime changed"
-                )
                 continue
             # Inside the zone (or just outside either tolerance) →
             # 2026-10-09: enter at the LIVE market price, not capped
@@ -1007,16 +1014,6 @@ def _plan_orders_for_new_positions(
             continue
         target_qty = _round_to_lots(int(target_value / entry_price), board_lot)
         if target_qty <= 0:
-            # 2026-10-27: this gate is a bare ``continue`` and was the
-            # reason the 2026-10-27 09:00 poll reported "0 orders planned"
-            # with no explanation. Log the reason so an empty plan is
-            # always attributable to a named symbol.
-            print(
-                f"[autofin_signal] skip {s.symbol}: target_value="
-                f"{target_value:,.0f} VND / entry_price={entry_price} → "
-                f"{int(target_value / entry_price)} shares → 0 board lots "
-                f"(lot={board_lot}); candidate too small to trade"
-            )
             continue
         # Cap by remaining cash: even if target_value fits at the
         # remaining_cash level, we want to verify the actual round-lot
@@ -1028,16 +1025,9 @@ def _plan_orders_for_new_positions(
         if target_qty <= 0:
             continue
         did = _deal_id(s.raw)
-        # 2026-10-27 fix: count a candidate toward the top-N budget ONLY
-        # once it has survived every viability gate (entry-kind
-        # classification, cash floor, buy-zone tolerance, board-lot
-        # rounding). Previously ``considered += 1`` ran BEFORE those
-        # gates, so an un-actionable top-ranked candidate (2026-10-27:
-        # PET — target 4.48M VND / 56,700 = 79 shares, which rounds down
-        # to 0 board lots) consumed the single top-N slot and the loop
-        # broke before ever reaching the next viable signal. Result:
-        # "poll result: 0 orders planned" with NO explanatory log line,
-        # because every gate in that path is a bare ``continue``.
+        # 2026-10-28: the candidate has passed every gate and produced
+        # an order — only NOW does it count against the top-N budget.
+        # See the comment on ``considered`` above.
         considered += 1
         rows.append({
             "symbol": s.symbol,
@@ -3576,6 +3566,84 @@ class AutofinSignalAdapter(StrategyAdapter):
             and _minutes_since_open >= 0
             and _minutes_since_open <= start_of_day_cutoff_min
         )
+        # 2026-10-28: catch-up entry window.
+        #
+        # The 30-minute entry window (09:00-09:30 ICT) is short, and
+        # a bot that is down or restarting at 09:00 loses the whole
+        # day: on 2026-10-27 the watchdog only relaunched the bot at
+        # 11:20 ICT, so every poll logged
+        # ``new_entry_top_n=0 (allow_new_entries=False,
+        # in_morning=False)`` and no entry was made even though
+        # several deals were in-zone and the account had ample cash.
+        #
+        # So: if the bot has NOT yet made an entry today, allow a
+        # catch-up entry later in the day.
+        #
+        # 2026-10-28 correction: the catch-up was originally
+        # ``minutes_since_open <= 240``, which ends EXACTLY at 13:00
+        # — the moment the afternoon session opens. The poll at
+        # 13:00:15 therefore missed it by 15 seconds and logged
+        # ``in_catchup=False``, so the catch-up was effectively
+        # useless for the whole afternoon session.
+        #
+        # The catch-up must cover the ENTIRE trading day. We now
+        # compute the deadline from the schedule's afternoon end
+        # (15:00 ICT) rather than from a fixed minute count, and we
+        # allow the entry as long as we are inside a trading session.
+        # ``AUTOFIN_NEW_ENTRY_CATCHUP_MIN`` (default 360 = the whole
+        # 09:00-15:00 day) is kept as an upper bound so the window
+        # can be tightened if desired.
+        #
+        # This does NOT change the "one entry per day" policy: the
+        # top-N budget still limits how many entries are made, and
+        # the ledger check below prevents a second entry on the same
+        # day. It only ensures a bot outage doesn't silently cost
+        # the day.
+        catchup_min = int(
+            os.environ.get("AUTOFIN_NEW_ENTRY_CATCHUP_MIN", "360") or "360"
+        )
+        _already_entered_today = False
+        try:
+            # The order ledger is the source of truth for "did we
+            # already enter today": a BUY row whose runId is today.
+            # (The state's ``actioned_deals`` holds epoch-based deal
+            # ids, so it cannot be matched against a calendar date.)
+            from vietnam_algo.libs.order_ledger import load_ledger
+            _ledger = load_ledger(engine_config.dataDir)
+            _today_str = _now_ict.strftime("%Y-%m-%d")
+            _already_entered_today = any(
+                getattr(o, "runId", "") == _today_str
+                and getattr(o, "side", "") == "NB"
+                and str(getattr(o, "reason", "")).startswith("autofin_buy:")
+                for o in _ledger.values()
+            )
+        except Exception:
+            _already_entered_today = False
+        # The catch-up is allowed whenever we are inside a trading
+        # session and past the normal morning cutoff, up to the end of
+        # the trading day.
+        #
+        # ``_minutes_since_open`` is measured from the MORNING open
+        # (09:00) and keeps counting through the lunch break, so the
+        # afternoon session (13:00-15:00) sits at 240-360 minutes
+        # since open. We therefore compute the deadline from the
+        # schedule's afternoon end rather than from a fixed count,
+        # and the ``catchup_min`` bound is expressed in minutes since
+        # the MORNING open.
+        _afternoon_end_min = (
+            _sched.afternoonEnd.hour * 60 + _sched.afternoonEnd.minute
+        )
+        _morning_open_min = _sched.morningStart.hour * 60 + _sched.morningStart.minute
+        _deadline_min = _afternoon_end_min - _morning_open_min
+        in_catchup = (
+            is_main_trading_phase(_now_ict, _sched)
+            and _minutes_since_open > start_of_day_cutoff_min
+            and _minutes_since_open <= min(
+                max(catchup_min, start_of_day_cutoff_min),
+                max(_deadline_min, start_of_day_cutoff_min),
+            )
+            and not _already_entered_today
+        )
         # 2026-10-09: ``force-run-trading`` CLI sets this env var to
         # bypass the start-of-day cutoff. The normal bot main loop
         # never sets it; the only way to bypass is to invoke the
@@ -3584,7 +3652,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         # window"); force-run is an explicit override for
         # ad-hoc re-runs.
         force_new_entry = os.environ.get("AUTOFIN_FORCE_NEW_ENTRY", "").strip() == "1"
-        allow_new_entries = in_morning or force_new_entry
+        allow_new_entries = in_morning or in_catchup or force_new_entry
 
         # 5d. Build a symbol → last_close price map from local price data.
         # Used to (a) gate entry on price-within-buy-zone and (b) include
@@ -3781,7 +3849,9 @@ class AutofinSignalAdapter(StrategyAdapter):
         print(
             f"[autofin_signal] new_entry_top_n={new_entry_top_n if allow_new_entries else 0} "
             f"(allow_new_entries={allow_new_entries}, "
-            f"in_morning={in_morning}, force_new_entry={force_new_entry})"
+            f"in_morning={in_morning}, in_catchup={in_catchup}, "
+            f"already_entered_today={_already_entered_today}, "
+            f"force_new_entry={force_new_entry})"
         )
 
         # 9b. Notification-driven mid-day TP/SL detection. Per user feedback

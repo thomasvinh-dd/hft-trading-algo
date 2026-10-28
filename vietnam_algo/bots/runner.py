@@ -951,6 +951,16 @@ def _submit_autofin_deals_to_dnse(
             # no ATO), the price is no longer auction-determined —
             # send the signal price.
             signal_price = int(o.get("price") or 0)
+            # 2026-10-28: the leg's reason identifies whether this is
+            # a PROTECTIVE stop or a discretionary exit. It MUST be
+            # resolved BEFORE the sell-at-market override below,
+            # because a protective stop must never be re-priced to
+            # "fill at market" — on 2026-10-28 the TVN stop leg was
+            # overridden from its intended 9,360 to 10,150 (bid×0.99)
+            # precisely so it would fill instantly, which liquidates
+            # the position instead of protecting it.
+            reason = str(o.get("reason") or f"autofin:{deal.get('action', '?')}")
+            is_protective_leg = _is_protective_reason(reason)
             if is_auction:
                 # Will be re-evaluated after we know the market
                 price = 0
@@ -999,6 +1009,7 @@ def _submit_autofin_deals_to_dnse(
             if (
                 side == "NS"
                 and not is_auction
+                and not is_protective_leg
                 and os.environ.get("AUTOFIN_SELL_AT_MARKET", "1") != "0"
             ):
                 try:
@@ -1050,9 +1061,43 @@ def _submit_autofin_deals_to_dnse(
             # instead of 0 — the LO orderType accepts a non-zero price.
             if is_auction and otype == "LO":
                 price = signal_price
-            reason = str(o.get("reason") or f"autofin:{deal.get('action', '?')}")
             if is_auction and signal_price > 0:
                 reason = f"{reason} [session={session.value} signal_price={signal_price}]"
+            # 2026-10-28: a PROTECTIVE leg (stop-loss) must be a native
+            # DNSE conditional (STOP) order — never a plain limit sell.
+            #
+            # A sell LO at the stop level is MARKETABLE whenever the
+            # market is above it: on 2026-10-28 the ORS stop (14,400)
+            # was replaced by the re-pricer with the live bid (~15,150)
+            # and the position was liquidated instead of protected. A
+            # native STOP rests at the broker as a trigger and only
+            # becomes a NORMAL order once the market reaches the level.
+            #
+            # DNSE's STOP order generates a NORMAL order of type LO/MTL
+            # only (docs/dnse-api/guide-trading_order.txt L370-385), so
+            # the orderType is forced to LO and ``price`` must be > 0
+            # even in an auction session.
+            stop_fields: dict[str, Any] = {}
+            if is_protective_leg and side == "NS":
+                stop_level = _sl_stop_level_from_reason(reason) or signal_price
+                if stop_level <= 0:
+                    print(
+                        f"[protective_stop] {sym}: no recoverable stop "
+                        f"level in {reason!r} — skipping the protective leg"
+                    )
+                    continue
+                otype = "LO"
+                price = _hose_price_tick(int(round(stop_level * 0.995))) or stop_level
+                from datetime import datetime as _dt2, timedelta as _td2
+                stop_fields = {
+                    "orderCategory": "STOP",
+                    "stopPrice": stop_level,
+                    "conditionOperator": "<=",
+                    "durationType": "GTD",
+                    "durationDateTime": (
+                        _dt2.now(vietnam_now().tzinfo) + _td2(days=30)
+                    ).isoformat(),
+                }
             orders.append(DnseOrder(
                 symbol=sym,
                 side=side,
@@ -1063,6 +1108,7 @@ def _submit_autofin_deals_to_dnse(
                 sourceOrderId=_stable_id(deal, o),
                 sourceDate=trade_date,
                 reason=reason,
+                **stop_fields,
             ))
 
     if not orders:
@@ -1070,9 +1116,6 @@ def _submit_autofin_deals_to_dnse(
             "submitted": [],
             "skipped_existing": 0,
             "unknown": 0,
-            "rejected": 0,
-            "token_rejected": 0,
-            "rejected_details": [],
             "total": 0,
         }
         if out_of_zone:
@@ -1223,6 +1266,91 @@ _T2_REJECT_CODES = ("TRADE_QUANTITY_NOT_ENOUGH",)
 # and the bot re-submits the same dead SL every hour — see the
 # function's docstring).
 _T2_RETRY_MARKER_RE = re.compile(r"\s*\[t2-retry from [^\]]+\]")
+
+# 2026-10-28: recovers the intended price of an auction-planned SL.
+#
+# An SL planned during an ATO/ATC auction window is submitted with
+# price=0 (the exchange sets the fill price) and the intended price
+# survives only in the reason string:
+#
+#   autofin_user_sl:deal#1792713600:ORS:10%:14400 [session=ATO signal_price=14400]
+#
+# The T+2 retry replays it as a LIMIT order, and DNSE rejects a limit
+# order with price 0 — so without this recovery the retry fails on a
+# price error and the position stays unprotected. We prefer the
+# explicit ``signal_price=`` marker and fall back to the
+# ``:<pct>:<price>`` segment of the autofin reason.
+_SL_SIGNAL_PRICE_RE = re.compile(r"signal_price=([0-9][0-9_,]*(?:\.[0-9]+)?)")
+_SL_REASON_PRICE_RE = re.compile(r":\d+(?:\.\d+)?%?:([0-9][0-9_,]*(?:\.[0-9]+)?)")
+
+# 2026-10-28: the reason prefixes that mark a PROTECTIVE stop leg.
+#
+# ``autofin_user_sl:`` is the user's own stop-loss level (the
+# ``:<pct>:<level>`` form) and ``autofin_sl:`` is autofin's own
+# computed stop. Both are PROTECTION, not a discretionary exit —
+# they must never be re-priced to "fill at market".
+_SL_PROTECTIVE_REASON_PREFIXES = ("autofin_sl:", "autofin_user_sl:")
+
+
+def _is_protective_reason(reason: str | None) -> bool:
+    """Return True if the reason marks a protective (stop-loss) leg.
+
+    A protective leg is a STOP, not a take-profit. It must be
+    submitted as a native DNSE conditional order and must never be
+    re-priced toward the live bid — doing so turns protection into
+    an immediate liquidation (see MEMORY.md, the 2026-10-28 ORS
+    incident: a sell LO at 14,400 against a 15,150 bid crossed and
+    filled instantly at 15,150).
+    """
+    r = (reason or "").strip()
+    return r.startswith(_SL_PROTECTIVE_REASON_PREFIXES)
+
+
+def _sl_stop_level_from_reason(reason: str | None) -> int:
+    """Recover the INTENDED stop level from an SL reason string.
+
+    The ledger ``price`` of an auction-planned SL is 0 (correct for
+    ATO — the exchange sets the fill price), so the intended level
+    survives only in the reason::
+
+        autofin_user_sl:deal#1792713600:ORS:10%:14400
+        autofin_user_sl:deal#1792713600:ORS:10%:14400 [session=ATO signal_price=14400]
+        autofin_sl:deal#1785888000:BAF:27900
+
+    Strategy: drop the bracketed annotation, split on ':' and take
+    the LAST purely-numeric field. That handles all three formats
+    above — including ``autofin_sl:`` which has no ``%`` segment
+    and therefore is NOT matched by ``_SL_REASON_PRICE_RE``.
+
+    Returns 0 when no level can be recovered (caller must skip the
+    symbol rather than submit a doomed or marketable order).
+    """
+    r = (reason or "").strip()
+    if not r:
+        return 0
+    # Drop a trailing "[...]" annotation (session / signal_price).
+    r = r.split("[", 1)[0]
+    for field in reversed(r.split(":")):
+        f = field.strip().replace(",", "").replace("_", "")
+        if not f:
+            continue
+        try:
+            value = int(float(f))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    # Fall back to the explicit markers.
+    for pattern in (_SL_SIGNAL_PRICE_RE, _SL_REASON_PRICE_RE):
+        m = pattern.search(reason or "")
+        if m:
+            try:
+                value = int(float(m.group(1).replace(",", "")))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return 0
 
 
 def _is_t2_rejection(error: str) -> bool:
@@ -1377,6 +1505,11 @@ def retry_t2_settlement_sl_orders(
         "t2_due": 0,
         "stale_no_position": 0,
         "stale_details": [],
+        # 2026-10-28: SLs whose price had to be recovered from the
+        # auction ``signal_price=`` marker, and SLs we could not price
+        # at all (so no limit order was placed).
+        "recovered_price": [],
+        "no_price": [],
         "resubmitted": 0,
         "resubmit_dnse_ids": [],
         "resubmit_errors": [],
@@ -1430,8 +1563,23 @@ def retry_t2_settlement_sl_orders(
                 # Verified against account 0003937868:
                 #   ABB → tradeQuantity=100, openQuantity=100
                 #   TLG → tradeQuantity=100, openQuantity=100
+                #
+                # 2026-10-28 fix: prefer ``openQuantity`` (shares we
+                # hold) over ``tradeQuantity`` (the SETTLED net
+                # quantity). The ORS position bought 2026-10-26
+                # reported ``tradeQuantity=0, openQuantity=200``
+                # because the shares had not finished settling. The
+                # old preference for ``tradeQuantity`` therefore
+                # read 0 and the T+2 retry classified the ORS SL as
+                # "position already closed" — skipping the retry for
+                # a position we DO hold, leaving it unprotected.
+                #
+                # ``openQuantity`` is the right field for "can I sell
+                # these shares": it is non-zero as soon as the BUY
+                # fills. We fall back to ``tradeQuantity`` for older
+                # payloads that lack it, and to ``quantity`` last.
                 raw_qty = None
-                for field in ("tradeQuantity", "openQuantity", "quantity"):
+                for field in ("openQuantity", "tradeQuantity", "quantity"):
                     if row.get(field) is not None:
                         raw_qty = row.get(field)
                         break
@@ -1619,9 +1767,95 @@ def retry_t2_settlement_sl_orders(
         # suppresses the second and later attempts.
         base_reason = _T2_RETRY_MARKER_RE.sub("", sl.reason or "").strip()
 
+        # 2026-10-28 fix (retrying an auction-priced SL at price 0).
+        #
+        # An SL planned during an ATO/ATC auction window is submitted
+        # with price=0 (the exchange determines the fill price) and
+        # the intended price is recorded only in the reason string:
+        #
+        #   autofin_user_sl:deal#...:ORS:10%:14400 [session=ATO signal_price=14400]
+        #
+        # The T+2 retry replays the ledger row's ``price`` — which is
+        # 0 — but as a LIMIT order (``orderType="LO"``). DNSE rejects
+        # a LO with price 0, so the retry would fail with a price
+        # error instead of succeeding once the T+2.5 settlement
+        # cleared. The position would stay UNPROTECTED.
+        #
+        # This is exactly the ORS position bought on 2026-10-26: its
+        # SL was rejected with TRADE_QUANTITY_NOT_ENOUGH (T+2), and
+        # the retry would have replayed it at price 0.
+        #
+        # Fix: recover the intended price from the ``signal_price=``
+        # marker (or the ``:<pct>:<price>`` segment of the autofin
+        # reason) and use it for the LO retry. The recovery is
+        # recorded in the summary so the operator can see it.
+        # The intended stop level is recovered from the REASON (below).
+        # ``retry_price`` is only a fallback for the generated order's
+        # limit price and must NOT gate eligibility any more: the old
+        # ``%``-anchored regex could not read an ``autofin_sl:`` reason
+        # (e.g. ``autofin_sl:deal#…:BAF:27900`` has no ``%`` segment),
+        # and skipping those symbols left their positions unprotected.
+        retry_price = int(sl.price or 0)
+
+        # 2026-10-28: the retry must place a NATIVE DNSE conditional
+        # (STOP) order, never a plain limit order.
+        #
+        # A sell LO at the stop level is MARKETABLE: on 2026-10-28
+        # the ORS retry submitted a NORMAL sell LO @ 14,400 against a
+        # 15,150 bid and DNSE filled it instantly at 15,150 — the
+        # position was liquidated instead of protected, and no
+        # protective order ever rested at the broker.
+        #
+        # A native STOP order is a conditional instruction: DNSE
+        # watches the market and, when the trigger fires, generates a
+        # NORMAL order with the parameters we pre-set. The two field
+        # groups are (docs/dnse-api/guide-trading_order.txt L330-470):
+        #
+        #   STOP group  → stopPrice, conditionOperator, durationType,
+        #                  durationDateTime
+        #   NORMAL group → side, orderType, price, quantity,
+        #                  loanPackageId  (the order generated on trigger)
+        #
+        # Rules that matter:
+        #   1. ``price`` (the generated NORMAL order's limit) MUST be
+        #      > 0 — DNSE rejects price=0 for an LO.
+        #   2. ``durationType`` accepts ONLY "GTD", and
+        #      ``durationDateTime`` (ISO 8601) is then mandatory.
+        #
+        # The intended level comes from the REASON (the ledger price
+        # of an auction-planned SL is 0), and the generated order's
+        # limit is set slightly BELOW the stop level so that it is
+        # marketable at the moment the trigger fires — otherwise the
+        # stop would trigger and then not fill.
+        stop_level = _sl_stop_level_from_reason(base_reason)
+        if stop_level <= 0:
+            # No level to protect at — skip rather than submit a
+            # doomed or marketable order. The operator is told.
+            summary["no_price"].append(
+                f"{sl.symbol}: SL has no recoverable stop level in "
+                f"{base_reason!r} — cannot place a protective STOP"
+            )
+            continue
+        if retry_price <= 0:
+            retry_price = stop_level
+            summary["recovered_price"].append(
+                f"{sl.symbol}: SL price 0 -> {retry_price:,.0f} "
+                f"(recovered from the autofin reason)"
+            )
+        # The generated NORMAL order's limit: just below the trigger
+        # so it crosses the book as soon as the stop fires.
+        generated_limit = _hose_price_tick(int(round(stop_level * 0.995)))
+        if generated_limit <= 0:
+            generated_limit = stop_level
+        # GTD expiry: 30 days out, ISO 8601 in Vietnam time.
+        from datetime import datetime as _dt, timedelta as _td
+        gtd_expiry = (
+            _dt.now(vietnam_now().tzinfo) + _td(days=30)
+        ).isoformat()
+
         new_source_id = int(
             _hl.sha1(
-                f"t2-retry|{today_iso}|{sl.symbol}|{sl.price}|{sl.quantity}|{base_reason}".encode()
+                f"t2-retry|{today_iso}|{sl.symbol}|{stop_level}|{sl.quantity}|{base_reason}".encode()
             ).hexdigest()[:12],
             16,
         )
@@ -1632,8 +1866,18 @@ def retry_t2_settlement_sl_orders(
             original_pkg = int(sl.lastDetail.get("loanPackageId") or 0)
         pkg = _resolve_pkg(sl.symbol, original_pkg)
         orders_to_resubmit.append(DnseOrder(
-            symbol=sl.symbol, side=sl.side, quantity=sl.quantity, price=sl.price,
+            symbol=sl.symbol, side=sl.side, quantity=sl.quantity,
+            # The generated NORMAL order's limit (must be > 0).
+            price=generated_limit,
             loanPackageId=pkg, orderType="LO",
+            # 2026-10-28: native DNSE conditional (STOP) order.
+            # A stop-loss SELL triggers when the market falls TO the
+            # level, hence conditionOperator "<=".
+            orderCategory="STOP",
+            stopPrice=stop_level,
+            conditionOperator="<=",
+            durationType="GTD",
+            durationDateTime=gtd_expiry,
             sourceOrderId=new_source_id, sourceDate=today_iso,
             reason=f"{base_reason} [t2-retry from {sl.sourceDate}]",
         ))
@@ -1937,6 +2181,16 @@ def _maybe_reprice_stale_order(
     # 1. Eligibility
     if item.side not in ("NB", "NS"):
         summary["reason"] = f"side {item.side!r} is not BUY or SELL"
+        return summary
+    # 2026-10-28: a protective STOP order must NEVER be re-priced.
+    # The re-pricer moves a SELL's limit toward the live bid and, past
+    # the 3% cap, CANCELS the order — on a protective stop that would
+    # move the trigger level and then remove the protection entirely,
+    # leaving the holding naked. That is the exact failure this whole
+    # STOP implementation exists to prevent.
+    if (getattr(item, "orderCategory", "NORMAL") or "NORMAL").upper() == "STOP":
+        summary["reason"] = "protective STOP order is never re-priced"
+        summary["action"] = "skipped"
         return summary
     if item.status != "open":
         summary["reason"] = f"status is {item.status!r}, not open"
@@ -2252,6 +2506,10 @@ def _monitor_order_statuses(
         try:
             detail = client.order_detail(
                 account_no, item.dnseOrderId, trading_token=trading_token,
+                # 2026-10-28: poll with the order's own category. A
+                # STOP order cannot be resolved with the default
+                # ``orderCategory=NORMAL``.
+                order_category=(getattr(item, "orderCategory", "NORMAL") or "NORMAL").upper(),
             )
         except Exception as exc:
             # Network blip or DNSE down. Don't spam Telegram on transient
@@ -2493,6 +2751,16 @@ def run_auto_bot(
     # iteration is skipped so ``--once`` mode still terminates
     # immediately without a phantom pre-cycle sleep.
     first_iter = True
+    # 2026-10-28: loop-scoped state for the shared-token watcher.
+    # ``_last_adopted_token_issued_at`` lets us log only when the token
+    # ACTUALLY changes (the cron writes a new token at 08:30 ICT, so
+    # we want one line, not one per minute).
+    # ``_last_stale_token_warn_min`` throttles the "token is STALE"
+    # warning to once per hour, and ``_stale_token_alert_date``
+    # ensures the Telegram alert fires at most once per ICT day.
+    _last_adopted_token_issued_at: str | None = None
+    _last_stale_token_warn_min: int | None = None
+    _stale_token_alert_date: str = ""
     while True:
         if not first_iter:
             time.sleep(sleep_seconds)
@@ -2515,40 +2783,81 @@ def run_auto_bot(
         # freshness check in ``ensure_fresh_trading_token`` can do
         # its job from the very first cycle.
         if live_submit:
+            # 2026-10-28: the shared-token hydration runs on EVERY
+            # cycle (the whole block lives inside the ``while True``
+            # loop, and ``load_state`` reloads the state each
+            # iteration). That was fine when it always succeeded —
+            # it just logged one line per minute. But when the
+            # token goes STALE it logged the same "token is STALE"
+            # warning every 60 seconds, all night: the 2026-10-27
+            # run produced 1,300+ identical lines and buried every
+            # other message.
+            #
+            # We now:
+            #   * log the STALE warning at most once per hour (and
+            #     notify Telegram once per day, so a missed 08:30-ICT
+            #     cron is visible to the operator);
+            #   * keep watching for the cron to refresh the token and
+            #     adopt it as soon as it appears — the bot recovers
+            #     on its own the next morning instead of needing a
+            #     manual restart.
             try:
                 if _hydrate_shared_token_into_state(
                     state, engine_config.dataDir,
                 ):
-                    print(
-                        f"[{now.isoformat()}] startup: adopted shared "
-                        f"DNSE trading token (issued_at="
-                        f"{getattr(state, 'tokenIssuedAt', '?')})"
-                    )
-                    # Persist it so the token survives a restart and
-                    # so the state file reflects the token we are
-                    # actually using.
-                    try:
-                        save_state(
-                            state, engine_config.dataDir,
-                            strategy_name=strategy_name,
-                        )
-                    except Exception as _exc:
+                    _adopted_at = getattr(state, "tokenIssuedAt", "?")
+                    if _adopted_at != _last_adopted_token_issued_at:
+                        _last_adopted_token_issued_at = _adopted_at
                         print(
-                            f"[{now.isoformat()}] startup: saving state "
-                            f"after token hydration failed: {_exc}"
+                            f"[{now.isoformat()}] adopted shared DNSE "
+                            f"trading token (issued_at={_adopted_at})"
                         )
+                        # Persist it so the token survives a restart
+                        # and so the state file reflects the token we
+                        # are actually using.
+                        try:
+                            save_state(
+                                state, engine_config.dataDir,
+                                strategy_name=strategy_name,
+                            )
+                        except Exception as _exc:
+                            print(
+                                f"[{now.isoformat()}] saving state after "
+                                f"token hydration failed: {_exc}"
+                            )
                 else:
                     _sh = load_shared_trading_token(engine_config.dataDir)
                     if _sh:
-                        print(
-                            f"[{now.isoformat()}] startup: shared DNSE "
-                            f"trading token is STALE (issued_at="
-                            f"{_sh.get('issued_at', '?')}) — the 08:30-ICT "
-                            f"get_otp cron may have missed its window"
-                        )
+                        _issued = str(_sh.get("issued_at") or "?")
+                        _now_min = now.hour * 60 + now.minute
+                        if (
+                            _last_stale_token_warn_min is None
+                            or _now_min - _last_stale_token_warn_min >= 60
+                        ):
+                            _last_stale_token_warn_min = _now_min
+                            print(
+                                f"[{now.isoformat()}] shared DNSE trading "
+                                f"token is STALE (issued_at={_issued}) — the "
+                                f"08:30-ICT get_otp cron may have missed its "
+                                f"window; orders will be skipped until it "
+                                f"refreshes"
+                            )
+                        # Notify at most once per ICT day so a missed
+                        # cron is visible without spamming.
+                        if _stale_token_alert_date != today:
+                            _stale_token_alert_date = today
+                            notify(
+                                "🚨 Vietnam Algo: DNSE trading token is STALE\n"
+                                f"account: {account_no}\n"
+                                f"issued_at: {_issued}\n"
+                                "The 08:30-ICT get_otp cron may have missed "
+                                "its window. Orders will be SKIPPED (not "
+                                "sent with a bad token) until the token "
+                                "refreshes."
+                            )
             except Exception as exc:
                 print(
-                    f"[{now.isoformat()}] startup token hydration failed: "
+                    f"[{now.isoformat()}] shared token hydration failed: "
                     f"{type(exc).__name__}: {str(exc)[:200]}"
                 )
         # 2026-10-21 BAF incident: ``token`` is normally assigned by
@@ -3115,6 +3424,23 @@ def run_auto_bot(
                             f"{t2_summary['stale_no_position']} order(s) — "
                             "position already closed (no shares to protect):\n"
                             + "\n".join(t2_summary["stale_details"][:5])
+                        )
+                    # 2026-10-28: report SLs whose price had to be
+                    # recovered from the auction marker, and SLs we
+                    # could not price at all (so NO protective order
+                    # was placed — the position is unprotected).
+                    if t2_summary.get("recovered_price"):
+                        notify(
+                            "ℹ️ Vietnam Algo: T+2 SL retry recovered a price\n"
+                            + "\n".join(t2_summary["recovered_price"][:5])
+                        )
+                    if t2_summary.get("no_price"):
+                        notify(
+                            "🚨 Vietnam Algo: T+2 SL retry could NOT place a "
+                            "stop-loss (no price)\n"
+                            "The position is UNPROTECTED — place the SL "
+                            "manually:\n"
+                            + "\n".join(t2_summary["no_price"][:5])
                         )
                 except Exception as exc:
                     print(f"[{now.isoformat()}] t2-sl-retry crashed: {type(exc).__name__}: {str(exc)[:200]}")

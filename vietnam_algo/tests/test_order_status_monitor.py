@@ -108,7 +108,7 @@ class _StubClient:
             self._by_id = {}
         self.calls: list[tuple[str, str | None]] = []
 
-    def order_detail(self, account_no: str, order_id: str | int, trading_token: str | None = None):
+    def order_detail(self, account_no: str, order_id: str | int, trading_token: str | None = None, order_category: str = "NORMAL"):
         self.calls.append((str(order_id), trading_token))
         if hasattr(self, "_raise") and self._raise:
             raise self._raise
@@ -320,7 +320,7 @@ def test_monitor_api_error_records_on_ledger_does_not_crash(tmp_path, notify_spy
     ])
 
     class _SelectiveClient(_StubClient):
-        def order_detail(self, account_no, order_id, trading_token=None):
+        def order_detail(self, account_no, order_id, trading_token=None, order_category="NORMAL"):
             if order_id == "1":
                 raise RuntimeError("connection reset")
             return _detail("filled", id=order_id, filledQuantity=100)

@@ -416,7 +416,10 @@ def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[st
         if not item.dnseOrderId or item.status not in {"submitted", "open", "partial", "unknown", "submitting"}:
             continue
         try:
-            detail = client.order_detail(account_no, item.dnseOrderId, trading_token=trading_token)
+            detail = client.order_detail(
+                account_no, item.dnseOrderId, trading_token=trading_token,
+                order_category=item.orderCategory or "NORMAL",
+            )
             status = normalize_ledger_status(order_status_from_detail(detail))
             ledger[key] = LedgerOrder(
                 runId=item.runId,
@@ -433,6 +436,19 @@ def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[st
                 updatedAt=now,
                 lastDetail=detail,
                 error=item.error,
+                # 2026-10-27: preserve the re-pricing bookkeeping and the
+                # STOP fields. The previous explicit reconstruction
+                # silently reset repriceCount / lastRepricedAt /
+                # originalPrice to their defaults, and it would have
+                # reset orderCategory to "NORMAL" — which would make the
+                # monitor poll a STOP order with the wrong category and
+                # make the re-pricer treat it as a normal, repriceable
+                # limit order.
+                repriceCount=item.repriceCount,
+                lastRepricedAt=item.lastRepricedAt,
+                originalPrice=item.originalPrice,
+                orderCategory=item.orderCategory or "NORMAL",
+                stopPrice=item.stopPrice,
             )
             updates.append({"sourceOrderId": item.sourceOrderId, "symbol": item.symbol, "status": status, "dnseOrderId": item.dnseOrderId})
         except Exception as exc:
@@ -484,6 +500,12 @@ def execute_orders_with_ledger(
             # would compute its cap against its own (new) price and
             # chase the market forever.
             originalPrice=int(payload["price"]),
+            # 2026-10-27: persist the DNSE order class + trigger level so
+            # a STOP row stays identifiable across restarts (the monitor
+            # needs the category to poll it, the re-pricer needs it to
+            # leave it alone).
+            orderCategory=str(payload.get("orderCategory") or "NORMAL").upper(),
+            stopPrice=int(payload.get("stopPrice") or 0),
         )
         save_ledger(ledger, data_dir)
         try:
@@ -496,9 +518,26 @@ def execute_orders_with_ledger(
                 price=float(payload["price"]),
                 loan_package_id=int(payload["loanPackageId"]),
                 order_type=str(payload["orderType"]),
+                # 2026-10-27: native STOP (conditional) order support.
+                # These are only sent when the category is STOP — the
+                # client raises for a STOP order that is missing them,
+                # and ignores them entirely for a NORMAL order.
+                order_category=str(payload.get("orderCategory") or "NORMAL").upper(),
+                stop_price=payload.get("stopPrice") or None,
+                condition_operator=payload.get("conditionOperator") or None,
+                duration_type=payload.get("durationType") or None,
+                duration_date_time=payload.get("durationDateTime") or None,
+                stop_order_price=payload.get("stopOrderPrice") or None,
             )
             order_id = dnse_order_id(response)
-            detail = client.order_detail(account_no, order_id, trading_token=trading_token) if order_id else response
+            detail = (
+                client.order_detail(
+                    account_no, order_id, trading_token=trading_token,
+                    order_category=str(payload.get("orderCategory") or "NORMAL").upper(),
+                )
+                if order_id
+                else response
+            )
             status = normalize_ledger_status(order_status_from_detail(detail)) if order_id else "unknown"
             ledger[key] = LedgerOrder(**{**ledger[key].__dict__, "status": status, "dnseOrderId": order_id, "updatedAt": utc_now(), "lastDetail": detail})
             results.append({"status": "submitted", "order": payload, "response": response, "detail": detail})

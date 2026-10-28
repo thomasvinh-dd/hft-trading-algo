@@ -779,6 +779,11 @@ class DnseClient:
         order_type: str = "LO",
         market_type: str = "STOCK",
         order_category: str = "NORMAL",
+        stop_price: int | float | None = None,
+        condition_operator: str | None = None,
+        duration_type: str | None = None,
+        duration_date_time: str | None = None,
+        stop_order_price: int | float | None = None,
     ) -> dict[str, Any] | list[Any]:
         """POST /accounts/{accountNo}/orders — place a NORMAL stock order.
 
@@ -841,6 +846,53 @@ class DnseClient:
             body["loanPackageId"] = 0
         else:
             body["loanPackageId"] = int(loan_package_id)
+        # 2026-10-27: native STOP (conditional) orders.
+        #
+        # A DNSE STOP order is NOT a limit order — it is a conditional
+        # instruction: the broker watches the market and, when the
+        # trigger condition is met, generates a NORMAL order with the
+        # parameters we pre-set here. The request carries TWO groups
+        # of fields (see docs/dnse-api/guide-trading_order.txt L330-470):
+        #
+        #   * STOP fields  → stopPrice, conditionOperator, durationType,
+        #                     durationDateTime
+        #   * NORMAL fields → symbol, side, orderType, price, quantity,
+        #                     loanPackageId (the order that gets
+        #                     generated when the stop triggers)
+        #
+        # Two rules that matter for the bot:
+        #   1. ``price`` MUST be > 0. DNSE rejects price=0 for an LO
+        #      order (docs/dnse-api/README.md:143) and the price is the
+        #      limit of the generated NORMAL order, so it must be a
+        #      real number.
+        #   2. ``durationType`` for a STOP order accepts ONLY "GTD",
+        #      and ``durationDateTime`` (ISO 8601) is then mandatory.
+        #
+        # These fields are sent ONLY for orderCategory == "STOP" so the
+        # NORMAL order body stays byte-for-byte identical.
+        if str(order_category).upper() == "STOP":
+            if stop_price is None:
+                raise ValueError("place_stock_order: STOP order requires stop_price")
+            if int(price) <= 0:
+                raise ValueError(
+                    "place_stock_order: STOP order requires price > 0 "
+                    f"(got {price!r}) — DNSE rejects price=0 for LO"
+                )
+            if not condition_operator:
+                raise ValueError("place_stock_order: STOP order requires condition_operator")
+            if str(duration_type or "").upper() != "GTD":
+                raise ValueError(
+                    "place_stock_order: STOP order requires duration_type='GTD' "
+                    f"(got {duration_type!r})"
+                )
+            if not duration_date_time:
+                raise ValueError("place_stock_order: STOP order requires duration_date_time")
+            body["stopPrice"] = int(stop_price)
+            body["conditionOperator"] = str(condition_operator)
+            body["durationType"] = str(duration_type).upper()
+            body["durationDateTime"] = str(duration_date_time)
+            if stop_order_price is not None:
+                body["stopOrderPrice"] = int(stop_order_price)
         return self.request(
             "POST",
             f"/accounts/{account_no}/orders",
