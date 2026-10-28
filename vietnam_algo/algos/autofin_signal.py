@@ -3576,19 +3576,31 @@ class AutofinSignalAdapter(StrategyAdapter):
         # in_morning=False)`` and no entry was made even though
         # several deals were in-zone and the account had ample cash.
         #
-        # So: if the bot has NOT yet made an entry today AND the
-        # session is still in the morning, allow a catch-up entry up
-        # to ``AUTOFIN_NEW_ENTRY_CATCHUP_MIN`` minutes after the
-        # open (default 240 = the whole morning session, up to the
-        # lunch break).
+        # So: if the bot has NOT yet made an entry today, allow a
+        # catch-up entry later in the day.
+        #
+        # 2026-10-28 correction: the catch-up was originally
+        # ``minutes_since_open <= 240``, which ends EXACTLY at 13:00
+        # — the moment the afternoon session opens. The poll at
+        # 13:00:15 therefore missed it by 15 seconds and logged
+        # ``in_catchup=False``, so the catch-up was effectively
+        # useless for the whole afternoon session.
+        #
+        # The catch-up must cover the ENTIRE trading day. We now
+        # compute the deadline from the schedule's afternoon end
+        # (15:00 ICT) rather than from a fixed minute count, and we
+        # allow the entry as long as we are inside a trading session.
+        # ``AUTOFIN_NEW_ENTRY_CATCHUP_MIN`` (default 360 = the whole
+        # 09:00-15:00 day) is kept as an upper bound so the window
+        # can be tightened if desired.
         #
         # This does NOT change the "one entry per day" policy: the
         # top-N budget still limits how many entries are made, and
-        # the ``actioned_deals`` bookkeeping prevents a second entry
-        # on the same deal. It only ensures a bot outage doesn't
-        # silently cost the day.
+        # the ledger check below prevents a second entry on the same
+        # day. It only ensures a bot outage doesn't silently cost
+        # the day.
         catchup_min = int(
-            os.environ.get("AUTOFIN_NEW_ENTRY_CATCHUP_MIN", "240") or "240"
+            os.environ.get("AUTOFIN_NEW_ENTRY_CATCHUP_MIN", "360") or "360"
         )
         _already_entered_today = False
         try:
@@ -3607,10 +3619,29 @@ class AutofinSignalAdapter(StrategyAdapter):
             )
         except Exception:
             _already_entered_today = False
+        # The catch-up is allowed whenever we are inside a trading
+        # session and past the normal morning cutoff, up to the end of
+        # the trading day.
+        #
+        # ``_minutes_since_open`` is measured from the MORNING open
+        # (09:00) and keeps counting through the lunch break, so the
+        # afternoon session (13:00-15:00) sits at 240-360 minutes
+        # since open. We therefore compute the deadline from the
+        # schedule's afternoon end rather than from a fixed count,
+        # and the ``catchup_min`` bound is expressed in minutes since
+        # the MORNING open.
+        _afternoon_end_min = (
+            _sched.afternoonEnd.hour * 60 + _sched.afternoonEnd.minute
+        )
+        _morning_open_min = _sched.morningStart.hour * 60 + _sched.morningStart.minute
+        _deadline_min = _afternoon_end_min - _morning_open_min
         in_catchup = (
             is_main_trading_phase(_now_ict, _sched)
             and _minutes_since_open > start_of_day_cutoff_min
-            and _minutes_since_open <= max(catchup_min, start_of_day_cutoff_min)
+            and _minutes_since_open <= min(
+                max(catchup_min, start_of_day_cutoff_min),
+                max(_deadline_min, start_of_day_cutoff_min),
+            )
             and not _already_entered_today
         )
         # 2026-10-09: ``force-run-trading`` CLI sets this env var to

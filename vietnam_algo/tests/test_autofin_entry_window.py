@@ -25,7 +25,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vietnam_algo.libs.schedule import TradingSchedule  # noqa: E402
+from vietnam_algo.libs.schedule import (  # noqa: E402
+    TradingSchedule,
+    VIETNAM_TZ,
+)
+from datetime import datetime  # noqa: E402
 
 
 def _minutes_since_open(now, sched) -> float:
@@ -54,21 +58,57 @@ def test_entry_window_covers_0900_to_0930() -> None:
     assert _minutes_since_open(time(9, 31), sched) > cutoff
 
 
-def test_catchup_window_extends_to_the_lunch_break() -> None:
-    """The default catch-up allowance covers the whole morning session.
+def test_catchup_window_covers_the_afternoon_session() -> None:
+    """The catch-up must survive into the afternoon session.
 
-    The morning session runs 09:00-11:30 ICT (the lunch break starts
-    at 13:00 per the afternoon session), so a 240-minute catch-up
-    covers 09:00-13:00 and a bot that restarts at 11:20 still gets
-    its entry.
+    2026-10-28: the catch-up was ``minutes_since_open <= 240``,
+    which ends EXACTLY at 13:00 — the moment the afternoon session
+    opens. The poll at 13:00:15 missed it by 15 seconds and logged
+    ``in_catchup=False``, so the catch-up was useless for the whole
+    afternoon.
+
+    The window must therefore reach the end of the trading day
+    (15:00 ICT = 360 minutes after the 09:00 open).
     """
     from datetime import time
     sched = TradingSchedule()
-    catchup = 240
-    # 11:20 ICT — exactly when the 2026-10-27 watchdog relaunched
-    # the bot.
-    assert _minutes_since_open(time(11, 20), sched) == 140
-    assert _minutes_since_open(time(11, 20), sched) <= catchup
+    open_min = sched.morningStart.hour * 60 + sched.morningStart.minute
+    close_min = sched.afternoonEnd.hour * 60 + sched.afternoonEnd.minute
+    deadline = close_min - open_min
+    assert deadline == 360, deadline
+
+    # 13:00:15 — the exact poll that failed.
+    mins_1300 = 240 + 15 / 60.0
+    assert mins_1300 > 240, (
+        "the old 240-minute limit ended exactly at the 13:00 session "
+        "open, so the 13:00:15 poll fell outside it"
+    )
+    assert mins_1300 <= deadline
+
+    # 14:30 — still inside the trading day.
+    assert _minutes_since_open(time(14, 30), sched) == 330
+    assert 330 <= deadline
+
+
+def test_catchup_stops_at_the_end_of_the_trading_day() -> None:
+    """After 15:00 ICT there is no catch-up.
+
+    At exactly 15:00 the elapsed time equals the deadline, so the
+    ``is_main_trading_phase`` gate is what closes the window (the
+    session is over). After 15:00 both gates are closed.
+    """
+    from datetime import time
+    from vietnam_algo.libs.schedule import is_main_trading_phase
+    sched = TradingSchedule()
+    open_min = sched.morningStart.hour * 60 + sched.morningStart.minute
+    close_min = sched.afternoonEnd.hour * 60 + sched.afternoonEnd.minute
+    deadline = close_min - open_min
+    assert _minutes_since_open(time(15, 0), sched) == deadline
+    # 15:00 is the end of the session -> not a main trading phase.
+    dt = datetime.combine(
+        datetime.now(VIETNAM_TZ).date(), time(15, 0), tzinfo=VIETNAM_TZ,
+    )
+    assert is_main_trading_phase(dt, sched) is False
 
 
 def test_catchup_is_disabled_after_an_entry_was_already_made() -> None:
