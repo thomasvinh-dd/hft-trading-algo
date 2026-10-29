@@ -771,7 +771,8 @@ def _plan_orders_for_new_positions(
     already_planned_symbols: set[str] | None = None,
     available_cash_vnd: float | None = None,
     new_entry_min_cash_pct: float = 0.05,
-    top_n: int = 1,
+    # 2026-10-29: up to 3 qualifying entries per day (was 1).
+    top_n: int = 3,
 ) -> list[dict[str, Any]]:
     """Emit BUY + TP + SL bracket orders for **new** positions only.
 
@@ -808,10 +809,13 @@ def _plan_orders_for_new_positions(
         we skip ALL new entries for this cycle. This prevents
         tiny dust entries when the portfolio is already nearly
         fully invested.
-      - ``top_n`` (default 1) — only the top-N signals (in the
+      - ``top_n`` (default 3) — at most the top-N signals (in the
         order returned by the caller, typically autofin's
         ``/signal-static-suggest`` ordering) can produce entries.
-        This enforces "only the top suggestion" per user spec.
+        Counts ENTRIES MADE, not candidates examined: a candidate
+        that fails the price zone, the recomment classification or
+        the cash/lot-sizing gate does not consume a slot
+        (2026-10-28 fix). User request 2026-10-29: "let use top 3".
 
     Per user feedback (2026-09-09): also accept ``already_planned_symbols`` —
     a set of symbols that are already in the bot's persistent
@@ -2097,7 +2101,9 @@ def decide_orders(
     autofin_closing_ids: set[str] | None = None,
     autofin_fractions: dict[str, float] | None = None,
     new_entry_min_cash_pct: float = 0.05,
-    new_entry_top_n: int = 1,
+    # 2026-10-29: top 3 autofin suggestions may produce entries per
+    # day (was 1). Counts ENTRIES MADE, not candidates examined.
+    new_entry_top_n: int = 3,
     available_cash_vnd_override: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
@@ -3525,19 +3531,34 @@ class AutofinSignalAdapter(StrategyAdapter):
             )
         except ValueError:
             new_entry_min_cash_pct = 0.05
+        # 2026-10-29: the entry budget is now the top 3 autofin
+        # suggestions (was 1). User request: "currently we are using
+        # top 1 when check entry, let use top 3".
+        #
+        # The count is of ENTRIES MADE, not candidates examined (see
+        # the 2026-10-28 fix in ``_plan_orders_for_new_positions``):
+        # a candidate that fails the price zone, the recomment
+        # classification or the cash/lot-sizing gate no longer burns a
+        # slot. So "top 3" means up to 3 qualifying entries per day.
+        #
+        # The cash budget still binds: each entry is sized at
+        # ``nav * rate_for_nav`` and the entries share the remaining
+        # cash, so 3 entries can only be placed if the cash and the
+        # board-lot rounding allow it.
         try:
             new_entry_top_n = int(
-                os.environ.get("AUTOFIN_NEW_ENTRY_TOP_N", "1") or "1"
+                os.environ.get("AUTOFIN_NEW_ENTRY_TOP_N", "3") or "3"
             )
         except ValueError:
-            new_entry_top_n = 1
+            new_entry_top_n = 3
         # allow_new_entries: True only at the start-of-day window
         # (between orderSubmitTime and a configurable cutoff, default
         # 09:45 ICT — gives the bot ~30 min after market open to make
-        # its single daily entry). The cutoff is in minutes after the
+        # its daily entries). The cutoff is in minutes after the
         # main trading session opens. After the cutoff the bot still
         # runs every cycle but only the partial-close / full-close
-        # paths can produce orders.
+        # paths can produce orders (plus the catch-up window, see
+        # below).
         try:
             start_of_day_cutoff_min = int(
                 os.environ.get("AUTOFIN_NEW_ENTRY_CUTOFF_MIN", "30") or "30"

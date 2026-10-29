@@ -26,18 +26,33 @@ reason string.
 from __future__ import annotations
 
 import sys
-from datetime import time
+from datetime import datetime, time
 from pathlib import Path
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from vietnam_algo.bots import runner as runner_mod  # noqa: E402
 from vietnam_algo.bots.runner import (  # noqa: E402
     _is_protective_reason,
     _submit_autofin_deals_to_dnse,
 )
+
+
+@pytest.fixture
+def in_continuous_session(monkeypatch):
+    """Pin ``vietnam_now()`` to a continuous-trading moment.
+
+    The session-aware submit path rejects orders placed outside
+    09:00-11:30 / 13:00-15:00 ICT, so without this the helper
+    short-circuits with ``skipped_off_hours`` and nothing is tested.
+    """
+    fixed = datetime(2026, 10, 29, 10, 0, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+    monkeypatch.setattr(runner_mod, "vietnam_now", lambda: fixed)
+    return fixed
 
 
 def _quote(bid_vnd: int) -> dict:
@@ -108,7 +123,7 @@ def _run(tmp_path, deal, monkeypatch, env=None):
     return submitted
 
 
-def test_stop_loss_keeps_its_intended_level(tmp_path, monkeypatch) -> None:
+def test_stop_loss_keeps_its_intended_level(tmp_path, monkeypatch, in_continuous_session) -> None:
     """A protective SL must be submitted at its own level, not the bid.
 
     The stop is submitted as a native DNSE conditional (STOP) order:
@@ -142,7 +157,7 @@ def test_stop_loss_keeps_its_intended_level(tmp_path, monkeypatch) -> None:
     assert order.conditionOperator == "<=", order.conditionOperator
 
 
-def test_exit_order_still_gets_the_live_bid_override(tmp_path, monkeypatch) -> None:
+def test_exit_order_still_gets_the_live_bid_override(tmp_path, monkeypatch, in_continuous_session) -> None:
     """A take-profit / partial close must STILL be sold at the bid.
 
     The override exists so exits always fill. Excluding stop-losses
@@ -164,7 +179,7 @@ def test_exit_order_still_gets_the_live_bid_override(tmp_path, monkeypatch) -> N
     )
 
 
-def test_auction_stop_loss_recovers_its_level(tmp_path, monkeypatch) -> None:
+def test_auction_stop_loss_recovers_its_level(tmp_path, monkeypatch, in_continuous_session) -> None:
     """An auction-planned SL (price=0) recovers its level from the reason."""
     monkeypatch.setenv("AUTOFIN_SELL_AT_MARKET", "1")
     deal = _deal(
@@ -194,7 +209,7 @@ def test_autofin_sl_prefix_is_protective() -> None:
     assert _is_protective_reason(None) is False
 
 
-def test_sell_at_market_kill_switch_still_works_for_exits(tmp_path, monkeypatch) -> None:
+def test_sell_at_market_kill_switch_still_works_for_exits(tmp_path, monkeypatch, in_continuous_session) -> None:
     """``AUTOFIN_SELL_AT_MARKET=0`` still disables the override for exits."""
     monkeypatch.setenv("AUTOFIN_SELL_AT_MARKET", "0")
     deal = _deal(
