@@ -1375,6 +1375,38 @@ def _sl_stop_level_from_reason(reason: str | None) -> int:
     return 0
 
 
+def _sl_pct_from_reason(reason: str | None) -> float | None:
+    """Recover the stop-loss PERCENTAGE from an SL reason string.
+
+    The autofin strategy encodes a user stop-loss as::
+
+        autofin_user_sl:deal#<id>:<SYM>:<pct>:<price>
+
+    e.g. ``autofin_user_sl:deal#1789344000:ABB:10%:15930`` → 10 %.
+    The percentage is a plain integer (not a fraction), so it is
+    returned as a fraction (0.10).
+
+    Returns None when the reason carries no explicit percentage — the
+    caller must then leave the recorded price alone (it may be
+    autofin's own declared SL, which must not be recomputed).
+    """
+    if not reason:
+        return None
+    r = reason.split("[", 1)[0]
+    # Look for a "<digits>%" token.
+    for field in r.split(":"):
+        f = field.strip()
+        if not f.endswith("%"):
+            continue
+        try:
+            value = float(f[:-1].replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value < 100:
+            return value / 100.0
+    return None
+
+
 def _is_t2_rejection(error: str) -> bool:
     """Return True if the error indicates a T+2 settlement block.
 
@@ -1624,9 +1656,22 @@ def retry_t2_settlement_sl_orders(
         summary["resubmit_errors"].append(f"load_ledger failed: {exc}")
         return summary
 
-    # Index BUY orders by deal_id (latest BUY wins; we use the
-    # most recent BUY for the settlement date check).
+    # Index BUY orders by deal_id.
+    #
+    # 2026-10-29 (ABB incident): the old code kept the LATEST BUY per
+    # deal ("latest wins" by updatedAt). For the ABB deal
+    # ``1789344000:ABB`` that picked the 500-share BUY that was
+    # CANCELLED at 07:06 on 2026-10-13, while the BUY that actually
+    # FILLED (100 @ 17,700, dnseOrderId 133161) was at 03:11 the same
+    # morning. Every downstream check then compared the SL against a
+    # non-existent 500-share fill, so the retry skipped the ABB
+    # protective stop for the entire life of the position.
+    #
+    # Fix: prefer a BUY that actually FILLED. Only when no BUY for the
+    # deal ever filled do we fall back to the latest BUY (so the
+    # "no matching BUY" path below still reports the situation).
     buy_by_did: dict[str, Any] = {}
+    filled_by_did: dict[str, Any] = {}
     for item in ledger.values():
         if item.side != "NB":
             continue
@@ -1637,9 +1682,35 @@ def retry_t2_settlement_sl_orders(
         prev = buy_by_did.get(did)
         if prev is None or (item.updatedAt or "") > (prev.updatedAt or ""):
             buy_by_did[did] = item
+        # ...but remember the FILLED one separately — it is the only
+        # BUY that proves which shares we actually own.
+        if item.status == "filled":
+            prev_f = filled_by_did.get(did)
+            if prev_f is None or (item.updatedAt or "") > (prev_f.updatedAt or ""):
+                filled_by_did[did] = item
+    # Prefer the filled BUY where one exists.
+    for did, filled in filled_by_did.items():
+        buy_by_did[did] = filled
 
     # Scan SL SELL orders in the rejected set.
-    candidates: list[tuple[Any, Any]] = []  # (sl_order, buy_order)
+    #
+    # 2026-10-29 (ABB incident): a deal can have SEVERAL rejected SL
+    # rows, each sized against a different BUY attempt:
+    #     ABB 1789344000:  100 @ 15,750 (cancelled)
+    #                        100 @ 15,930 (cancelled)
+    #                        500 @ 15,840 (rejected)   <- only this one
+    #                                                     was scannable
+    # The BUY that actually filled was 100 @ 17,700, so the correct
+    # stop is the 10%-below-fill level (15,930) for 100 shares — but
+    # the row the scan found was the 500-share 15,840 one.
+    #
+    # We therefore collect ALL rejected T+2 SL rows per deal and pick
+    # the best candidate: the one whose quantity matches what we
+    # actually HOLD, preferring the TIGHTEST (highest) stop level
+    # among the matches — a tighter stop protects more of the
+    # position. The looser rows are recorded in the summary so the
+    # operator can see what was skipped.
+    sl_candidates_by_did: dict[str, list[tuple[Any, Any]]] = {}
     for item in ledger.values():
         if item.side != "NS":
             continue
@@ -1660,47 +1731,109 @@ def retry_t2_settlement_sl_orders(
         if not _buy_settled_by_t2(buy.sourceDate or "", today_iso, now_time=now_time):
             summary["t2_pending"] += 1
             continue
-        # T+2.5 cleared — but the BUY must have actually filled for
-        # the SL to be valid. SLs whose BUY expired/cancelled
-        # have no shares to sell; re-submitting them would
-        # always fail with TRADE_QUANTITY_NOT_ENOUGH (and that's
-        # the bug we're trying to avoid confusing the operator
-        # about).
-        if not _buy_filled_and_matches_sl(buy, item.quantity):
+        sl_candidates_by_did.setdefault(did, []).append((item, buy))
+
+    candidates: list[tuple[Any, Any, int]] = []
+    for did, rows in sl_candidates_by_did.items():
+        # How many shares do we hold right now?
+        held = _fetch_live_position_qty(client, account_no, rows[0][0].symbol)
+        if held is not None and held <= 0:
+            for item, _buy in rows:
+                summary["stale_no_position"] += 1
+                summary["stale_details"].append(
+                    f"{item.symbol}: SL {int(item.quantity or 0)} @ {item.price:,.0f} "
+                    f"but holding {held} — position already closed, "
+                    f"skipping T+2 retry"
+                )
             continue
-        # 2026-10-23 fix (retry loop on a sold-out position): the
-        # gate above only proves the BUY filled — it says nothing
-        # about whether we STILL HOLD those shares today. Once the
-        # position was sold by another path (e.g. the 2026-10-21
-        # autofin capital_protect exit that liquidated all 200 BAF),
-        # every subsequent retry is guaranteed to fail with
-        # ``TRADE_QUANTITY_NOT_ENOUGH / deal not found``, forever.
+        # 2026-10-29 (ABB incident): the SL's requested quantity can
+        # DIFFER from the BUY that actually filled.
         #
-        # We saw exactly that on 2026-10-23: 19 rejected BAF/ABB SL
-        # rows in the ledger, all T+2-blocked from 2026-10-13, with
-        # ZERO BAF remaining on the DNSE account. The bot faithfully
-        # re-submitted the dead SL every hour and the Telegram alert
-        # repeated 4 identical failures per cycle.
+        # The ABB deal ``1789344000:ABB`` has three BUYs in the
+        # ledger: one EXPIRED (100 @ 17,500), one FILLED (100 @ 17,700)
+        # and one CANCELLED (500 @ 17,600). The rejected SL row asks
+        # for 500 shares (it was sized against the cancelled BUY), so
+        # ``_buy_filled_and_matches_sl(filled_buy, 500)`` was False and
+        # the ABB protective stop was skipped forever — leaving a live
+        # 100-share position with NO stop for 16 days.
         #
-        # Fix: query live positions once per call and drop any
-        # candidate whose held qty is 0 (or less than the SL qty).
-        # The SL is then recorded as stale in the summary instead of
-        # being retried forever. Requires a live DNSE call; if the
-        # lookup fails we keep the previous behaviour (retry) so a
-        # transient outage doesn't silently disable protection.
-        held = _fetch_live_position_qty(client, account_no, item.symbol)
-        if held is not None and held < int(item.quantity or 0):
-            summary["stale_no_position"] += 1
-            summary["stale_details"].append(
-                f"{item.symbol}: SL {int(item.quantity or 0)} @ {item.price:,.0f} "
-                f"but holding {held} — position already closed, "
-                f"skipping T+2 retry"
+        # The retry now sizes the SL to what we actually HOLD (the
+        # live position qty), instead of demanding an exact match.
+        # The stop LEVEL is unchanged (it is recomputed separately
+        # from the filled BUY below).
+        #
+        # We still keep the 2026-10-23 "partial liquidation" guard: if
+        # the SL asks for MORE than we hold AND the filled BUY itself
+        # was for that larger quantity, the position was deliberately
+        # reduced by another path — re-submitting a partially-fillable
+        # SL would fail with TRADE_QUANTITY_NOT_ENOUGH forever. That
+        # case is recorded as stale.
+        #
+        # Among the candidate rows we prefer one whose quantity
+        # already matches the held quantity; failing that we take the
+        # tightest (highest) stop level, because a tighter stop
+        # protects more of the position.
+        def _score(pair: tuple[Any, Any]) -> tuple[int, int]:
+            sl_row, _b = pair
+            qty = int(sl_row.quantity or 0)
+            qty_match = 0 if (held is not None and qty == held) else 1
+            level = _sl_stop_level_from_reason(sl_row.reason) or int(sl_row.price or 0)
+            return (qty_match, -level)
+
+        rows.sort(key=_score)
+        item, buy = rows[0]
+        for skipped, _sb in rows[1:]:
+            summary.setdefault("skipped_alt_sl", []).append(
+                f"{skipped.symbol}: SL {int(skipped.quantity or 0)} @ "
+                f"{skipped.price:,.0f} (not the best candidate for this deal)"
             )
+        sl_qty = int(item.quantity or 0)
+        # 2026-10-23 guard (partial liquidation): the SL asks for MORE
+        # than we hold, AND the BUY that filled was for that same
+        # larger quantity — i.e. the position was deliberately reduced
+        # by another path. Re-submitting a partially-fillable SL
+        # would fail with TRADE_QUANTITY_NOT_ENOUGH forever, so it is
+        # recorded as stale instead.
+        #
+        # 2026-10-29 (ABB): the SL asks for MORE than we hold but the
+        # filled BUY was for a SMALLER quantity — the SL row was
+        # sized against a different (later cancelled) BUY. That is a
+        # stale-row artefact, not a deliberate reduction, so we clamp
+        # the SL to the held quantity instead of skipping it.
+        if held is not None and sl_qty > held:
+            filled_buy_qty = int(buy.quantity or 0)
+            if filled_buy_qty and filled_buy_qty <= held:
+                # The BUY filled for <= what we hold → the SL row is
+                # simply mis-sized. Clamp it.
+                summary.setdefault("clamped_sl_qty", []).append(
+                    f"{item.symbol}: SL {sl_qty} -> {held} shares "
+                    f"(the filled BUY was {filled_buy_qty} @ "
+                    f"{buy.price:,.0f}; the SL row was sized against a "
+                    f"different BUY)"
+                )
+                sl_qty = held
+            else:
+                # The BUY filled for MORE than we hold → the position
+                # was reduced on purpose. Skip as stale.
+                summary["stale_no_position"] += 1
+                summary["stale_details"].append(
+                    f"{item.symbol}: SL {sl_qty} @ {item.price:,.0f} "
+                    f"but holding {held} — position partially liquidated, "
+                    f"skipping T+2 retry"
+                )
+                continue
+        elif held is not None and sl_qty <= 0:
+            sl_qty = held
+        # The BUY must have actually filled for the SL to be valid.
+        # SLs whose BUY expired/cancelled have no shares to sell;
+        # re-submitting them would always fail with
+        # TRADE_QUANTITY_NOT_ENOUGH.
+        if not _buy_filled_and_matches_sl(buy, sl_qty):
             continue
-        # T+2.5 cleared AND the BUY actually filled at the matching
-        # qty AND we still hold the shares — eligible for retry.
+        # T+2.5 cleared AND the BUY actually filled AND we still hold
+        # the shares — eligible for retry.
         summary["t2_due"] += 1
-        candidates.append((item, buy))
+        candidates.append((item, buy, sl_qty))
 
     if not candidates:
         return summary
@@ -1764,7 +1897,7 @@ def retry_t2_settlement_sl_orders(
         return cash_pkg_cache[sym]
 
     orders_to_resubmit: list[DnseOrder] = []
-    for sl, buy in candidates:
+    for sl, buy, sl_qty in candidates:
         # 2026-10-23 fix (unbounded retry loop): strip any
         # ``[t2-retry from ...]`` markers already appended by a
         # PREVIOUS retry before deriving the sourceOrderId and the
@@ -1858,6 +1991,34 @@ def retry_t2_settlement_sl_orders(
                 f"{base_reason!r} — cannot place a protective STOP"
             )
             continue
+        # 2026-10-29 (ABB incident): re-derive the stop level from the
+        # BUY THAT ACTUALLY FILLED when the stale SL row's level does
+        # not match it.
+        #
+        # The ABB deal has three BUYs (expired 100 @ 17,500, filled 100
+        # @ 17,700, cancelled 500 @ 17,600) and three SL rows priced
+        # 15,750 / 15,930 / 15,840. The row that survived the scan
+        # (500 @ 15,840) was sized against the CANCELLED 500-share BUY
+        # — 10% below 17,600 — while the shares we actually own cost
+        # 17,700. The correct stop is 10% below 17,700 = 15,930.
+        #
+        # The reason encodes the intended rule ("...:10%:<price>"), so
+        # we can recompute it from the fill and compare. We only
+        # override when the reason carries an explicit percentage AND
+        # the recomputed level differs — so a genuinely different
+        # level (e.g. autofin's own declared SL) is left alone.
+        pct = _sl_pct_from_reason(base_reason)
+        if pct and buy is not None and int(buy.price or 0) > 0:
+            fill = int(buy.price)
+            recomputed = int(round(fill * (1.0 - pct)))
+            if recomputed > 0 and recomputed != stop_level:
+                summary.setdefault("recomputed_stop_level", []).append(
+                    f"{sl.symbol}: stop level {stop_level:,.0f} -> "
+                    f"{recomputed:,.0f} "
+                    f"({pct:.0%} below the filled BUY at {fill:,.0f}; "
+                    f"the stale SL row was sized against a different BUY)"
+                )
+                stop_level = recomputed
         if retry_price <= 0:
             retry_price = stop_level
             summary["recovered_price"].append(
@@ -1874,7 +2035,7 @@ def retry_t2_settlement_sl_orders(
 
         new_source_id = int(
             _hl.sha1(
-                f"t2-retry|{today_iso}|{sl.symbol}|{stop_level}|{sl.quantity}|{base_reason}".encode()
+                f"t2-retry|{today_iso}|{sl.symbol}|{stop_level}|{sl_qty}|{base_reason}".encode()
             ).hexdigest()[:12],
             16,
         )
@@ -1885,7 +2046,10 @@ def retry_t2_settlement_sl_orders(
             original_pkg = int(sl.lastDetail.get("loanPackageId") or 0)
         pkg = _resolve_pkg(sl.symbol, original_pkg)
         orders_to_resubmit.append(DnseOrder(
-            symbol=sl.symbol, side=sl.side, quantity=sl.quantity,
+            # 2026-10-29 (ABB incident): use the CLAMPED quantity —
+            # what we actually hold — not the quantity the stale SL
+            # row was sized against.
+            symbol=sl.symbol, side=sl.side, quantity=sl_qty,
             # The generated NORMAL order's limit (must be > 0).
             price=generated_limit,
             loanPackageId=pkg, orderType="LO",

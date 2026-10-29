@@ -410,13 +410,41 @@ def trading_token_from_email(client: DnseClient, otp_type: str = "email_otp") ->
 
 
 def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[str, LedgerOrder], trading_token: str | None = None) -> tuple[dict[str, LedgerOrder], list[dict[str, object]]]:
+    """Refresh the live status of every non-terminal ledger row.
+
+    2026-10-29 (ABB incident): the poll MUST use the order's own
+    ``orderCategory``. A STOP order cannot be resolved with the
+    default ``orderCategory=NORMAL`` — DNSE answers HTTP 404
+    "Order not found" — and this function used to do exactly that.
+
+    The consequence was severe and silent:
+
+      1. Every STOP row was forced back to ``status="unknown"``.
+      2. ``unknown`` is an AMBIGUOUS ledger status.
+      3. ``unsafe_existing_orders`` blocks the WHOLE submit run when
+         any row for that run_id is ambiguous.
+      4. So the T+2 retry could not place the missing ABB protective
+         stop — the two existing STOP orders (TCB, VOS) blocked it.
+
+    That is exactly what happened: a live ABB position had no stop for
+    16 days while the bot reported "T+2 due: 1, resubmitted: 0" every
+    cycle with no error.
+
+    The poll now passes the row's own category, mirroring the order
+    monitor in ``bots/runner.py`` (which was already fixed for this on
+    2026-10-28).
+    """
     updates: list[dict[str, object]] = []
     now = utc_now()
     for key, item in list(ledger.items()):
         if not item.dnseOrderId or item.status not in {"submitted", "open", "partial", "unknown", "submitting"}:
             continue
         try:
-            detail = client.order_detail(account_no, item.dnseOrderId, trading_token=trading_token)
+            detail = client.order_detail(
+                account_no, item.dnseOrderId, trading_token=trading_token,
+                # A STOP order is only resolvable with orderCategory=STOP.
+                order_category=(getattr(item, "orderCategory", "NORMAL") or "NORMAL").upper(),
+            )
             status = normalize_ledger_status(order_status_from_detail(detail))
             ledger[key] = LedgerOrder(
                 runId=item.runId,
@@ -433,9 +461,15 @@ def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[st
                 updatedAt=now,
                 lastDetail=detail,
                 error=item.error,
+                orderCategory=getattr(item, "orderCategory", "NORMAL") or "NORMAL",
+                stopPrice=getattr(item, "stopPrice", 0) or 0,
+                strategy=getattr(item, "strategy", "") or "",
             )
             updates.append({"sourceOrderId": item.sourceOrderId, "symbol": item.symbol, "status": status, "dnseOrderId": item.dnseOrderId})
         except Exception as exc:
+            # Keep the row's own category on the error path too — a
+            # dropped orderCategory would make the NEXT poll fail the
+            # same way.
             ledger[key] = LedgerOrder(**{**item.__dict__, "status": "unknown", "updatedAt": now, "error": str(exc)})
             updates.append({"sourceOrderId": item.sourceOrderId, "symbol": item.symbol, "status": "unknown", "error": str(exc)})
     return ledger, updates
