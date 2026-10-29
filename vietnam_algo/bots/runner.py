@@ -1076,6 +1076,11 @@ def _submit_autofin_deals_to_dnse(
         orders=orders,
         data_dir=data_dir,
         run_id=trade_date,
+        # 2026-10-29: tag the owning strategy so the momentum bot's
+        # order monitor does not report these orders in its own
+        # Telegram chat (both bots share one ledger + one DNSE
+        # account).
+        strategy="autofin_signal",
     )
     # 2026-10-13 debug: surface the raw result statuses
     def _sym(r: dict) -> str:
@@ -1675,6 +1680,8 @@ def retry_t2_settlement_sl_orders(
             orders=orders_to_resubmit,
             data_dir=data_dir,
             run_id=today_iso,
+            # 2026-10-29: retried SLs belong to the autofin bot.
+            strategy="autofin_signal",
         )
     except Exception as exc:
         summary["resubmit_errors"].append(f"execute_orders_with_ledger: {exc}")
@@ -2190,6 +2197,7 @@ def _monitor_order_statuses(
     data_dir: Path,
     *,
     throttle_seconds: int = 60,
+    strategy: str = "",
 ) -> dict[str, Any]:
     """Poll DNSE for status updates on every non-terminal order in the ledger.
 
@@ -2217,6 +2225,9 @@ def _monitor_order_statuses(
     summary: dict[str, Any] = {
         "polled": 0,
         "skipped_throttle": 0,
+        # 2026-10-29: orders skipped because they belong to another
+        # strategy's bot (the two bots share one ledger).
+        "skipped_other_strategy": 0,
         "changes": [],
         "errors": [],
         "terminal_transitions": 0,
@@ -2257,6 +2268,22 @@ def _monitor_order_statuses(
     reprice_tolerance_pct = float(os.environ.get("ORDER_REPRICE_TOLERANCE_PCT", "0.03"))
 
     for key, item in list(ledger.items()):
+        # 2026-10-29: only monitor orders belonging to THIS strategy.
+        #
+        # The autofin and momentum bots share one DNSE account and
+        # therefore one ledger file. Without this filter each bot's
+        # monitor picks up the other's orders: on 2026-10-29 the
+        # momentum bot (chat 6761941695) posted
+        # "✅ Vietnam Algo: order VOS → FILLED" for the autofin bot's
+        # VOS BUY (dnseOrderId 20321) — an order the momentum
+        # strategy never placed.
+        #
+        # Rows written before the ``strategy`` field existed have an
+        # empty owner. Those are monitored by EVERY bot, so legacy
+        # orders don't silently go unmonitored.
+        if strategy and item.strategy and item.strategy != strategy:
+            summary["skipped_other_strategy"] += 1
+            continue
         # Only poll orders that DNSE knows about AND that haven't reached
         # a terminal state. Terminal-state orders are "done" — polling
         # them would just confirm what we already know.
@@ -2664,12 +2691,25 @@ def run_auto_bot(
             monitor_summary = _monitor_order_statuses(
                 client, account_no, _monitor_token, engine_config.dataDir,
                 throttle_seconds=int(os.environ.get("ORDER_MONITOR_THROTTLE_SECONDS", "60")),
+                # 2026-10-29: only monitor THIS strategy's orders. The
+                # two bots share one ledger + one DNSE account, so
+                # without this the momentum bot reports the autofin
+                # bot's fills in its own Telegram chat.
+                strategy=engine_config.strategy or "",
             )
-            if monitor_summary.get("polled") or monitor_summary.get("changes") or monitor_summary.get("errors"):
+            if (
+                monitor_summary.get("polled")
+                or monitor_summary.get("changes")
+                or monitor_summary.get("errors")
+                or monitor_summary.get("skipped_other_strategy")
+            ):
                 print(
                     f"[{now.isoformat()}] order monitor: "
                     f"polled={monitor_summary['polled']} "
                     f"throttle_skipped={monitor_summary['skipped_throttle']} "
+                    # 2026-10-29: orders owned by the OTHER strategy's
+                    # bot (the two bots share one ledger).
+                    f"other_strategy={monitor_summary.get('skipped_other_strategy', 0)} "
                     f"changes={len(monitor_summary['changes'])} "
                     f"terminal={monitor_summary['terminal_transitions']} "
                     f"errors={len(monitor_summary['errors'])}"

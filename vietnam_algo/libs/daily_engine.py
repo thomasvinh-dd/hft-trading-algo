@@ -448,7 +448,16 @@ def execute_orders_with_ledger(
     orders: list[object],
     data_dir: Path,
     run_id: str,
+    strategy: str = "",
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], bool]:
+    """Submit ``orders`` to DNSE, recording them in the shared ledger.
+
+    ``strategy`` tags each new ledger row with the strategy that
+    created it (2026-10-29). The autofin and momentum bots share one
+    DNSE account and therefore one ledger file, so without the tag
+    each bot's order monitor reports the OTHER bot's orders to its
+    own Telegram chat.
+    """
     from dataclasses import asdict
 
     ledger = load_ledger(data_dir)
@@ -484,6 +493,9 @@ def execute_orders_with_ledger(
             # would compute its cap against its own (new) price and
             # chase the market forever.
             originalPrice=int(payload["price"]),
+            # 2026-10-29: tag the owning strategy so each bot's
+            # order monitor only reports its own orders.
+            strategy=strategy,
         )
         save_ledger(ledger, data_dir)
         try:
@@ -705,7 +717,13 @@ def run_daily_once(
         notify(risk_block_message(result_payload))
         return result_payload
     run_id = trade_date_value or "unknown"
-    results, reconciliation, submit_complete = execute_orders_with_ledger(client, account_no, trading_token, orders, engine_config.dataDir, run_id)
+    results, reconciliation, submit_complete = execute_orders_with_ledger(
+        client, account_no, trading_token, orders, engine_config.dataDir, run_id,
+        # 2026-10-29: tag the owning strategy so each bot's order
+        # monitor only reports its own orders (both bots share one
+        # ledger and one DNSE account).
+        strategy=engine_config.strategy or "",
+    )
 
     # Reconcile any rebuy orders that filled — drop them from the persistent
     # pending queue. Pending rebays whose BUY did NOT fill (rejected, expired,

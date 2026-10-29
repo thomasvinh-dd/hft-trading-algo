@@ -1573,6 +1573,9 @@ def main(argv: list[str] | None = None) -> int:
                 orders,
                 args.data_dir,
                 selected_date or "unknown",
+                # 2026-10-29: tag the owning strategy so each bot's
+                # order monitor only reports its own orders.
+                strategy=getattr(args, "strategy", "") or "",
             )
         elif args.monitor:
             results = execute_dnse_orders_with_monitoring(

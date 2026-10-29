@@ -164,7 +164,8 @@ def _patch_executor(monkeypatch, captured: dict) -> None:
     (``from vietnam_algo.libs.daily_engine import execute_orders_with_ledger``)
     so we patch the source module, not the runner attribute.
     """
-    def _fake_execute(*, client, account_no, trading_token, orders, data_dir, run_id):
+    def _fake_execute(*, client, account_no, trading_token, orders, data_dir,
+                      run_id, strategy: str = ""):
         captured["orders"] = list(orders)
         return (
             [{"status": "submitted", "detail": {"id": f"DNSE-{o.symbol}-001"}} for o in orders],

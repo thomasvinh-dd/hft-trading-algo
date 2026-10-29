@@ -191,7 +191,11 @@ def test_monitor_no_orders_returns_empty_summary(tmp_path, notify_spy) -> None:
     client = _StubClient([])
     summary = _monitor_order_statuses(client, "A", "tok", tmp_path)
     assert summary == {
-        "polled": 0, "skipped_throttle": 0, "changes": [],
+        "polled": 0, "skipped_throttle": 0,
+        # 2026-10-29: orders skipped because they belong to another
+        # strategy's bot.
+        "skipped_other_strategy": 0,
+        "changes": [],
         "errors": [], "terminal_transitions": 0,
         "repriced": [], "abandoned": [],
         "force_replan": False, "force_replan_symbols": [],

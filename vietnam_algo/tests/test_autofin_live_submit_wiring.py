@@ -28,7 +28,8 @@ class _StubLedger:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def __call__(self, *, client, account_no, trading_token, orders, data_dir, run_id):
+    def __call__(self, *, client, account_no, trading_token, orders, data_dir,
+                 run_id, strategy: str = ""):
         from vietnam_algo.libs.trading_engine import DnseOrder
         self.calls.append(
             dict(
@@ -363,7 +364,8 @@ def test_invalid_orders_skipped(stub_ledger, stub_client, in_continuous_session)
 def test_skipped_existing_and_unknown_counts(monkeypatch, in_continuous_session):
     """The result dict must surface skipped_existing_ledger and unknown counts."""
 
-    def stub_ledger(client, account_no, trading_token, orders, data_dir, run_id):
+    def stub_ledger(client, account_no, trading_token, orders, data_dir, run_id,
+                    strategy: str = ""):
         return [
             {"status": "submitted", "response": {"id": "A1"}, "detail": {"id": "A1"}},
             {"status": "skipped_existing_ledger", "ledgerStatus": "open"},
