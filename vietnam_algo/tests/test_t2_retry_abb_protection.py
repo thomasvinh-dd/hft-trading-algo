@@ -358,3 +358,52 @@ def test_reconcile_keeps_the_category_on_the_error_path(tmp_path) -> None:
     )
     assert out["k"].orderCategory == "STOP"
     assert out["k"].stopPrice == 10550
+
+
+# -----------------------------------------------------------------------------
+# The submit path must persist the STOP fields
+# -----------------------------------------------------------------------------
+
+def test_submit_persists_the_stop_category(tmp_path) -> None:
+    """A submitted STOP order must be recorded with its category.
+
+    Without ``orderCategory=STOP`` in the ledger row, the order monitor
+    polls the order as NORMAL — DNSE answers HTTP 404 for a STOP order
+    requested that way — and the row is forced back to the ambiguous
+    "unknown" status, which then blocks every subsequent submit run.
+    """
+    from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
+    from vietnam_algo.libs.order_ledger import load_ledger
+    from vietnam_algo.libs.trading_engine import DnseOrder
+
+    client = MagicMock()
+    client.place_stock_order.return_value = {"id": "dnse-stop-1"}
+    client.order_detail.return_value = {"id": "dnse-stop-1", "orderStatus": "New"}
+    client.get_cash_loan_package_id.return_value = 1036
+
+    order = DnseOrder(
+        symbol="ABB", side="NS", quantity=100, price=15850,
+        loanPackageId=1036, orderType="LO",
+        orderCategory="STOP", stopPrice=15930,
+        conditionOperator="<=", durationType="GTD",
+        durationDateTime="2026-11-28T13:27:24.369+07:00",
+        sourceOrderId=46993485424118, sourceDate="2026-10-29",
+        reason="autofin_user_sl:deal#1789344000:ABB:10%:15840 [t2-retry]",
+    )
+    execute_orders_with_ledger(
+        client=client, account_no="0003937868", trading_token="tok",
+        orders=[order], data_dir=tmp_path, run_id="2026-10-29",
+        strategy="autofin_signal",
+    )
+
+    led = load_ledger(tmp_path)
+    row = next(
+        it for it in led.values()
+        if it.symbol == "ABB" and it.side == "NS"
+    )
+    assert row.orderCategory == "STOP", (
+        f"the ledger must record orderCategory=STOP, got "
+        f"{row.orderCategory!r}"
+    )
+    assert row.stopPrice == 15930
+    assert row.dnseOrderId == "dnse-stop-1"

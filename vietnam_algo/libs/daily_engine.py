@@ -530,6 +530,17 @@ def execute_orders_with_ledger(
             # 2026-10-29: tag the owning strategy so each bot's
             # order monitor only reports its own orders.
             strategy=strategy,
+            # 2026-10-29 (ABB incident): persist the DNSE conditional
+            # (STOP) fields. Without them the ledger row says
+            # ``orderCategory=NORMAL`` / ``stopPrice=0``, and the
+            # order monitor then polls the order with the WRONG
+            # category — DNSE answers HTTP 404 for a STOP order
+            # requested as NORMAL — so a perfectly good protective
+            # stop shows up as an error and its row is forced back to
+            # the ambiguous "unknown" status, which blocks every
+            # subsequent submit run.
+            orderCategory=str(payload.get("orderCategory") or "NORMAL"),
+            stopPrice=int(payload.get("stopPrice") or 0),
         )
         save_ledger(ledger, data_dir)
         try:
