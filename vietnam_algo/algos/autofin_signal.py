@@ -3638,8 +3638,21 @@ class AutofinSignalAdapter(StrategyAdapter):
                 want_id = int(str(did).split(":", 1)[0])
             except ValueError:
                 want_id = 0
+            # 2026-10-29 (VOS incident): match on (_id, symbol).
+            # autofin's ``_id`` is the deal's open-time timestamp, NOT
+            # a globally unique id — VOS, MSB, ABB, TCB, FRT and SCL
+            # all share ``_id=1792627200``. Matching on ``_id`` alone
+            # can therefore select ANOTHER symbol's row and copy its
+            # recommendation onto this deal (that is how a "reduce"
+            # deal ended up carrying MSB's "Khuyến nghị đầu tư" entry
+            # text). If no row matches this exact (id, symbol) pair we
+            # report the failure instead of borrowing a foreign row.
             match = next(
-                (d for d in deals if int(d.get("_id", 0) or 0) == want_id),
+                (
+                    d for d in deals
+                    if int(d.get("_id", 0) or 0) == want_id
+                    and str(d.get("symbol") or "").strip().upper() == sym
+                ),
                 None,
             )
             if match is None:
@@ -3768,6 +3781,25 @@ class AutofinSignalAdapter(StrategyAdapter):
             # endpoint may return several deals for the same
             # symbol (different windows). ``_id`` is the deal's
             # open-time Unix-ts, so it's stable across pages.
+            #
+            # 2026-10-29 (VOS incident): autofin's ``_id`` is NOT
+            # unique across symbols — it is only the deal's open-time
+            # timestamp, so several symbols opened on the same day
+            # share it (VOS, MSB, ABB, TCB, FRT and SCL all have
+            # ``_id=1792627200``). The match must therefore also
+            # require the SYMBOL to match.
+            #
+            # The old code fell back to ``deals[0]`` (the most recent
+            # deal for the symbol) when the ``_id`` was absent, and
+            # then OVERWROTE the tracked deal's cached recommendation
+            # with that row's text. Because ``_id`` collisions are
+            # common, the fallback could copy ANOTHER symbol's
+            # recommendation — e.g. MSB's "Khuyến nghị đầu tư" (an
+            # entry) onto VOS's row, which is exactly how a reduce
+            # deal looked like an entry recommendation.
+            #
+            # Fix: match on (_id, symbol); if no row matches, do NOT
+            # fall back to an unrelated row — skip the deal instead.
             try:
                 want_id = int(str(did).split(":", 1)[0])
             except ValueError:
@@ -3776,9 +3808,19 @@ class AutofinSignalAdapter(StrategyAdapter):
                 (
                     d for d in deals
                     if int(d.get("_id", 0) or 0) == want_id
+                    and str(d.get("symbol") or "").strip().upper() == sym
                 ),
-                deals[0],  # fallback: most recent for this sym
+                None,
             )
+            if match is None:
+                # 2026-10-29: no row for THIS deal for THIS symbol.
+                # Do not borrow another row's recommendation.
+                print(
+                    f"[autofin_signal] orphan deal {did} ({sym}) not "
+                    f"found in /signal-deals?symbol={sym} — skipping "
+                    f"(no fallback to an unrelated row)"
+                )
+                continue
             # 2026-10-21 BAF fix: ``lastRecomment`` is the SHORT
             # headline (e.g. ``🛡️ Chốt lãi -1.75 % bảo toàn vốn``)
             # while the FULL text including ``tại P`` (e.g.

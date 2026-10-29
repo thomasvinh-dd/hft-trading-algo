@@ -129,12 +129,24 @@ def _stub_client(deals_by_symbol: dict[str, list[dict[str, Any]]]) -> MagicMock:
     [
         ("Khuyến nghị đầu tư", True),
         ("Ngày khuyến nghị: 22/10/2026", True),
+        # The full entry CARD. It contains "Vùng chốt lãi" — and
+        # therefore the substring "chốt lãi" — which used to make it
+        # classify as a TP step. It must be an entry.
+        ("Ngày khuyến nghị: 22/10/2026 🟢 Vùng mua: 11,700 - 12,100 "
+         "🎯 Vùng chốt lãi: 13,100 - 14,800 📈 Lợi nhuận dự phóng: "
+         "11.97 % - 26.50 % 🔴 Giá cắt lỗ: 10,550 💹 Rủi ro thanh khoản: 20 %",
+         True),
         ("", True),  # unknown -> allowed
         ("⚠️ Hạ tỷ trọng lần 2", False),
         ("⚠️ Hạ 50 % tỉ trọng lần 1", False),
+        ("[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 11,100 - Nắm giữ: 4 ngày Lỗ: -9.09 %", False),
         ("💰 Chốt lãi lần 1 mức giá 13,100", False),
         ("🛡️ Chốt lãi -1.75 % bảo toàn vốn tại 30,950", False),
         ("Đóng DEAL chạm điểm chặn lãi (Lãi: 29.84 %)", False),
+        # The stop-loss headline. It is a full-close signal handled by
+        # _parse_partial_close, but for the ENTRY gate it must still be
+        # blocked — autofin is telling us to sell, not buy.
+        ("🛑 Chạm điểm cắt lỗ, cân nhắc hạ 100 % tỷ trọng Giá: 25,400", False),
     ],
 )
 def test_held_deal_gate_blocks_non_entry_recommendations(rec, expect_allowed):
@@ -166,6 +178,117 @@ def test_vos_specific_regression_reduce_deal_is_not_an_entry():
     assert out == [], (
         "a deal autofin wants to REDUCE must not become an entry candidate"
     )
+
+
+# ---------------------------------------------------------------------------
+# The _id is NOT unique across symbols (autofin reuses the open-time ts)
+# ---------------------------------------------------------------------------
+
+def test_autofin_deal_id_is_not_unique_across_symbols():
+    """autofin's ``_id`` is the deal's open-time timestamp, so several
+    symbols opened on the same day share it.
+
+    Confirmed live on 2026-10-29:
+        VOS, MSB, ABB, TCB, FRT and SCL all have ``_id=1792627200``.
+    """
+    from vietnam_algo.algos.autofin_signal import _deal_id
+
+    vos = {"_id": 1792627200, "symbol": "VOS"}
+    msb = {"_id": 1792627200, "symbol": "MSB"}
+    assert vos["_id"] == msb["_id"]
+    # ...but the bot's composite key IS unique.
+    assert _deal_id(vos) == "1792627200:VOS"
+    assert _deal_id(msb) == "1792627200:MSB"
+    assert _deal_id(vos) != _deal_id(msb)
+
+
+def test_refresh_does_not_borrow_another_symbols_row():
+    """A tracked deal must never inherit ANOTHER symbol's
+    recommendation.
+
+    The old /signal-deals matcher fell back to ``deals[0]`` when the
+    ``_id`` was absent. Because ``_id`` collides across symbols, that
+    could copy e.g. MSB's "Khuyến nghị đầu tư" (an entry) onto VOS's
+    row — which is exactly how a reduce deal looked like an entry.
+    """
+    our_deals = {
+        "1792627200:VOS": {
+            "symbol": "VOS",
+            "lastRecomment": "⚠️ Hạ tỷ trọng lần 2",
+            "_our_qty": 0,
+        },
+    }
+    # /signal-deals?symbol=VOS returns rows whose _id does NOT include
+    # VOS's deal id (e.g. autofin rotated the id space).
+    client = _stub_client({
+        "VOS": [{
+            "_id": 1792627200,
+            "symbol": "MSB",  # a FOREIGN symbol with a colliding id
+            "lastRecomment": "Khuyến nghị đầu tư",
+            "statusDeal": {"isClosed": False},
+        }],
+    })
+    adapter = _make_adapter(our_deals)
+    report = adapter._refresh_stale_deal_recomments(client, [], [])
+
+    assert report["refreshed"] == [], (
+        "a row for a DIFFERENT symbol must never be adopted"
+    )
+    assert len(report["failed"]) == 1
+    # The cached text is untouched.
+    assert our_deals["1792627200:VOS"]["lastRecomment"] == "⚠️ Hạ tỷ trọng lần 2"
+
+
+def test_orphan_augment_does_not_borrow_another_symbols_row():
+    """Same protection for the orphan-deal augmentation path."""
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    our_deals = {
+        "1792627200:VOS": {
+            "symbol": "VOS",
+            "lastRecomment": "Khuyến nghị đầu tư",
+            "_our_qty": 0,
+        },
+    }
+    client = _stub_client({
+        "VOS": [{
+            "_id": 1792627200,
+            "symbol": "MSB",  # foreign symbol, colliding id
+            "lastRecomment": "Khuyến nghị đầu tư",
+            "statusDeal": {"isClosed": False},
+        }],
+    })
+    adapter = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    adapter._our_deals = our_deals
+    holding: list[dict] = []
+    adapter._augment_orphan_deals(client, holding)
+
+    assert holding == [], (
+        "no synthetic holding row may be created from another symbol's deal"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The entry CARD must classify as `entry`, not `tp`
+# ---------------------------------------------------------------------------
+
+def test_entry_card_classifies_as_entry_not_tp():
+    """The full entry card contains "Vùng chốt lãi", so the substring
+    "chốt lãi" made it classify as a TP step. It is the entry
+    recommendation.
+    """
+    from vietnam_algo.libs.autofin_signals import RECOMMENT_KIND_TP
+
+    card = (
+        "Ngày khuyến nghị: 22/10/2026 "
+        "🟢 Vùng mua: 11,700 - 12,100 "
+        "🎯 Vùng chốt lãi: 13,100 - 14,800 "
+        "📈 Lợi nhuận dự phóng: 11.97 % - 26.50 % "
+        "🔴 Giá cắt lỗ: 10,550 "
+        "💹 Rủi ro thanh khoản: 20 %"
+    )
+    assert classify_recomment(card) == RECOMMENT_KIND_ENTRY
+    assert classify_recomment(card) != RECOMMENT_KIND_TP
 
 
 def test_held_deal_gate_still_allows_entry_recommendation():
