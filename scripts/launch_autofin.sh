@@ -96,6 +96,19 @@ echo "DNSE_API_KEY=${DNSE_API_KEY:0:10}..."
 echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID"
 echo "AUTOFIN_USER_SL_PCT=$AUTOFIN_USER_SL_PCT"
 
+# 2026-10-29: the lock fd must NOT be inherited by the bot.
+#
+# The bot is started as a child of this script, so it inherits fd 9
+# (the open lock). The flock is then held for the bot's ENTIRE
+# lifetime, not just for the launch sequence — and every later launch
+# (manual or watchdog) blocks forever on ``flock 9``. We hit exactly
+# that: after the first launch the lock was still held by the running
+# bot (PID 2014827) and no subsequent launch could proceed.
+#
+# Closing fd 9 in the child (``9>&-``) releases the lock as soon as
+# this script exits, while keeping it held for the whole launch
+# sequence. The wait-until-up loop below still guarantees the
+# watchdog never observes a gap.
 nohup env PYTHONUNBUFFERED=1 \
     DNSE_API_KEY="$DNSE_API_KEY" \
     DNSE_API_SECRET="$DNSE_API_SECRET" \
@@ -112,6 +125,7 @@ nohup env PYTHONUNBUFFERED=1 \
         --account-no 0003937868 --loan-package-id 1775 \
         --sleep-seconds 60 --no-sync-data --strategy autofin_signal \
         --live-submit \
+    9>&- \
     > "$LOG_DIR/autofin.log" 2>&1 &
 disown
 sleep 8

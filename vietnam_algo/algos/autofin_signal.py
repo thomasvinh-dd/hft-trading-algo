@@ -37,6 +37,7 @@ from typing import Any
 
 from vietnam_algo.libs.autofin_signals import (
     RECOMMENT_KIND_ENTRY,
+    RECOMMENT_KIND_UNKNOWN,
     AutofinClient,
     AutofinSignal,
     classify_recomment,
@@ -57,6 +58,60 @@ from .base import StrategyAdapter
 
 
 DEFAULT_BOARD_LOT = 100
+
+# 2026-10-29 (VOS incident): how old a cached ``lastRecomment`` may be
+# before we re-fetch it from autofin's /signal-deals endpoint. The bot
+# cycles every 60 s, so 15 minutes bounds the per-cycle API cost to
+# roughly one refresh per tracked deal per 15 minutes.
+DEFAULT_STALE_RECOMMENT_MAX_AGE_SECONDS = 900
+
+# How long to wait before retrying a refresh that FAILED. Some tracked
+# deals can never be refreshed (their ``_id`` is absent from autofin's
+# /signal-deals history), and without a backoff they would cost one API
+# call every cycle forever.
+_FAILED_REFRESH_BACKOFF_SECONDS = 3600
+
+
+def _age_seconds(stamp: Any) -> float | None:
+    """Age of an ISO timestamp in seconds, or None if unknown/unparseable."""
+    if not stamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
+def _mark_refresh_attempt(sig: dict[str, Any]) -> None:
+    """Record a FAILED refresh attempt so we don't retry every cycle.
+
+    Some tracked deals can never be refreshed — e.g. their ``_id`` is
+    not present in autofin's /signal-deals history at all (old closed
+    deals, or an id mapping that autofin no longer exposes). Without a
+    backoff those would cost one API call per cycle forever.
+
+    We stamp the attempt time and treat the deal as "recently tried"
+    for ``_FAILED_REFRESH_BACKOFF_SECONDS`` (default 1 hour).
+    """
+    sig["_last_refresh_attempt_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _deal_id_in(rows: list[dict[str, Any]], did: str) -> bool:
+    """True if ``did`` appears in the ``_id`` of any row in ``rows``.
+
+    Handles both raw dicts (holding/suggest payloads) and
+    ``AutofinSignal`` objects (which carry the raw dict in ``.raw``).
+    """
+    for r in rows:
+        raw = getattr(r, "raw", None)
+        if not isinstance(raw, dict):
+            raw = r if isinstance(r, dict) else {}
+        if _deal_id(raw) == did:
+            return True
+    return False
 
 
 def _load_env_credentials() -> tuple[str, str]:
@@ -707,6 +762,32 @@ def _expand_signals_with_held_unentered(
     the upper and lower bounds — i.e. a price more than 5 % below
     ``supply_from`` is also rejected as out-of-zone. De-duplicated
     against existing ``signals`` by deal_id so fresh signals win.
+
+    2026-10-29 (VOS incident): this function now ALSO gates on the
+    deal's current RECOMMENDATION KIND.
+
+    Before this fix the function only checked ``isClosed`` and
+    ``_our_qty``, so it could propose a BUY for a deal autofin was
+    actively telling us to trim. On 2026-10-29 the bot opened a NEW
+    position on VOS even though autofin's recommendation for that
+    deal had already moved to "⚠️ Hạ tỷ trọng lần 2" (reduce weight)
+    four days after the deal opened.
+
+    The gate is deliberately narrow:
+
+    - ``entry`` → allowed (this is a fresh entry recommendation).
+    - ``unknown`` → allowed. autofin publishes the "Ngày khuyến nghị"
+      entry card on some endpoints and an empty/other headline on
+      others; refusing to enter on an unrecognised headline would
+      silently stop the bot from trading at all.
+    - ``reduce`` / ``tp`` / ``capital_protect`` / ``close`` → BLOCKED.
+      These all mean autofin wants us to SELL, not buy. Entering here
+      would fight autofin's own recommendation.
+
+    Note the recommendation text used for the gate is taken from the
+    HOLDING row when present, and otherwise from our cached deal state
+    (which the caller refreshes from /signal-deals — see
+    ``_refresh_stale_deal_recomments``).
     """
     seen_ids: set[str] = {_deal_id(s.raw) for s in signals if s.symbol}
     out: list[AutofinSignal] = list(signals)
@@ -728,6 +809,18 @@ def _expand_signals_with_held_unentered(
         except Exception:
             continue
         if not sig.symbol:
+            continue
+        # 2026-10-29 (VOS incident): gate on the recommendation KIND.
+        # A deal whose current autofin recommendation is a TP / SL /
+        # reduce / close must never become a BUY candidate — autofin is
+        # telling us to SELL that position, not to open one.
+        rec_kind = classify_recomment(sig.last_recomment)
+        if rec_kind not in (RECOMMENT_KIND_ENTRY, RECOMMENT_KIND_UNKNOWN):
+            print(
+                f"[autofin_signal] held-deal candidate skipped "
+                f"{sig.symbol} ({did}): recommendation kind="
+                f"{rec_kind!r} rec={sig.last_recomment[:60]!r}"
+            )
             continue
         cur = current_prices.get(sig.symbol, 0)
         if cur <= 0:
@@ -2189,6 +2282,49 @@ def decide_orders(
         if did:
             autofin_holding_by_id[did] = dict(d)
 
+    # 1a-bis. Refresh the cached ``lastRecomment`` for EVERY tracked deal
+    # that appears in a fresh holding or suggest response.
+    #
+    # 2026-10-29 (VOS incident): the cached recomment for a tracked
+    # deal was written once (when the deal first entered ``our_deals``)
+    # and only refreshed for deals we HOLD (inside
+    # ``_plan_partial_close_orders``). A tracked-but-not-held deal —
+    # exactly the shape of the VOS row at 09:01 on 2026-10-29 — kept
+    # its original entry-card text forever. The bot then read the
+    # stale "Khuyến nghị đầu tư" as an entry recommendation and opened
+    # a new position on a deal autofin had already told us to reduce.
+    #
+    # The entry gate in ``_expand_signals_with_held_unentered`` relies on
+    # this text, so it must be fresh BEFORE the gate runs. Doing the
+    # refresh here (before step 2) guarantees that.
+    _fresh_rec_by_did: dict[str, str] = {}
+    for _row in list(holding) + list(signals):
+        # ``holding`` rows are raw dicts; ``signals`` are
+        # AutofinSignal objects — normalise both to the raw dict.
+        _raw = getattr(_row, "raw", None)
+        if not isinstance(_raw, dict):
+            _raw = _row if isinstance(_row, dict) else {}
+        _did = _deal_id(_raw)
+        if not _did:
+            continue
+        _rec = str(_raw.get("lastRecomment") or "").strip()
+        if not _rec:
+            continue
+        _fresh_rec_by_did[_did] = _rec
+    for _did, _rec in _fresh_rec_by_did.items():
+        _sig = our_deals.get(_did)
+        if _sig is None:
+            continue
+        _old = str(_sig.get("lastRecomment") or "")
+        if _old != _rec:
+            print(
+                f"[decide_orders] refreshed cached recommendation for "
+                f"{_did}: {_old[:40]!r} -> {_rec[:40]!r} "
+                f"(kind={classify_recomment(_rec)})"
+            )
+        _sig["lastRecomment"] = _rec
+        _sig["_last_recomment_at"] = datetime.now(timezone.utc).isoformat()
+
     # 1a. Determine the cash budget for new BUYs.
     #
     # Two paths:
@@ -2364,6 +2500,14 @@ def decide_orders(
         if did not in new_our_deals:
             new_our_deals[did] = dict(s.raw)
         new_our_deals[did].setdefault("_our_qty", 0)
+        # 2026-10-29: stamp when the cached recomment was last refreshed
+        # so ``_refresh_stale_deal_recomments`` can tell a fresh cached
+        # text from a stale one. Without this stamp every tracked deal
+        # looks infinitely stale and we would re-fetch all of them on
+        # every cycle.
+        new_our_deals[did].setdefault(
+            "_last_recomment_at", datetime.now(timezone.utc).isoformat(),
+        )
         # Intentionally do NOT set ``_our_qty`` from the planned
         # order quantity. See the comment above.
     # for each close, mark the deal closed (qty=0) but KEEP it in the
@@ -3191,6 +3335,370 @@ class AutofinSignalAdapter(StrategyAdapter):
                 print(f"[autofin_signal] per-order notify failed: {exc}")
             self._notified_order_keys |= keys
 
+    def _build_decision_summary(
+        self,
+        *,
+        raw_payloads: dict[str, Any],
+        holding: list[dict[str, Any]],
+        signals: list[dict[str, Any]],
+        closing: list[dict[str, Any]],
+        risk: list[dict[str, Any]],
+        refresh_report: dict[str, Any],
+        all_orders: list[dict[str, Any]],
+        new_orders: list[dict[str, Any]],
+        partial_orders: list[dict[str, Any]],
+        close_orders: list[dict[str, Any]],
+        deals_actioned: list[dict[str, Any]],
+        our_deals: dict[str, dict[str, Any]],
+        positions: dict[str, int],
+        nav: float,
+        account: str,
+        trade_date: str,
+        allow_new_entries: bool,
+        new_entry_top_n: int,
+        current_prices: dict[str, float],
+    ) -> dict[str, Any]:
+        """Build the human-readable record of what we decided this cycle.
+
+        The point (2026-10-29) is auditability: for every candidate we
+        record (a) what autofin said, (b) how we classified it, and
+        (c) what we did about it. When a position turns out wrong we
+        can then tell whether autofin sent bad data or we misread good
+        data.
+        """
+        # Per-deal view of the recommendation we acted on.
+        deal_view: list[dict[str, Any]] = []
+        for did, sig in sorted(our_deals.items()):
+            rec = str(sig.get("lastRecomment") or "")
+            deal_view.append({
+                "deal_id": did,
+                "symbol": sig.get("symbol"),
+                "our_qty": int(sig.get("_our_qty", 0) or 0),
+                "recommendation": rec,
+                "recommendation_kind": classify_recomment(rec),
+                "recommendation_age_seconds": _age_seconds(
+                    sig.get("_last_recomment_at")
+                ),
+                "supply_F": sig.get("supply_F"),
+                "supply_T": sig.get("supply_T"),
+                "sl_F": sig.get("sL_F"),
+                "tp_F": sig.get("tP_F"),
+                "rateForNav": sig.get("rateForNav"),
+                "in_holding": _deal_id_in(holding, did),
+                "in_suggest": _deal_id_in(signals, did),
+            })
+
+        # Candidates we could have entered, and why we didn't (if we
+        # didn't). This is the part that was invisible before.
+        entry_candidates: list[dict[str, Any]] = []
+        entered_symbols = {o.get("symbol") for o in new_orders}
+        for did, sig in sorted(our_deals.items()):
+            sym = str(sig.get("symbol") or "")
+            if not sym:
+                continue
+            rec = str(sig.get("lastRecomment") or "")
+            kind = classify_recomment(rec)
+            entry_candidates.append({
+                "deal_id": did,
+                "symbol": sym,
+                "recommendation": rec,
+                "recommendation_kind": kind,
+                "our_qty": int(sig.get("_our_qty", 0) or 0),
+                "held_on_dnse": int(positions.get(sym, 0) or 0),
+                "current_price": current_prices.get(sym),
+                "entered_this_cycle": sym in entered_symbols,
+                "eligible_for_entry": (
+                    kind in (RECOMMENT_KIND_ENTRY, RECOMMENT_KIND_UNKNOWN)
+                    and int(positions.get(sym, 0) or 0) <= 0
+                ),
+            })
+
+        return {
+            "capturedAt": datetime.now(timezone.utc).isoformat(),
+            "tradeDate": trade_date,
+            "account": account,
+            "nav": nav,
+            "positions": positions,
+            "counts": {
+                "holding": len(holding),
+                "suggest": len(signals),
+                "closing": len(closing),
+                "risk": len(risk),
+                "trackedDeals": len(our_deals),
+                "allOrders": len(all_orders),
+                "newOrders": len(new_orders),
+                "partialOrders": len(partial_orders),
+                "closeOrders": len(close_orders),
+            },
+            "entryGate": {
+                "allowNewEntries": allow_new_entries,
+                "newEntryTopN": new_entry_top_n,
+            },
+            "staleRecommentRefresh": refresh_report,
+            "deals": deal_view,
+            "entryCandidates": entry_candidates,
+            "orders": [
+                {
+                    "symbol": o.get("symbol"),
+                    "side": o.get("side"),
+                    "price": o.get("price"),
+                    "quantity": o.get("quantity"),
+                    "kind": o.get("kind"),
+                    "reason": o.get("reason"),
+                }
+                for o in all_orders
+            ],
+            "dealsActioned": deals_actioned,
+            "rawPayloadSizes": {
+                k: (len(v) if isinstance(v, (list, dict)) else 1)
+                for k, v in raw_payloads.items()
+            },
+        }
+
+    def _write_decision_snapshot(
+        self,
+        data_dir: Path,
+        raw_payloads: dict[str, Any],
+        summary: dict[str, Any],
+    ) -> Path | None:
+        """Write the raw payload bundle + the decision summary."""
+        try:
+            from vietnam_algo.libs.autofin_snapshot import write_snapshot
+            return write_snapshot(data_dir, raw_payloads, summary)
+        except Exception as exc:
+            print(
+                f"[autofin_signal] decision snapshot failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+    def _log_decision_summary(self, summary: dict[str, Any]) -> None:
+        """Print a structured, greppable decision log line.
+
+        One line per cycle so an operator can answer "why did the bot
+        enter / not enter X?" from the log alone, without opening the
+        snapshot files.
+        """
+        counts = summary.get("counts", {})
+        gate = summary.get("entryGate", {})
+        refresh = summary.get("staleRecommentRefresh", {})
+        refreshed = refresh.get("refreshed", []) or []
+        failed = refresh.get("failed", []) or []
+        entered = [
+            c for c in summary.get("entryCandidates", [])
+            if c.get("entered_this_cycle")
+        ]
+        blocked = [
+            c for c in summary.get("entryCandidates", [])
+            if not c.get("entered_this_cycle")
+            and c.get("recommendation_kind") not in (
+                RECOMMENT_KIND_ENTRY, RECOMMENT_KIND_UNKNOWN,
+            )
+        ]
+        parts = [
+            "[autofin_decision]",
+            f"trade_date={summary.get('tradeDate')}",
+            f"nav={summary.get('nav', 0):,.0f}",
+            f"holding={counts.get('holding')}",
+            f"suggest={counts.get('suggest')}",
+            f"tracked={counts.get('trackedDeals')}",
+            f"orders={counts.get('allOrders')}"
+            f"(new={counts.get('newOrders')}"
+            f",partial={counts.get('partialOrders')}"
+            f",close={counts.get('closeOrders')})",
+            f"entries_allowed={gate.get('allowNewEntries')}",
+            f"top_n={gate.get('newEntryTopN')}",
+            f"refreshed={len(refreshed)}",
+            f"refresh_failed={len(failed)}",
+            f"entered={','.join(c['symbol'] for c in entered) or '-'}",
+        ]
+        if blocked:
+            parts.append(
+                "blocked_non_entry="
+                + ",".join(
+                    f"{c['symbol']}({c['recommendation_kind']})"
+                    for c in blocked
+                )
+            )
+        for r in refreshed:
+            if r.get("changed"):
+                parts.append(
+                    f"rec_changed:{r.get('symbol')}"
+                    f"({r.get('old_recommendation', '')[:24]!r}->"
+                    f"{r.get('new_recommendation', '')[:24]!r})"
+                )
+        print(" ".join(parts))
+
+    def _refresh_stale_deal_recomments(
+        self,
+        client: "AutofinClient",
+        holding: list[dict[str, Any]],
+        suggest: list[dict[str, Any]],
+        raw_payloads: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Refresh the cached ``lastRecomment`` for tracked deals whose
+        cached copy has gone stale.
+
+        2026-10-29 (VOS incident): our cached ``lastRecomment`` for a
+        tracked deal is written once, when the deal first enters
+        ``our_deals`` (see ``new_our_deals[did] = dict(s.raw)``), and
+        is NOT refreshed afterwards unless the deal happens to reappear
+        in a fresh holding/suggest response.
+
+        For VOS that meant the bot kept acting on the 22/10 entry card
+        ("Khuyến nghị đầu tư" → an entry recommendation) for seven days
+        after autofin had moved the deal to "⚠️ Hạ tỷ trọng lần 2"
+        (reduce weight). The bot entered a NEW VOS position on
+        2026-10-29 on the strength of that stale text.
+
+        Mechanism: for every tracked deal whose cached recomment is
+        older than ``_stale_recomment_max_age_seconds`` (default 900
+        = 15 min) AND which is not already covered by a fresh
+        holding/suggest row, fetch ``/signal-deals?symbol=<sym>``, find
+        the row matching the canonical ``_id``, and overwrite the cached
+        ``lastRecomment`` (and ``numberOfProfit``) with the fresh
+        values.
+
+        We deliberately refresh only STALE rows so the per-cycle API
+        cost stays bounded (a handful of calls per cycle, not ~21).
+
+        Returns a small report dict for the decision summary:
+        ``{"refreshed": [...], "skipped_fresh": [...], "failed": [...]}``
+        """
+        report: dict[str, Any] = {
+            "refreshed": [], "skipped_fresh": [], "failed": [],
+        }
+        max_age = self._stale_recomment_max_age_seconds()
+        now = datetime.now(timezone.utc).timestamp()
+
+        # Deals already covered by a fresh response need no refresh.
+        fresh_dids: set[str] = set()
+        for row in list(holding) + list(suggest):
+            raw = getattr(row, "raw", None)
+            if not isinstance(raw, dict):
+                raw = row if isinstance(row, dict) else {}
+            did = _deal_id(raw)
+            if did:
+                fresh_dids.add(did)
+
+        for did, sig in list(self._our_deals.items()):
+            sym = str(sig.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            if did in fresh_dids:
+                # Still present upstream — the caller merges the fresh
+                # row into the deal state further down the cycle.
+                continue
+            # Age of the cached recomment.
+            stamp = sig.get("_last_recomment_at")
+            if stamp:
+                try:
+                    age = now - datetime.fromisoformat(str(stamp)).timestamp()
+                except (TypeError, ValueError):
+                    age = max_age + 1.0  # unparseable → treat as stale
+            else:
+                # Never stamped (pre-fix state files) → stale.
+                age = max_age + 1.0
+            if age < max_age:
+                report["skipped_fresh"].append(did)
+                continue
+            # Failure backoff: a deal whose refresh keeps failing (e.g.
+            # its _id is not in autofin's /signal-deals history at all)
+            # must not cost an API call on every single cycle.
+            attempt_stamp = sig.get("_last_refresh_attempt_at")
+            if attempt_stamp:
+                try:
+                    since = now - datetime.fromisoformat(
+                        str(attempt_stamp)).timestamp()
+                except (TypeError, ValueError):
+                    since = 0.0
+                if since < _FAILED_REFRESH_BACKOFF_SECONDS:
+                    report["skipped_fresh"].append(did)
+                    continue
+            try:
+                deals = client.fetch_deals(symbol=sym, page_size=10)
+            except Exception as exc:
+                _mark_refresh_attempt(sig)
+                report["failed"].append({
+                    "deal_id": did, "symbol": sym,
+                    "error": f"{type(exc).__name__}: {str(exc)[:120]}",
+                })
+                continue
+            # 2026-10-29: keep the raw payload for the snapshot.
+            if raw_payloads is not None:
+                bucket = raw_payloads.setdefault("signal_deals", {})
+                bucket[str(sym).upper()] = deals
+            if not deals:
+                _mark_refresh_attempt(sig)
+                report["failed"].append({
+                    "deal_id": did, "symbol": sym, "error": "no rows",
+                })
+                continue
+            try:
+                want_id = int(str(did).split(":", 1)[0])
+            except ValueError:
+                want_id = 0
+            match = next(
+                (d for d in deals if int(d.get("_id", 0) or 0) == want_id),
+                None,
+            )
+            if match is None:
+                _mark_refresh_attempt(sig)
+                report["failed"].append({
+                    "deal_id": did, "symbol": sym,
+                    "error": "deal not found in /signal-deals",
+                })
+                continue
+            fresh_rec = str(match.get("lastRecomment") or "").strip()
+            if not fresh_rec:
+                _mark_refresh_attempt(sig)
+                report["failed"].append({
+                    "deal_id": did, "symbol": sym,
+                    "error": "empty lastRecomment",
+                })
+                continue
+            old_rec = str(sig.get("lastRecomment") or "")
+            changed = fresh_rec != old_rec
+            sig["lastRecomment"] = fresh_rec
+            sig["_last_recomment_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            if "_last_numberOfProfit" in sig or match.get("numberOfProfit") is not None:
+                sig["_last_numberOfProfit"] = int(
+                    match.get("numberOfProfit") or 0
+                )
+            report["refreshed"].append({
+                "deal_id": did,
+                "symbol": sym,
+                "changed": changed,
+                "old_recommendation": old_rec[:80],
+                "new_recommendation": fresh_rec[:80],
+                "new_kind": classify_recomment(fresh_rec),
+            })
+            if changed:
+                print(
+                    f"[autofin_signal] refreshed stale recomment "
+                    f"{did} ({sym}): {old_rec[:40]!r} -> {fresh_rec[:40]!r} "
+                    f"(kind={classify_recomment(fresh_rec)})"
+                )
+        return report
+
+    def _stale_recomment_max_age_seconds(self) -> int:
+        """How old a cached ``lastRecomment`` may be before we refresh it.
+
+        Read from ``AUTOFIN_STALE_RECOMMENT_MAX_AGE_SECONDS``; default
+        900 (15 minutes). The bot's cycle is 60 s, so this bounds the
+        per-cycle API cost to roughly one refresh per tracked deal per
+        15 minutes.
+        """
+        raw = os.environ.get("AUTOFIN_STALE_RECOMMENT_MAX_AGE_SECONDS", "").strip()
+        if raw:
+            try:
+                return max(0, int(float(raw)))
+            except ValueError:
+                pass
+        return DEFAULT_STALE_RECOMMENT_MAX_AGE_SECONDS
+
     def _augment_orphan_deals(
         self,
         client: "AutofinClient",
@@ -3337,18 +3845,27 @@ class AutofinSignalAdapter(StrategyAdapter):
         client = self._client_lazy()
         self._load_state(config.dataDir)
 
+        # 2026-10-29: collect the RAW autofin payloads used for this
+        # cycle's decision so we can snapshot them. When something goes
+        # wrong we need to be able to answer "did autofin send us bad
+        # data, or did we misread good data?" — which is impossible
+        # without the raw responses (the VOS incident).
+        raw_payloads: dict[str, Any] = {}
+
         # 1. /signal-static-holding — autofin currently open positions
         try:
             holding = client.fetch_holding(page_size=50)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_holding failed: {exc}")
             holding = []
+        raw_payloads["holding"] = holding
         # 2. /signal-static-suggest — latest recommended signals
         try:
             signals = client.fetch_signals(page_size=20)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_signals failed: {exc}")
             signals = []
+        raw_payloads["suggest"] = signals
         # 3. /closing-signals — recently closed
         try:
             closing = client.fetch_closing(page_size=50)
@@ -3362,6 +3879,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             # libs/autofin_signals.py:_request_with_token_refresh.
             notify(f"⚠️ autofin fetch_closing failed: {exc}")
             closing = []
+        raw_payloads["closing"] = closing
         # 3b. CATCH-UP: if the bot has been down for more than
         # ``_catchup_threshold_seconds`` (default 24h) since its last
         # poll, scan every held+closed deal's ``hisRecomment``
@@ -3395,6 +3913,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         except Exception as exc:
             notify(f"⚠️ autofin fetch_risk failed: {exc}")
             risk = []
+        raw_payloads["risk"] = risk
         # 4b. Fetch each holding's full recomment history so partial
         # closes can honour autofin's per-step "Tỷ trọng X %" fraction
         # (the live /signal-static-holding endpoint only returns a
@@ -3403,6 +3922,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         # Without this, partial closes fall back to the 1/3 default
         # which is wrong for ASP today (autofin says 10%).
         autofin_fractions: dict[str, float] = {}
+        deals_by_symbol: dict[str, Any] = {}
         for h in holding:
             sym = h.get("symbol") or h.get("stockCode")
             if not sym:
@@ -3412,6 +3932,8 @@ class AutofinSignalAdapter(StrategyAdapter):
             except Exception as exc:
                 print(f"[autofin_signal] fetch_deals({sym}) failed: {exc}")
                 continue
+            # 2026-10-29: keep the raw payload for the snapshot.
+            deals_by_symbol[str(sym).upper()] = deals
             if not deals:
                 continue
             result = latest_partial_close_fraction(deals[0])
@@ -3437,6 +3959,28 @@ class AutofinSignalAdapter(StrategyAdapter):
         # BAF was not in /signal-static-holding → bot reported
         # "0 orders planned" and never placed the SELL. See
         # ``_augment_orphan_deals`` for the full mechanism.
+        #
+        # 4d. REFRESH STALE RECOMMENDATIONS (2026-10-29, VOS incident).
+        # Our cached ``lastRecomment`` for a tracked deal is written
+        # once and never refreshed unless the deal reappears in a fresh
+        # holding/suggest response. For VOS that meant acting on the
+        # 22/10 entry card ("Khuyến nghị đầu tư") for seven days after
+        # autofin had moved the deal to "⚠️ Hạ tỷ trọng lần 2" — and
+        # the bot opened a NEW VOS position on 2026-10-29 because of
+        # it. This refreshes any tracked deal whose cached text has
+        # gone stale. Runs BEFORE the orphan augmentation so both the
+        # entry gate and the partial-close path see fresh text.
+        try:
+            refresh_report = self._refresh_stale_deal_recomments(
+                client, holding, signals, raw_payloads,
+            )
+        except Exception as exc:
+            print(
+                f"[autofin_signal] stale recomment refresh failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            refresh_report = {"refreshed": [], "skipped_fresh": [],
+                              "failed": [{"error": str(exc)[:200]}]}
         self._augment_orphan_deals(client, holding)
         # 5. fetch our current DNSE positions for sizing
         try:
@@ -3961,6 +4505,43 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "reason": r["reason"],
             } for i, r in enumerate(all_orders)],
         }, indent=2, ensure_ascii=False))
+
+        # 11b. SNAPSHOT THE RAW AUTOFIN PAYLOADS + THE DECISION (2026-10-29).
+        #
+        # The user asked: "everytime we do a decision, let snapshot the
+        # response from autofin and log that so that we can track later
+        # if the error is from us or from autofin".
+        #
+        # The raw bundle holds every autofin response this cycle used.
+        # The summary holds what WE decided and why, including the
+        # recommendation kind we derived from autofin's text. Comparing
+        # the two after an incident answers "was autofin wrong, or did
+        # we misread autofin?".
+        snapshot_summary = self._build_decision_summary(
+            raw_payloads=raw_payloads,
+            holding=holding,
+            signals=signals,
+            closing=closing,
+            risk=risk,
+            refresh_report=refresh_report,
+            all_orders=all_orders,
+            new_orders=new_orders,
+            partial_orders=partial_orders,
+            close_orders=close_orders,
+            deals_actioned=deals_actioned,
+            our_deals=self._our_deals,
+            positions=positions,
+            nav=nav,
+            account=account,
+            trade_date=today,
+            allow_new_entries=allow_new_entries,
+            new_entry_top_n=new_entry_top_n,
+            current_prices=current_prices,
+        )
+        self._write_decision_snapshot(
+            config.dataDir, raw_payloads, snapshot_summary,
+        )
+        self._log_decision_summary(snapshot_summary)
 
         # 12. send per-order Telegram notifications for any newly-detected
         # action since the last cycle. The EOD summary will still bundle

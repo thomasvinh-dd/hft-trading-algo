@@ -415,9 +415,19 @@ def classify_recomment(rec_text: str) -> str:
          capital_protect.
       3. If text contains "Chốt lãi" (with the 💰 icon, even without
          "bảo toàn vốn") → tp.
-      4. If text contains "Hạ " + "%" + "tỉ trọng" → reduce.
+      4. If text contains "Hạ" AND "tỉ trọng"/"tỷ trọng" → reduce.
       5. If text contains "khuyến nghị" (case-insensitive) → entry.
       6. Otherwise → unknown (be conservative: not an entry).
+
+    2026-10-29 (VOS incident): autofin publishes TWO spellings of the
+    reduce headline —
+        "⚠️ Hạ 50 % tỉ trọng lần 1"   (with the percentage)
+        "⚠️ Hạ tỷ trọng lần 2"       (WITHOUT the percentage)
+    The second form was classified as ``unknown`` because the old rule
+    required a literal "%" between "hạ" and "tỉ trọng". The VOS deal's
+    headline used exactly that form, so the bot never saw it as a
+    reduce signal. The rule now matches on the "hạ" + "tỉ trọng"
+    pair alone and accepts both spellings of "tỷ trọng".
     """
     if not rec_text:
         return RECOMMENT_KIND_UNKNOWN
@@ -433,8 +443,10 @@ def classify_recomment(rec_text: str) -> str:
     if "chốt lãi" in text or "💰" in rec_text:
         if "chốt lãi" in text or "💰" in rec_text:
             return RECOMMENT_KIND_TP
-    # 4. Reduce ("⚠️ Hạ X % tỉ trọng lần N")
-    if "hạ" in text and "tỉ trọng" in text:
+    # 4. Reduce ("⚠️ Hạ X % tỉ trọng lần N" / "⚠️ Hạ tỷ trọng lần N")
+    #    Both the "tỉ trọng" and "tỷ trọng" spellings occur in
+    #    autofin's headlines, and the percentage is optional.
+    if "hạ" in text and ("tỉ trọng" in text or "tỷ trọng" in text):
         return RECOMMENT_KIND_REDUCE
     # 5. Fresh entry ("Khuyến nghị đầu tư" / "Ngày khuyến nghị: ...")
     if "khuyến nghị" in text:
