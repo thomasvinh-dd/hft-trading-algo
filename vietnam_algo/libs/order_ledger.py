@@ -94,6 +94,26 @@ class LedgerOrder:
     # order). Kept alongside ``orderCategory`` so a stop order's
     # parameters survive a ledger round-trip.
     stopPrice: int = 0
+    # 2026-10-29: which strategy owns this order.
+    #
+    # The autofin and momentum bots share ONE ledger file
+    # (``data/live/order_ledger.json``) because they share a DNSE
+    # account. Without an owner tag, each bot's order monitor picks
+    # up the OTHER bot's orders and notifies its own Telegram chat.
+    #
+    # On 2026-10-29 the momentum bot (chat 6761941695) sent
+    # "✅ Vietnam Algo: order VOS → FILLED" for the autofin bot's
+    # VOS BUY (dnseOrderId 20321) — a VOS order the momentum strategy
+    # never placed.
+    #
+    # The order monitor now filters on this field, so each bot only
+    # reports (and re-prices) its own orders.
+    #
+    # Empty string = unknown owner (legacy rows written before this
+    # field existed). Those are treated as belonging to EVERY bot, so
+    # pre-existing orders keep being monitored rather than silently
+    # going unmonitored. New rows always carry an explicit owner.
+    strategy: str = ""
 
 
 def ledger_path(data_dir: Path = DEFAULT_DATA_DIR) -> Path:
@@ -133,14 +153,13 @@ def load_ledger(data_dir: Path = DEFAULT_DATA_DIR) -> dict[str, LedgerOrder]:
                 repriceCount=int(row.get("repriceCount") or 0),
                 lastRepricedAt=str(row.get("lastRepricedAt") or ""),
                 originalPrice=int(row.get("originalPrice") or 0) or int(row.get("price") or 0),
-                # 2026-10-28: restore the DNSE order class + trigger
-                # level. Without this every row reloads as
-                # ``orderCategory="NORMAL"`` / ``stopPrice=0``, so a
-                # resting STOP would be polled as a NORMAL order (and
-                # could not be resolved by the broker) and the
-                # re-pricer would treat it as an ordinary limit order.
-                orderCategory=str(row.get("orderCategory") or "NORMAL").upper(),
+                # 2026-10-28: DNSE conditional-stop fields (kept in
+                # sync with ``LedgerOrder``).
+                orderCategory=str(row.get("orderCategory") or "NORMAL"),
                 stopPrice=int(row.get("stopPrice") or 0),
+                # 2026-10-29: which strategy owns this order. Empty
+                # = legacy row, monitored by every bot.
+                strategy=str(row.get("strategy") or ""),
             )
         except (TypeError, ValueError):
             continue

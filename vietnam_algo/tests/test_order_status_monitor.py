@@ -108,7 +108,9 @@ class _StubClient:
             self._by_id = {}
         self.calls: list[tuple[str, str | None]] = []
 
-    def order_detail(self, account_no: str, order_id: str | int, trading_token: str | None = None, order_category: str = "NORMAL"):
+    def order_detail(self, account_no: str, order_id: str | int,
+                      trading_token: str | None = None,
+                      order_category: str = "NORMAL"):
         self.calls.append((str(order_id), trading_token))
         if hasattr(self, "_raise") and self._raise:
             raise self._raise
@@ -191,7 +193,11 @@ def test_monitor_no_orders_returns_empty_summary(tmp_path, notify_spy) -> None:
     client = _StubClient([])
     summary = _monitor_order_statuses(client, "A", "tok", tmp_path)
     assert summary == {
-        "polled": 0, "skipped_throttle": 0, "changes": [],
+        "polled": 0, "skipped_throttle": 0,
+        # 2026-10-29: orders skipped because they belong to another
+        # strategy's bot.
+        "skipped_other_strategy": 0,
+        "changes": [],
         "errors": [], "terminal_transitions": 0,
         "repriced": [], "abandoned": [],
         "force_replan": False, "force_replan_symbols": [],
@@ -320,7 +326,8 @@ def test_monitor_api_error_records_on_ledger_does_not_crash(tmp_path, notify_spy
     ])
 
     class _SelectiveClient(_StubClient):
-        def order_detail(self, account_no, order_id, trading_token=None, order_category="NORMAL"):
+        def order_detail(self, account_no, order_id, trading_token=None,
+                          order_category="NORMAL"):
             if order_id == "1":
                 raise RuntimeError("connection reset")
             return _detail("filled", id=order_id, filledQuantity=100)

@@ -166,12 +166,14 @@ class _StubLedger:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def __call__(self, *, client, account_no, trading_token, orders, data_dir, run_id):
+    def __call__(self, *, client, account_no, trading_token, orders, data_dir,
+                 run_id, strategy: str = ""):
         from vietnam_algo.libs.trading_engine import DnseOrder
         self.calls.append(
             dict(
                 client=client, account_no=account_no, trading_token=trading_token,
                 orders=list(orders), data_dir=data_dir, run_id=run_id,
+                strategy=strategy,
             )
         )
         return [
