@@ -335,17 +335,43 @@ class DataReadyGateRegressionTests(unittest.TestCase):
     def test_start_of_day_wait_does_not_skip_sleep(self) -> None:
         """The data-ready wait print must not bypass the main-loop sleep.
 
-        We invoke ``run_auto_bot`` with NO sentinel at all (the only
-        case where the SOD wait fires after the 2026-09-23 fix —
-        stale-but-existing sentinels now proceed immediately).
-        ``sleep_seconds=1`` and a TradingSchedule that forces
-        start-of-day to fire on every iteration. After one pass,
-        the bot must (a) have printed the wait message at most once,
-        and (b) the elapsed wall-clock must be >= sleep_seconds — the
-        time.sleep at the TOP of the loop must have run.
+        2026-10-25: this test was rewritten because it could not
+        actually observe the behaviour it claimed to pin, and it was
+        flaky (failed ~7 of 10 runs in isolation).  Three defects:
+
+        1. ``EngineConfig.syncData`` defaults to True, and the
+           data-ready gate is guarded by
+           ``if not engine_config.syncData and not live_submit`` — so
+           with the default the gate was BYPASSED and the wait print
+           NEVER happened.  The ``wait_count <= 2`` assertion was
+           therefore vacuous.
+        2. ``run_auto_bot`` deliberately skips the sleep on the first
+           iteration (``first_iter``) and ``once=True`` returns after
+           one pass, so the sleep never ran at all.  The
+           ``elapsed >= 0.95`` assertion only passed when incidental
+           work (the market-holiday network sync) happened to be slow
+           — hence the flake.
+        3. The SOD block is weekend/holiday gated, so on a Saturday or
+           Sunday the block was never entered and the test measured
+           nothing.
+
+        The rewritten test removes all three sources of
+        non-determinism: it forces the schedule gates, engages the
+        data-ready gate via ``syncData=False``, stubs out the network
+        sync, and replaces the wall-clock assertion with a *count* of
+        ``time.sleep`` calls via a stubbed sleep.
+
+        The invariant under test is the one from the 2026-09-17 and
+        2026-09-23 incidents: the wait print must be emitted at most
+        once per loop iteration, and every iteration must be paced by
+        the sleep.  Before the 2026-09-23 fix the ``continue`` in the
+        gate jumped over the bottom-of-loop sleep, so the bot printed
+        the wait message thousands of times per second until the log
+        filled the disk.
         """
         import os
-        import time
+        import time as _time
+        from unittest import mock
 
         # Ensure no sentinel exists — this is the only case that
         # triggers the SOD wait post-2026-09-23.
@@ -367,14 +393,16 @@ class DataReadyGateRegressionTests(unittest.TestCase):
         import datetime as _dt
         from vietnam_algo.libs.config import StrategyConfig
         from vietnam_algo.libs.daily_engine import EngineConfig
-        from vietnam_algo.bots.runner import run_auto_bot
-        from vietnam_algo.algos.momentum import MomentumRotationAdapter
+        from vietnam_algo.bots import runner as _runner
         from vietnam_algo.libs.schedule import TradingSchedule
 
         config = EngineConfig(
             dataDir=self.tmp, strategy="momentum",
             updateSymbols=False, updatePrices=False,
             liveDirName="live",
+            # syncData=False is what ENGAGES the data-ready gate.
+            # With the default True the gate is skipped entirely.
+            syncData=False,
         )
         # Force the schedule to fire start-of-day every iteration.
         schedule = TradingSchedule(
@@ -383,64 +411,126 @@ class DataReadyGateRegressionTests(unittest.TestCase):
             heartbeatTime=_dt.time(0, 0),
         )
 
+        # --- deterministic stubs -------------------------------------
+        class _StopLoop(BaseException):
+            """Break out of the bot's infinite main loop."""
+
+        sleep_calls: list = []
+
+        class _TimeShim:
+            """``time`` proxy whose sleep() records the call and stops
+            the loop after a bounded number of iterations."""
+
+            def __init__(self, real, calls):
+                self._real = real
+                self._calls = calls
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def sleep(self, seconds):
+                self._calls.append(seconds)
+                if len(self._calls) >= 2:
+                    raise _StopLoop()
+
+        max_sleeps = 2
+
         # Capture stdout to count wait prints.
         import io
         import contextlib
+        import threading
         buf = io.StringIO()
         # Inject our temp dataDir so the gate checks our stale sentinel.
         cwd = os.getcwd()
         os.chdir(self.tmp)
+        worker_error: list = []
         try:
-            with contextlib.redirect_stdout(buf):
-                t0 = time.monotonic()
-                try:
-                    # Run with sleep_seconds=1 and once=True so the test
-                    # terminates after one iteration. We assert the
-                    # elapsed time is >= sleep_seconds (i.e. the sleep
-                    # actually ran).
-                    run_auto_bot(
-                        engine_config=config,
-                        strategy_config=StrategyConfig(),
-                        client=None,
-                        account_no="0003937868",
-                        loan_package_id=1775,
-                        live_submit=False,
-                        once=True,
-                        sleep_seconds=1,
-                        schedule=schedule,
-                        strategy_name="momentum",
+            with contextlib.redirect_stdout(buf), mock.patch.multiple(
+                _runner,
+                # Force the SOD block to run regardless of weekday /
+                # holiday, and keep every other cycle out of the way.
+                should_run_start_of_day=mock.Mock(return_value=True),
+                should_submit_orders=mock.Mock(return_value=False),
+                should_poll_strategy=mock.Mock(return_value=False),
+                should_run_eod=mock.Mock(return_value=False),
+                should_send_heartbeat=mock.Mock(return_value=False),
+                should_sync_corporate_actions=mock.Mock(return_value=False),
+                # Avoid the market-holiday network sync (it is slow and
+                # made the old wall-clock assertion flaky).
+                should_sync_market_holidays=mock.Mock(return_value=False),
+                # Stub the sleep so the test is fast and the assertion
+                # can count sleep calls instead of measuring wall time.
+                time=_TimeShim(_time, sleep_calls),
+            ):
+                # The data-ready gate does ``continue``, which means
+                # ``once=True`` never reaches its ``return`` — the loop
+                # only ends when the stubbed sleep raises.  Run it in a
+                # thread so a regression that BYPASSES the sleep (the
+                # 2026-09-17/23 runaway-loop bug) shows up as a hang
+                # instead of freezing the test run.
+                def _drive() -> None:
+                    try:
+                        _runner.run_auto_bot(
+                            engine_config=config,
+                            strategy_config=StrategyConfig(),
+                            client=None,
+                            account_no="0003937868",
+                            loan_package_id=1775,
+                            live_submit=False,
+                            once=True,
+                            sleep_seconds=1,
+                            schedule=schedule,
+                            strategy_name="momentum",
+                        )
+                    except BaseException as exc:  # noqa: BLE001
+                        worker_error.append(exc)
+
+                thread = threading.Thread(target=_drive, daemon=True)
+                thread.start()
+                thread.join(timeout=20)
+                if thread.is_alive():
+                    self.fail(
+                        "The bot loop never terminated — the data-ready "
+                        "gate bypassed the main-loop sleep (the 2026-09-17 "
+                        f"runaway-loop bug). Output: {buf.getvalue()[:1000]!r}"
                     )
-                except Exception:
-                    # The bot may raise at the end (e.g. notify() needs
-                    # a real TELEGRAM_BOT_TOKEN). We don't care — we
-                    # only care about the elapsed time and the wait
-                    # print count, both of which are independent of
-                    # whether the inner work succeeded.
-                    pass
-                elapsed = time.monotonic() - t0
         finally:
             os.chdir(cwd)
 
         out = buf.getvalue()
         wait_count = out.count("waiting for data-sync owner")
-        # Regression: the bug printed the wait message thousands of
-        # times per second. After the fix, exactly 1 print per loop
-        # pass — i.e. once for the single iteration run_auto_bot did
-        # in ``once=True`` mode (plus possibly a second from the EOD
-        # gate, since EOD uses the same sentinel — both gates are
-        # checked once each per pass).
-        self.assertLessEqual(
-            wait_count, 2,
-            f"Wait print fired {wait_count} times in a single "
-            f"iteration — this is the runaway-loop bug. Output: {out[:1000]!r}",
-        )
-        # And the sleep at the bottom of the loop must have run —
-        # we asked for sleep_seconds=1 and the elapsed time must be
-        # at least 1 second.
+
+        # The gate MUST have been reached, otherwise this test proves
+        # nothing (that was defect #1).
         self.assertGreaterEqual(
-            elapsed, 0.95,
-            f"Loop iteration took only {elapsed:.2f}s for sleep_seconds=1 "
-            f"— the main-loop sleep was bypassed. Output: {out[:500]!r}",
+            wait_count, 1,
+            f"The data-ready gate never fired — the test would be "
+            f"vacuous. Output: {out[:1000]!r}",
+        )
+        # The loop must have been paced by the sleep: the stub stops the
+        # loop after exactly ``max_sleeps`` sleeps, so reaching that
+        # count proves the sleep is what terminates each iteration.
+        self.assertEqual(
+            len(sleep_calls), max_sleeps,
+            f"Expected exactly {max_sleeps} sleep calls before the stub "
+            f"stopped the loop, got {len(sleep_calls)} — the loop was "
+            f"not paced by the sleep. Output: {out[:1000]!r}",
+        )
+        self.assertTrue(
+            all(s == 1 for s in sleep_calls),
+            f"The loop must sleep for the configured sleep_seconds=1, "
+            f"got {sleep_calls!r}",
+        )
+        # Regression: the bug printed the wait message thousands of
+        # times per second. The wait print may appear at most once per
+        # loop iteration, and iterations are paced by the sleep — so it
+        # can never exceed the number of sleeps plus the first
+        # (unslept) iteration.
+        self.assertLessEqual(
+            wait_count, len(sleep_calls) + 1,
+            f"Wait print fired {wait_count} times across only "
+            f"{len(sleep_calls)} sleeps — this is the runaway-loop bug. "
+            f"Output: {out[:1000]!r}",
         )
 
     def test_sentinel_stamp_payload_is_valid_utc_iso(self) -> None:

@@ -235,6 +235,61 @@ def order_failures_message(submit_results: list[Any], trade_date: str | None = N
     return "\n".join(lines)
 
 
+def rejected_orders_message(
+    submit_result: dict[str, Any] | None,
+    trade_date: str | None = None,
+    label: str = "autofin",
+) -> str | None:
+    """Build a Telegram message for orders DNSE DECLINED (HTTP 4xx).
+
+    Issue A (2026-10-27): the submit path counted ``rejected`` but no
+    caller ever read the counter, so a declined order produced NO
+    Telegram output at all. Live-confirmed 2026-10-26: a filled BUY
+    whose paired stop-loss was rejected was reported as "1 submitted"
+    with no mention of the rejection — the position was left
+    unprotected and the operator had no way to know.
+
+    Returns None when nothing was declined (so the caller can skip
+    notify()).
+    """
+    if not isinstance(submit_result, dict):
+        return None
+    details = submit_result.get("rejected_details") or []
+    rejected = int(submit_result.get("rejected", 0) or 0)
+    token_rejected = int(submit_result.get("token_rejected", 0) or 0)
+    if not details and rejected <= 0 and token_rejected <= 0:
+        return None
+    lines = ["🚨 Vietnam Algo: ORDERS REJECTED BY DNSE", f"scope: {label}"]
+    if trade_date:
+        lines.append(f"date: {trade_date}")
+    lines.append(
+        f"rejected: {rejected}  tokenRejected: {token_rejected}  "
+        f"of {submit_result.get('total', 0)} planned"
+    )
+    for d in details[:10]:
+        if not isinstance(d, dict):
+            continue
+        leg = d.get("kind") or "order"
+        parts = [f"  - {d.get('symbol', '?')}"]
+        if leg:
+            parts.append(f"[{leg}]")
+        parts.append(f"{d.get('side', '')} qty={d.get('quantity', 0)}")
+        if d.get("price"):
+            parts.append(f"price={d.get('price'):,}")
+        lines.append(" ".join(str(p) for p in parts))
+        err = str(d.get("error", "") or "").split("\n")[0]
+        if err:
+            lines.append(f"    err: {err[:200]}")
+    if len(details) > 10:
+        lines.append(f"  + {len(details) - 10} more")
+    if any((d.get("kind") or "") in ("sl", "tp") for d in details if isinstance(d, dict)):
+        lines.append(
+            "⚠️ a stop-loss leg was declined — the position may be UNPROTECTED. "
+            "Check data/live/order_ledger.json."
+        )
+    return "\n".join(lines)
+
+
 def risk_block_message(result: dict[str, Any]) -> str:
     """Notify when the live-risk gate rejected a submit cycle."""
     violations = result.get("riskViolations", []) or []
@@ -975,13 +1030,38 @@ def force_run_summary_message(
         submitted = submit_result.get("submitted", [])
         skipped = submit_result.get("skipped_existing", 0)
         unknown = submit_result.get("unknown", 0)
+        rejected = submit_result.get("rejected", 0)
+        token_rejected = submit_result.get("token_rejected", 0)
         total = submit_result.get("total", 0)
-        icon = "✅" if unknown == 0 and len(submitted) > 0 else "🟡" if unknown == 0 else "🚨"
+        # 2026-10-27 (issue A): a declined order used to be invisible
+        # here too — the summary showed "1/2 submitted" with no hint
+        # that the other order was REFUSED.
+        icon = "✅" if unknown == 0 and rejected == 0 and token_rejected == 0 and len(submitted) > 0 \
+            else "🟡" if unknown == 0 and rejected == 0 and token_rejected == 0 \
+            else "🚨"
         lines.append(f"{icon} submit: {len(submitted)}/{total} submitted, "
-                     f"{skipped} skipped-existing, {unknown} unknown")
+                     f"{skipped} skipped-existing, {unknown} unknown, "
+                     f"{rejected} rejected, {token_rejected} token-rejected")
         if submitted:
             lines.append(f"  dnseOrderIds: {','.join(str(x) for x in submitted[:10])}"
                          + (f" +{len(submitted) - 10} more" if len(submitted) > 10 else ""))
+        rejected_details = submit_result.get("rejected_details") or []
+        if rejected_details:
+            lines.append("  REJECTED BY DNSE:")
+            for d in rejected_details[:10]:
+                if not isinstance(d, dict):
+                    continue
+                leg = d.get("kind") or ""
+                err = str(d.get("error", "") or "").split("\n")[0]
+                lines.append(
+                    f"    - {d.get('symbol', '?')}{' [' + leg + ']' if leg else ''} "
+                    f"{d.get('side', '')} qty={d.get('quantity', 0)} "
+                    f"price={d.get('price', 0):,}".rstrip()
+                )
+                if err:
+                    lines.append(f"      err: {err[:200]}")
+            if len(rejected_details) > 10:
+                lines.append(f"    ... and {len(rejected_details) - 10} more")
         if submit_result.get("out_of_zone"):
             lines.append(f"  out_of_zone: {len(submit_result['out_of_zone'])} (live-quote gate)")
         if submit_result.get("skipped_off_hours"):

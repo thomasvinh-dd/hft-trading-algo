@@ -80,7 +80,19 @@ def _client() -> MagicMock:
 
 
 def test_auction_sl_is_retried_at_the_recovered_price(tmp_path) -> None:
-    """The retry must place the limit SL at 14,400, not at 0."""
+    """The retry must place the stop at the recovered level 14,400, not 0.
+
+    2026-10-28 update: the retry now places a NATIVE DNSE conditional
+    (STOP) order rather than a plain limit sell — a plain sell LO at
+    the stop level is marketable and liquidates the position instead
+    of protecting it (the ORS incident: LO @ 14,400 crossed against a
+    15,150 bid and filled 200 shares instantly).
+
+    So the recovered level is the TRIGGER (``stop_price``), and the
+    ``price`` field is the limit of the NORMAL sell that DNSE
+    generates once the trigger fires — set just below the trigger so
+    it crosses the book at that moment.
+    """
     _seed_auction_sl(tmp_path)
     client = _client()
     submitted: list[dict] = []
@@ -99,9 +111,18 @@ def test_auction_sl_is_retried_at_the_recovered_price(tmp_path) -> None:
     assert summary["resubmit_errors"] == [], summary["resubmit_errors"]
 
     assert len(submitted) == 1
-    assert submitted[0]["price"] == 14400, (
-        f"the SL must be placed at the recovered price 14400, got "
+    assert submitted[0]["order_category"] == "STOP", submitted[0]
+    assert submitted[0]["stop_price"] == 14400, (
+        f"the stop must be triggered at the recovered level 14400, got "
+        f"{submitted[0]['stop_price']}"
+    )
+    assert submitted[0]["price"] > 0, (
+        f"the generated NORMAL sell needs a real limit (> 0), got "
         f"{submitted[0]['price']}"
+    )
+    assert submitted[0]["price"] <= 14400, (
+        f"the generated limit must sit at/below the trigger so it "
+        f"crosses when the stop fires: {submitted[0]['price']}"
     )
     assert submitted[0]["order_type"] == "LO"
     assert submitted[0]["symbol"] == "ORS"

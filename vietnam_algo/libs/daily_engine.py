@@ -508,9 +508,33 @@ def execute_orders_with_ledger(
                 price=float(payload["price"]),
                 loan_package_id=int(payload["loanPackageId"]),
                 order_type=str(payload["orderType"]),
+                # 2026-10-28: native DNSE conditional (STOP) order
+                # fields. A protective stop-loss must be submitted as a
+                # conditional order that rests at the broker, NOT as a
+                # plain limit sell — a limit sell at the stop level is
+                # marketable whenever the market is above it (the
+                # 2026-10-28 ORS incident: an LO @ 14,400 against a
+                # 15,150 bid filled instantly, liquidating 200
+                # shares instead of protecting them).
+                #
+                # Only passed when the order actually IS a stop; a
+                # normal order leaves the defaults in place.
+                order_category=str(
+                    payload.get("orderCategory") or "NORMAL"
+                ).upper(),
+                stop_price=payload.get("stopPrice") or None,
+                condition_operator=payload.get("conditionOperator") or None,
+                duration_type=payload.get("durationType") or None,
+                duration_date_time=payload.get("durationDateTime") or None,
             )
             order_id = dnse_order_id(response)
-            detail = client.order_detail(account_no, order_id, trading_token=trading_token) if order_id else response
+            detail = client.order_detail(
+                account_no, order_id, trading_token=trading_token,
+                # A STOP order must be resolved with its own category.
+                order_category=str(
+                    payload.get("orderCategory") or "NORMAL"
+                ).upper(),
+            ) if order_id else response
             status = normalize_ledger_status(order_status_from_detail(detail)) if order_id else "unknown"
             ledger[key] = LedgerOrder(**{**ledger[key].__dict__, "status": status, "dnseOrderId": order_id, "updatedAt": utc_now(), "lastDetail": detail})
             results.append({"status": "submitted", "order": payload, "response": response, "detail": detail})
