@@ -4705,6 +4705,50 @@ class AutofinSignalAdapter(StrategyAdapter):
         # 10. Update our persistent state. Note: decide_orders() returns
         # a deep-copied new_our_deals; we copy it back into our adapter's
         # state so subsequent calls see the new positions.
+        #
+        # 2026-10-30 (VOS incident): a DRY-RUN cycle must NOT consume
+        # the "already fired" markers. ``decide_orders`` records
+        # ``_last_recomment`` / ``_last_numberOfProfit`` on the deal
+        # the moment it PLANS a partial close. In a dry run nothing is
+        # ever submitted, so persisting the marker would silently
+        # swallow the real trim on the next LIVE cycle — the position
+        # would never be trimmed even though the reduce was seen.
+        #
+        # We therefore restore the pre-cycle markers for every planned
+        # partial close when ``live_submit`` is False. (In live mode
+        # the runner re-arms them again if the submit does not reach
+        # DNSE — see ``rearm_unsubmitted_actions``.)
+        if not live_submit:
+            restored = 0
+            # Collect the deal ids whose partial close was PLANNED
+            # this cycle. Matching on the deal id (not on "any order
+            # is a partial") keeps this to the deals that actually
+            # fired.
+            planned_dids: set[str] = set()
+            for o in all_orders:
+                reason = str(o.get("reason") or "")
+                if not (
+                    reason.startswith("autofin_partial:deal#")
+                    or "autofin_partial_event:" in reason
+                ):
+                    continue
+                _did = _extract_deal_id(reason)
+                if _did:
+                    planned_dids.add(_did)
+            for did in planned_dids:
+                sig = new_our_deals.get(did)
+                if sig is None:
+                    continue
+                sig.pop("_last_recomment", None)
+                sig.pop("_last_numberOfProfit", None)
+                sig.pop("_last_partial_fraction", None)
+                restored += 1
+            if restored:
+                print(
+                    f"[autofin_signal] dry-run: restored the action "
+                    f"markers for {restored} planned partial close(s) so "
+                    f"the live cycle still acts on them"
+                )
         self._our_deals = new_our_deals
         new_orders = [o for o in all_orders if o.get("side") == "NB" and "tp:" not in o.get("reason", "") and "sl:" not in o.get("reason", "")]
         partial_orders = [
