@@ -3419,6 +3419,68 @@ class AutofinSignalAdapter(StrategyAdapter):
 
         return new_orders
 
+    def rearm_unsubmitted_actions(
+        self,
+        deals_actioned: list[dict[str, Any]],
+        submitted_symbols: set[str],
+    ) -> list[str]:
+        """Re-arm the action markers for partial closes that were NOT
+        submitted, so they fire again on the next cycle.
+
+        2026-10-30 (VOS incident): ``_plan_partial_close_orders`` records
+        ``_last_recomment`` / ``_last_numberOfProfit`` on the deal the
+        moment it PLANS the order — before the runner has submitted it
+        to DNSE. If the submit then fails (off-hours, token rejected,
+        DNSE rejection), the marker says "already fired" and the trim
+        is never retried. The position stays un-trimmed forever.
+
+        That is exactly what happened to VOS: the reduce was planned
+        at 23:13 ICT (off-hours), the submit was skipped, and the
+        marker was written anyway — so on the next trading session the
+        bot would have seen "already fired" and skipped the trim.
+
+        The runner calls this after the submit and passes the set of
+        symbols that actually reached DNSE. For every planned partial
+        close whose symbol is not in that set, the marker is rolled
+        back so the next cycle plans it again.
+
+        Returns the list of re-armed symbols (for the log).
+        """
+        rearmed: list[str] = []
+        for deal in deals_actioned or []:
+            sym = str(deal.get("symbol") or "").strip().upper()
+            if not sym or sym in submitted_symbols:
+                continue
+            did = str(deal.get("deal_id") or "")
+            sig = self._our_deals.get(did)
+            if sig is None:
+                continue
+            # Only re-arm partial closes — a planned BUY or full close
+            # is re-planned by its own path (the actioned-deals /
+            # ledger dedup), and re-arming those could double-buy.
+            orders = deal.get("dnse_orders") or []
+            kinds = {str(o.get("kind") or "") for o in orders}
+            reasons = " ".join(str(o.get("reason") or "") for o in orders)
+            is_partial = (
+                kinds & {"partial_close", "close_event"}
+                or "autofin_partial" in reasons
+                or "autofin_partial_event" in reasons
+            )
+            if not is_partial:
+                continue
+            # Roll the marker back to "never fired" so the next cycle
+            # plans the same step again.
+            sig.pop("_last_recomment", None)
+            sig.pop("_last_numberOfProfit", None)
+            sig.pop("_last_partial_fraction", None)
+            rearmed.append(sym)
+            print(
+                f"[autofin_signal] re-armed {sym} ({did}): the partial "
+                f"close was planned but NOT submitted — it will be "
+                f"planned again on the next cycle"
+            )
+        return rearmed
+
     def _notify_new_orders(self, deals_actioned: list[dict[str, Any]]) -> None:
         """Send a short Telegram message for any deal-actioned entry that
         hasn't been notified yet. Updates ``self._notified_order_keys`` so

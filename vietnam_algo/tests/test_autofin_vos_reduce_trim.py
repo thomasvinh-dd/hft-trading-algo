@@ -203,6 +203,112 @@ def test_a_new_lap_still_fires() -> None:
 
 
 # -----------------------------------------------------------------------------
+# Re-arming an action that was planned but NOT submitted
+# -----------------------------------------------------------------------------
+
+def _adapter(state: dict):
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    a = AutofinSignalAdapter.__new__(AutofinSignalAdapter)
+    a._our_deals = state
+    a._notified_order_keys = set()
+    a._notified_event_ids = set()
+    a._actioned_deals = set()
+    return a
+
+
+def _vos_deal_actioned() -> dict:
+    """The ``deals_actioned`` row the runner gets back from planning."""
+    return {
+        "action": "partial_close",
+        "symbol": "VOS",
+        "deal_id": "1792627200:VOS",
+        "lastRecomment": SHORT,
+        "dnse_orders": [{
+            "symbol": "VOS", "side": "NS", "price": 11100.0,
+            "quantity": 200, "kind": "partial_close",
+            "reason": "autofin_partial:deal#1792627200:VOS:reduce_lap:"
+                      "lap2:pct50:[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 ...",
+        }],
+    }
+
+
+def test_rearm_when_the_partial_close_was_not_submitted() -> None:
+    """A planned-but-not-submitted partial close must be re-armed.
+
+    Without this the "already fired" marker swallows the trim forever
+    (2026-10-30, the VOS reduce).
+    """
+    state = {
+        "1792627200:VOS": {
+            "symbol": "VOS",
+            "lastRecomment": SHORT,
+            "_our_qty": 100,
+            "_last_numberOfProfit": 0,
+            "_last_recomment": FULL,
+            "_last_partial_fraction": 0.5,
+        },
+    }
+    adapter = _adapter(state)
+    rearmed = adapter.rearm_unsubmitted_actions(
+        [_vos_deal_actioned()], set(),   # nothing was submitted
+    )
+    assert rearmed == ["VOS"], rearmed
+    sig = state["1792627200:VOS"]
+    assert "_last_recomment" not in sig
+    assert "_last_numberOfProfit" not in sig
+    assert "_last_partial_fraction" not in sig
+
+
+def test_rearm_does_nothing_when_the_order_was_submitted() -> None:
+    """A partial close that reached DNSE keeps its fired marker."""
+    state = {
+        "1792627200:VOS": {
+            "symbol": "VOS",
+            "lastRecomment": SHORT,
+            "_our_qty": 100,
+            "_last_numberOfProfit": 0,
+            "_last_recomment": FULL,
+            "_last_partial_fraction": 0.5,
+        },
+    }
+    adapter = _adapter(state)
+    rearmed = adapter.rearm_unsubmitted_actions(
+        [_vos_deal_actioned()], {"VOS"},   # VOS was submitted
+    )
+    assert rearmed == [], rearmed
+    sig = state["1792627200:VOS"]
+    assert sig["_last_recomment"] == FULL
+    assert sig["_last_numberOfProfit"] == 0
+    assert sig["_last_partial_fraction"] == 0.5
+
+
+def test_rearm_does_not_touch_a_planned_buy() -> None:
+    """A planned BUY is re-planned by its own path — re-arming it could
+    double-buy, so the re-arm must ignore it."""
+    state = {
+        "1792627200:VOS": {
+            "symbol": "VOS",
+            "lastRecomment": SHORT,
+            "_our_qty": 0,
+        },
+    }
+    adapter = _adapter(state)
+    buy_deal = {
+        "action": "new_entry",
+        "symbol": "VOS",
+        "deal_id": "1792627200:VOS",
+        "dnse_orders": [{
+            "symbol": "VOS", "side": "NB", "price": 11700,
+            "quantity": 300, "kind": "entry",
+            "reason": "autofin_buy:deal#1792627200:VOS:nav15pct:...",
+        }],
+    }
+    rearmed = adapter.rearm_unsubmitted_actions([buy_deal], set())
+    assert rearmed == [], rearmed
+
+
+# -----------------------------------------------------------------------------
 # Lot rounding
 # -----------------------------------------------------------------------------
 

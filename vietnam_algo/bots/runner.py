@@ -734,7 +734,14 @@ def _submit_autofin_deals_to_dnse(
     from vietnam_algo.libs.trading_engine import DnseOrder
 
     if not deals_actioned:
-        return {"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}
+        # 2026-10-30: nothing reached DNSE.
+        return {
+            "submitted": [],
+            "submitted_symbols": [],
+            "skipped_existing": 0,
+            "unknown": 0,
+            "total": 0,
+        }
 
     # 2026-10-07: filter new_entry deals whose LIVE best-ask has moved
     # out of the supply zone since planning. ``out_of_zone`` collects
@@ -802,6 +809,8 @@ def _submit_autofin_deals_to_dnse(
             # to send a Telegram summary combining submit + out_of_zone.
             return {
                 "submitted": [],
+                # 2026-10-30: nothing reached DNSE.
+                "submitted_symbols": [],
                 "skipped_existing": 0,
                 "unknown": 0,
                 "rejected": 0,
@@ -859,6 +868,8 @@ def _submit_autofin_deals_to_dnse(
         )
         return {
             "submitted": [],
+            # 2026-10-30: nothing reached DNSE.
+            "submitted_symbols": [],
             "skipped_existing": 0,
             "unknown": 0,
             "rejected": 0,
@@ -1139,6 +1150,11 @@ def _submit_autofin_deals_to_dnse(
     print(f"[submit-debug] execute_orders_with_ledger returned {len(results)} results: {[(r.get('status'), _sym(r)) for r in results]}")
 
     submitted_ids: list[str] = []
+    # 2026-10-30 (VOS incident): the SYMBOLS whose orders actually
+    # reached DNSE. The caller uses this to re-arm the action markers
+    # for partial closes that were planned but NOT submitted (off-hours
+    # / token rejection) so they are planned again next cycle.
+    submitted_symbols: list[str] = []
     skipped_existing = 0
     unknown = 0
     rejected = 0
@@ -1218,6 +1234,9 @@ def _submit_autofin_deals_to_dnse(
                     dnse_id = resp.get("id") or resp.get("orderId")
             if dnse_id:
                 submitted_ids.append(str(dnse_id))
+                _s = _detail(r).get("symbol")
+                if _s:
+                    submitted_symbols.append(str(_s).strip().upper())
         elif status == "skipped_existing_ledger":
             skipped_existing += 1
         elif status in ("unknown",):
@@ -1225,6 +1244,8 @@ def _submit_autofin_deals_to_dnse(
 
     return {
         "submitted": submitted_ids,
+        # 2026-10-30: which symbols actually reached DNSE.
+        "submitted_symbols": sorted(set(submitted_symbols)),
         "skipped_existing": skipped_existing,
         "unknown": unknown,
         "rejected": rejected,
@@ -1568,6 +1589,11 @@ def retry_t2_settlement_sl_orders(
         "resubmit_dnse_ids": [],
         "resubmit_errors": [],
         "pkg_lookup_errors": [],
+        # 2026-10-29: deals whose protective STOP is already working
+        # at the broker (skipped) and deals that are only PARTIALLY
+        # protected (topped up). See the duplicate-STOP guard below.
+        "already_protected": [],
+        "partially_protected": [],
     }
 
     # Cache of symbol -> held qty so a position appearing multiple
@@ -1655,6 +1681,45 @@ def retry_t2_settlement_sl_orders(
     except Exception as exc:
         summary["resubmit_errors"].append(f"load_ledger failed: {exc}")
         return summary
+
+    # 2026-10-29 (duplicate-STOP guard): index the protective stops
+    # that already WORK at the broker, keyed by (symbol, deal id).
+    #
+    # The retry's own dedup is a NO-OP across days. The generated
+    # ``sourceOrderId`` hashes ``today_iso``, so tomorrow's pass
+    # computes a DIFFERENT id and the ledger dedup key
+    # (``run_id:sourceOrderId:symbol:side``) never matches the row
+    # written today. The rejected parent SL row stays status=rejected
+    # forever, so it is re-selected on EVERY pass — and without this
+    # guard every day would stack another STOP onto a position that
+    # is already protected.
+    #
+    # Live case (ABB): on 2026-10-29 the retry placed a STOP for
+    # ABB 100 @ 15,930 while the parent row
+    # ``autofin_user_sl:deal#1789344000:ABB:10%:15840`` (500 shares,
+    # status=rejected) stayed scannable. On 2026-10-30 that same
+    # parent row is selected again and would place a duplicate STOP.
+    #
+    # Keyed by DEAL, not just symbol: every autofin SL reason carries
+    # ``deal#<id>:<SYM>``, and two deals in the same symbol are two
+    # different positions that each need their own stop.
+    #
+    # Only CONFIRMED-working statuses count. "unknown" is excluded on
+    # purpose: it means the broker state could not be read, and
+    # skipping on that basis could leave a position unprotected.
+    protected_qty_by_deal: dict[tuple[str, str], int] = {}
+    for _row in ledger.values():
+        if (getattr(_row, "orderCategory", "NORMAL") or "NORMAL").upper() != "STOP":
+            continue
+        if _row.status not in ("submitted", "open", "partial", "prepared", "submitting"):
+            continue
+        _row_did = _extract_deal_id_from_reason(_row.reason or "")
+        if not _row_did:
+            continue
+        _key = (_row.symbol.upper(), _row_did)
+        protected_qty_by_deal[_key] = (
+            protected_qty_by_deal.get(_key, 0) + int(_row.quantity or 0)
+        )
 
     # Index BUY orders by deal_id.
     #
@@ -1824,11 +1889,32 @@ def retry_t2_settlement_sl_orders(
                 continue
         elif held is not None and sl_qty <= 0:
             sl_qty = held
+        # 2026-10-29 (duplicate-STOP guard): this deal may ALREADY have
+        # a protective STOP working at the broker from an earlier retry
+        # pass. The retry's own dedup cannot catch it — the generated
+        # ``sourceOrderId`` hashes ``today_iso``, so it changes every
+        # day and the ledger key never matches yesterday's row.
+        # Without this guard each daily pass would stack another STOP
+        # onto the same position.
+        needed_qty = sl_qty
+        already = protected_qty_by_deal.get((item.symbol.upper(), did), 0)
+        if already > 0:
+            if already >= needed_qty:
+                summary.setdefault("already_protected", []).append(
+                    f"{item.symbol}: {already} share(s) already protected by a "
+                    f"live STOP for this deal — skipping the T+2 retry"
+                )
+                continue
+            summary.setdefault("partially_protected", []).append(
+                f"{item.symbol}: {already} of {needed_qty} share(s) already "
+                f"protected by a live STOP — topping up the remainder"
+            )
+            sl_qty = needed_qty - already
         # The BUY must have actually filled for the SL to be valid.
         # SLs whose BUY expired/cancelled have no shares to sell;
         # re-submitting them would always fail with
         # TRADE_QUANTITY_NOT_ENOUGH.
-        if not _buy_filled_and_matches_sl(buy, sl_qty):
+        if not _buy_filled_and_matches_sl(buy, needed_qty):
             continue
         # T+2.5 cleared AND the BUY actually filled AND we still hold
         # the shares — eligible for retry.
@@ -3617,6 +3703,12 @@ def run_auto_bot(
                             f"resubmitted={t2_summary['resubmitted']} "
                             f"errors={len(t2_summary['resubmit_errors'])}"
                         )
+                    # 2026-10-29: surface the duplicate-STOP guard, so a
+                    # skipped retry is visible instead of silent.
+                    for _note in t2_summary.get("already_protected", []) or []:
+                        print(f"[{now.isoformat()}] t2-sl-retry: {_note}")
+                    for _note in t2_summary.get("partially_protected", []) or []:
+                        print(f"[{now.isoformat()}] t2-sl-retry: {_note}")
                     if t2_summary.get("resubmitted"):
                         notify(
                             "\n".join([
@@ -3793,6 +3885,40 @@ def run_auto_bot(
                                 f"{submit_result.get('token_rejected', 0)} token-rejected "
                                 f"(of {submit_result['total']} planned)"
                             )
+                            # 2026-10-30 (VOS incident): the strategy
+                            # marks a partial close as "fired" when it
+                            # PLANS it, before we know whether it
+                            # reached DNSE. If the submit was skipped
+                            # (off-hours, no token) or rejected, the
+                            # marker would say "already done" and the
+                            # trim would never be retried — leaving the
+                            # position un-trimmed indefinitely.
+                            # Re-arm the actions that did not make it.
+                            try:
+                                _rearm = strategy_adapter.rearm_unsubmitted_actions(
+                                    poll_result.get("deals_actioned") or [],
+                                    set(
+                                        str(s).strip().upper()
+                                        for s in (submit_result.get("submitted_symbols") or [])
+                                    ),
+                                )
+                                if _rearm:
+                                    # Persist the re-armed state so the
+                                    # next cycle sees the action as
+                                    # pending, not done.
+                                    strategy_adapter._save_state(
+                                        engine_config.dataDir
+                                    )
+                                    print(
+                                        f"[{now.isoformat()}] re-armed "
+                                        f"unsubmitted partial closes: "
+                                        f"{', '.join(_rearm)}"
+                                    )
+                            except Exception as exc:
+                                print(
+                                    f"[{now.isoformat()}] re-arm failed: "
+                                    f"{type(exc).__name__}: {str(exc)[:200]}"
+                                )
                             if submit_result["submitted"]:
                                 notify(
                                     "Vietnam Algo: autofin mid-day SUBMITTED to DNSE\n"
@@ -3904,6 +4030,11 @@ def run_auto_bot(
                                     f"stale_no_position={t2_summary.get('stale_no_position', 0)} "
                                     f"errors={len(t2_summary['resubmit_errors'])}"
                                 )
+                            # 2026-10-29: surface the duplicate-STOP guard.
+                            for _note in t2_summary.get("already_protected", []) or []:
+                                print(f"[{now.isoformat()}] t2-sl-retry (mid-day): {_note}")
+                            for _note in t2_summary.get("partially_protected", []) or []:
+                                print(f"[{now.isoformat()}] t2-sl-retry (mid-day): {_note}")
                                 if t2_summary.get("resubmitted"):
                                     notify(
                                         "🔁 Vietnam Algo: T+2 SL retry (mid-day)\n"
@@ -4175,6 +4306,33 @@ def run_auto_bot(
                         f"{submit_result.get('token_rejected', 0)} token-rejected "
                         f"(of {submit_result['total']} planned)"
                     )
+                    # 2026-10-30 (VOS incident): re-arm the partial
+                    # closes that were planned but NOT submitted, so
+                    # they are planned again on the next cycle instead
+                    # of being silently swallowed by the "already
+                    # fired" marker.
+                    try:
+                        _rearm = strategy_adapter.rearm_unsubmitted_actions(
+                            result.get("deals_actioned") or [],
+                            set(
+                                str(s).strip().upper()
+                                for s in (submit_result.get("submitted_symbols") or [])
+                            ),
+                        )
+                        if _rearm:
+                            strategy_adapter._save_state(
+                                engine_config.dataDir
+                            )
+                            print(
+                                f"[{now.isoformat()}] eod re-armed "
+                                f"unsubmitted partial closes: "
+                                f"{', '.join(_rearm)}"
+                            )
+                    except Exception as exc:
+                        print(
+                            f"[{now.isoformat()}] eod re-arm failed: "
+                            f"{type(exc).__name__}: {str(exc)[:200]}"
+                        )
                     if submit_result["submitted"]:
                         notify(
                             "Vietnam Algo: autofin EOD SUBMITTED to DNSE\n"

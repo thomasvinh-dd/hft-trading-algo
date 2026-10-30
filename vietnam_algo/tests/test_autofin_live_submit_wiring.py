@@ -142,7 +142,16 @@ def test_empty_deals_actioned_short_circuits(stub_ledger):
         data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
-    assert result == {"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}
+    # 2026-10-30: the result also carries ``submitted_symbols`` — the
+    # symbols whose orders actually reached DNSE. The caller uses it to
+    # re-arm planned-but-not-submitted partial closes.
+    assert result == {
+        "submitted": [],
+        "submitted_symbols": [],
+        "skipped_existing": 0,
+        "unknown": 0,
+        "total": 0,
+    }
     assert stub_ledger.calls == []
 
 
