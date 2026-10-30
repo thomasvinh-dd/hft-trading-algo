@@ -1421,6 +1421,51 @@ def _parse_percent(s: str) -> float:
     return float(s.replace(",", "").strip() or "0")
 
 
+def _partial_close_step_key(action: "PartialCloseAction") -> str:
+    """A stable identity for a partial-close STEP.
+
+    2026-10-30 (VOS incident): autofin re-publishes the SAME reduce
+    recommendation with an incremented "lần" number as the loss
+    deepens. The VOS deal has TWO such events:
+
+        [VOS] ⚠️ Hạ 50 % tỉ trọng lần 1 Giá: 11,100 - Nắm giữ: 4 ngày Lỗ: -8.68 %
+        [VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 11,100 - Nắm giữ: 4 ngày Lỗ: -9.09 %
+
+    Same price, same 50 % fraction, same holding period — only the
+    loss % differs. It is ONE recommendation re-published, NOT two
+    independent 50 % trims. autofin's own ``numberOfProfit`` is still
+    0 for this deal, which confirms it (a genuine TP lap increments
+    that counter — see HDB, whose numberOfProfit is 2 for its 2 TP
+    laps).
+
+    Acting on the raw TEXT therefore sold the position twice: lap 1
+    sold 200 of 300 shares, lap 2 sold the remaining 100 — a 100 %
+    exit from what autofin asked to be a 50 % trim.
+
+    Genuine TP steps DO stack: each TP lap has a DIFFERENT (higher)
+    target price ("Chốt lãi lần 1 mức giá 22,100" then "lần 2 mức
+    giá 23,400"). So the step identity for a TP includes the price.
+
+    The identity rules:
+      - take_profit_lap → action + PRICE (a new price = a new step)
+      - reduce_lap      → action + FRACTION + PRICE (a re-published
+                          reduce keeps the same fraction and price, so
+                          it is the same step and must not fire again)
+      - capital_protect → action + PRICE
+      - full_close      → action
+    """
+    if action.action == "take_profit_lap":
+        return f"{action.action}@{int(action.price)}"
+    if action.action == "reduce_lap":
+        return (
+            f"{action.action}@{int(round(action.percent))}pct"
+            f"@{int(action.price)}"
+        )
+    if action.action == "capital_protect":
+        return f"{action.action}@{int(action.price)}"
+    return action.action
+
+
 def _parse_partial_close(recomment: str) -> PartialCloseAction:
     """Parse the Vietnamese `lastRecomment` text into a typed action.
 
@@ -1646,21 +1691,39 @@ def _plan_partial_close_orders(
         # is set after each fire (line 1575-1576) so ``last_rec``
         # reflects the most recent FIRED recomment, not the most
         # recent seen recomment.
-        # 2026-10-30 (VOS incident): the dedup key must be the text we
-        # ACTED ON, not the short headline. When the headline is not
-        # actionable we act on the full event text, so the event text
-        # is what must be compared against ``_last_recomment`` —
-        # otherwise the same reduce step would re-fire every cycle
-        # (the headline never changes) or, worse, never fire at all.
+        # 2026-10-30 (VOS incident): the dedup key must identify the
+        # STEP, not the raw text. autofin re-publishes the SAME reduce
+        # recommendation with an incremented "lần" number as the loss
+        # deepens (VOS has "lần 1" and "lần 2" at the SAME price
+        # 11,100 and the SAME 50 %). Keying on the raw text treated
+        # that re-publish as a new step and sold the position twice.
+        #
+        # ``_partial_close_step_key`` collapses a re-published reduce to
+        # the same identity (action + fraction + price) while keeping
+        # genuinely new TP steps distinct (their price differs).
         effective_rec = event_text if event_text else rec
+        step_key = _partial_close_step_key(action)
+        last_step_key = str(sig.get("_last_partial_step_key") or "")
+        if last_step_key:
+            # We have a recorded step identity → compare identities.
+            # This is what stops a re-published reduce ("Hạ 50 % ...
+            # lần 2" after "lần 1", same price, same fraction) from
+            # selling the position a second time.
+            step_changed = step_key != last_step_key
+        else:
+            # Legacy state (no step key recorded): fall back to the
+            # text comparison so an unchanged announcement still does
+            # not re-fire.
+            step_changed = bool(effective_rec) and effective_rec != last_rec
         is_orphan_fresh = bool(h.get("_orphan_injected")) and \
             action.action in (
                 "capital_protect", "take_profit_lap", "reduce_lap",
             ) and \
-            effective_rec != last_rec
+            step_changed
         if last_nP < 0 and not is_orphan_fresh:
             sig["_last_numberOfProfit"] = cur_nP
             sig["_last_recomment"] = effective_rec
+            sig["_last_partial_step_key"] = step_key
             continue
         # Fire when EITHER:
         #   (a) ``numberOfProfit`` incremented (TP1 → TP2 → TP3 steps), OR
@@ -1683,10 +1746,11 @@ def _plan_partial_close_orders(
         #       seen step but the latest fraction differs from the
         #       one we last sold at.
         nP_changed = cur_nP > last_nP
-        # 2026-10-30 (VOS incident): compare the text we ACTED ON. When
-        # the short headline is not actionable we act on the full event
-        # text, so that is the text whose change signals a new step.
-        recomment_changed = bool(effective_rec) and effective_rec != last_rec
+        # 2026-10-30 (VOS incident): a new STEP is what triggers the
+        # fire — not a change in the raw text. A re-published reduce
+        # ("Hạ 50 % ... lần 2" after "lần 1", same price, same
+        # fraction) is the SAME step and must not sell again.
+        recomment_changed = step_changed
         # Orphan-fresh deals: force nP_changed=True so the
         # ``nP_changed or recomment_changed or fraction_changed``
         # gate below is satisfied. The fresh recomment is itself
@@ -1852,8 +1916,12 @@ def _plan_partial_close_orders(
         })
         sig["_last_numberOfProfit"] = cur_nP
         # 2026-10-30 (VOS incident): record the text we ACTED ON so the
-        # next cycle's change-detection compares like with like.
+        # next cycle's change-detection compares like with like, and the
+        # STEP KEY so a re-published reduce (same fraction + price, new
+        # "lần" number) is recognised as the SAME step and does not
+        # sell the position a second time.
         sig["_last_recomment"] = effective_rec
+        sig["_last_partial_step_key"] = step_key
         sig["_our_qty"] = max(0, our_qty - delta)
         # Track the fraction we sold at so the next cycle can detect
         # an autofin-side lag where the recomment text was published
@@ -3473,6 +3541,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             sig.pop("_last_recomment", None)
             sig.pop("_last_numberOfProfit", None)
             sig.pop("_last_partial_fraction", None)
+            sig.pop("_last_partial_step_key", None)
             rearmed.append(sym)
             print(
                 f"[autofin_signal] re-armed {sym} ({did}): the partial "
@@ -4742,6 +4811,7 @@ class AutofinSignalAdapter(StrategyAdapter):
                 sig.pop("_last_recomment", None)
                 sig.pop("_last_numberOfProfit", None)
                 sig.pop("_last_partial_fraction", None)
+                sig.pop("_last_partial_step_key", None)
                 restored += 1
             if restored:
                 print(

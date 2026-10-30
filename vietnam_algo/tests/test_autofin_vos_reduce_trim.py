@@ -203,6 +203,142 @@ def test_a_new_lap_still_fires() -> None:
 
 
 # -----------------------------------------------------------------------------
+# A RE-PUBLISHED reduce must not sell twice
+# -----------------------------------------------------------------------------
+
+LAP1 = ("[VOS] ⚠️ Hạ 50 % tỉ trọng lần 1 Giá: 11,100 - Nắm giữ: 4 ngày "
+        "Lỗ: -8.68 %")
+LAP2 = ("[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 11,100 - Nắm giữ: 4 ngày "
+        "Lỗ: -9.09 %")
+LAP3 = ("[VOS] ⚠️ Hạ 50 % tỉ trọng lần 3 Giá: 11,100 - Nắm giữ: 4 ngày "
+        "Lỗ: -9.50 %")
+
+
+def test_republished_reduce_does_not_sell_twice() -> None:
+    """autofin re-publishes the SAME reduce with an incremented "lần".
+
+    The VOS deal has three such events, all at the SAME price (11,100)
+    with the SAME 50 % fraction — only the loss % differs. It is ONE
+    recommendation re-published, not three independent 50 % trims.
+    autofin's own ``numberOfProfit`` for the deal is 0, which confirms
+    it (a genuine TP lap increments that counter).
+
+    Keying the dedup on the raw text sold the position TWICE: lap 1
+    sold 200 of 300 shares, lap 2 sold the remaining 100 — a 100 %
+    exit from what autofin asked to be a 50 % trim.
+    """
+    state = _vos_state()
+    holding = _vos_holding()
+    kwargs = dict(
+        our_positions={"VOS": 300},
+        autofin_fractions={"1792627200:VOS": 0.5},
+    )
+
+    fired = []
+    for lap_text in (LAP1, LAP2, LAP3):
+        rows = _plan_partial_close_orders(
+            state, holding,
+            autofin_event_texts={"1792627200:VOS": lap_text},
+            **kwargs,
+        )
+        fired.extend(rows)
+        # After the first trim only 100 shares remain.
+        kwargs["our_positions"] = {"VOS": 100}
+
+    assert len(fired) == 1, (
+        f"only ONE trim may fire for a re-published reduce, got {fired}"
+    )
+    assert fired[0]["quantity"] == 200
+    # 100 shares left — a 50 % trim, not a full exit.
+    assert state["1792627200:VOS"]["_our_qty"] == 100
+
+
+def test_genuine_tp_laps_still_stack() -> None:
+    """TP laps DO escalate to a new price, so they must each fire.
+
+    HDB: "Chốt lãi lần 1 mức giá 22,100" then "lần 2 mức giá 23,400"
+    — different prices, genuinely different exit steps.
+    """
+    tp1 = "[HDB] 💰 Chốt lãi lần 1 mức giá 22,100 Tỷ trọng 30 % danh mục nắm giữ"
+    tp2 = "[HDB] 💰 Chốt lãi lần 2 mức giá 23,400 Tỷ trọng 30 % danh mục nắm giữ"
+
+    def _hold(nP: int) -> list[dict]:
+        return [{
+            "_id": 1786492800, "symbol": "HDB", "numberOfProfit": nP,
+            "lastRecomment": (
+                "💰 Chốt lãi lần 1 mức giá 22,100" if nP == 1
+                else "💰 Chốt lãi lần 2 mức giá 23,400"
+            ),
+            "_orphan_injected": True,
+        }]
+
+    state = {
+        "1786492800:HDB": {
+            "symbol": "HDB",
+            "lastRecomment": "💰 Chốt lãi lần 1 mức giá 22,100",
+            "_our_qty": 600,
+            "_last_numberOfProfit": None,
+            "_last_recomment": None,
+        },
+    }
+    common = dict(
+        autofin_fractions={"1786492800:HDB": 0.3},
+    )
+    r1 = _plan_partial_close_orders(
+        state, _hold(1), our_positions={"HDB": 600},
+        autofin_event_texts={"1786492800:HDB": tp1}, **common,
+    )
+    assert len(r1) == 1, r1
+    assert r1[0]["price"] == 22100
+
+    r2 = _plan_partial_close_orders(
+        state, _hold(2), our_positions={"HDB": 400},
+        autofin_event_texts={"1786492800:HDB": tp2}, **common,
+    )
+    assert len(r2) == 1, (
+        f"a genuine TP step at a new price must still fire, got {r2}"
+    )
+    assert r2[0]["price"] == 23400
+
+
+def test_step_key_distinguishes_reduce_from_tp() -> None:
+    """The step identity itself."""
+    from vietnam_algo.algos.autofin_signal import (
+        _parse_partial_close,
+        _partial_close_step_key,
+    )
+
+    a1 = _parse_partial_close(LAP1)
+    a2 = _parse_partial_close(LAP2)
+    # Same fraction, same price -> SAME step (only the "lần" differs).
+    assert _partial_close_step_key(a1) == _partial_close_step_key(a2)
+
+    tp1 = _parse_partial_close(
+        "[HDB] 💰 Chốt lãi lần 1 mức giá 22,100 Tỷ trọng 30 %")
+    tp2 = _parse_partial_close(
+        "[HDB] 💰 Chốt lãi lần 2 mức giá 23,400 Tỷ trọng 30 %")
+    # Different price -> DIFFERENT step.
+    assert _partial_close_step_key(tp1) != _partial_close_step_key(tp2)
+
+
+def test_legacy_state_without_a_step_key_does_not_refire() -> None:
+    """State written before the step key existed must still dedup."""
+    state = _vos_state()
+    state["1792627200:VOS"]["_last_numberOfProfit"] = 0
+    state["1792627200:VOS"]["_last_recomment"] = FULL
+    rows = _plan_partial_close_orders(
+        state, _vos_holding(),
+        our_positions={"VOS": 300},
+        autofin_fractions={"1792627200:VOS": 0.5},
+        autofin_event_texts={"1792627200:VOS": FULL},
+    )
+    assert rows == [], (
+        "an unchanged announcement must not re-fire, even without a "
+        "recorded step key"
+    )
+
+
+# -----------------------------------------------------------------------------
 # Re-arming an action that was planned but NOT submitted
 # -----------------------------------------------------------------------------
 
