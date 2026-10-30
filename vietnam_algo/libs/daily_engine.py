@@ -22,6 +22,7 @@ from .market_calendar import live_trading_dates
 from .notifier import daily_generation_message, notify, submit_message, portfolio_snapshot_message
 from .order_ledger import (
     LedgerOrder,
+    T2_REJECTED_STATUS,
     TOKEN_REJECTED_STATUS,
     dnse_order_id,
     ledger_key,
@@ -619,15 +620,33 @@ def execute_orders_with_ledger(
             # cron refreshes it) and not unsafe (so it doesn't block
             # other orders).
             is_token_rejection = "INVALID_TRADING_TOKEN" in err_text
+            # 2026-10-31 (the VOS T+2.5 case): a SELL for shares that
+            # have not settled yet is rejected with HTTP 400
+            # ``TRADE_QUANTITY_NOT_ENOUGH``. That is NOT permanent —
+            # the very same payload succeeds once the T+2.5
+            # settlement clears (typically a few hours later on the
+            # same day, or the next trading day after a weekend).
+            #
+            # Classifying it as a plain "rejected" (terminal) made the
+            # order permanently un-retryable: the ledger's dedup key
+            # matches on any terminal status, so the VOS trim would
+            # have been silently lost after one too-early submit.
+            #
+            # It gets its own status: not terminal (re-attemptable
+            # after settlement), not unsafe (it must not block the
+            # other orders in the run).
+            is_t2_rejection = "TRADE_QUANTITY_NOT_ENOUGH" in err_text
             is_permanent_rejection = (
                 "HTTP 400" in err_text
                 or "HTTP 401" in err_text
                 or "HTTP 403" in err_text
                 or "HTTP 404" in err_text
                 or "HTTP 422" in err_text
-            ) and not is_token_rejection
+            ) and not is_token_rejection and not is_t2_rejection
             if is_token_rejection:
                 terminal_status = TOKEN_REJECTED_STATUS
+            elif is_t2_rejection:
+                terminal_status = T2_REJECTED_STATUS
             else:
                 terminal_status = "rejected" if is_permanent_rejection else "unknown"
             ledger[key] = LedgerOrder(**{

@@ -95,8 +95,15 @@ def test_invalid_trading_token_is_classified_as_token_rejected(tmp_path) -> None
 
 
 def test_other_400_still_classified_as_rejected(tmp_path) -> None:
-    """A genuine permanent 4xx must remain terminal ``rejected``."""
-    client = _client_rejecting_with("TRADE_QUANTITY_NOT_ENOUGH")
+    """A genuine permanent 4xx must remain terminal ``rejected``.
+
+    2026-10-31: ``TRADE_QUANTITY_NOT_ENOUGH`` is NO LONGER in this
+    bucket — it is the T+2.5 settlement case and gets its own
+    retryable ``t2_rejected`` status (see
+    ``test_t2_rejection_is_retryable_not_terminal``). A genuinely
+    permanent 4xx (e.g. an invalid price lot) must still be terminal.
+    """
+    client = _client_rejecting_with("INVALID_PRICE_LOT")
     order = _make_order("BAF", "NS", 200, 27900, source_order_id=11111)
 
     results, _recon, _complete = execute_orders_with_ledger(
@@ -105,6 +112,65 @@ def test_other_400_still_classified_as_rejected(tmp_path) -> None:
     )
 
     assert results[0]["status"] == "rejected"
+
+
+def test_t2_rejection_is_retryable_not_terminal(tmp_path) -> None:
+    """A T+2.5 settlement rejection must NOT be terminal.
+
+    2026-10-31 (the VOS case): a SELL submitted before the shares
+    settled is rejected with HTTP 400 ``TRADE_QUANTITY_NOT_ENOUGH``.
+    Classifying that as the terminal "rejected" made the order
+    permanently un-retryable — the ledger's dedup key matches on any
+    terminal status — so the trim was silently lost.
+
+    It gets its own status: neither terminal (re-attemptable once
+    settlement clears) nor unsafe (it must not block the other orders
+    in the run).
+    """
+    from vietnam_algo.libs.order_ledger import (
+        AMBIGUOUS_LEDGER_STATUSES,
+        T2_REJECTED_STATUS,
+        TERMINAL_LEDGER_STATUSES,
+        load_ledger,
+    )
+
+    client = _client_rejecting_with("TRADE_QUANTITY_NOT_ENOUGH")
+    order = _make_order("VOS", "NS", 200, 11100, source_order_id=11111)
+
+    results, _recon, _complete = execute_orders_with_ledger(
+        client=client, account_no="0003937868", trading_token="tok",
+        orders=[order], data_dir=tmp_path, run_id="2026-10-29",
+    )
+
+    assert results[0]["status"] == T2_REJECTED_STATUS
+    assert T2_REJECTED_STATUS not in TERMINAL_LEDGER_STATUSES
+    assert T2_REJECTED_STATUS not in AMBIGUOUS_LEDGER_STATUSES
+
+    led = load_ledger(tmp_path)
+    row = next(iter(led.values()))
+    assert row.status == T2_REJECTED_STATUS
+    # It must NOT block the other orders in the run.
+    assert not [
+        r for r in led.values()
+        if r.status in AMBIGUOUS_LEDGER_STATUSES
+    ]
+
+
+def test_t2_rejection_does_not_block_other_orders(tmp_path) -> None:
+    """A T+2-rejected order must not wedge the whole submit run."""
+    client = _client_rejecting_with("TRADE_QUANTITY_NOT_ENOUGH")
+    order1 = _make_order("VOS", "NS", 200, 11100, source_order_id=11111)
+    order2 = _make_order("MSB", "NB", 100, 12000, source_order_id=22222)
+
+    results, _recon, _complete = execute_orders_with_ledger(
+        client=client, account_no="0003937868", trading_token="tok",
+        orders=[order1, order2], data_dir=tmp_path, run_id="2026-10-29",
+    )
+
+    statuses = [r["status"] for r in results]
+    assert "t2_rejected" in statuses
+    # The second order must still have been attempted — not blocked.
+    assert len(results) == 2, results
 
 
 def test_token_rejection_does_not_block_other_orders(tmp_path) -> None:

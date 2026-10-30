@@ -40,6 +40,7 @@ from vietnam_algo.libs.notifier import (
 )
 from vietnam_algo.libs.order_ledger import (
     LedgerOrder,
+    T2_REJECTED_STATUS,
     TERMINAL_LEDGER_STATUSES,
     filled_quantity,
     load_ledger,
@@ -659,6 +660,42 @@ def _extract_best_bid_in_vnd(quote: object) -> int | None:
     return int(round(v * 1000.0))
 
 
+def settlement_deferred_message(
+    submit_result: dict,
+    trade_date: str,
+    label: str = "autofin",
+) -> str | None:
+    """Telegram message for SELLS deferred by the T+2.5 settlement gate.
+
+    2026-10-31 (the VOS case): the shares bought on Friday
+    2026-10-29 are not sellable until 12:00 ICT on Monday
+    2026-11-02. The trim is deferred (not submitted) and planned
+    again on the next cycle.
+
+    The operator needs to see this: without it, a reduce that
+    autofin published would look like nothing happened, and the
+    position would stay un-trimmed until the next trading session.
+    """
+    deferred = (submit_result or {}).get("settlement_deferred") or []
+    if not deferred:
+        return None
+    lines = [
+        f"⏳ Vietnam Algo: autofin SELL deferred (T+2.5 settlement)",
+        f"date: {trade_date}",
+        "reason: the shares are not settled yet — the sell is re-planned "
+        "on a later cycle.",
+    ]
+    for d in deferred[:10]:
+        lines.append(
+            f"  {d.get('symbol', '?')}: {d.get('quantity', 0):,} shares "
+            f"(bought {d.get('buy_date', '?')}, settles "
+            f"{d.get('settles_on', '?')})"
+        )
+    if len(deferred) > 10:
+        lines.append(f"  + {len(deferred) - 10} more")
+    return "\n".join(lines)
+
+
 def _submit_autofin_deals_to_dnse(
     deals_actioned: list[dict],
     *,
@@ -733,6 +770,11 @@ def _submit_autofin_deals_to_dnse(
     from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
     from vietnam_algo.libs.trading_engine import DnseOrder
 
+    # 2026-10-31: SELLS deferred because the shares have not settled
+    # yet (T+2.5). Declared here so every result dict can reference
+    # it, including the early returns below.
+    settlement_deferred: list[dict] = []
+
     if not deals_actioned:
         # 2026-10-30: nothing reached DNSE.
         return {
@@ -741,6 +783,7 @@ def _submit_autofin_deals_to_dnse(
             "skipped_existing": 0,
             "unknown": 0,
             "total": 0,
+            "settlement_deferred": settlement_deferred,
         }
 
     # 2026-10-07: filter new_entry deals whose LIVE best-ask has moved
@@ -818,6 +861,9 @@ def _submit_autofin_deals_to_dnse(
                 "rejected_details": [],
                 "total": 0,
                 "out_of_zone": out_of_zone,
+                # 2026-10-31: SELLS deferred because the shares have
+                # not settled yet (T+2.5).
+                "settlement_deferred": settlement_deferred,
             }
 
     # Build a stable sourceOrderId for each (deal, side, price, kind) tuple
@@ -877,6 +923,9 @@ def _submit_autofin_deals_to_dnse(
             "rejected_details": [],
             "total": 0,
             "out_of_zone": out_of_zone,
+            # 2026-10-31: SELLS deferred because the shares have not
+            # settled yet (T+2.5).
+            "settlement_deferred": settlement_deferred,
             "skipped_off_hours": sum(
                 1 for d in deals_actioned for _ in (d.get("dnse_orders") or [])
             ),
@@ -919,6 +968,56 @@ def _submit_autofin_deals_to_dnse(
     # per symbol and override the order type accordingly.
     market_cache: dict[str, str] = {}
     market_lookup_errors: list[str] = []
+
+    # 2026-10-31 (the VOS T+2.5 case): a SELL cannot be submitted
+    # before the position has SETTLED. Vietnam settles T+2.5, and the
+    # SELL is only accepted from 12:00 ICT on the 2nd TRADING day
+    # after the buy.
+    #
+    # The VOS case: bought Friday 2026-10-29, autofin published the
+    # reduce on the same day. The bot planned the trim, but on Monday
+    # 2026-11-02 (the first trading day after the weekend) the shares
+    # were still NOT settled — settlement clears at 12:00 that day.
+    # Submitting at 09:00 produced DNSE's
+    # ``TRADE_QUANTITY_NOT_ENOUGH`` rejection, which (being HTTP 400)
+    # was classified as a TERMINAL "rejected" ledger row — so the trim
+    # was silently lost forever.
+    #
+    # We now defer such a SELL to the next cycle instead of submitting
+    # an order that cannot be accepted. The deferral is reported to
+    # the operator and the action is re-armed by the caller, so the
+    # trim is planned again once settlement clears.
+    #
+    # The BUY date comes from the order ledger (the filled BUY's
+    # ``sourceDate``). When we cannot determine it we DO NOT block —
+    # a missing date must not prevent an exit.
+    _buy_date_by_symbol: dict[str, str] = {}
+    _settlement_holidays: set[str] = set()
+    try:
+        from vietnam_algo.libs.market_calendar import load_market_holidays
+        _settlement_holidays = load_market_holidays(data_dir)
+    except Exception:
+        _settlement_holidays = set()
+    try:
+        from vietnam_algo.libs.order_ledger import load_ledger as _load_led
+        _led = _load_led(data_dir)
+        for _it in _led.values():
+            if _it.side != "NB" or _it.status != "filled":
+                continue
+            if not _it.sourceDate:
+                continue
+            _sym = str(_it.symbol or "").upper()
+            _prev = _buy_date_by_symbol.get(_sym)
+            # Keep the LATEST filled BUY — that is the one whose
+            # settlement clock matters for the shares we still hold.
+            if _prev is None or _it.sourceDate > _prev:
+                _buy_date_by_symbol[_sym] = _it.sourceDate
+    except Exception as exc:
+        print(
+            f"[autofin_settlement_gate] could not read the ledger for "
+            f"BUY dates: {type(exc).__name__}: {str(exc)[:160]} — "
+            f"the gate will not block any SELL"
+        )
 
     def _order_type_for_symbol(sym: str, default_otype: str) -> str:
         """Return the orderType DNSE will accept for this symbol+session.
@@ -972,6 +1071,42 @@ def _submit_autofin_deals_to_dnse(
             # the position instead of protecting it.
             reason = str(o.get("reason") or f"autofin:{deal.get('action', '?')}")
             is_protective_leg = _is_protective_reason(reason)
+            # 2026-10-31 (the VOS T+2.5 case): defer a SELL whose
+            # shares have not settled yet. Submitting it produces
+            # DNSE's TRADE_QUANTITY_NOT_ENOUGH rejection, which is an
+            # HTTP 400 and therefore classified as a TERMINAL
+            # "rejected" ledger row — the trim would be silently lost.
+            # Deferring keeps the action pending so the next cycle
+            # (after settlement clears) submits it.
+            #
+            # PROTECTIVE legs are exempt: a stop-loss must rest at the
+            # broker immediately, and DNSE accepts a conditional STOP
+            # order for unsettled shares (it only rejects the
+            # generated sell when the trigger fires).
+            if side == "NS" and not is_protective_leg:
+                _buy_date = _buy_date_by_symbol.get(sym)
+                if _buy_date:
+                    _now_t = vietnam_now().time()
+                    if not _buy_settled_by_t2(
+                        _buy_date, trade_date, now_time=_now_t,
+                        holidays=_settlement_holidays,
+                    ):
+                        _settle_on = _t2_settlement_date(
+                            _buy_date, _settlement_holidays
+                        )
+                        settlement_deferred.append({
+                            "symbol": sym,
+                            "quantity": quantity,
+                            "buy_date": _buy_date,
+                            "settles_on": _settle_on,
+                            "reason": reason,
+                        })
+                        print(
+                            f"[autofin_settlement_gate] {sym}: deferring a "
+                            f"SELL of {quantity} — bought {_buy_date}, "
+                            f"settles {_settle_on or '?'} (T+2.5)"
+                        )
+                        continue
             if is_auction:
                 # Will be re-evaluated after we know the market
                 price = 0
@@ -1122,9 +1257,18 @@ def _submit_autofin_deals_to_dnse(
     if not orders:
         result = {
             "submitted": [],
+            # 2026-10-30: nothing reached DNSE.
+            "submitted_symbols": [],
             "skipped_existing": 0,
             "unknown": 0,
+            "rejected": 0,
+            "token_rejected": 0,
+            "t2_rejected": 0,
+            "rejected_details": [],
             "total": 0,
+            # 2026-10-31: the SELLS that were deferred because the
+            # shares have not settled yet (T+2.5).
+            "settlement_deferred": settlement_deferred,
         }
         if out_of_zone:
             result["out_of_zone"] = out_of_zone
@@ -1159,6 +1303,9 @@ def _submit_autofin_deals_to_dnse(
     unknown = 0
     rejected = 0
     token_rejected = 0
+    # 2026-10-31: SELLs DNSE refused because the shares are not
+    # settled yet (T+2.5). Retryable, not permanent.
+    t2_rejected = 0
     # 2026-10-27 (issue A): keep the DETAIL of every declined order
     # so the Telegram path can name the symbol, the leg and the DNSE
     # error. Previously only a bare counter was returned and NO
@@ -1214,6 +1361,17 @@ def _submit_autofin_deals_to_dnse(
             d = _detail(r)
             d["status"] = status
             rejected_details.append(d)
+        elif status == T2_REJECTED_STATUS:
+            # 2026-10-31 (the VOS T+2.5 case): the shares are not
+            # settled yet. The order is NOT permanently dead — it
+            # becomes valid once the settlement clears, so it gets
+            # its own counter and its own ledger status (neither
+            # terminal nor unsafe). The strategy re-arms the action
+            # so the next cycle plans it again.
+            t2_rejected += 1
+            d = _detail(r)
+            d["status"] = status
+            rejected_details.append(d)
         elif status == "token_rejected":
             # 2026-10-27: ``token_rejected`` is deliberately
             # non-terminal so the order can be retried after the
@@ -1250,9 +1408,14 @@ def _submit_autofin_deals_to_dnse(
         "unknown": unknown,
         "rejected": rejected,
         "token_rejected": token_rejected,
+        # 2026-10-31: T+2.5 settlement rejections (retryable).
+        "t2_rejected": t2_rejected,
         "rejected_details": rejected_details,
         "total": len(orders),
         "out_of_zone": out_of_zone,
+        # 2026-10-31: SELLS deferred because the shares have not
+        # settled yet (T+2.5).
+        "settlement_deferred": settlement_deferred,
     }
 
 
@@ -1460,6 +1623,7 @@ def _buy_settled_by_t2(
     buy_source_date: str,
     today_iso: str,
     now_time: "_time | None" = None,
+    holidays: "set[str] | None" = None,
 ) -> bool:
     """Return True if the BUY's T+2.5 settlement has cleared.
 
@@ -1467,13 +1631,28 @@ def _buy_settled_by_t2(
     from the user: "vn stock market using t+2.5"). The BUY
     at T+0 settles by T+2.5, meaning the SELL order for the
     position is accepted starting from 12:00 PM (noon) on
-    T+2. So:
-      - If today is buy_date + 3 or more: settled (T+3 onward).
-      - If today is buy_date + 2 and current time >= 12:00:
-        settled (T+2.5 reached).
-      - If today is buy_date + 2 and current time < 12:00: NOT
-        settled yet — wait until noon.
-      - If today is buy_date + 1 or earlier: NOT settled.
+    T+2 — where T+2 means the **second TRADING day** after the buy,
+    not the second calendar day.
+
+      - On the 3rd trading day or later: settled.
+      - On the 2nd trading day, at or after 12:00: settled.
+      - On the 2nd trading day, before 12:00: NOT settled — wait
+        until noon.
+      - On the buy day or the 1st trading day: NOT settled.
+
+    2026-10-31 (the VOS case): the old implementation counted
+    CALENDAR days. A position bought on Friday 2026-10-29 was
+    therefore considered settled from Sunday 2026-10-31 12:00 —
+    a non-trading day — and, worse, "settled" on Monday
+    2026-11-02 09:00, i.e. before the T+2.5 cutoff. DNSE rejects
+    such a SELL with TRADE_QUANTITY_NOT_ENOUGH, and because that
+    rejection was classified as a terminal "rejected" ledger row,
+    the trim was permanently lost.
+
+    With TRADING days the same position settles on
+    2026-11-02 (Monday) at 12:00 ICT:
+        trading days: 10-29 (T+0), 10-30 (T+1), 11-02 (T+2)
+    (10-31/11-01 are the weekend and do not count.)
 
     The half-day logic is important: empirically, DNSE rejected
     the simulated T+2 retry on 2026-10-15 (Thu, 2 calendar days
@@ -1484,22 +1663,74 @@ def _buy_settled_by_t2(
     When ``now_time`` is None, we assume it's already past noon
     (the conservative default — over-retrying one half-day is
     safer than under-retrying and leaving the user unprotected).
+
+    ``holidays`` is the optional set of non-trading HOSE holiday
+    dates (YYYY-MM-DD). It is applied on top of the weekend rule.
     """
-    from datetime import date as _date, time as _time
+    from datetime import date as _date_cls, time as _time, timedelta as _td
     try:
-        buy_date = _date.fromisoformat(buy_source_date)
-        today = _date.fromisoformat(today_iso)
+        buy_date = _date_cls.fromisoformat(buy_source_date)
+        today = _date_cls.fromisoformat(today_iso)
     except ValueError:
         return False
-    days_diff = (today - buy_date).days
-    if days_diff >= 3:
+
+    # 2026-10-31: count TRADING days, not calendar days. Weekends
+    # and holidays do not advance the settlement clock.
+    from vietnam_algo.libs.market_calendar import trading_dates_between
+
+    holiday_set = holidays or set()
+    # Build the trading-day ladder from the buy date forward. We
+    # need at most 3 trading days, but we ask for more so the
+    # helper can walk over holidays.
+    ladder = trading_dates_between(
+        buy_date.isoformat(),
+        (buy_date + _td(days=20)).isoformat(),
+        holiday_set,
+    )
+    if len(ladder) < 2:
+        # Fewer than 2 trading days known (should not happen) —
+        # treat as not settled.
+        return False
+    t_plus_2 = ladder[2] if len(ladder) > 2 else None
+    if t_plus_2 is None:
+        return False
+
+    if today.isoformat() > t_plus_2:
         return True
-    if days_diff == 2:
+    if today.isoformat() == t_plus_2:
         cutoff = _time(12, 0)
         if now_time is None:
             return True  # assume past noon
         return now_time >= cutoff
     return False
+
+
+def _t2_settlement_date(
+    buy_source_date: str,
+    holidays: "set[str] | None" = None,
+) -> str:
+    """The date on which a BUY's T+2.5 settlement clears (YYYY-MM-DD).
+
+    This is the 2nd TRADING day after the buy; the SELL is accepted
+    from 12:00 ICT on that date. See ``_buy_settled_by_t2`` for the
+    weekend / holiday handling.
+
+    Returns "" when the ladder cannot be built.
+    """
+    from datetime import date as _date_cls, timedelta as _td
+    try:
+        buy_date = _date_cls.fromisoformat(buy_source_date)
+    except ValueError:
+        return ""
+    from vietnam_algo.libs.market_calendar import trading_dates_between
+    ladder = trading_dates_between(
+        buy_date.isoformat(),
+        (buy_date + _td(days=20)).isoformat(),
+        holidays or set(),
+    )
+    if len(ladder) < 3:
+        return ""
+    return ladder[2]
 
 
 def _buy_filled_and_matches_sl(buy: Any, sl_quantity: int) -> bool:
@@ -1531,6 +1762,7 @@ def retry_t2_settlement_sl_orders(
     now_time: "_time | None" = None,
     loan_package_id_by_symbol: dict[str, int] | None = None,
     loan_package_id: int = 0,
+    holidays: "set[str] | None" = None,
 ) -> dict:
     """Re-submit SL SELL orders that were rejected due to T+2.5 settlement.
 
@@ -1779,7 +2011,11 @@ def retry_t2_settlement_sl_orders(
     for item in ledger.values():
         if item.side != "NS":
             continue
-        if item.status != "rejected":
+        # 2026-10-31: a T+2 rejection now lands in its own
+        # ``t2_rejected`` status (not the terminal "rejected"), so the
+        # retry must scan BOTH — the old rows still carry "rejected",
+        # the new ones carry "t2_rejected".
+        if item.status not in ("rejected", T2_REJECTED_STATUS):
             continue
         if not _is_t2_rejection(item.error or ""):
             continue
@@ -1793,8 +2029,15 @@ def retry_t2_settlement_sl_orders(
             # No matching BUY found — the BUY is also rejected/never
             # placed, so there's nothing to SELL. Skip.
             continue
-        if not _buy_settled_by_t2(buy.sourceDate or "", today_iso, now_time=now_time):
+        if not _buy_settled_by_t2(
+            buy.sourceDate or "", today_iso, now_time=now_time,
+            holidays=holidays,
+        ):
             summary["t2_pending"] += 1
+            summary.setdefault("t2_pending_details", []).append(
+                f"{item.symbol}: settles on "
+                f"{_t2_settlement_date(buy.sourceDate or '', holidays) or '?'}"
+            )
             continue
         sl_candidates_by_did.setdefault(did, []).append((item, buy))
 
@@ -3987,6 +4230,15 @@ def run_auto_bot(
                                 if len(out_of_zone) > 10:
                                     lines.append(f"  + {len(out_of_zone) - 10} more")
                                 notify("\n".join(lines))
+                            # 2026-10-31: tell the operator about the
+                            # SELLS deferred by the T+2.5 settlement
+                            # gate — a reduce that autofin published
+                            # must not look like nothing happened.
+                            _defer_msg = settlement_deferred_message(
+                                submit_result, today, "autofin mid-day",
+                            )
+                            if _defer_msg:
+                                notify(_defer_msg)
                         except Exception as exc:
                             notify(
                                 "\n".join([
@@ -4381,6 +4633,12 @@ def run_auto_bot(
                         if len(out_of_zone) > 10:
                             lines.append(f"  + {len(out_of_zone) - 10} more")
                         notify("\n".join(lines))
+                    # 2026-10-31: the T+2.5 settlement deferrals.
+                    _defer_msg = settlement_deferred_message(
+                        submit_result, today, "autofin EOD",
+                    )
+                    if _defer_msg:
+                        notify(_defer_msg)
                 except Exception as exc:
                     notify(
                         "\n".join([

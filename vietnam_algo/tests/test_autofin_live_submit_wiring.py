@@ -145,12 +145,15 @@ def test_empty_deals_actioned_short_circuits(stub_ledger):
     # 2026-10-30: the result also carries ``submitted_symbols`` — the
     # symbols whose orders actually reached DNSE. The caller uses it to
     # re-arm planned-but-not-submitted partial closes.
+    # 2026-10-31: and ``settlement_deferred`` — the SELLS that were
+    # held back because the shares have not settled yet (T+2.5).
     assert result == {
         "submitted": [],
         "submitted_symbols": [],
         "skipped_existing": 0,
         "unknown": 0,
         "total": 0,
+        "settlement_deferred": [],
     }
     assert stub_ledger.calls == []
 
