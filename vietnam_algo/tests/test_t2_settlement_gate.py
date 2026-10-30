@@ -151,10 +151,23 @@ def _client() -> MagicMock:
 
 
 def _submit(tmp_path: Path, client, trade_date: str, now) -> dict:
+    """Run the submit helper with the clock pinned to ``now``.
+
+    ``vietnam_now`` must return a TIMEZONE-AWARE datetime — the
+    session detection (``current_session``) relies on it to work out
+    whether the market is open. A naive datetime made the helper
+    treat every call as off-hours, which is why these tests failed
+    on the VPS (where "now" is a Saturday) but passed locally.
+    """
+    from zoneinfo import ZoneInfo
+
     import vietnam_algo.bots.runner as runner_mod
 
+    ict = ZoneInfo("Asia/Ho_Chi_Minh")
+    aware = now if now.tzinfo else now.replace(tzinfo=ict)
+
     orig = runner_mod.vietnam_now
-    runner_mod.vietnam_now = lambda: now
+    runner_mod.vietnam_now = lambda: aware
     try:
         from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
         return _submit_autofin_deals_to_dnse(
@@ -218,9 +231,12 @@ def test_a_protective_stop_is_not_deferred(tmp_path) -> None:
     client = _client()
     now = datetime.datetime(2026, 11, 2, 9, 30)
 
+    from zoneinfo import ZoneInfo
+
     import vietnam_algo.bots.runner as runner_mod
+    aware = now.replace(tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
     orig = runner_mod.vietnam_now
-    runner_mod.vietnam_now = lambda: now
+    runner_mod.vietnam_now = lambda: aware
     try:
         from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
         result = _submit_autofin_deals_to_dnse(
