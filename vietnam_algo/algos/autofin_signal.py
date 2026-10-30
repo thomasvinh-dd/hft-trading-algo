@@ -154,10 +154,21 @@ def _round_up_to_lots(quantity: int, board_lot: int = DEFAULT_BOARD_LOT) -> int:
     position", ``10% × 600 = 60`` shares but Vietnamese boards trade
     in lots of 100. Rounding down would skip the order entirely;
     rounding up emits the smallest lot that exceeds the desired qty.
+
+    2026-10-30 (VOS incident): the old formula
+    ``((quantity + board_lot - 1) // board_lot) * board_lot`` rounded
+    EXACT multiples up by a whole extra lot — 150 became 200 and 100
+    became 200. On the VOS reduce (50 % of 300 = 150 shares) that
+    oversold by 50 shares, and a 100-share trim would have doubled
+    it. The fix rounds up only when the quantity is NOT already a
+    multiple of the lot.
     """
     if quantity <= 0:
         return 0
-    return ((quantity + board_lot - 1) // board_lot) * board_lot
+    remainder = quantity % board_lot
+    if remainder == 0:
+        return quantity
+    return quantity + (board_lot - remainder)
 
 
 def _extract_partial_fraction(
@@ -1475,6 +1486,7 @@ def _plan_partial_close_orders(
     our_positions: dict[str, int] | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
     autofin_fractions: dict[str, float] | None = None,
+    autofin_event_texts: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Emit partial SELL orders for deals we hold that autofin still holds
     but whose ``numberOfProfit`` has increased since the previous cycle.
@@ -1509,6 +1521,30 @@ def _plan_partial_close_orders(
     don't pass it), fall back to ``_our_qty`` from the deal dict so the
     historical test suite keeps working.
 
+    ``autofin_event_texts`` (2026-10-30, the VOS incident) maps a deal
+    id to the FULL text of its most recent actionable recommendation
+    event, as published in autofin's ``hisRecomment`` history.
+
+    This matters because autofin's SHORT ``lastRecomment`` headline is
+    often not parseable as an action. For VOS on 2026-10-30 the
+    headline was::
+
+        "⚠️ Hạ tỷ trọng lần 2"
+
+    which carries NO percentage, NO price and NO parseable reduce
+    pattern — ``_parse_partial_close`` returns ``unknown`` and the
+    partial-close path skipped the deal entirely. The actionable text
+    only exists in ``hisRecomment``::
+
+        "[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 11,100 - Nắm giữ: 4 ngày"
+
+    which parses as ``reduce_lap`` lap 2, price 11,100, 50 %. We were
+    holding 300 VOS shares and the bot never trimmed a single one.
+
+    So when the short headline does not parse, we fall back to the
+    full event text. The headline still wins when it parses, because
+    it is the most recent state.
+
     Mutates the deal dicts in-place to update ``_last_numberOfProfit``
     so the next cycle plans from the correct baseline.
     """
@@ -1538,6 +1574,39 @@ def _plan_partial_close_orders(
         h = autofin_by_id[did]
         rec = str(h.get("lastRecomment") or "")
         action = _parse_partial_close(rec)
+        # 2026-10-30 (VOS incident): autofin's SHORT headline is often
+        # not parseable as an action, even though the FULL event text
+        # in hisRecomment is. For VOS the headline was
+        # "⚠️ Hạ tỷ trọng lần 2" — no percentage, no price, no
+        # parseable reduce pattern — so ``action.action`` was
+        # "unknown" and the partial-close path skipped the deal.
+        # We were holding 300 shares and never trimmed one.
+        #
+        # The full text ("[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 11,100
+        # - Nắm giữ: 4 ngày") parses as reduce_lap lap 2 @ 11,100,
+        # 50 %. So when the headline does not parse, fall back to the
+        # most recent actionable event text.
+        #
+        # The headline still WINS when it parses — it is the most
+        # recent state. Only "unknown" triggers the fallback.
+        event_text = ""
+        if action.action == "unknown":
+            event_text = str((autofin_event_texts or {}).get(did) or "")
+            if event_text:
+                fallback_action = _parse_partial_close(event_text)
+                if fallback_action.action not in (
+                    "unknown", "full_close", "stop_loss_close",
+                ):
+                    print(
+                        f"[autofin_signal] {sig.get('symbol')} ({did}): "
+                        f"short recomment {rec[:40]!r} is not actionable — "
+                        f"using the full event text "
+                        f"{event_text[:60]!r} -> "
+                        f"{fallback_action.action} lap "
+                        f"{fallback_action.lap} @ {fallback_action.price:,.0f} "
+                        f"({fallback_action.percent:.0f}%)"
+                    )
+                    action = fallback_action
         # "stop_loss_close" → 100% sell at autofin's suggested price;
         # handled by ``_plan_close_orders`` because it doesn't depend
         # on ``numberOfProfit``. "full_close" (Đóng DEAL) → handled
@@ -1546,7 +1615,16 @@ def _plan_partial_close_orders(
             continue
 
         cur_nP = int(h.get("numberOfProfit") or 0)
-        last_nP = int(sig.get("_last_numberOfProfit", -1))
+        # 2026-10-30 (VOS incident): the state can hold an explicit
+        # ``None`` for ``_last_numberOfProfit`` (not just a missing
+        # key), and ``int(None)`` raises TypeError — which aborted the
+        # whole partial-close planning pass for EVERY deal in the
+        # cycle. Normalise both cases to -1 ("never seen").
+        _raw_last_nP = sig.get("_last_numberOfProfit", -1)
+        try:
+            last_nP = int(_raw_last_nP) if _raw_last_nP is not None else -1
+        except (TypeError, ValueError):
+            last_nP = -1
         last_rec = str(sig.get("_last_recomment") or "")
         # 2026-10-20 BAF incident: when an orphan deal is freshly
         # injected (``_orphan_injected=True``) we have NEVER seen
@@ -1568,14 +1646,21 @@ def _plan_partial_close_orders(
         # is set after each fire (line 1575-1576) so ``last_rec``
         # reflects the most recent FIRED recomment, not the most
         # recent seen recomment.
+        # 2026-10-30 (VOS incident): the dedup key must be the text we
+        # ACTED ON, not the short headline. When the headline is not
+        # actionable we act on the full event text, so the event text
+        # is what must be compared against ``_last_recomment`` —
+        # otherwise the same reduce step would re-fire every cycle
+        # (the headline never changes) or, worse, never fire at all.
+        effective_rec = event_text if event_text else rec
         is_orphan_fresh = bool(h.get("_orphan_injected")) and \
             action.action in (
                 "capital_protect", "take_profit_lap", "reduce_lap",
             ) and \
-            rec != last_rec
+            effective_rec != last_rec
         if last_nP < 0 and not is_orphan_fresh:
             sig["_last_numberOfProfit"] = cur_nP
-            sig["_last_recomment"] = rec
+            sig["_last_recomment"] = effective_rec
             continue
         # Fire when EITHER:
         #   (a) ``numberOfProfit`` incremented (TP1 → TP2 → TP3 steps), OR
@@ -1598,7 +1683,10 @@ def _plan_partial_close_orders(
         #       seen step but the latest fraction differs from the
         #       one we last sold at.
         nP_changed = cur_nP > last_nP
-        recomment_changed = bool(rec) and rec != last_rec
+        # 2026-10-30 (VOS incident): compare the text we ACTED ON. When
+        # the short headline is not actionable we act on the full event
+        # text, so that is the text whose change signals a new step.
+        recomment_changed = bool(effective_rec) and effective_rec != last_rec
         # Orphan-fresh deals: force nP_changed=True so the
         # ``nP_changed or recomment_changed or fraction_changed``
         # gate below is satisfied. The fresh recomment is itself
@@ -1753,11 +1841,19 @@ def _plan_partial_close_orders(
             "kind": order_kind,
             "reason": (
                 f"autofin_partial:deal#{did}:{action.action}:"
-                f"lap{action.lap}:pct{int(round(action.percent * 100))}:{rec[:60]}"
+                # 2026-10-30 (VOS incident): ``action.percent`` is a
+                # PERCENTAGE (50.0), not a fraction. The old code
+                # multiplied by 100 again and wrote "pct5000" for a
+                # 50 % trim — misleading in the ledger and the
+                # Telegram message.
+                f"lap{action.lap}:pct{int(round(action.percent))}:"
+                f"{effective_rec[:60]}"
             ),
         })
         sig["_last_numberOfProfit"] = cur_nP
-        sig["_last_recomment"] = rec
+        # 2026-10-30 (VOS incident): record the text we ACTED ON so the
+        # next cycle's change-detection compares like with like.
+        sig["_last_recomment"] = effective_rec
         sig["_our_qty"] = max(0, our_qty - delta)
         # Track the fraction we sold at so the next cycle can detect
         # an autofin-side lag where the recomment text was published
@@ -1892,7 +1988,10 @@ def _event_to_partial_orders(
         "kind": order_kind,
         "reason": (
             f"autofin_partial_event:{our_match_id}:{action.action}:"
-            f"lap{action.lap}:pct{int(round(action.percent * 100))}:"
+            # 2026-10-30: ``action.percent`` is a PERCENTAGE (50.0),
+            # not a fraction — the old code multiplied by 100 again
+            # and wrote "pct5000" for a 50 % trim.
+            f"lap{action.lap}:pct{int(round(action.percent))}:"
             f"{(event_title or '')[:60]}"
         ),
     }]
@@ -2193,6 +2292,12 @@ def decide_orders(
     data_dir: "Path | None" = None,
     autofin_closing_ids: set[str] | None = None,
     autofin_fractions: dict[str, float] | None = None,
+    # 2026-10-30 (VOS incident): deal_id → FULL text of the most
+    # recent actionable recommendation event, from autofin's
+    # ``hisRecomment`` history. Used as the fallback when the short
+    # ``lastRecomment`` headline is not parseable as an action (VOS's
+    # "⚠️ Hạ tỷ trọng lần 2" carries no % / price / pattern).
+    autofin_event_texts: dict[str, str] | None = None,
     new_entry_min_cash_pct: float = 0.05,
     # 2026-10-29: top 3 autofin suggestions may produce entries per
     # day (was 1). Counts ENTRIES MADE, not candidates examined.
@@ -2424,6 +2529,9 @@ def decide_orders(
         our_positions=our_positions,
         board_lot=board_lot,
         autofin_fractions=autofin_fractions,
+        # 2026-10-30 (VOS incident): the full event text is the
+        # fallback when the short headline is not actionable.
+        autofin_event_texts=autofin_event_texts,
     )
     # Filter to deals we actually hold — use our_positions (DNSE /
     # dry-run state) as ground truth. _our_qty in our_deals can be
@@ -3964,11 +4072,32 @@ class AutofinSignalAdapter(StrategyAdapter):
         # Without this, partial closes fall back to the 1/3 default
         # which is wrong for ASP today (autofin says 10%).
         autofin_fractions: dict[str, float] = {}
+        # 2026-10-30 (VOS incident): the FULL text of the most recent
+        # actionable event, per deal. The short ``lastRecomment``
+        # headline is often not parseable as an action — VOS's was
+        # "⚠️ Hạ tỷ trọng lần 2", which carries no percentage, no
+        # price and no parseable reduce pattern — while the full
+        # ``hisRecomment`` text ("[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2
+        # Giá: 11,100 ...") parses perfectly. Without this map the
+        # partial-close path skipped the reduce and we held 300 VOS
+        # shares untouched.
+        autofin_event_texts: dict[str, str] = {}
         deals_by_symbol: dict[str, Any] = {}
+        # The set of symbols we need the history for: every holding
+        # row PLUS every tracked deal we actually hold. VOS is NOT in
+        # /signal-static-holding (it is an orphan — autofin dropped it
+        # from the holding list), so iterating over ``holding`` alone
+        # would never have fetched its history.
+        symbols_needed: dict[str, str] = {}
         for h in holding:
             sym = h.get("symbol") or h.get("stockCode")
-            if not sym:
-                continue
+            if sym:
+                symbols_needed[str(sym).upper()] = _deal_id(h)
+        for did, sig in self._our_deals.items():
+            sym = str(sig.get("symbol") or "").strip().upper()
+            if sym and sym not in symbols_needed:
+                symbols_needed[sym] = did
+        for sym, did in symbols_needed.items():
             try:
                 deals = client.fetch_deals(symbol=sym, page_size=5)
             except Exception as exc:
@@ -3978,13 +4107,37 @@ class AutofinSignalAdapter(StrategyAdapter):
             deals_by_symbol[str(sym).upper()] = deals
             if not deals:
                 continue
-            result = latest_partial_close_fraction(deals[0])
+            # Match the deal by (_id, symbol) — autofin's ``_id`` is
+            # only the open-time timestamp and collides across
+            # symbols (2026-10-29).
+            want_id = 0
+            if did:
+                try:
+                    want_id = int(str(did).split(":", 1)[0])
+                except ValueError:
+                    want_id = 0
+            match = next(
+                (
+                    d for d in deals
+                    if int(d.get("_id", 0) or 0) == want_id
+                    and str(d.get("symbol") or "").strip().upper() == sym
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            result = latest_partial_close_fraction(match)
             if result is None:
                 continue
-            frac, _raw_text = result
-            did = _deal_id(h)
-            if did:
-                autofin_fractions[did] = frac
+            frac, raw_text = result
+            deal_id = _deal_id(match) or did
+            if deal_id:
+                autofin_fractions[deal_id] = frac
+                # Keep the full event text so the partial-close path
+                # can fall back to it when the headline is not
+                # actionable.
+                if raw_text:
+                    autofin_event_texts[deal_id] = raw_text
         # 4c. ORPHAN DEAL AUGMENTATION (2026-10-20 BAF incident):
         # /signal-static-holding sometimes drops deals that we still
         # hold on DNSE — typically when an operator manually closes
@@ -4444,6 +4597,9 @@ class AutofinSignalAdapter(StrategyAdapter):
             actioned_deals=self._actioned_deals,
             autofin_closing_ids=closing_ids,
             autofin_fractions=autofin_fractions,
+            # 2026-10-30 (VOS incident): the full event text, used as
+            # the fallback when the short headline is not actionable.
+            autofin_event_texts=autofin_event_texts,
             # New-entry gating (user spec 2026-09-21):
             # - new_entry_top_n=0 disables new entries entirely
             #   (used outside the start-of-day window)
