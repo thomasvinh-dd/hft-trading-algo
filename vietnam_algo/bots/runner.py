@@ -708,7 +708,7 @@ def _submit_autofin_deals_to_dnse(
     data_dir: "Path",
     trade_date: str,
     loan_package_id_by_symbol: dict[str, int] | None = None,
-    live_quote_tolerance_pct: float = 0.03,
+    live_quote_tolerance_pct: float | None = None,
 ) -> dict:
     """Convert autofin adapter's ``deals_actioned`` into ``DnseOrder``
     records and submit them to DNSE via ``execute_orders_with_ledger``.
@@ -757,9 +757,20 @@ def _submit_autofin_deals_to_dnse(
     trade_date:
         ISO date used as ``sourceDate`` on every order in this batch.
     live_quote_tolerance_pct:
-        Per-side tolerance (default 5 %) for the live-quote gate.
+        Per-side tolerance for the live-quote gate.
         ``supply_T * (1 + tol)`` and ``supply_F * (1 - tol)`` form the
         upper / lower edges the live best-ask must stay within.
+
+        2026-10-31: this is the SUBMIT-TIME re-check of the same buy
+        zone the strategy used at planning time. It MUST match the
+        planning tolerance (``AUTOFIN_BUY_ZONE_TOLERANCE_PCT``,
+        default 1 %) — otherwise the effective buy window would still
+        be 3 % wide, because a plan accepted at +2 % would be dropped
+        at submit and a plan accepted at -2 % would pass here but
+        have been planned outside the tighter band.
+
+        ``None`` means "use the configured tolerance". Pass an
+        explicit value to override it in a test.
 
     Returns
     -------
@@ -771,6 +782,18 @@ def _submit_autofin_deals_to_dnse(
     """
     from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
     from vietnam_algo.libs.trading_engine import DnseOrder
+
+    # 2026-10-31: the submit-time live-quote gate uses the SAME
+    # tolerance as the planning-time zone gate. They must match —
+    # otherwise the effective buy window is whichever is wider, and
+    # the user asked for a tight 1 % band.
+    if live_quote_tolerance_pct is None:
+        from vietnam_algo.algos.autofin_signal import buy_zone_tolerance_pct
+        _tol_above, _tol_below = buy_zone_tolerance_pct()
+        # The live gate is symmetric — it uses the WIDER of the two
+        # sides so an asymmetric planning tolerance can never make
+        # the submit gate stricter than the plan it is checking.
+        live_quote_tolerance_pct = max(_tol_above, _tol_below)
 
     # 2026-10-31: SELLS deferred because the shares have not settled
     # yet (T+2.5). Declared here so every result dict can reference

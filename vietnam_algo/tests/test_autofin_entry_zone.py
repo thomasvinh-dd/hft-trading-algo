@@ -148,27 +148,26 @@ def test_plan_enters_at_supply_to_when_price_equals_supply_to():
 
 
 def test_plan_enters_at_market_when_price_below_supply_to():
-    """Price below supply_T but within 3% of supply_F → enter at the
-    LIVE market price (no more min(cur, s_hi) cap).
+    """Price below supply_T but within the tolerance of supply_F → enter
+    at the LIVE market price (no more min(cur, s_hi) cap).
 
-    2026-10-09 fix: the lower-bound check uses a 3% tolerance band
-    below ``supply_F`` (matching the upper-bound 3% above ``supply_T``).
-    5820 is 3% below ``supply_F=6000`` so it's exactly at the
-    tolerance edge, and we enter at the live market price 5820 (not
-    capped at supply_T=6100). The previous behaviour was to cap at
-    min(5820, 6100)=5820, which happens to be the same number here,
-    but the rationale has changed: the cap is gone, the live price
-    is the entry price.
+    2026-10-09 fix: the lower-bound check uses a tolerance band below
+    ``supply_F`` (matching the upper-bound band above ``supply_T``).
+    The entry price is the LIVE market price, not the cap.
+
+    2026-10-31: the tolerance was tightened from 3 % to 1 % (the user
+    asked for "+-1 %"), so the lower edge is now
+    ``supply_F * 0.99 = 5940`` (was 5820).
     """
     sig = _make_signal("APH", supply_from=6000, supply_to=6100)
     rows = _plan_orders_for_new_positions(
         selected=[sig],
         nav_vnd=1_000_000_000,
         our_positions={},
-        current_prices={"APH": 5820.0},  # 3.0% below supply_F=6000 → at edge
+        current_prices={"APH": 5940.0},  # 1.0% below supply_F=6000 → at edge
     )
     buy = next(r for r in rows if r["side"] == "NB")
-    assert buy["price"] == 5820  # entry at live market price (was min=5820)
+    assert buy["price"] == 5940  # entry at live market price
 
 
 def test_plan_enters_at_min_when_price_at_supply_from():
@@ -202,25 +201,27 @@ def test_plan_skips_when_price_below_buy_zone_by_more_than_tolerance():
 
 
 def test_plan_skips_at_lower_tolerance_boundary():
-    """Boundary: cur = supply_F * (1 - 3%) is the inclusive limit. Below
+    """Boundary: cur = supply_F * (1 - 1%) is the inclusive limit. Below
     that, skip. Above (including equal), enter.
+
+    2026-10-31: the tolerance was tightened from 3 % to 1 %.
     """
     sig = _make_signal("APH", supply_from=6000, supply_to=6100)
-    # At the exact tolerance boundary → still enter (cur=5820).
+    # At the exact tolerance boundary → still enter (cur=5940).
     rows = _plan_orders_for_new_positions(
         selected=[sig],
         nav_vnd=1_000_000_000,
         our_positions={},
-        current_prices={"APH": 5820.0},  # supply_F * 0.97 = 5820 → enter
+        current_prices={"APH": 5940.0},  # supply_F * 0.99 = 5940 → enter
     )
     buy = next(r for r in rows if r["side"] == "NB")
-    assert buy["price"] == 5820
-    # One tick below the boundary → skip (cur=5819 < 5820).
+    assert buy["price"] == 5940
+    # One tick below the boundary → skip (cur=5939 < 5940).
     rows2 = _plan_orders_for_new_positions(
         selected=[sig],
         nav_vnd=1_000_000_000,
         our_positions={},
-        current_prices={"APH": 5819.0},
+        current_prices={"APH": 5939.0},
     )
     assert rows2 == [], "should skip just below tolerance"
 
@@ -242,34 +243,35 @@ def test_plan_skips_lower_bound_when_supply_F_undeclared():
 
 
 def test_plan_enters_at_above_zone_up_to_tolerance():
-    """Price up to 3% above supply_T → still enter at the live price.
+    """Price up to 1% above supply_T → still enter at the live price.
 
     2026-10-09 fix: with 3% tolerance, cur=6300 (3.3% above
     supply_T=6100) is OUTSIDE the tolerance and the entry is
-    skipped. Previously (5% tolerance) it was inside. We pick a
-    boundary value (cur=6280 = 2.95% above) that is inside the new
-    3% tolerance and verify the entry happens at the LIVE price
-    (not capped at supply_T=6100).
+    skipped.
+
+    2026-10-31: the tolerance was tightened from 3 % to 1 % (the user
+    asked for "+-1 %"), so the upper edge is now
+    ``supply_T * 1.01 = 6161`` (was 6280-ish).
     """
     sig = _make_signal("APH", supply_from=6000, supply_to=6100)
-    # At 2.95% above supply_T=6100 → inside the 3% tolerance.
+    # At 0.98% above supply_T=6100 → inside the 1% tolerance.
     rows = _plan_orders_for_new_positions(
         selected=[sig],
         nav_vnd=1_000_000_000,
         our_positions={},
-        current_prices={"APH": 6280.0},  # 2.95% above supply_T=6100 → inside
+        current_prices={"APH": 6160.0},  # 0.98% above supply_T=6100 → inside
     )
     buy = next(r for r in rows if r["side"] == "NB")
     # 2026-10-09 fix: entry price = LIVE market price, NOT min(cur, s_hi)
-    assert buy["price"] == 6280  # live market price, was min(6280, 6100) = 6100
-    # Just above 3% tolerance → skip.
+    assert buy["price"] == 6160  # live market price, was min(6160, 6100) = 6100
+    # Just above the 1% tolerance → skip.
     rows2 = _plan_orders_for_new_positions(
         selected=[sig],
         nav_vnd=1_000_000_000,
         our_positions={},
-        current_prices={"APH": 6300.0},  # 3.3% above → skip
+        current_prices={"APH": 6162.0},  # 1.02% above → skip
     )
-    assert rows2 == [], "should skip just above 3% tolerance"
+    assert rows2 == [], "should skip just above the 1% tolerance"
 
 
 def test_plan_falls_back_to_supply_to_when_no_price():
@@ -409,15 +411,17 @@ def test_expand_skips_when_price_just_below_supply_F():
 
 
 def test_expand_includes_held_at_lower_tolerance_boundary():
-    """At the exact 3% lower-bound (``supply_F * 0.97``), still included.
-    ``VHM @ 5820`` is exactly at the tolerance edge → include.
+    """At the exact 1% lower-bound (``supply_F * 0.99``), still included.
+    ``VHM @ 5940`` is exactly at the tolerance edge → include.
+
+    2026-10-31: the tolerance was tightened from 3 % to 1 %.
     """
     holding = [_make_holding_record("VHM", deal_id=42, supply_from=6000, supply_to=6100)]
     out = _expand_signals_with_held_unentered(
         signals=[],
         holding=holding,
         our_deals={},
-        current_prices={"VHM": 5820.0},  # supply_F * 0.97 = 5820 → enter
+        current_prices={"VHM": 5940.0},  # supply_F * 0.99 = 5940 → enter
     )
     assert len(out) == 1
     assert out[0].symbol == "VHM"

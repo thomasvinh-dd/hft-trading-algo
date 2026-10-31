@@ -693,7 +693,8 @@ def _expand_signals_with_held_unentered(
     holding: list[dict[str, Any]],
     our_deals: dict[str, dict[str, Any]],
     current_prices: dict[str, float],
-    above_zone_tolerance_pct: float = 0.03,
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+    above_zone_tolerance_pct: float = 0.01,
 ) -> list[AutofinSignal]:
     """Augment ``signals`` with held-but-not-entered deals that are
     currently in the buy zone.
@@ -775,8 +776,9 @@ def _plan_orders_for_new_positions(
     min_order_value_vnd: float = 1_000_000,
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
-    above_zone_tolerance_pct: float = 0.03,
-    below_zone_tolerance_pct: float = 0.03,
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+    above_zone_tolerance_pct: float = 0.01,
+    below_zone_tolerance_pct: float = 0.01,
     already_planned_symbols: set[str] | None = None,
     available_cash_vnd: float | None = None,
     new_entry_min_cash_pct: float = 0.05,

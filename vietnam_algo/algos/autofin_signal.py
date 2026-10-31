@@ -141,6 +141,63 @@ def _env_partial_close_fraction() -> float | None:
     return None
 
 
+# 2026-10-31: the buy-zone tolerance.
+#
+# The bot used to accept an entry when the live price was within
+# +-3 % of either edge of autofin's declared supply zone
+# ("Vùng mua"). The user tightened it to +-1 %
+# ("i wanna change the buy window from +- 3% to +-1%").
+#
+# A tighter band means we only enter when the price is essentially
+# inside the zone autofin published — we do not chase a price that
+# has run away from the recommended entry band.
+#
+# Tunable per environment via ``AUTOFIN_BUY_ZONE_TOLERANCE_PCT``
+# (a fraction, e.g. ``0.01`` for 1 %). ``AUTOFIN_BUY_ZONE_TOLERANCE_ABOVE_PCT``
+# / ``_BELOW_PCT`` override the two sides independently.
+DEFAULT_BUY_ZONE_TOLERANCE_PCT = 0.01
+
+
+def buy_zone_tolerance_pct() -> tuple[float, float]:
+    """Return the (above, below) buy-zone tolerances as fractions.
+
+    2026-10-31: was +-3 % on both sides; the user asked for +-1 %.
+    The two sides can be overridden independently, but by default they
+    are symmetric.
+    """
+    raw = os.environ.get("AUTOFIN_BUY_ZONE_TOLERANCE_PCT", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = DEFAULT_BUY_ZONE_TOLERANCE_PCT
+    else:
+        value = DEFAULT_BUY_ZONE_TOLERANCE_PCT
+    # A tolerance must be non-negative and sane (< 100 %).
+    if not (0.0 <= value < 1.0):
+        value = DEFAULT_BUY_ZONE_TOLERANCE_PCT
+
+    above = value
+    raw_above = os.environ.get("AUTOFIN_BUY_ZONE_TOLERANCE_ABOVE_PCT", "").strip()
+    if raw_above:
+        try:
+            above = float(raw_above)
+        except ValueError:
+            pass
+    below = value
+    raw_below = os.environ.get("AUTOFIN_BUY_ZONE_TOLERANCE_BELOW_PCT", "").strip()
+    if raw_below:
+        try:
+            below = float(raw_below)
+        except ValueError:
+            pass
+    if not (0.0 <= above < 1.0):
+        above = value
+    if not (0.0 <= below < 1.0):
+        below = value
+    return above, below
+
+
 def _round_to_lots(quantity: int, board_lot: int = DEFAULT_BOARD_LOT) -> int:
     if quantity <= 0:
         return 0
@@ -750,7 +807,8 @@ def _expand_signals_with_held_unentered(
     holding: list[dict[str, Any]],
     our_deals: dict[str, dict[str, Any]],
     current_prices: dict[str, float],
-    above_zone_tolerance_pct: float = 0.03,
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+    above_zone_tolerance_pct: float = DEFAULT_BUY_ZONE_TOLERANCE_PCT,
 ) -> list[AutofinSignal]:
     """Augment ``signals`` with held-but-not-entered deals that are
     currently in the buy zone.
@@ -870,8 +928,11 @@ def _plan_orders_for_new_positions(
     min_order_value_vnd: float = 1_000_000,
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
-    above_zone_tolerance_pct: float = 0.03,
-    below_zone_tolerance_pct: float = 0.03,
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %). The
+    # user tightened the band so we only enter when the live price is
+    # essentially inside the zone autofin published.
+    above_zone_tolerance_pct: float = DEFAULT_BUY_ZONE_TOLERANCE_PCT,
+    below_zone_tolerance_pct: float = DEFAULT_BUY_ZONE_TOLERANCE_PCT,
     already_planned_symbols: set[str] | None = None,
     available_cash_vnd: float | None = None,
     new_entry_min_cash_pct: float = 0.05,
@@ -2545,8 +2606,11 @@ def decide_orders(
     # /signal-static-holding.
     augmented_signals = signals
     if current_prices:
+        # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+        _tol_above, _tol_below = buy_zone_tolerance_pct()
         augmented_signals = _expand_signals_with_held_unentered(
             signals, holding, our_deals, current_prices,
+            above_zone_tolerance_pct=_tol_above,
         )
 
     # 2b. Filter out signals for deals we've ALREADY actioned (entry,
@@ -2582,10 +2646,14 @@ def decide_orders(
     # for partial-close / full-close detection only.
 
     # 5. Compute orders
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+    _tol_above, _tol_below = buy_zone_tolerance_pct()
     new_orders = _plan_orders_for_new_positions(
         selected, nav, our_positions,
         board_lot=board_lot, user_sl_pct=user_sl_pct,
         current_prices=current_prices,
+        above_zone_tolerance_pct=_tol_above,
+        below_zone_tolerance_pct=_tol_below,
         already_planned_symbols=already_planned_symbols,
         available_cash_vnd=available_cash_vnd,
         new_entry_min_cash_pct=new_entry_min_cash_pct,
