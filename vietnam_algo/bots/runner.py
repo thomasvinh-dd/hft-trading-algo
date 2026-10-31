@@ -51,7 +51,9 @@ from vietnam_algo.libs.order_ledger import (
 from vietnam_algo.libs.schedule import (
     TradingSchedule,
     TradingSession,
+    VIETNAM_TZ,
     current_session,
+    is_auction_session,
     local_date,
     order_type_for_session,
     should_poll_strategy,
@@ -931,7 +933,68 @@ def _submit_autofin_deals_to_dnse(
             ),
         }
     session_order_type = order_type_for_session(session)
-    is_auction = session in (TradingSession.ATO, TradingSession.ATC)
+    is_auction = is_auction_session(session)
+
+    # 2026-10-31: NO orders in the ATO / ATC auction windows.
+    #
+    # The user asked for this explicitly ("we should not do trade in
+    # ato and atc session"), and the live ledger shows why it
+    # matters:
+    #
+    #   2026-10-26 09:01:08  ORS  BUY  price=0  [session=ATO]
+    #   2026-10-29 09:01:17  VOS  BUY  price=0  [session=ATO]
+    #
+    # An auction order is submitted with ``price=0`` — the fill price
+    # is decided by the auction, not by us. The VOS BUY filled at
+    # 11,800 (the ATO price) while the continuous-market bid was
+    # ~10,800; we paid the auction premium and had no say in it.
+    #
+    # Worse, ``price=0`` on a BUY means "buy at ANY price" to DNSE —
+    # an unbounded risk rather than a bounded one.
+    #
+    # The block covers ALL orders, including protective STOPs (the
+    # user's explicit choice). A stop planned during the window is
+    # deferred to the next continuous session by the re-arm logic.
+    #
+    # Post-close (14:45-15:00) is NOT an auction — it is a normal LO
+    # session on HOSE (PLO) with a real price — so it stays
+    # tradeable.
+    if is_auction:
+        _auction_orders = sum(
+            1 for d in deals_actioned for _ in (d.get("dnse_orders") or [])
+        )
+        notify(
+            "\n".join([
+                f"⚠️ Vietnam Algo: autofin LIVE submit SKIPPED "
+                f"({session.value} auction)",
+                f"date: {trade_date}",
+                f"orders: {_auction_orders}",
+                f"reason: the bot does not trade in the {session.value} "
+                f"auction window (09:00-09:15 / 14:30-14:45) — an "
+                f"auction order is sent with price=0, so the fill price "
+                f"is decided by the auction.",
+                "next attempt: the next continuous session "
+                "(09:15-11:30 / 13:00-14:30).",
+            ])
+        )
+        return {
+            "submitted": [],
+            # 2026-10-30: nothing reached DNSE.
+            "submitted_symbols": [],
+            "skipped_existing": 0,
+            "unknown": 0,
+            "rejected": 0,
+            "token_rejected": 0,
+            "t2_rejected": 0,
+            "rejected_details": [],
+            "total": 0,
+            "out_of_zone": out_of_zone,
+            # 2026-10-31: SELLS deferred because the shares have not
+            # settled yet (T+2.5).
+            "settlement_deferred": settlement_deferred,
+            # 2026-10-31: the orders held back by the auction gate.
+            "skipped_auction": _auction_orders,
+        }
 
     # 2026-10-12: the DNSE server REQUIRES ``loanPackageId`` in every
     # place_stock_order body, and treats ``0`` as "no value" (rejected
@@ -1826,7 +1889,35 @@ def retry_t2_settlement_sl_orders(
         # protected (topped up). See the duplicate-STOP guard below.
         "already_protected": [],
         "partially_protected": [],
+        # 2026-10-31: the auction gate. The T+2 retry places real
+        # orders, so it must respect the same "no orders in ATO/ATC"
+        # rule as the main submit path (the user's explicit choice
+        # was to block ALL orders, stops included).
+        "skipped_auction": 0,
     }
+
+    # 2026-10-31: never place an order in the ATO / ATC auction
+    # windows. See ``_submit_autofin_deals_to_dnse`` for the full
+    # rationale (an auction order is sent with price=0, so the fill
+    # price is decided by the auction).
+    if now_time is not None:
+        _sch = TradingSchedule()
+        _session_now = (
+            TradingSession.ATO
+            if _sch.atoStart <= now_time < _sch.atoEnd
+            else (
+                TradingSession.ATC
+                if _sch.atcStart <= now_time < _sch.atcEnd
+                else None
+            )
+        )
+        if _session_now is not None:
+            summary["skipped_auction"] = 1
+            print(
+                f"[t2-sl-retry] skipped: the {_session_now.value} auction "
+                f"window does not accept bot orders"
+            )
+            return summary
 
     # Cache of symbol -> held qty so a position appearing multiple
     # times in the ledger (several SL variants per deal) only costs
@@ -2694,6 +2785,26 @@ def _maybe_reprice_stale_order(
     # 1. Eligibility
     if item.side not in ("NB", "NS"):
         summary["reason"] = f"side {item.side!r} is not BUY or SELL"
+        return summary
+    # 2026-10-31: the bot does not trade in the ATO / ATC auction
+    # windows — no orders at all, re-prices included. The re-pricer
+    # cancels the old order and places a new one, so it is a submit.
+    #
+    # The time comes from ``now_epoch`` (the caller's clock), which
+    # the runner sets to ICT. ``datetime.now()`` would be UTC on the
+    # VPS and the auction windows would never match.
+    _sch = TradingSchedule()
+    _now_t = datetime.fromtimestamp(now_epoch, tz=VIETNAM_TZ).time()
+    if (
+        _sch.atoStart <= _now_t < _sch.atoEnd
+        or _sch.atcStart <= _now_t < _sch.atcEnd
+    ):
+        summary["reason"] = (
+            f"re-price skipped: the auction window "
+            f"({_sch.atoStart}-{_sch.atoEnd} / "
+            f"{_sch.atcStart}-{_sch.atcEnd}) does not accept bot orders"
+        )
+        summary["action"] = "skipped"
         return summary
     # 2026-10-28: a protective STOP order must NEVER be re-priced.
     # The re-pricer moves a SELL's limit toward the live bid and, past
@@ -4125,7 +4236,10 @@ def run_auto_bot(
                                 f"{submit_result['skipped_existing']} skipped-existing, "
                                 f"{submit_result['unknown']} unknown, "
                                 f"{submit_result.get('rejected', 0)} rejected, "
-                                f"{submit_result.get('token_rejected', 0)} token-rejected "
+                                f"{submit_result.get('token_rejected', 0)} token-rejected, "
+                                f"{submit_result.get('t2_rejected', 0)} t2-rejected, "
+                                f"{submit_result.get('skipped_auction', 0)} skipped-auction, "
+                                f"{submit_result.get('settlement_deferred') and len(submit_result['settlement_deferred']) or 0} settlement-deferred "
                                 f"(of {submit_result['total']} planned)"
                             )
                             # 2026-10-30 (VOS incident): the strategy
@@ -4555,7 +4669,9 @@ def run_auto_bot(
                         f"{submit_result['skipped_existing']} skipped-existing, "
                         f"{submit_result['unknown']} unknown, "
                         f"{submit_result.get('rejected', 0)} rejected, "
-                        f"{submit_result.get('token_rejected', 0)} token-rejected "
+                        f"{submit_result.get('token_rejected', 0)} token-rejected, "
+                        f"{submit_result.get('t2_rejected', 0)} t2-rejected, "
+                        f"{submit_result.get('skipped_auction', 0)} skipped-auction "
                         f"(of {submit_result['total']} planned)"
                     )
                     # 2026-10-30 (VOS incident): re-arm the partial

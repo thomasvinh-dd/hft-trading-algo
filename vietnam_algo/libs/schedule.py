@@ -84,6 +84,34 @@ def should_refresh_token(moment: datetime, done_for_date: str | None, schedule: 
     return is_trading_day(moment, holidays) and done_for_date != today and local_time(moment) >= schedule.tokenTime
 
 
+def is_auction_session(session: "TradingSession") -> bool:
+    """True for the ATO / ATC auction windows.
+
+    2026-10-31: the bot must NOT trade in an auction.
+
+    Two reasons, both of which showed up in the live ledger:
+
+    1. An auction order is submitted with ``price=0`` — the auction
+       price is decided at the close of the window, not by us. We
+       lose all control over the fill price. The VOS BUY on
+       2026-10-29 09:01:17 was submitted that way and filled at
+       11,800 (the ATO price) while the continuous-market bid was
+       ~10,800.
+
+    2. ``price=0`` on a BUY means "buy at ANY price" to DNSE. That
+       is an unbounded risk, not a bounded one.
+
+    The user asked for this explicitly: no orders in ATO or ATC.
+    Protective STOPs are included — the decision is to block ALL
+    orders, not just trades. A stop planned in the window is
+    deferred to the next continuous session.
+
+    Post-close (14:45-15:00) is NOT an auction — it is a normal LO
+    session on HOSE (PLO) with a real price — so it stays tradeable.
+    """
+    return session in (TradingSession.ATO, TradingSession.ATC)
+
+
 def should_submit_orders(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
     today = local_date(moment)
     return (
