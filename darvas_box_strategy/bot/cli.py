@@ -377,15 +377,16 @@ def cmd_scan_exits(args) -> int:
             print(f"  {key}: no bars after entry, skipping")
             continue
 
-        # Only look at bars we haven't evaluated yet.
+        # Only evaluate bars we haven't seen yet. The evaluator walks
+        # the bars in order and updates the running state (peak close,
+        # tier_idx, trailing_active) as it goes, so we must feed it the
+        # NEW bars only — replaying old ones would double-count the
+        # bar counter and could re-fire a deduped event.
         if pos.last_bar_date:
-            fresh = [b for b in bars if str(b.time) > str(pos.last_bar_date)]
-            if not fresh:
+            eval_bars = [b for b in bars if str(b.time) > str(pos.last_bar_date)]
+            if not eval_bars:
                 print(f"  {key}: no new bars since {pos.last_bar_date}, skipping")
                 continue
-            # Include the last evaluated bar for state continuity
-            # (peak close etc.), then the new bars.
-            eval_bars = [b for b in bars if str(b.time) >= str(pos.last_bar_date)]
         else:
             eval_bars = bars
 

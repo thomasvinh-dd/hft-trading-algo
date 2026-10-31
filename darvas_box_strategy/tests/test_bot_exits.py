@@ -350,6 +350,8 @@ class ExecutorParityTests(unittest.TestCase):
         )
         already = set()
         bot = []
+        # Feed the bars one at a time — the way cmd_scan_exits does it
+        # on each cron run (one new bar per day).
         for b in bars:
             for ev in evaluate_exits(pos, [b], cfg, already_notified=already):
                 already.add(ev.dedupe_key)
@@ -372,6 +374,57 @@ class ExecutorParityTests(unittest.TestCase):
         self.assertEqual(
             [p for _, _, p in bt], [p for _, _, p in bot],
             f"fill prices differ:\n  backtest={bt}\n  bot={bot}",
+        )
+
+    def test_multi_bar_single_call_matches_executor(self):
+        """Feeding ALL bars in one call must give the same result.
+
+        This is the path used when a position is first seeded and the
+        scanner walks its full history.
+        """
+        from darvas_box_strategy.bot.cli import _bars_after_entry
+        from darvas_box_strategy.bot.exits import evaluate_exits
+        from darvas_box_strategy.bot.positions import LivePosition
+        from darvas_box_strategy.darvas.base_detector import Base
+        from darvas_box_strategy.darvas.executor import simulate_trade
+        from darvas_box_strategy.darvas.signal_generator import Signal
+
+        cfg = _cfg()
+        ticker, entry_date = "POW", "2025-12-30"
+        entry_price, shares = 11_500.0, 11_500
+        tiers = ((1.063, 0.10), (1.125, 0.30), (1.210, 0.30))
+        bars = _bars_after_entry(ticker, entry_date)
+        if not bars:
+            self.skipTest("no price data for POW")
+
+        base = Base(ticker=ticker, base_low=entry_price * 0.85,
+                    base_high=entry_price * 0.95, end_idx=0,
+                    days_in_base=10, volume_compression=1.0)
+        sig = Signal(
+            ticker=ticker, signal_date=date(2025, 12, 29),
+            entry_date=date.fromisoformat(entry_date),
+            entry_price=entry_price, base=base,
+            sl_F=entry_price * 0.82, sl_T=entry_price * 0.90,
+            tiers=tiers, conviction="low", size_pct=0.15, shares=shares,
+            max_volume=99_999, bars_remaining=200,
+        )
+        result = simulate_trade(sig, bars, cfg)
+        bt = [(f.kind, abs(f.shares), round(f.level, 2)) for f in result.fills
+              if f.kind != "DIVIDEND"]
+
+        pos = LivePosition(
+            ticker=ticker, entry_date=entry_date, entry_price=entry_price,
+            shares=shares, remaining=shares, size_pct=0.15,
+            sl_T=entry_price * 0.90, sl_F=entry_price * 0.82,
+            tiers=[[m, p] for m, p in tiers],
+            conviction="low", peak_close=entry_price, last_close=entry_price,
+        )
+        evs = evaluate_exits(pos, bars, cfg)
+        bot = [(ev.kind, ev.shares, round(ev.price, 2)) for ev in evs]
+
+        self.assertEqual(
+            [(k, s) for k, s, _ in bt], [(k, s) for k, s, _ in bot],
+            f"exit events differ:\n  backtest={bt}\n  bot={bot}",
         )
 
     def test_trail_exit_matches_executor(self):
