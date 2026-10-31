@@ -310,6 +310,7 @@ class ExecutorParityTests(unittest.TestCase):
     user to sell at the wrong time or the wrong size.
     """
 
+
     def _run_both(self, ticker, entry_date, entry_price, shares, tiers,
                   sl_pct_t=0.10, sl_pct_f=0.18):
         from darvas_box_strategy.bot.cli import _bars_after_entry
@@ -439,6 +440,86 @@ class ExecutorParityTests(unittest.TestCase):
             [(k, s) for k, s, _ in bt], [(k, s) for k, s, _ in bot],
             f"exit events differ:\n  backtest={bt}\n  bot={bot}",
         )
+
+
+class DryRunStateTests(unittest.TestCase):
+    """A --dry-run must never consume an event.
+
+    Regression: `scan-exits --dry-run` used to mark the detected
+    events as notified and persist the state file. The follow-up real
+    run then found no new events and sent nothing — the operator
+    never got the notification.
+    """
+
+    def _run_scan_exits(self, state_path, dry_run):
+        """Run cmd_scan_exits against a temp state file + real data."""
+        import darvas_box_strategy.bot.cli as cli_mod
+        from darvas_box_strategy.bot import positions as pos_mod
+
+        # Point the CLI at our temp state file.
+        orig_state = cli_mod.STATE_PATH
+        cli_mod.STATE_PATH = state_path
+        sent = []
+
+        def fake_send(config, text, **kw):
+            sent.append(text)
+            return {"ok": True}
+
+        orig_send = cli_mod.send_telegram
+        cli_mod.send_telegram = fake_send
+        try:
+            class Args:
+                pass
+            a = Args()
+            a.dry_run = dry_run
+            rc = cli_mod.cmd_scan_exits(a)
+        finally:
+            cli_mod.send_telegram = orig_send
+            cli_mod.STATE_PATH = orig_state
+        return rc, sent
+
+    def test_dry_run_does_not_consume_events(self):
+        import tempfile
+        import shutil
+        from pathlib import Path
+        from darvas_box_strategy.bot.positions import LivePosition, save_state
+
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            state_path = tmp / "positions.json"
+            # A position whose sl_T is above the last close, so a
+            # partial stop fires on the final bar.
+            positions = {
+                "VNM_TEST": LivePosition(
+                    ticker="VNM", entry_date="2026-08-10", entry_price=62_000.0,
+                    shares=2_400, remaining=2_400, size_pct=0.15,
+                    sl_T=60_000.0, sl_F=58_000.0,
+                    tiers=[[1.063, 0.10], [1.125, 0.30], [1.210, 0.30]],
+                    conviction="low", peak_close=64_000.0, last_close=58_200.0,
+                ),
+            }
+            save_state(positions, state_path)
+
+            rc, sent = self._run_scan_exits(state_path, dry_run=True)
+            self.assertEqual(rc, 0)
+            # Dry run sent nothing over the wire.
+            self.assertEqual(sent, [])
+
+            # The state file must still contain the position, and the
+            # 'notified' list must be EMPTY so the real run can notify.
+            reloaded = load_state(state_path)
+            self.assertIn("VNM_TEST", reloaded,
+                          "dry-run removed the position from the state file")
+            self.assertEqual(reloaded["VNM_TEST"].notified, [],
+                             "dry-run marked events as notified")
+
+            # Now the real run must actually notify.
+            rc2, sent2 = self._run_scan_exits(state_path, dry_run=False)
+            self.assertEqual(rc2, 0)
+            self.assertEqual(len(sent2), 1, "real run sent no notification")
+            self.assertIn("Partial stop", sent2[0])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

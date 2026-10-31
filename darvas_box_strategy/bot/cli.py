@@ -258,7 +258,7 @@ def cmd_scan_signals(args) -> int:
 
     # Load live position state so we can (a) avoid re-alerting on the
     # same breakout and (b) start tracking new positions for exit events.
-    positions = load_state()
+    positions = load_state(STATE_PATH)
     existing_tickers = {p.ticker for p in positions.values()}
 
     new_positions = []
@@ -303,7 +303,7 @@ def cmd_scan_signals(args) -> int:
     # Persist position state BEFORE sending, so a crash between send and
     # save doesn't cause a duplicate alert on the next run.
     if new_positions:
-        save_state(positions)
+        save_state(positions, STATE_PATH)
 
     result = send_telegram(config, text)
     print(json.dumps(result, indent=2))
@@ -357,7 +357,7 @@ def cmd_scan_exits(args) -> int:
         return 1
 
     cfg = build_default_config()
-    positions = load_state()
+    positions = load_state(STATE_PATH)
     if not positions:
         msg = "📭 *Darvas Box: No open positions tracked*"
         if args.dry_run:
@@ -406,11 +406,15 @@ def cmd_scan_exits(args) -> int:
             print(f"  {key}: no exit events (bar {pos.last_bar_date}, "
                   f"remaining {pos.remaining:,} sh)")
 
-    # Persist state BEFORE sending so a crash doesn't cause duplicates.
-    for key in closed_keys:
-        remove_position(positions, key)
-    if all_events or closed_keys:
-        save_state(positions)
+    # Persist state BEFORE sending so a crash between send and save
+    # cannot cause a duplicate alert on the next run.
+    # A --dry-run must NOT persist: the events have not been sent yet,
+    # so the next real run must still be able to notify them.
+    if not args.dry_run:
+        for key in closed_keys:
+            remove_position(positions, key)
+        if all_events or closed_keys:
+            save_state(positions, STATE_PATH)
 
     if not all_events:
         msg = format_no_exits_summary(len(positions))
@@ -451,7 +455,7 @@ def cmd_positions(args) -> int:
         print("ERROR: No Telegram config", file=sys.stderr)
         return 1
 
-    positions = load_state()
+    positions = load_state(STATE_PATH)
     text = format_positions_summary(list(positions.values()))
     if args.dry_run:
         print("DRY RUN — would send:")
