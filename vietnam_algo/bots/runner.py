@@ -138,6 +138,84 @@ def _mirror_daily_report(
         print(f"[daily_reports] write '{source}' failed: {exc}")
 
 
+def _notify_stale_token_if_blocking(
+    data_dir,
+    account_no: str,
+    deals_actioned: list | None,
+    now=None,
+    alert_state: dict | None = None,
+) -> bool:
+    """Notify the operator when a STALE trading token will BLOCK an order.
+
+    2026-10-31. The user reported the "DNSE trading token is STALE"
+    alert firing at 22:46 on a Saturday — no trading session, no
+    order to send. The token is only renewed lazily (when a new order
+    is planned), so a stale token is only ACTIONABLE at the moment it
+    would block a submit.
+
+    The alert therefore fires only when ALL of these hold:
+
+    1. There is at least one order to send (``deals_actioned`` is
+       non-empty).
+    2. We are inside a live trading session (a trading day, and
+       within the 09:00-15:00 ICT window).
+    3. The shared token is actually stale (not merely absent).
+
+    It is still throttled to once per ICT day so a missed 08:30-ICT
+    cron does not spam.
+
+    Returns True when the alert was sent.
+    """
+    from vietnam_algo.libs.schedule import is_main_trading_phase
+
+    # (1) Only when there is an order to send.
+    if not deals_actioned:
+        return False
+
+    # (2) Only inside a live trading session.
+    moment = now if now is not None else vietnam_now()
+    if not is_main_trading_phase(moment):
+        return False
+
+    # (3) The token must actually be stale.
+    shared = load_shared_trading_token(data_dir)
+    if not shared:
+        return False
+    issued = str(shared.get("issued_at") or "?")
+    from vietnam_algo.libs.dnse.auth import is_token_fresh
+    if is_token_fresh(shared.get("token"), issued_at=shared.get("issued_at")):
+        return False
+
+    # Throttle: at most once per ICT day.
+    today = local_date(moment)
+    if alert_state is not None:
+        if alert_state.get("date") == today:
+            return False
+        alert_state["date"] = today
+
+    _n_orders = sum(
+        1 for d in (deals_actioned or []) for _ in (d.get("dnse_orders") or [])
+    )
+    _symbols = sorted({
+        str(d.get("symbol") or "?") for d in (deals_actioned or [])
+    })
+    notify(
+        "🚨 Vietnam Algo: DNSE trading token is STALE — ORDERS BLOCKED\n"
+        f"account: {account_no}\n"
+        f"issued_at: {issued}\n"
+        f"orders waiting: {_n_orders} ({', '.join(_symbols[:8])})"
+        + (f" +{len(_symbols) - 8} more" if len(_symbols) > 8 else "")
+        + "\nThe 08:30-ICT get_otp cron may have missed its window. "
+        "These orders will be SKIPPED (not sent with a bad token) until "
+        "the token refreshes."
+    )
+    print(
+        f"[{moment.isoformat()}] stale-token ALERT sent: "
+        f"{_n_orders} order(s) blocked ({', '.join(_symbols[:8])})"
+    )
+    return True
+
+
 def _hydrate_shared_token_into_state(state, data_dir) -> bool:
     """Copy the latest DNSE token from the shared file into the
     bot's in-memory state if it's fresh enough.
@@ -3423,11 +3501,16 @@ def run_auto_bot(
     # ACTUALLY changes (the cron writes a new token at 08:30 ICT, so
     # we want one line, not one per minute).
     # ``_last_stale_token_warn_min`` throttles the "token is STALE"
-    # warning to once per hour, and ``_stale_token_alert_date``
-    # ensures the Telegram alert fires at most once per ICT day.
+    # LOG LINE to once per hour.
+    #
+    # 2026-10-31: the Telegram ALERT moved into
+    # ``_notify_stale_token_if_blocking``, which fires only when a
+    # stale token actually blocks an order in a live trading session.
+    # ``_stale_token_alert_state`` carries the once-per-ICT-day
+    # throttle for it.
     _last_adopted_token_issued_at: str | None = None
     _last_stale_token_warn_min: int | None = None
-    _stale_token_alert_date: str = ""
+    _stale_token_alert_state: dict = {}
     while True:
         if not first_iter:
             time.sleep(sleep_seconds)
@@ -3493,6 +3576,28 @@ def run_auto_bot(
                                 f"token hydration failed: {_exc}"
                             )
                 else:
+                    # 2026-10-31: the STALE-token ALERT moved out of
+                    # this block.
+                    #
+                    # This block runs on EVERY cycle (every ~60 s), all
+                    # day and all night. The operator was getting the
+                    # "DNSE trading token is STALE" Telegram alert at
+                    # 22:46 on a SATURDAY — when there was no trading
+                    # session and no order to send.
+                    #
+                    # The user's rule: the alert should only fire in a
+                    # LIVE TRADING SESSION, and only when we actually
+                    # have an ORDER to send with it. The token is only
+                    # renewed lazily — when a new order is planned — so
+                    # a stale token is only actionable at the moment
+                    # it would block a submit.
+                    #
+                    # The log line below stays (it is cheap, throttled to
+                    # once an hour, and useful for post-mortems), but
+                    # the Telegram notification now happens in
+                    # ``_notify_stale_token_if_blocking`` — called from
+                    # the mid-day poll and the EOD submit, only when
+                    # there are orders to send and the market is open.
                     _sh = load_shared_trading_token(engine_config.dataDir)
                     if _sh:
                         _issued = str(_sh.get("issued_at") or "?")
@@ -3508,19 +3613,6 @@ def run_auto_bot(
                                 f"08:30-ICT get_otp cron may have missed its "
                                 f"window; orders will be skipped until it "
                                 f"refreshes"
-                            )
-                        # Notify at most once per ICT day so a missed
-                        # cron is visible without spamming.
-                        if _stale_token_alert_date != today:
-                            _stale_token_alert_date = today
-                            notify(
-                                "🚨 Vietnam Algo: DNSE trading token is STALE\n"
-                                f"account: {account_no}\n"
-                                f"issued_at: {_issued}\n"
-                                "The 08:30-ICT get_otp cron may have missed "
-                                "its window. Orders will be SKIPPED (not "
-                                "sent with a bad token) until the token "
-                                "refreshes."
                             )
             except Exception as exc:
                 print(
@@ -4230,6 +4322,33 @@ def run_auto_bot(
                                 f"token hydrate failed: "
                                 f"{type(exc).__name__}: {str(exc)[:200]}"
                             )
+                    # 2026-10-31: the stale-token ALERT.
+                    #
+                    # This is the ONLY place (besides the EOD submit)
+                    # where it belongs: we are in a live trading
+                    # session and we have orders to send, so a stale
+                    # token actually BLOCKS them.
+                    #
+                    # It is checked independently of ``token`` — a
+                    # stale token can be present in the state (so
+                    # ``token`` is truthy) and still be past its
+                    # 12-hour validity window.
+                    if live_submit:
+                        try:
+                            _notify_stale_token_if_blocking(
+                                engine_config.dataDir,
+                                account_no,
+                                (poll_result.get("deals_actioned") or [])
+                                if isinstance(poll_result, dict) else [],
+                                now=now,
+                                alert_state=_stale_token_alert_state,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[{now.isoformat()}] stale-token alert "
+                                f"failed: {type(exc).__name__}: "
+                                f"{str(exc)[:200]}"
+                            )
                     # Live mode: actually submit the planned orders to
                     # DNSE via execute_orders_with_ledger. We do this
                     # BEFORE the dry-run apply so the dry-run state
@@ -4670,6 +4789,63 @@ def run_auto_bot(
             # by (run_id, sourceOrderId, symbol, side) so the same
             # logical order can't be double-submitted if the bot
             # restarts mid-day and the EOD replans it.
+            #
+            # 2026-10-31: the EOD path hydrates its own token from the
+            # shared file. It used to rely on the loop-scoped ``token``,
+            # which is only set by the ``should_submit_orders`` block —
+            # and that block is SKIPPED for autofin_signal (it is a
+            # mid-day/EOD strategy, see the comment there). So the EOD
+            # submit was silently skipped whenever the bot had not
+            # happened to run the submit cycle that day.
+            if live_submit and isinstance(result, dict) and result.get("deals_actioned"):
+                _eod_deals = result.get("deals_actioned") or []
+                if not token:
+                    try:
+                        shared = load_shared_trading_token(
+                            engine_config.dataDir,
+                        )
+                        from vietnam_algo.libs.dnse.auth import (
+                            is_token_fresh as _is_fresh,
+                        )
+                        if shared and shared.get("token") and _is_fresh(
+                            shared.get("token"),
+                            issued_at=shared.get("issued_at"),
+                        ):
+                            token = str(shared["token"])
+                            print(
+                                f"[{now.isoformat()}] eod submit hydrated "
+                                f"trading token from shared file "
+                                f"(issued_at={shared.get('issued_at','?')})"
+                            )
+                        elif shared and shared.get("token"):
+                            print(
+                                f"[{now.isoformat()}] eod submit: shared "
+                                f"trading token is STALE (issued_at="
+                                f"{shared.get('issued_at','?')}) — orders "
+                                f"will be skipped rather than rejected "
+                                f"with INVALID_TRADING_TOKEN"
+                            )
+                    except Exception as exc:
+                        print(
+                            f"[{now.isoformat()}] eod submit token hydrate "
+                            f"failed: {type(exc).__name__}: {str(exc)[:200]}"
+                        )
+                # 2026-10-31: the stale-token ALERT. Same rule as the
+                # mid-day poll — a live session, orders to send, and a
+                # token that is genuinely stale.
+                try:
+                    _notify_stale_token_if_blocking(
+                        engine_config.dataDir,
+                        account_no,
+                        _eod_deals,
+                        now=now,
+                        alert_state=_stale_token_alert_state,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[{now.isoformat()}] stale-token alert failed: "
+                        f"{type(exc).__name__}: {str(exc)[:200]}"
+                    )
             if (
                 live_submit
                 and isinstance(result, dict)
