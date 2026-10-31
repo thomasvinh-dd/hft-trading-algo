@@ -157,6 +157,17 @@ _mk_darvas_report() {
     printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli send-report >> %s/darvas_report.log 2>&1\n' \
         "$(_guard_ict 16:00)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
 }
+# Exit-event scanner (TIER / TRAIL / SL_SCALE / SL_HARD notifications).
+# Runs right after the pre-market scan and again after the close so
+# exit events are picked up on the same trading day they fire.
+_mk_darvas_exits() {
+    printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-exits >> %s/darvas_exits.log 2>&1\n' \
+        "$(_guard_ict 09:05)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+}
+_mk_darvas_exits_eod() {
+    printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-exits >> %s/darvas_exits.log 2>&1\n' \
+        "$(_guard_ict 15:25)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+}
 _mk_pg_backup() {
     printf '0 * * * * %s%s/scripts/backup_postgres.sh >> /var/log/hft-postgres-backup.log 2>&1\n' \
         "$(_guard_utc 23:00)" "$PROJECT_DIR"
@@ -166,9 +177,11 @@ _mk_watchdog() {
 }
 
 _mk_entries() {
-    printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         "$(_mk_pg_backup)" \
         "$(_mk_darvas_scan)" \
+        "$(_mk_darvas_exits)" \
+        "$(_mk_darvas_exits_eod)" \
         "$(_mk_darvas_report)" \
         "$(_mk_get_otp)" \
         "$(_mk_common_sync)" \
@@ -191,7 +204,7 @@ _mk_entries() {
 # covered by it.
 _filter_managed() {
     printf '%s\n' "$1" \
-        | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum\|scan-signals\|send-report\|backup_postgres\|CRON_TZ=' \
+        | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum\|scan-signals\|scan-exits\|send-report\|backup_postgres\|CRON_TZ=' \
         | sed '/^[[:space:]]*$/d' \
         || true
 }

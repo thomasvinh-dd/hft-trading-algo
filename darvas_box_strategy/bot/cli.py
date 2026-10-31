@@ -33,6 +33,25 @@ from .report import (
     format_recent_trades,
     format_ticker_breakdown,
 )
+from .positions import (
+    STATE_PATH,
+    LivePosition,
+    find_position_for_ticker,
+    load_state,
+    mark_notified,
+    position_from_signal,
+    remove_position,
+    save_state,
+    upsert_position,
+)
+from .exits import ExitEvent, evaluate_exits
+from .messages import (
+    format_entry_alert,
+    format_exit_event,
+    format_exit_events,
+    format_no_exits_summary,
+    format_positions_summary,
+)
 
 
 PRICES_DIR = ROOT / "vietnam_algo" / "data" / "prices"
@@ -237,13 +256,30 @@ def cmd_scan_signals(args) -> int:
             continue
         signals.append(signal)
 
-    if not signals:
-        lines = [f"📭 *Darvas Box: No breakout signals* on last bar"]
+    # Load live position state so we can (a) avoid re-alerting on the
+    # same breakout and (b) start tracking new positions for exit events.
+    positions = load_state()
+    existing_tickers = {p.ticker for p in positions.values()}
+
+    new_positions = []
+    fresh_signals = []
+    for s in signals:
+        if s.ticker in existing_tickers:
+            # Already have an open position for this ticker — one active
+            # deal per ticker. Don't re-alert, don't track a duplicate.
+            continue
+        fresh_signals.append(s)
+        pos = position_from_signal(s)
+        upsert_position(positions, pos)
+        new_positions.append((s, pos))
+
+    if not fresh_signals:
+        lines = ["📭 *Darvas Box: No breakout signals* on last bar"]
     else:
-        lines = [f"🚨 *Darvas Box: {len(signals)} breakout signal(s)*"]
+        lines = [f"🚨 *Darvas Box: {len(fresh_signals)} breakout signal(s)*"]
         lines.append(f"_Universe_: HOSE blue chips ({len(filtered)} tickers)")
         lines.append("")
-        for s in sorted(signals, key=lambda x: -x.size_pct):
+        for s in sorted(fresh_signals, key=lambda x: -x.size_pct):
             notional = s.shares * s.entry_price
             lines.append(
                 f"• *{s.ticker}* @ {s.entry_price:,.0f}\n"
@@ -257,8 +293,169 @@ def cmd_scan_signals(args) -> int:
     if args.dry_run:
         print("DRY RUN — would send:")
         print(text)
+        if new_positions:
+            print()
+            print("DRY RUN — would track as new position(s):")
+            for s, pos in new_positions:
+                print(f"  {pos.key}  {pos.shares:,} sh @ {pos.entry_price:,.0f}")
         return 0
 
+    # Persist position state BEFORE sending, so a crash between send and
+    # save doesn't cause a duplicate alert on the next run.
+    if new_positions:
+        save_state(positions)
+
+    result = send_telegram(config, text)
+    print(json.dumps(result, indent=2))
+
+    # Send a separate, richer message per new position so the exit
+    # tracker has the details (TPs, stops) visible on Telegram.
+    for s, pos in new_positions:
+        msg = format_entry_alert(
+            ticker=pos.ticker,
+            entry_price=pos.entry_price,
+            shares=pos.shares,
+            size_pct=pos.size_pct,
+            sl_T=pos.sl_T,
+            sl_F=pos.sl_F,
+            tiers=pos.tiers,
+        )
+        r = send_telegram(config, msg)
+        ok = r.get("ok")
+        print(f"  position {pos.key}: {'sent OK' if ok else 'FAILED'}")
+        if not ok:
+            print(f"    {r}", file=sys.stderr)
+        time.sleep(0.3)
+    return 0 if result.get("ok") else 1
+
+
+def _bars_after_entry(ticker: str, entry_date: str) -> list:
+    """Load price bars strictly after the entry date for a ticker."""
+    path = PRICES_DIR / f"{ticker}.json"
+    bars = load_price_bars(path)
+    out = []
+    for b in bars:
+        # PriceBar.time is an ISO date string
+        if str(b.time) > str(entry_date):
+            out.append(b)
+    return out
+
+
+def cmd_scan_exits(args) -> int:
+    """Evaluate the exit ladder for tracked positions and notify Telegram.
+
+    This is the counterpart to ``scan-signals``: it walks each open
+    position's price history, applies the TIER / TRAIL / SL_SCALE /
+    SL_HARD rules, and sends a Telegram message for every NEW exit
+    event (deduped so the same event is never sent twice).
+    """
+    config = load_telegram_config(
+        env_path=ROOT / "vietnam_algo" / "env" / ".env.telegram"
+    )
+    if config is None and not args.dry_run:
+        print("ERROR: No Telegram config", file=sys.stderr)
+        return 1
+
+    cfg = build_default_config()
+    positions = load_state()
+    if not positions:
+        msg = "📭 *Darvas Box: No open positions tracked*"
+        if args.dry_run:
+            print("DRY RUN — would send:")
+            print(msg)
+            return 0
+        result = send_telegram(config, msg)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 1
+
+    all_events = []   # list of (position, [ExitEvent])
+    closed_keys = []
+
+    for key, pos in list(positions.items()):
+        bars = _bars_after_entry(pos.ticker, pos.entry_date)
+        if not bars:
+            print(f"  {key}: no bars after entry, skipping")
+            continue
+
+        # Only look at bars we haven't evaluated yet.
+        if pos.last_bar_date:
+            fresh = [b for b in bars if str(b.time) > str(pos.last_bar_date)]
+            if not fresh:
+                print(f"  {key}: no new bars since {pos.last_bar_date}, skipping")
+                continue
+            # Include the last evaluated bar for state continuity
+            # (peak close etc.), then the new bars.
+            eval_bars = [b for b in bars if str(b.time) >= str(pos.last_bar_date)]
+        else:
+            eval_bars = bars
+
+        already = set(pos.notified)
+        events = evaluate_exits(pos, eval_bars, cfg, already_notified=already)
+        pos.last_bar_date = str(eval_bars[-1].time)
+
+        if events:
+            all_events.append((pos, events))
+            for ev in events:
+                mark_notified(pos, ev.dedupe_key)
+            print(f"  {key}: {len(events)} exit event(s) — "
+                  f"{', '.join(e.kind for e in events)}")
+            if pos.remaining <= 0:
+                closed_keys.append(key)
+        else:
+            print(f"  {key}: no exit events (bar {pos.last_bar_date}, "
+                  f"remaining {pos.remaining:,} sh)")
+
+    # Persist state BEFORE sending so a crash doesn't cause duplicates.
+    for key in closed_keys:
+        remove_position(positions, key)
+    if all_events or closed_keys:
+        save_state(positions)
+
+    if not all_events:
+        msg = format_no_exits_summary(len(positions))
+        if args.dry_run:
+            print("DRY RUN — would send:")
+            print(msg)
+            return 0
+        result = send_telegram(config, msg)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 1
+
+    failed = 0
+    for pos, events in all_events:
+        text = (format_exit_events(pos, events) if len(events) > 1
+                else format_exit_event(pos, events[0]))
+        if args.dry_run:
+            print("=" * 60)
+            print("DRY RUN — would send:")
+            print("=" * 60)
+            print(text)
+            continue
+        r = send_telegram(config, text)
+        if r.get("ok"):
+            print(f"  {pos.key}: sent OK ({len(events)} event(s))")
+        else:
+            failed += 1
+            print(f"  {pos.key}: FAILED: {r}", file=sys.stderr)
+        time.sleep(0.3)
+    return 0 if failed == 0 else 1
+
+
+def cmd_positions(args) -> int:
+    """Print the tracked open positions (and optionally notify Telegram)."""
+    config = load_telegram_config(
+        env_path=ROOT / "vietnam_algo" / "env" / ".env.telegram"
+    )
+    if config is None and not args.dry_run:
+        print("ERROR: No Telegram config", file=sys.stderr)
+        return 1
+
+    positions = load_state()
+    text = format_positions_summary(list(positions.values()))
+    if args.dry_run:
+        print("DRY RUN — would send:")
+        print(text)
+        return 0
     result = send_telegram(config, text)
     print(json.dumps(result, indent=2))
     return 0 if result.get("ok") else 1
@@ -298,6 +495,18 @@ def main(argv=None) -> int:
     p_scan.add_argument("--lookback", type=int, default=0,
                        help="How many bars back to scan (0=today, 1=yesterday)")
     p_scan.set_defaults(func=cmd_scan_signals)
+
+    p_exits = sub.add_parser(
+        "scan-exits",
+        help="Evaluate exit ladder (TIER/TRAIL/SL) for tracked positions "
+             "and notify Telegram")
+    p_exits.add_argument("--dry-run", action="store_true")
+    p_exits.set_defaults(func=cmd_scan_exits)
+
+    p_pos = sub.add_parser(
+        "positions", help="Show tracked open positions")
+    p_pos.add_argument("--dry-run", action="store_true")
+    p_pos.set_defaults(func=cmd_positions)
 
     p_show = sub.add_parser("show-config", help="Print default config")
     p_show.set_defaults(func=cmd_show_config)

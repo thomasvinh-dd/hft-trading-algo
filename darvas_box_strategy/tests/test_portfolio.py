@@ -111,7 +111,7 @@ class PortfolioSizePositionTests(unittest.TestCase):
             volume_compression: float = 1.0
         cfg = StrategyConfig(
             base=BaseConfig(), breakout=BreakoutConfig(),
-            exits=ExitsConfig(), trailing=TrailingConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0), trailing=TrailingConfig(),
             universe=UniverseConfig(),
             backtest=BacktestConfig(
                 start_nav=1e9, size_low=0.20, size_high=0.40,
@@ -149,7 +149,7 @@ class PortfolioSizePositionTests(unittest.TestCase):
             volume_compression: float = 1.0
         cfg = StrategyConfig(
             base=BaseConfig(), breakout=BreakoutConfig(),
-            exits=ExitsConfig(), trailing=TrailingConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0), trailing=TrailingConfig(),
             universe=UniverseConfig(),
             backtest=BacktestConfig(
                 start_nav=10_000.0, size_low=0.20, size_high=0.40,
@@ -179,7 +179,7 @@ class PortfolioBasicTests(unittest.TestCase):
         self.cfg = StrategyConfig(
             base=BaseConfig(),
             breakout=BreakoutConfig(),
-            exits=ExitsConfig(tiers=((1.10, 1.0),)),  # 10% TP, 100% sell
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=((1.10, 1.0),)),  # 10% TP, 100% sell
             trailing=TrailingConfig(),
             universe=UniverseConfig(),
             backtest=BacktestConfig(
@@ -362,7 +362,7 @@ class TradeFillsTests(unittest.TestCase):
             base=BaseConfig(),
             breakout=BreakoutConfig(),
             # Three TP tiers: 5%, 10%, 20% — for testing tier exits
-            exits=ExitsConfig(tiers=((1.05, 0.30), (1.10, 0.30), (1.20, 0.40))),
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=((1.05, 0.30), (1.10, 0.30), (1.20, 0.40))),
             trailing=TrailingConfig(),
             universe=UniverseConfig(),
             backtest=BacktestConfig(
