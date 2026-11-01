@@ -20,6 +20,7 @@
 # Usage:
 #   bash scripts/deploy.sh              # deploy
 #   bash scripts/deploy.sh --dry-run    # show what would change
+#   bash scripts/deploy.sh --delete     # also remove files only on the VPS
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -56,11 +57,31 @@ EXCLUDES=(
     --exclude='*.bin'
 )
 
+# --delete is OFF by default: the VPS hosts files that are NOT in the
+# local checkout (postgres/initdb.d/*.sql — the real Postgres init
+# scripts, plus operator helper scripts). A blanket --delete would
+# wipe them. Enable it only with --delete when you know the local
+# tree is a superset of the remote one.
+DELETE=""
+for arg in "$@"; do
+    case "$arg" in
+        --delete) DELETE="--delete" ;;
+    esac
+done
+
 echo "=== Deploying $PROJECT_DIR -> $VPS:$REMOTE_DIR ==="
 echo "--- excluded from sync (runtime data) ---"
 printf '    %s\n' "${EXCLUDES[@]}"
+if [[ -z "$DELETE" ]]; then
+    echo "--- --delete is OFF (files only on the VPS are kept) ---"
+else
+    echo "--- --delete is ON (files only on the VPS WILL BE REMOVED) ---"
+fi
 
-RSYNC_ARGS=(-avz --delete "${EXCLUDES[@]}" "${DRY_RUN}")
+RSYNC_ARGS=(-avz "${EXCLUDES[@]}" "${DRY_RUN}")
+if [[ -n "$DELETE" ]]; then
+    RSYNC_ARGS+=(--delete)
+fi
 if [[ -n "$DRY_RUN" ]]; then
     RSYNC_ARGS+=(--itemize-changes)
 fi

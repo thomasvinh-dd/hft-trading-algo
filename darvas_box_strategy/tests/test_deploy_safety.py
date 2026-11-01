@@ -86,11 +86,33 @@ class DeployScriptTests(unittest.TestCase):
         for pattern in (".git", "__pycache__", "*.log", "*.env"):
             self.assertIn(pattern, excludes, f"deploy.sh must exclude {pattern}")
 
-    def test_uses_delete_flag(self):
-        """--delete so files removed on the VPS are removed locally too."""
+    def test_delete_is_opt_in(self):
+        """--delete must be opt-in, never the default.
+
+        The VPS hosts files that are not in the local checkout
+        (postgres/initdb.d/*.sql, operator helper scripts). A blanket
+        --delete would wipe them.
+        """
         self.assertIn(
             "--delete", self.src,
-            "deploy.sh should use --delete so deletions propagate",
+            "deploy.sh should support --delete",
+        )
+        self.assertIn(
+            'DELETE=""', self.src,
+            "--delete must default to OFF",
+        )
+        self.assertIn(
+            "--delete is OFF", self.src,
+            "deploy.sh should warn that --delete is off by default",
+        )
+
+    def test_delete_flag_not_in_default_rsync_args(self):
+        """The default rsync invocation must not pass --delete."""
+        m = re.search(r"RSYNC_ARGS=\((.*?)\)", self.src, re.DOTALL)
+        self.assertIsNotNone(m, "RSYNC_ARGS not found in deploy.sh")
+        self.assertNotIn(
+            "--delete", m.group(1),
+            "--delete must be added conditionally, not in the default args",
         )
 
     def test_documented_incident(self):
