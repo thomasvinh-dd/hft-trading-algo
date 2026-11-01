@@ -102,6 +102,89 @@ def _load_ca_index() -> list[dict]:
     return []
 
 
+def _mirror_symbols_to_db(data_dir: Path) -> int:
+    """Mirror ``symbols.json`` into the Postgres ``symbols`` table.
+
+    Same best-effort contract as the price mirror — a Postgres outage
+    must not break the sync.
+    """
+    import os
+
+    if os.environ.get("HFT_MIRROR_TO_DB", "1") == "0":
+        return 0
+    try:
+        from vietnam_algo.libs.db import DbClient
+        from vietnam_algo.libs.db_sync import mirror_symbols
+        from vietnam_algo.libs.data import read_json
+    except ImportError as exc:  # pragma: no cover — psycopg2 missing
+        print(f"[common_sync] skipping Postgres symbol mirror: {exc}")
+        return 0
+
+    path = data_dir / "symbols.json"
+    if not path.exists():
+        return 0
+    try:
+        payload = read_json(path)
+    except Exception as exc:
+        print(f"[common_sync] symbol mirror read: {exc}")
+        return 0
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not items:
+        return 0
+
+    db = DbClient.from_default()
+    count = mirror_symbols(db, items)
+    if count:
+        print(f"[common_sync] symbols mirrored to Postgres: {count}")
+    return count or 0
+
+
+def _mirror_prices_to_db(
+    symbols: list[str],
+    data_dir: Path,
+    paths: list[Path],
+) -> int:
+    """Mirror freshly-written price JSON files into the Postgres mirror.
+
+    Postgres is the intended source of truth for market data (see
+    ``vietnam_algo/db.py``), but only ``daily_engine.update_dataset()``
+    fed it — and the cron drives prices through ``common_sync``, which
+    calls ``sync_prices_incremental`` directly. So ``prices_dnse`` sat
+    empty while the JSON files were current.
+
+    Best-effort: a Postgres outage must not break the sync. The
+    ``mirror_*`` helpers swallow ``DbError`` and log.
+
+    Set ``HFT_MIRROR_TO_DB=0`` to disable.
+    """
+    import os
+
+    if os.environ.get("HFT_MIRROR_TO_DB", "1") == "0":
+        return 0
+    try:
+        from vietnam_algo.libs.db import DbClient
+        from vietnam_algo.libs.db_sync import mirror_prices
+        from vietnam_algo.libs.data import read_json
+    except ImportError as exc:  # pragma: no cover — psycopg2 missing
+        print(f"[common_sync] skipping Postgres mirror (no psycopg2): {exc}")
+        return 0
+
+    db = DbClient.from_default()
+    touched = 0
+    for symbol, path in zip(symbols, paths):
+        try:
+            payload = read_json(path)
+        except Exception as exc:
+            print(f"[common_sync] mirror read {symbol}: {exc}")
+            continue
+        bars = payload.get("items") if isinstance(payload, dict) else None
+        if not bars:
+            continue
+        if mirror_prices(db, symbol, bars):
+            touched += 1
+    return touched
+
+
 def run() -> CommonSyncResult:
     """Do the day's common sync. Skips already-done work.
 
@@ -153,6 +236,11 @@ def run() -> CommonSyncResult:
     if not symbols:
         raise RuntimeError("sync_symbols returned 0 symbols — aborting")
 
+    # Mirror the symbol universe into Postgres too — the ``symbols``
+    # table only had a single leftover test row, so a DB-side reader
+    # had no idea which tickers exist.
+    _mirror_symbols_to_db(DATA_DIR)
+
     # Surface the denylist size for log observability — when DNSE stops
     # carrying a symbol it lands here and is skipped on future syncs.
     denylist = load_invalid_symbol_denylist(DATA_DIR)
@@ -181,6 +269,21 @@ def run() -> CommonSyncResult:
             f"to the invalid-symbol denylist"
         )
     print(f"[common_sync] prices refreshed: {len(paths)} (incremental)")
+
+    # Mirror the refreshed prices into Postgres.
+    #
+    # Before this, only ``daily_engine.update_dataset()`` mirrored
+    # prices to the DB — but the cron drives prices through
+    # ``common_sync`` (which calls ``sync_prices_incremental``
+    # directly). So the mirror never ran on the cron path and
+    # ``prices_dnse`` sat empty (0 rows) even though the JSON files
+    # were current. Postgres is meant to be the source of truth for
+    # downstream readers, so it has to be fed here.
+    mirrored = _mirror_prices_to_db(symbols, DATA_DIR, paths)
+    print(
+        f"[common_sync] prices mirrored to Postgres: {mirrored}/{len(paths)}"
+    )
+
     if fetch_errors:
         # Separate 'invalid symbol' rejections (permanent — DNSE will
         # never carry these tickers) from real failures (network, 5xx,

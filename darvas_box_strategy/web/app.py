@@ -58,11 +58,15 @@ def create_app() -> Flask:
     @app.route("/api/health")
     def health():
         cache = load_cache()
+        from darvas_box_strategy.darvas.db_prices import db_price_stats
         return jsonify({
             "ok": True,
             "cache_path": str(CACHE_PATH),
             "cache_last_updated": cache.last_updated,
             "cache_exists": CACHE_PATH.exists(),
+            # Postgres is the source of truth for market data; the JSON
+            # files under vietnam_algo/data/prices/ are the fallback.
+            "price_source": db_price_stats(),
         })
 
     @app.route("/api/signals")

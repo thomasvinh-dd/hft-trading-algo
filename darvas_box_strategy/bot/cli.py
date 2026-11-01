@@ -25,6 +25,7 @@ from darvas_box_strategy.darvas import (
     run_backtest, load_price_bars, summary_report,
 )
 from darvas_box_strategy.darvas.data_loader import derive_meta, passes_universe
+from darvas_box_strategy.darvas.db_prices import load_bars
 
 from .telegram import TelegramConfig, load_telegram_config, send, send_telegram
 from .report import (
@@ -110,12 +111,11 @@ def build_default_config() -> StrategyConfig:
 def filter_universe(tickers: List[str], cfg: StrategyConfig,
                      prices_dir: Path = PRICES_DIR) -> List[str]:
     """Filter tickers that have sufficient data for the config."""
+    from darvas_box_strategy.darvas.db_prices import load_bars
+
     out = []
     for t in tickers:
-        path = prices_dir / f"{t}.json"
-        if not path.exists():
-            continue
-        bars = load_price_bars(path)
+        bars = load_bars(t, prices_dir)
         if len(bars) < cfg.breakout.min_history_days:
             continue
         meta = derive_meta(t, bars)
@@ -237,8 +237,7 @@ def cmd_scan_signals(args) -> int:
     as_of_offset = args.lookback  # 0 = today, 1 = yesterday, etc.
     signals = []
     for ticker in filtered:
-        path = PRICES_DIR / f"{ticker}.json"
-        bars = load_price_bars(path)
+        bars = load_bars(ticker)
         if len(bars) < cfg.breakout.min_history_days:
             continue
         idx = len(bars) - 1 - as_of_offset
@@ -331,8 +330,9 @@ def cmd_scan_signals(args) -> int:
 
 def _bars_after_entry(ticker: str, entry_date: str) -> list:
     """Load price bars strictly after the entry date for a ticker."""
-    path = PRICES_DIR / f"{ticker}.json"
-    bars = load_price_bars(path)
+    from darvas_box_strategy.darvas.db_prices import load_bars
+
+    bars = load_bars(ticker)
     out = []
     for b in bars:
         # PriceBar.time is an ISO date string

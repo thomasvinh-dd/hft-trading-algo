@@ -184,10 +184,7 @@ def get_current_signals(lookback: int = 0,
     filtered = filter_universe(tickers, cfg)
     signals: List[Dict[str, Any]] = []
     for ticker in filtered:
-        path = PRICES_DIR / f"{ticker}.json"
-        if not path.exists():
-            continue
-        bars = _load_bars_safe(path)
+        bars = _load_bars_safe(ticker)
         if len(bars) < cfg.breakout.min_history_days:
             continue
         idx = len(bars) - 1 - lookback
@@ -239,10 +236,7 @@ def get_recent_signals(days: int = 7, cfg=None) -> List[Dict[str, Any]]:
     filtered = filter_universe(tickers, cfg)
     out: List[Dict[str, Any]] = []
     for ticker in filtered:
-        path = PRICES_DIR / f"{ticker}.json"
-        if not path.exists():
-            continue
-        bars = _load_bars_safe(path)
+        bars = _load_bars_safe(ticker)
         if len(bars) < cfg.breakout.min_history_days:
             continue
         # Find the most recent base that ended within the last `days`
@@ -382,11 +376,7 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
     if ticker in cache.ticker_history:
         return cache.ticker_history[ticker]
 
-    path = PRICES_DIR / f"{ticker}.json"
-    if not path.exists():
-        return {"ticker": ticker, "summary": _empty_summary(), "deals": []}
-
-    bars = _load_bars_safe(path)
+    bars = _load_bars_safe(ticker)
     if len(bars) < cfg.breakout.min_history_days:
         return {"ticker": ticker, "summary": _empty_summary(), "deals": []}
 
@@ -647,10 +637,17 @@ def get_backtest_summary(cfg=None) -> Dict[str, Any]:
     return _summarize_backtest(result, cfg, filtered)
 
 
-def _load_bars_safe(path: Path):
-    """Wrapper to delay-import the loader (avoid circular)."""
-    from darvas_box_strategy.darvas.data_loader import load_price_bars
-    return load_price_bars(path)
+def _load_bars_safe(ticker: str):
+    """Load a ticker's bars, preferring Postgres over the JSON files.
+
+    The VPS keeps market data in both places. Postgres is the intended
+    source of truth; the JSON files are the fallback for when Postgres
+    is down (and, historically, the only source — which is how a stale
+    JSON copy could mark the dashboard's open deals against an
+    outdated price).
+    """
+    from darvas_box_strategy.darvas.db_prices import load_bars
+    return load_bars(ticker)
 
 
 def refresh_cache(lookback: int = 0) -> WebCache:
@@ -694,10 +691,7 @@ def refresh_cache(lookback: int = 0) -> WebCache:
     #    portfolio's day-by-day loop.
     last_bar_date_by_ticker: Dict[str, Any] = {}
     for ticker in filtered:
-        path = PRICES_DIR / f"{ticker}.json"
-        if not path.exists():
-            continue
-        bars = _load_bars_safe(path)
+        bars = _load_bars_safe(ticker)
         if bars:
             last_bar_date_by_ticker[ticker] = bars[-1].date
 
