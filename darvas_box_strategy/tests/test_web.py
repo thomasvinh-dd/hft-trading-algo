@@ -301,9 +301,79 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class OpenDealExhaustFillTests(unittest.TestCase):
+    """An open deal must not show a terminal 'sold everything' fill.
+
+    The executor emits an EXHAUST fill when the backtest runs out of
+    bars. That fill is a mark-to-market snapshot, NOT a sale — the
+    position is still held. The old timeline rendered it as a full
+    sell ("-2,400 sh, remaining 0") while the deal header said
+    "OPEN", which is self-contradictory.
+
+    Regression: the user saw VNM_2026-08-10 showing "sell all the
+    shares" and asked why the deal was still open.
+    """
+
+    def _fills(self, *, is_open):
+        from darvas_box_strategy.web.data import _fills_to_dicts
+        from darvas_box_strategy.darvas.executor import FillEvent
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from datetime import date
+
+        b = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                 days_in_base=10, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=b, sl_F=8_200.0, sl_T=9_000.0,
+            tiers=((1.10, 0.30),), conviction="low", size_pct=0.15,
+            shares=2_400, max_volume=99_999, bars_remaining=10,
+        )
+        fills = [
+            FillEvent(date=date(2026, 1, 3), kind="TIER", level=11_000.0,
+                      shares=-720, proceeds=7_920_000.0, fraction_of_pos=0.30,
+                      cumulative_proceeds=7_920_000.0, realized_pnl=720_000.0,
+                      remaining=1_680),
+            FillEvent(date=date(2026, 1, 4), kind="EXHAUST", level=9_500.0,
+                      shares=-1_680, proceeds=15_960_000.0, fraction_of_pos=1.0,
+                      cumulative_proceeds=23_880_000.0, realized_pnl=-840_000.0,
+                      remaining=0),
+        ]
+        return _fills_to_dicts(fills, signal=sig, is_open=is_open)
+
+    def test_open_deal_exhaust_becomes_mark(self):
+        out = self._fills(is_open=True)
+        last = out[-1]
+        self.assertEqual(last["kind"], "MARK")
+        self.assertEqual(last["shares"], 0,
+                         "open deal must not show a sell of the remaining shares")
+        self.assertEqual(last["pnl_delta"], 0.0)
+        self.assertIn("still open", last["note"].lower())
+        # The shares still held must be shown in the remaining column
+        self.assertEqual(last["remaining"], 1_680)
+        self.assertIn("1,680", last["note"])
+
+    def test_open_deal_still_shows_real_exits(self):
+        out = self._fills(is_open=True)
+        kinds = [f["kind"] for f in out]
+        self.assertIn("ENTRY", kinds)
+        self.assertIn("TIER", kinds)
+        # The real TIER exit keeps its negative share count
+        tier = next(f for f in out if f["kind"] == "TIER")
+        self.assertEqual(tier["shares"], -720)
+        self.assertEqual(tier["remaining"], 1_680)
+
+    def test_closed_deal_keeps_exhaust_sell(self):
+        """A CLOSED deal's EXHAUST fill is a real sale — keep it."""
+        out = self._fills(is_open=False)
+        last = out[-1]
+        self.assertEqual(last["kind"], "EXHAUST")
+        self.assertEqual(last["shares"], -1_680)
+        self.assertNotEqual(last["shares"], 0)
+
+
 class MakeDealIdTests(unittest.TestCase):
     """Tests for the deal_id generator."""
-
     def test_basic_format(self):
         from darvas_box_strategy.web.data import _make_deal_id
         from datetime import date

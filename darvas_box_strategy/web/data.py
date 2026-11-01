@@ -284,7 +284,7 @@ def get_open_positions(cfg=None) -> List[Dict[str, Any]]:
     return load_cache().open_positions
 
 
-def _fills_to_dicts(fills, signal=None) -> List[Dict[str, Any]]:
+def _fills_to_dicts(fills, signal=None, *, is_open: bool = False) -> List[Dict[str, Any]]:
     """Convert a list of FillEvent (or TradeFill) into JSON-safe dicts.
 
     The fill objects come from the executor (FillEvent) or the new
@@ -297,6 +297,13 @@ def _fills_to_dicts(fills, signal=None) -> List[Dict[str, Any]]:
     a proper ENTRY here using the signal's entry_price and shares.
     We also compute cumulative_pnl correctly: sum the per-fill
     realized_pnl values (not the gross proceeds).
+
+    ``is_open=True`` means the deal is still held (the backtest ran
+    out of bars). In that case the executor's terminal EXHAUST fill
+    is NOT a real sale — it is a mark-to-market snapshot taken at the
+    last available bar. We rewrite it so it reads as an open-position
+    marker (0 shares, no sale) instead of "sold everything", which
+    used to contradict the deal's own "OPEN" status.
     """
     out: List[Dict[str, Any]] = []
     # Synthesize ENTRY if the fills list doesn't have one
@@ -339,6 +346,21 @@ def _fills_to_dicts(fills, signal=None) -> List[Dict[str, Any]]:
                 "remaining": int(getattr(f, "remaining", 0)),
                 "note": "",
             }
+        # An open deal's terminal EXHAUST fill is a mark-to-market
+        # snapshot, not a sale. Rewrite it so the timeline does not
+        # claim "sold all shares" on a position that is still held.
+        if is_open and d.get("kind") == "EXHAUST":
+            # The EXHAUST fill records shares=0 remaining because the
+            # executor closed the position to settle the accounting.
+            # The shares actually still held are the ones it sold, so
+            # restore them for display.
+            held = abs(int(d.get("shares") or 0))
+            d["kind"] = "MARK"
+            d["shares"] = 0
+            d["remaining"] = held
+            d["pnl_delta"] = 0.0
+            d["cumulative_pnl"] = running_pnl
+            d["note"] = f"Position still open — {held:,} sh marked at last close"
         out.append(d)
     return out
 
@@ -444,7 +466,8 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
             "sl_F": float(sig.sl_F),
             "sl_T": float(sig.sl_T),
             # The bar-by-bar event log — used by the deal-detail modal
-            "fills": _fills_to_dicts(getattr(t, "fills", ()), signal=sig),
+            "fills": _fills_to_dicts(getattr(t, "fills", ()), signal=sig,
+                                     is_open=is_open),
         })
 
         # Update the "last exit date" tracker so the next signal
