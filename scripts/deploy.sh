@@ -78,12 +78,12 @@ else
     echo "--- --delete is ON (files only on the VPS WILL BE REMOVED) ---"
 fi
 
-RSYNC_ARGS=(-avz "${EXCLUDES[@]}" "${DRY_RUN}")
+RSYNC_ARGS=(-avz "${EXCLUDES[@]}")
 if [[ -n "$DELETE" ]]; then
     RSYNC_ARGS+=(--delete)
 fi
 if [[ -n "$DRY_RUN" ]]; then
-    RSYNC_ARGS+=(--itemize-changes)
+    RSYNC_ARGS+=(--dry-run --itemize-changes)
 fi
 
 rsync "${RSYNC_ARGS[@]}" "$PROJECT_DIR/" "$VPS:$REMOTE_DIR/"

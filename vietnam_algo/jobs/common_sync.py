@@ -185,22 +185,29 @@ def _mirror_prices_to_db(
     return touched
 
 
-def run() -> CommonSyncResult:
+def run(force_prices: bool = False) -> CommonSyncResult:
     """Do the day's common sync. Skips already-done work.
 
     Steps:
       1. Refresh symbols.json (sync_symbols).
       2. Refresh the price series for each symbol (sync_prices with
          ``skip_existing=True`` so we only fill what's missing).
-      3. Run the CA sync (incremental).
-      4. Stamp ``data_ready_for_eod`` with current mtime.
+      3. Mirror symbols + prices into Postgres.
+      4. Run the CA sync (incremental).
+      5. Stamp ``data_ready_for_eod`` with current mtime.
+
+    ``force_prices=True`` bypasses the trading-day guard. The cron only
+    runs on weekdays, but a missed Friday (or a deploy that clobbered
+    the data) leaves the mirror stale over the weekend, and there is no
+    cron slot to repair it until Monday. This flag lets an operator
+    backfill out of hours.
 
     Returns a CommonSyncResult summary. Exits non-zero only on a hard
     failure (e.g., empty universe, network down).
     """
     now = vietnam_now()
     today = local_date(now)
-    if already_done_today(today):
+    if already_done_today(today) and not force_prices:
         print(f"[common_sync] already done for {today}; re-stamping sentinel")
         SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         SENTINEL_PATH.write_text(datetime.now(tz=timezone.utc).isoformat())
@@ -213,7 +220,7 @@ def run() -> CommonSyncResult:
             sentinel=str(SENTINEL_PATH),
         )
 
-    if not is_trading_day(now):
+    if not is_trading_day(now) and not force_prices:
         # On weekends / holidays we still want the sentinel present
         # (Friday's plan should be readable on Monday morning), but
         # skipping the heavy work saves cost.
@@ -401,11 +408,16 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(description="Refresh shared price + CA data and stamp the EOD sentinel")
     parser.add_argument("--force", action="store_true", help="Re-run even if already done today (does NOT skip sentinel)")
+    parser.add_argument(
+        "--force-prices", action="store_true",
+        help="Refresh prices even on a non-trading day (weekend/holiday). "
+             "Use to backfill a missed Friday or repair the Postgres mirror.",
+    )
     args = parser.parse_args(argv)
     if args.force:
         TRADE_STATE.unlink(missing_ok=True)
     try:
-        result = run()
+        result = run(force_prices=args.force_prices)
     except Exception as exc:
         # Surface hard failures (network down, 0 symbols, etc.) to
         # Telegram so an operator notices even when the cron run is
