@@ -16,6 +16,13 @@ vietnam_algo/env/
 # Data — never commit (large + may contain PII)
 vietnam_algo/data/
 data/
+# Price history is fetched by the VPS sync job. It was tracked before
+# the rules above existed (commit ed16cff "init strategy algo"), which
+# caused a 2026-11-01 deploy to push stale local copies over the VPS's
+# fresh ones and rewind the market data by three months. Keep it
+# untracked — the VPS owns this data.
+vietnam_algo/data/prices/
+vietnam_algo/data/live/
 
 # Logs
 logs/
