@@ -138,6 +138,65 @@ def _mirror_daily_report(
         print(f"[daily_reports] write '{source}' failed: {exc}")
 
 
+def _stop_is_confirmed_live(row: Any) -> bool:
+    """True when DNSE has CONFIRMED a protective STOP is live.
+
+    2026-11-02 (TVN incident). The duplicate-STOP guard used to count
+    any STOP row with status ``submitted`` as "already protected". But
+    ``submitted`` only means WE sent the order — DNSE may still
+    reject it a moment later.
+
+    TVN's stop was submitted at 09:18:09 and rejected by DNSE at
+    09:19:29 with ``INVALID_PRICE_LOT``. The ledger row stayed
+    ``submitted`` until the order monitor polled it, so the next T+2
+    retry pass (09:49) concluded "300 shares already protected —
+    skipping" and the position was left with NO stop-loss.
+
+    The order monitor writes the DNSE order-detail payload into
+    ``lastDetail`` after a successful poll. A live stop therefore has
+    a ``lastDetail`` whose order status is one of the LIVE statuses
+    (``New``, ``PartiallyFilled``, ``PendingNew``). A row with no
+    detail, or with a terminal detail status, is NOT confirmed.
+
+    Rows whose ledger status is already ``open`` or ``partial`` were
+    themselves written by the monitor from a live detail, so they are
+    trusted without re-reading the detail.
+    """
+    status = str(getattr(row, "status", "") or "").lower()
+    if status in ("open", "partial"):
+        # The monitor only writes these from a live DNSE detail.
+        return True
+
+    detail = getattr(row, "lastDetail", None)
+    if not isinstance(detail, dict):
+        return False
+
+    raw = ""
+    for key in ("orderStatus", "status", "state"):
+        val = detail.get(key)
+        if val not in (None, ""):
+            raw = str(val)
+            break
+    if not raw:
+        return False
+
+    # Normalise camelCase → UPPER_SNAKE (same as the order ledger).
+    import re as _re
+    snake = _re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw).upper()
+
+    live_statuses = {
+        "NEW",
+        "PARTIALLY_FILLED",
+        "PARTIAL",
+        "PENDING_NEW",
+        "PENDING_REPLACE",
+        "PENDING_CANCEL",
+        "OPEN",
+        "SUBMITTED",
+    }
+    return snake in live_statuses
+
+
 def _notify_stale_token_if_blocking(
     data_dir,
     account_no: str,
@@ -654,7 +713,7 @@ def _extract_best_ask_in_vnd(quote: object) -> int | None:
     return int(round(v * 1000.0))
 
 
-def _hose_price_tick(price_vnd: int) -> int:
+def _hose_price_tick(price_vnd: int, market_id: str | None = None) -> int:
     """Return the HOSE tick size for a stock price, in VND.
 
     Per HOSE market rules, the minimum price increment depends on
@@ -680,11 +739,40 @@ def _hose_price_tick(price_vnd: int) -> int:
     always executes (down-rounded but the SELL is marketable;
     the 1% ``AUTOFIN_SELL_BID_DISCOUNT_PCT`` already gives a
     buffer for the bid to tick down).
+
+    2026-11-02 (TVN incident): ``market_id`` matters. The banded
+    ladder above is the HOSE (STO) ladder. UPCOM (UPX) stocks use a
+    FLAT 100-VND tick at EVERY price level — the 10-VND band below
+    10,000 VND does not apply.
+
+    TVN is a UPCOM stock. Its protective stop at 9,360 produced a
+    generated limit of ``round(9360 × 0.995) = 9313`` → rounded with
+    the HOSE ladder to **9,310** (a multiple of 10). DNSE rejected it
+    with ``INVALID_PRICE_LOT|Invalid price lot`` — UPCOM requires a
+    100-VND multiple, so the correct limit is **9,300**.
+
+    The live order book confirms the ladders::
+
+        TVN  (UPX) bid 9.3, 9.2, 9.1, 9.0, 8.9   → 100-VND tick
+        ABB  (UPX) bid 17.3, 17.2, 17.1, 17.0, 16.9 → 100-VND tick
+        TCB  (STO) bid 21.35, 21.3, 21.25          → 50-VND tick
+        VOS  (STO) bid 10.3, 10.25, 10.2           → 50-VND tick
+
+    NOTE: ABB's stop was accepted at 15,850 only by luck — 15,850 is
+    a multiple of 50 (the HOSE ladder) AND happens to be a multiple
+    of 10. It is NOT a multiple of 100, so a UPCOM-correct price for
+    ABB would be 15,800. Passing ``market_id`` makes this explicit
+    instead of accidental.
     """
     p = int(price_vnd)
     if p <= 0:
         return 0
-    if p < 10_000:
+    # 2026-11-02: UPCOM (UPX) uses a flat 100-VND tick at every
+    # price level. HNX also uses 100.
+    mid = str(market_id or "").strip().upper()
+    if mid in ("UPX", "HNX"):
+        tick = 100
+    elif p < 10_000:
         tick = 10
     elif p < 50_000:
         tick = 50
@@ -1341,7 +1429,13 @@ def _submit_autofin_deals_to_dnse(
                         # so DNSE doesn't reject with
                         # ``INVALID_PRICE_LOT``. See ``_hose_price_tick``
                         # for the rule table.
-                        sell_price = _hose_price_tick(raw_sell_price)
+                        #
+                        # 2026-11-02 (TVN): the ladder depends on the
+                        # BOARD — UPCOM uses a flat 100-VND tick even
+                        # below 10,000 VND, so we pass the market id.
+                        sell_price = _hose_price_tick(
+                            raw_sell_price, market_cache.get(sym),
+                        )
                         print(
                             f"[autofin_sell_at_market] {sym} SELL price "
                             f"override: signal={signal_price} → "
@@ -1397,7 +1491,17 @@ def _submit_autofin_deals_to_dnse(
                     )
                     continue
                 otype = "LO"
-                price = _hose_price_tick(int(round(stop_level * 0.995))) or stop_level
+                # 2026-11-02 (TVN): the price ladder depends on the
+                # BOARD. UPCOM (UPX) uses a flat 100-VND tick even
+                # below 10,000 VND — the TVN stop's limit of 9,310
+                # was a multiple of 10 (HOSE ladder) but NOT of 100,
+                # so DNSE rejected it with ``INVALID_PRICE_LOT``.
+                price = (
+                    _hose_price_tick(
+                        int(round(stop_level * 0.995)), market_cache.get(sym),
+                    )
+                    or stop_level
+                )
                 stop_fields = {
                     "orderCategory": "STOP",
                     "stopPrice": stop_level,
@@ -2131,11 +2235,39 @@ def retry_t2_settlement_sl_orders(
     # Only CONFIRMED-working statuses count. "unknown" is excluded on
     # purpose: it means the broker state could not be read, and
     # skipping on that basis could leave a position unprotected.
+    #
+    # 2026-11-02 (TVN incident): the guard ALSO requires that the
+    # broker has CONFIRMED the stop is live. A row that is merely
+    # ``submitted`` has NOT been validated by DNSE yet — DNSE can
+    # still reject it (TVN's was rejected with INVALID_PRICE_LOT a
+    # minute after the submit).
+    #
+    # The TVN sequence:
+    #   09:18:09  retry submits the STOP   → ledger status "submitted"
+    #   09:19:29  DNSE rejects it          → ledger STILL says "submitted"
+    #   09:49:47  next retry pass          → guard sees "submitted" and
+    #              says "300 shares already protected — skipping"
+    #              → the position is left with NO stop-loss at all.
+    #
+    # The confirmation comes from ``lastDetail``: the order monitor
+    # writes the DNSE order-detail payload there after a successful
+    # poll. Only a row whose detail shows a LIVE order status
+    # (New / PartiallyFilled / PendingNew) counts as protected.
     protected_qty_by_deal: dict[tuple[str, str], int] = {}
     for _row in ledger.values():
         if (getattr(_row, "orderCategory", "NORMAL") or "NORMAL").upper() != "STOP":
             continue
         if _row.status not in ("submitted", "open", "partial", "prepared", "submitting"):
+            continue
+        # 2026-11-02: require broker confirmation. Without it a
+        # just-submitted (and possibly already-rejected) stop would
+        # block the retry and leave the position unprotected.
+        if not _stop_is_confirmed_live(_row):
+            summary.setdefault("unconfirmed_stops", []).append(
+                f"{_row.symbol}: STOP {_row.dnseOrderId or '(no id)'} is "
+                f"{_row.status!r} but not confirmed live by the broker yet "
+                f"— the T+2 retry may still place one"
+            )
             continue
         _row_did = _extract_deal_id_from_reason(_row.reason or "")
         if not _row_did:
@@ -2417,6 +2549,31 @@ def retry_t2_settlement_sl_orders(
         cash_pkg_cache[sym] = int(pkg or 0)
         return cash_pkg_cache[sym]
 
+    # 2026-11-02 (TVN incident): the price ladder depends on the
+    # BOARD, and UPCOM (UPX) uses a flat 100-VND tick at every price
+    # level — the HOSE "below 10,000 → 10 VND" band does NOT apply.
+    #
+    # TVN is a UPCOM stock. Its stop at 9,360 produced a generated
+    # limit of 9,310 (a multiple of 10, per the HOSE ladder) and DNSE
+    # rejected it with ``INVALID_PRICE_LOT|Invalid price lot``. The
+    # correct UPCOM limit is 9,300.
+    #
+    # We look the market id up once per symbol and cache it.
+    market_id_cache: dict[str, str] = {}
+
+    def _resolve_market_id(sym: str) -> str:
+        if sym in market_id_cache:
+            return market_id_cache[sym]
+        try:
+            mid = client.get_market_id(sym)
+        except Exception as exc:
+            summary.setdefault("market_lookup_errors", []).append(
+                f"{sym}: {type(exc).__name__}: {str(exc)[:160]}"
+            )
+            mid = ""
+        market_id_cache[sym] = str(mid or "").upper()
+        return market_id_cache[sym]
+
     orders_to_resubmit: list[DnseOrder] = []
     for sl, buy, sl_qty in candidates:
         # 2026-10-23 fix (unbounded retry loop): strip any
@@ -2548,7 +2705,13 @@ def retry_t2_settlement_sl_orders(
             )
         # The generated NORMAL order's limit: just below the trigger
         # so it crosses the book as soon as the stop fires.
-        generated_limit = _hose_price_tick(int(round(stop_level * 0.995)))
+        #
+        # 2026-11-02 (TVN): the ladder is BOARD-dependent — UPCOM uses
+        # a flat 100-VND tick. The old HOSE-banded helper produced
+        # 9,310 for TVN, which DNSE rejected with INVALID_PRICE_LOT.
+        generated_limit = _hose_price_tick(
+            int(round(stop_level * 0.995)), _resolve_market_id(sl.symbol),
+        )
         if generated_limit <= 0:
             generated_limit = stop_level
         # GTD expiry: 30 days out, ISO 8601 in Vietnam time.
@@ -3122,11 +3285,17 @@ def _format_status_change_message(
     ]
     if isinstance(detail, dict):
         # Show extras that operators care about.
+        #
+        # 2026-11-02 (TVN): ``errorMessage`` is the field DNSE actually
+        # uses for a rejected order ("INVALID_PRICE_LOT|Invalid price
+        # lot"). It was NOT in this list, so the rejection reason was
+        # invisible to the operator even when a message was sent.
         for key in (
             "filledQuantity", "fillQuantity", "matchedQuantity",
             "averagePrice", "fillPrice", "lastPrice",
             "canceledQuantity", "leaveQuantity",
             "rejectReason", "cancelReason", "rejectedReason", "errorReason",
+            "errorMessage", "message",
         ):
             value = detail.get(key)
             if value is not None and value != "":
@@ -4543,12 +4712,49 @@ def run_auto_bot(
                                 print(f"[{now.isoformat()}] t2-sl-retry (mid-day): {_note}")
                             for _note in t2_summary.get("partially_protected", []) or []:
                                 print(f"[{now.isoformat()}] t2-sl-retry (mid-day): {_note}")
-                                if t2_summary.get("resubmitted"):
-                                    notify(
-                                        "🔁 Vietnam Algo: T+2 SL retry (mid-day)\n"
-                                        f"resubmitted: {t2_summary['resubmitted']}\n"
-                                        f"dnseOrderIds: {t2_summary['resubmit_dnse_ids']}"
-                                    )
+                            if t2_summary.get("resubmitted"):
+                                notify(
+                                    "🔁 Vietnam Algo: T+2 SL retry (mid-day)\n"
+                                    f"resubmitted: {t2_summary['resubmitted']}\n"
+                                    f"dnseOrderIds: {t2_summary['resubmit_dnse_ids']}"
+                                )
+                            # 2026-11-02 (TVN incident): the mid-day T+2
+                            # retry path NEVER notified on errors — only
+                            # the start-of-day path did. The TVN stop was
+                            # rejected by DNSE with
+                            # ``INVALID_PRICE_LOT|Invalid price lot``
+                            # and the operator got NO Telegram message:
+                            # the position silently lost its stop-loss.
+                            #
+                            # This is the alert the operator asked for.
+                            if t2_summary.get("resubmit_errors"):
+                                notify(
+                                    "🚨 Vietnam Algo: T+2 SL retry FAILED "
+                                    "(mid-day) — the position may be "
+                                    "UNPROTECTED\n"
+                                    f"date: {today}\n"
+                                    + "\n".join(t2_summary["resubmit_errors"][:5])
+                                )
+                            # 2026-11-02: a stop that could not be placed
+                            # at all (no recoverable price) leaves the
+                            # position with NO protection. Say so loudly.
+                            if t2_summary.get("no_price"):
+                                notify(
+                                    "🚨 Vietnam Algo: T+2 SL retry could NOT "
+                                    "place a stop-loss (no price)\n"
+                                    "The position is UNPROTECTED — place the "
+                                    "SL manually:\n"
+                                    + "\n".join(t2_summary["no_price"][:5])
+                                )
+                            # 2026-11-02 (TVN): a stop that was submitted
+                            # but NOT yet confirmed live by the broker.
+                            # It may still be rejected (TVN's was, with
+                            # INVALID_PRICE_LOT). The retry will not
+                            # stack a second one until the monitor
+                            # confirms the first — so this is the
+                            # operator's window to notice.
+                            for _note in t2_summary.get("unconfirmed_stops", []) or []:
+                                print(f"[{now.isoformat()}] t2-sl-retry (mid-day): {_note}")
                         except Exception as exc:
                             print(f"[{now.isoformat()}] t2-sl-retry mid-day crashed: {type(exc).__name__}: {str(exc)[:200]}")
                     # Mid-day polls also need to apply the planned orders

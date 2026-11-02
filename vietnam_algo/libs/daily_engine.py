@@ -656,6 +656,52 @@ def execute_orders_with_ledger(
                 "error": err_text,
             })
             results.append({"status": terminal_status, "order": payload, "error": err_text})
+            # 2026-11-02 (TVN incident): a SYNCHRONOUS rejection must
+            # notify the operator.
+            #
+            # The order monitor only notifies on a status CHANGE, and
+            # it skips rows whose ledger status is already terminal. A
+            # 4xx rejection is written as ``rejected`` right here — so
+            # the monitor never polls the row and NEVER sends a
+            # Telegram message. The TVN protective stop was rejected
+            # with ``INVALID_PRICE_LOT|Invalid price lot`` and the
+            # operator got no notification at all: the position
+            # silently lost its stop-loss.
+            #
+            # A rejected PROTECTIVE leg is the dangerous case — the
+            # position is now UNPROTECTED — so it always notifies.
+            try:
+                _is_stop = str(
+                    payload.get("orderCategory") or "NORMAL"
+                ).upper() == "STOP"
+                _is_protective = _is_stop or str(
+                    (payload.get("reason") or "")
+                ).startswith(("autofin_sl:", "autofin_user_sl:"))
+                if terminal_status == "rejected" and _is_protective:
+                    _sym = str(payload.get("symbol") or "?")
+                    _qty = int(payload.get("quantity") or 0)
+                    _px = int(payload.get("price") or 0)
+                    _stop_px = int(payload.get("stopPrice") or 0)
+                    _err_line = err_text.split("\n")[0][:220]
+                    try:
+                        notify(
+                            "🚨 Vietnam Algo: PROTECTIVE STOP REJECTED by DNSE "
+                            "— the position is UNPROTECTED\n"
+                            f"symbol: {_sym}\n"
+                            f"quantity: {_qty}\n"
+                            f"stop level: {_stop_px:,} VND\n"
+                            f"order limit: {_px:,} VND\n"
+                            f"err: {_err_line}\n"
+                            "The stop-loss was NOT placed. Place it manually, "
+                            "or fix the cause (price lot / quantity / "
+                            "settlement) so the retry can succeed."
+                        )
+                    except Exception:
+                        # A Telegram failure must not break the submit
+                        # loop — the row is already recorded.
+                        pass
+            except Exception:
+                pass
         save_ledger(ledger, data_dir)
     complete = submission_complete(ledger, run_id)
     return results, reconciliation, complete
