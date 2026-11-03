@@ -106,6 +106,27 @@ class LoadBarsTests(unittest.TestCase):
         bars = db_prices.load_bars("VNM", self.tmp)
         self.assertEqual([b.time for b in bars], ["2026-10-29", "2026-10-30"])
 
+    def test_db_values_survive_numeric_rounding(self):
+        """Postgres stores NUMERIC(18,4), so prices round to 4dp.
+
+        The DB and the JSON files must still agree to within that
+        tolerance — otherwise a strategy that reads prices from either
+        source computes different trades (which is exactly how the
+        max drawdown went from -21% to -70%).
+        """
+        db_prices._DB_CLIENT = FakeDbClient({
+            "VNM": [_row("2026-10-30", 55516.22260273973, 56279.33219178082,
+                         55230.05650684931, 55707.0, 454070.0)],
+        })
+        bars = db_prices.load_bars("VNM", self.tmp)
+        self.assertEqual(len(bars), 1)
+        b = bars[0]
+        self.assertAlmostEqual(b.open, 55516.2226, places=4)
+        self.assertAlmostEqual(b.high, 56279.3322, places=4)
+        self.assertAlmostEqual(b.close, 55707.0, places=4)
+        # The rounding must be tiny relative to the price.
+        self.assertLess(abs(b.high - 56279.33219178082), 1e-3)
+
     def test_malformed_db_rows_are_skipped(self):
         db_prices._DB_CLIENT = FakeDbClient({
             "VNM": [_row("2026-10-30", 1, 2, 0.5, 1.5),

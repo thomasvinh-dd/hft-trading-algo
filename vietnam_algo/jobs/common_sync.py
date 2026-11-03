@@ -152,6 +152,14 @@ def _mirror_prices_to_db(
     calls ``sync_prices_incremental`` directly. So ``prices_dnse`` sat
     empty while the JSON files were current.
 
+    The ticker is taken from each path's own stem — NOT zipped against
+    ``symbols``. ``sync_prices_incremental`` returns only the files it
+    actually changed, in its own iteration order, so zipping the two
+    lists paired every symbol with some OTHER symbol's price file. That
+    silently wrote ticker A's prices under ticker B (visible as e.g.
+    MWG priced at 8,300 VND when it trades at 72,300) and wrecked the
+    backtest: max drawdown -21% -> -70%.
+
     Best-effort: a Postgres outage must not break the sync. The
     ``mirror_*`` helpers swallow ``DbError`` and log.
 
@@ -171,7 +179,9 @@ def _mirror_prices_to_db(
 
     db = DbClient.from_default()
     touched = 0
-    for symbol, path in zip(symbols, paths):
+    for path in paths:
+        # The file name IS the ticker — never zip against ``symbols``.
+        symbol = path.stem.upper()
         try:
             payload = read_json(path)
         except Exception as exc:
