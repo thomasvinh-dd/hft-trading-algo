@@ -462,11 +462,17 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
 
         # Update the "last exit date" tracker so the next signal
         # for this ticker is rejected if it falls inside this
-        # trade's holding period. Open deals (no real exit yet)
-        # are treated as still open forever — the next signal
-        # would be rejected.
-        if not is_open:
-            last_exit_date = t.exit_date
+        # trade's holding period.
+        #
+        # Open deals must ALSO advance the tracker: a still-open deal
+        # occupies the ticker until it exits, so any later signal has
+        # to be rejected. (This used to advance the tracker only for
+        # closed deals, which let concurrent open deals pile up —
+        # ABB ended up with 5 open deals at once, GEE with 5.)
+        #
+        # An open deal's exit_date is the last available bar, so it
+        # blocks every subsequent signal on that ticker.
+        last_exit_date = t.exit_date
 
     # Sort by entry date descending — newest first
     deals.sort(key=lambda d: d["entry_date"], reverse=True)

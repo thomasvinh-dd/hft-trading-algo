@@ -527,22 +527,38 @@ class NoConcurrentPositionsTests(unittest.TestCase):
                         )
 
     def test_real_tickers_have_no_concurrent_deals(self):
-        """For a sample of HOSE blue chips, get_ticker_history should
-        never return two deals on the same ticker that overlap in
-        time. (Live trading can't have two open positions on one
-        ticker at once.)"""
+        """For HOSE blue chips, get_ticker_history should never return
+        two deals on the same ticker that overlap in time. (Live
+        trading can't have two open positions on one ticker at once.)
+
+        This used to sample only 5 tickers, and ABB — which had 5
+        concurrent open deals — wasn't one of them. The sample is now
+        the full 70-ticker universe plus every ticker that regressed.
+        """
         from darvas_box_strategy.bot.cli import build_default_config
         from darvas_box_strategy.web.data import get_ticker_history
         cfg = build_default_config()
-        # Try the first 5 blue chips — enough to catch a regression
-        # without making the test slow.
-        for ticker in ["MSN", "VCB", "VHM", "PLX", "GEE"]:
+        # The tickers that actually regressed, plus the historical sample.
+        tickers = ["MSN", "VCB", "VHM", "PLX", "GEE", "ABB", "ORS"]
+        try:
+            from darvas_box_strategy.bot.cli import load_blue_chips
+            tickers = sorted(set(tickers) | set(load_blue_chips()))
+        except Exception:
+            pass
+        for ticker in tickers:
             with self.subTest(ticker=ticker):
                 hist = get_ticker_history(ticker, cfg=cfg)
                 self.assertEqual(hist["ticker"], ticker)
                 deals = hist["deals"]
                 if not deals:
                     continue
+                # At most ONE open deal per ticker.
+                opens = [d for d in deals if d.get("is_open")]
+                self.assertLessEqual(
+                    len(opens), 1,
+                    f"{ticker}: {len(opens)} concurrent open deals: "
+                    f"{[d['deal_id'] for d in opens]}",
+                )
                 # Walk through chronologically — each entry_date
                 # must be > the previous exit_date
                 sorted_deals = sorted(deals, key=lambda d: d["entry_date"])
