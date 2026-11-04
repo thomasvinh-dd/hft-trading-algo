@@ -2799,6 +2799,13 @@ class AutofinSignalAdapter(StrategyAdapter):
         self._client: AutofinClient | None = None
         # Persistent state (loaded by the bot each cycle)
         self._our_deals: dict[str, dict[str, Any]] = {}  # deal_id → original signal
+        # 2026-11-04: the deals we track that autofin's
+        # /signal-static-holding no longer lists ("orphan" deals).
+        #
+        # The operator confirmed these are an autofin DATA-LOSS case —
+        # the deal was on autofin, but autofin lost it. The operator
+        # trades them MANUALLY, so the EOD report must name them.
+        self._orphan_deals: list[dict[str, Any]] = []
         # Order-key set already sent to Telegram — used to de-dupe per-order
         # notifications so we don't spam the chat every poll.
         self._notified_order_keys: set[str] = set()
@@ -3693,6 +3700,14 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "rateForNav": sig.get("rateForNav"),
                 "in_holding": _deal_id_in(holding, did),
                 "in_suggest": _deal_id_in(signals, did),
+                # 2026-11-04: an ORPHAN deal — we track it but
+                # autofin's /signal-static-holding does not list it
+                # (autofin data loss). The operator trades these
+                # manually; the EOD report names them.
+                "is_orphan": (
+                    not _deal_id_in(holding, did)
+                    and int(sig.get("_our_qty", 0) or 0) > 0
+                ),
             })
 
         # Candidates we could have entered, and why we didn't (if we
@@ -4059,9 +4074,33 @@ class AutofinSignalAdapter(StrategyAdapter):
         orphan_dids = [
             did for did in self._our_deals if did not in holding_dids
         ]
+        # 2026-11-04: record the ORPHAN DEALS for the EOD report.
+        #
+        # The operator confirmed these are NOT a bot bug: the deal WAS
+        # on autofin, but autofin's data for it was lost, so
+        # /signal-static-holding no longer lists it. The operator
+        # will trade them MANUALLY.
+        #
+        # So the EOD report must name them — otherwise a position
+        # silently stops being managed by the bot and nobody notices
+        # until it moves against us.
+        #
+        # IMPORTANT: only the orphans we ACTUALLY HOLD are listed. The
+        # tracked-deal state keeps every deal we ever touched (27 of
+        # them on 2026-11-04) and their ``_our_qty`` is 0 — we do not
+        # hold them. Listing all of them would bury the two that
+        # matter under 25 closed deals.
+        #
+        # ``self._positions`` is the authoritative live DNSE position
+        # map (symbol -> qty). It is set earlier in ``generate_orders``
+        # from the live portfolio snapshot.
+        self._orphan_deals = []
         if not orphan_dids:
             return
         seen_orphan_symbols: set[str] = set()
+        # The live position map (symbol -> qty). Only orphans we still
+        # HOLD are reported to the operator.
+        live_positions = getattr(self, "_positions", None) or {}
         for did in orphan_dids:
             sig = self._our_deals.get(did) or {}
             sym = str(sig.get("symbol", "") or "")
@@ -4127,6 +4166,18 @@ class AutofinSignalAdapter(StrategyAdapter):
                     f"found in /signal-deals?symbol={sym} — skipping "
                     f"(no fallback to an unrelated row)"
                 )
+                # 2026-11-04: record it for the EOD report. This is
+                # the WORST kind of orphan — autofin has no row for
+                # it at all, so there is no recommendation to act on.
+                _held_qty = int(live_positions.get(sym, 0) or 0)
+                if _held_qty > 0:
+                    self._orphan_deals.append({
+                        "deal_id": did,
+                        "symbol": sym,
+                        "qty": _held_qty,
+                        "reason": "no row in /signal-deals for this deal",
+                        "recovered": False,
+                    })
                 continue
             # 2026-10-21 BAF fix: ``lastRecomment`` is the SHORT
             # headline (e.g. ``🛡️ Chốt lãi -1.75 % bảo toàn vốn``)
@@ -4166,6 +4217,21 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "lastRecomment": last_rec,
                 "_orphan_injected": True,
             })
+            # 2026-11-04: record it for the EOD report. The deal IS
+            # recoverable (autofin still publishes a recomment for it
+            # via /signal-deals) but it is NOT in the holding list,
+            # so autofin's own dashboard does not show it — the
+            # operator needs to know it is still a live position.
+            _held_qty = int(live_positions.get(sym, 0) or 0)
+            if _held_qty > 0:
+                self._orphan_deals.append({
+                    "deal_id": did,
+                    "symbol": sym,
+                    "qty": _held_qty,
+                    "reason": "not in /signal-static-holding",
+                    "recovered": True,
+                    "last_recomment": last_rec,
+                })
             # Repair the cached recomment on our tracked deal
             # too so subsequent cycles see the latest text even
             # if the orphan path doesn't fire again.
@@ -5023,6 +5089,13 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "partial_symbols": [r["symbol"] for r in partial_orders],
                 "account": account,
                 "nav": nav,
+                # 2026-11-04: the orphan deals — the ones we track
+                # that autofin's /signal-static-holding no longer
+                # lists. The operator confirmed these are an autofin
+                # DATA-LOSS case (the deal WAS there, autofin lost
+                # it) and will trade them MANUALLY. The EOD report
+                # names them.
+                "orphan_deals": list(self._orphan_deals),
             },
             "deals_actioned": deals_actioned,
         }
@@ -5145,6 +5218,48 @@ class AutofinSignalAdapter(StrategyAdapter):
             lines.append(
                 f"⚠️  {sig['autofin_risk']} positions risk-flagged (see risk endpoint)"
             )
+            lines.append("")
+
+        # 2026-11-04: the ORPHAN DEALS notice.
+        #
+        # These are positions we track that autofin's
+        # /signal-static-holding no longer lists. The operator
+        # confirmed the cause is autofin DATA LOSS (the deal WAS on
+        # autofin; autofin dropped it) — NOT a bot bug — and will
+        # trade them MANUALLY.
+        #
+        # The notice is here because an orphan deal stops being
+        # managed by the bot: autofin no longer publishes a
+        # recommendation for it, so there is nothing for the bot to
+        # act on. Without this line the position silently stops
+        # being tracked and nobody notices until it moves against us.
+        orphan_deals = sig.get("orphan_deals") or []
+        if orphan_deals:
+            lines.append(
+                f"🧩 ORPHAN DEALS — MANUAL ACTION REQUIRED "
+                f"({len(orphan_deals)})"
+            )
+            lines.append(
+                "   autofin no longer lists these in "
+                "/signal-static-holding (autofin data loss). "
+                "Trade them manually."
+            )
+            for od in orphan_deals[:15]:
+                _sym = od.get("symbol", "?")
+                _did = od.get("deal_id", "?")
+                _qty = int(od.get("qty", 0) or 0)
+                _rec = od.get("last_recomment") or ""
+                _why = od.get("reason", "")
+                _line = f"  • {_sym}  [deal#{_did}]"
+                if _qty:
+                    _line += f"  qty={_qty:,}"
+                if _why:
+                    _line += f"  ({_why})"
+                lines.append(_line)
+                if _rec:
+                    lines.append(f"    last autofin signal: {_rec[:90]}")
+            if len(orphan_deals) > 15:
+                lines.append(f"  + {len(orphan_deals) - 15} more")
             lines.append("")
 
         lines.append(f"📁 Orders file: {result.get('latestOrdersCsv', '?')}")
