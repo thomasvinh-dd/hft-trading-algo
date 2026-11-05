@@ -4095,17 +4095,69 @@ class AutofinSignalAdapter(StrategyAdapter):
         # map (symbol -> qty). It is set earlier in ``generate_orders``
         # from the live portfolio snapshot.
         self._orphan_deals = []
+        live_positions = getattr(self, "_positions", None) or {}
+
+        # 2026-11-04 (symbol-level orphans): a POSITION we hold that
+        # autofin's holding list does not mention AT ALL.
+        #
+        # The deal-id walk below cannot find these: our tracked
+        # deal-ids do not always correspond to an autofin deal (the
+        # ABB case — we track ``1789344000:ABB`` but autofin's ABB
+        # deals are ``1776643200`` / ``1759708800`` / ...). And the
+        # per-symbol dedup (``seen_orphan_symbols``) means only the
+        # FIRST tracked deal per symbol is ever examined.
+        #
+        # For the operator's purpose — "I will trade this manually" —
+        # what matters is the POSITION, not the deal id. So we check
+        # the live positions directly against the holding symbols.
+        holding_symbols = {
+            str(h.get("symbol") or "").strip().upper()
+            for h in holding
+            if not (h.get("_orphan_injected") or False)
+            and str(h.get("symbol") or "").strip()
+        }
+        tracked_by_symbol: dict[str, list[str]] = {}
+        for did in orphan_dids:
+            _sym = str((self._our_deals.get(did) or {}).get("symbol") or "").strip().upper()
+            if _sym:
+                tracked_by_symbol.setdefault(_sym, []).append(did)
+        for sym, qty in sorted(live_positions.items()):
+            sym = str(sym or "").strip().upper()
+            if not sym or sym in holding_symbols:
+                continue
+            # We hold it and autofin does not list it at all.
+            _dids = tracked_by_symbol.get(sym) or []
+            self._orphan_deals.append({
+                "deal_id": _dids[0] if _dids else f"(untracked):{sym}",
+                "symbol": sym,
+                "qty": int(qty or 0),
+                "reason": "held position not listed by autofin",
+                "recovered": False,
+            })
+            print(
+                f"[autofin_signal] orphan POSITION {sym}: holding "
+                f"{qty} shares but autofin does not list it in "
+                f"/signal-static-holding — reporting for manual action"
+            )
+
         if not orphan_dids:
             return
+        # 2026-11-04: symbols already reported by the position-level
+        # check above must not be reported TWICE (the operator only
+        # needs one line per position) — but the deal walk must still
+        # RUN for them, because it is what injects the synthetic
+        # holding entry that lets the bot act on a recoverable orphan.
+        _already_reported = {
+            str(od.get("symbol") or "").strip().upper()
+            for od in self._orphan_deals
+        }
         seen_orphan_symbols: set[str] = set()
-        # The live position map (symbol -> qty). Only orphans we still
-        # HOLD are reported to the operator.
-        live_positions = getattr(self, "_positions", None) or {}
         for did in orphan_dids:
             sig = self._our_deals.get(did) or {}
             sym = str(sig.get("symbol", "") or "")
             if not sym or sym in seen_orphan_symbols:
                 continue
+            seen_orphan_symbols.add(sym)
             # The downstream ``_plan_partial_close_orders`` already
             # gates on ``our_positions.get(symbol, 0) > 0`` (line
             # 1429), so stale ``_our_qty`` here is fine — the
@@ -4171,13 +4223,28 @@ class AutofinSignalAdapter(StrategyAdapter):
                 # it at all, so there is no recommendation to act on.
                 _held_qty = int(live_positions.get(sym, 0) or 0)
                 if _held_qty > 0:
-                    self._orphan_deals.append({
-                        "deal_id": did,
-                        "symbol": sym,
-                        "qty": _held_qty,
-                        "reason": "no row in /signal-deals for this deal",
-                        "recovered": False,
-                    })
+                    _existing = next(
+                        (
+                            od for od in self._orphan_deals
+                            if str(od.get("symbol") or "").strip().upper() == sym
+                        ),
+                        None,
+                    )
+                    if _existing is not None:
+                        # Already reported at the POSITION level.
+                        _existing["reason"] = (
+                            "no row in /signal-deals for this deal"
+                        )
+                        _existing["recovered"] = False
+                        _existing["deal_id"] = did
+                    else:
+                        self._orphan_deals.append({
+                            "deal_id": did,
+                            "symbol": sym,
+                            "qty": _held_qty,
+                            "reason": "no row in /signal-deals for this deal",
+                            "recovered": False,
+                        })
                 continue
             # 2026-10-21 BAF fix: ``lastRecomment`` is the SHORT
             # headline (e.g. ``🛡️ Chốt lãi -1.75 % bảo toàn vốn``)
@@ -4224,14 +4291,29 @@ class AutofinSignalAdapter(StrategyAdapter):
             # operator needs to know it is still a live position.
             _held_qty = int(live_positions.get(sym, 0) or 0)
             if _held_qty > 0:
-                self._orphan_deals.append({
-                    "deal_id": did,
-                    "symbol": sym,
-                    "qty": _held_qty,
-                    "reason": "not in /signal-static-holding",
-                    "recovered": True,
-                    "last_recomment": last_rec,
-                })
+                _existing = next(
+                    (
+                        od for od in self._orphan_deals
+                        if str(od.get("symbol") or "").strip().upper() == sym
+                    ),
+                    None,
+                )
+                if _existing is not None:
+                    # Already reported at the POSITION level — enrich
+                    # that entry rather than adding a second line for
+                    # the same position.
+                    _existing["last_recomment"] = last_rec[:200]
+                    _existing["recovered"] = True
+                    _existing["deal_id"] = did
+                else:
+                    self._orphan_deals.append({
+                        "deal_id": did,
+                        "symbol": sym,
+                        "qty": _held_qty,
+                        "reason": "not in /signal-static-holding",
+                        "recovered": True,
+                        "last_recomment": last_rec,
+                    })
             # Repair the cached recomment on our tracked deal
             # too so subsequent cycles see the latest text even
             # if the orphan path doesn't fire again.

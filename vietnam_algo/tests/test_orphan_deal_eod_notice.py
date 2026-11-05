@@ -253,6 +253,126 @@ def test_no_orphans_means_an_empty_list() -> None:
 
 
 # -----------------------------------------------------------------------------
+# symbol-level orphans (the ABB / TCB case)
+# -----------------------------------------------------------------------------
+
+def test_a_held_position_autofin_does_not_list_is_reported() -> None:
+    """A POSITION we hold that autofin does not mention at all.
+
+    2026-11-04 (the ABB case): our tracked deal-id is
+    ``1789344000:ABB`` but autofin's ABB deals are ``1776643200`` /
+    ``1759708800`` / ... — there is NO match. The deal-id walk
+    therefore cannot find it, and the per-symbol dedup means only the
+    first tracked ABB deal is ever examined.
+
+    For the operator's purpose — "I will trade this manually" — what
+    matters is the POSITION, not the deal id. So the check is done at
+    the symbol level against the live positions.
+    """
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    class _Client:
+        def fetch_deals(self, symbol, page_size=10):
+            # autofin has ABB deals, but NOT the one we track.
+            return [{
+                "_id": 1776643200,
+                "symbol": "ABB",
+                "lastRecomment": "Đóng DEAL chạm điểm chặn lãi (Lãi: 30.04 %)",
+                "hisRecomment": [],
+                "numberOfProfit": 4,
+            }]
+
+    adapter = AutofinSignalAdapter()
+    adapter._our_deals = {
+        "1789344000:ABB": {"symbol": "ABB", "_our_qty": 100},
+    }
+    # We hold ABB; autofin's holding list does not mention ABB at all.
+    adapter._positions = {"ABB": 100}
+    adapter._augment_orphan_deals(_Client(), [])
+
+    assert len(adapter._orphan_deals) == 1
+    od = adapter._orphan_deals[0]
+    assert od["symbol"] == "ABB"
+    assert od["qty"] == 100
+    assert od["recovered"] is False
+    # The deal walk refines the reason: autofin has no row for THIS
+    # deal either, which is more specific than "not listed by autofin".
+    assert "no row in /signal-deals" in od["reason"]
+
+
+def test_a_position_autofin_lists_is_not_an_orphan() -> None:
+    """The position check must not fire for a symbol autofin holds."""
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    class _Client:
+        def fetch_deals(self, symbol, page_size=10):
+            return []
+
+    adapter = AutofinSignalAdapter()
+    adapter._our_deals = {
+        "1789344000:ABB": {"symbol": "ABB", "_our_qty": 100},
+    }
+    adapter._positions = {"ABB": 100}
+    # autofin DOES list ABB.
+    holding = [{"_id": 1789344000, "symbol": "ABB"}]
+    adapter._augment_orphan_deals(_Client(), holding)
+
+    assert adapter._orphan_deals == []
+
+
+def test_a_position_is_reported_only_once() -> None:
+    """One line per position — the position check and the deal walk
+    must not both report the same symbol."""
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    class _Client:
+        def fetch_deals(self, symbol, page_size=10):
+            # A MATCHING row — the deal walk would also report it.
+            return [{
+                "_id": 1792713600,
+                "symbol": "AAS",
+                "lastRecomment": "Khuyến nghị đầu tư",
+                "hisRecomment": [],
+                "numberOfProfit": 0,
+            }]
+
+    adapter = AutofinSignalAdapter()
+    adapter._our_deals = {
+        "1792713600:AAS": {"symbol": "AAS", "_our_qty": 300},
+    }
+    adapter._positions = {"AAS": 300}
+    adapter._augment_orphan_deals(_Client(), [])
+
+    assert len(adapter._orphan_deals) == 1
+    od = adapter._orphan_deals[0]
+    assert od["symbol"] == "AAS"
+    assert od["qty"] == 300
+    # The recovered recomment enriches the single entry.
+    assert od["recovered"] is True
+    assert "Khuyến nghị" in od["last_recomment"]
+
+
+def test_an_untracked_held_position_is_still_reported() -> None:
+    """We hold it but have no tracked deal for it → still an orphan."""
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    class _Client:
+        def fetch_deals(self, symbol, page_size=10):
+            return []
+
+    adapter = AutofinSignalAdapter()
+    adapter._our_deals = {}
+    adapter._positions = {"XYZ": 100}
+    adapter._augment_orphan_deals(_Client(), [])
+
+    assert len(adapter._orphan_deals) == 1
+    od = adapter._orphan_deals[0]
+    assert od["symbol"] == "XYZ"
+    assert od["qty"] == 100
+    assert od["deal_id"] == "(untracked):XYZ"
+
+
+# -----------------------------------------------------------------------------
 # the decision snapshot records the orphan flag
 # -----------------------------------------------------------------------------
 
