@@ -1,14 +1,29 @@
-"""Tests for the ORPHAN DEAL notice in the EOD report (2026-11-04).
+"""Tests for the ORPHAN DEALS notice in the EOD report.
 
-The operator confirmed the orphan deals are NOT a bot bug: the deal
-WAS on autofin, but autofin's data for it was lost, so
-``/signal-static-holding`` no longer lists it. The operator will
-trade them MANUALLY.
+2026-11-04: the operator asked for a notice listing the orphan deals
+so he could trade them manually.
 
-So the EOD report must NAME them. Without that, a position silently
-stops being managed by the bot — autofin publishes no recommendation
-for it, so there is nothing for the bot to act on — and nobody
-notices until the position moves against us.
+2026-11-05 (corrected): the operator clarified what an orphan IS::
+
+    "the orphan deal mean we can not get detail with that deal or
+     ticker anymore, not they are not in static holding list, pls
+     check"
+
+So the test is NOT "is the symbol in /signal-static-holding". It is:
+"can autofin still give us DETAIL for the deal we entered?" — judged
+by the tracked deal-id, which is the authoritative link to the
+autofin deal.
+
+Two flavours, needing different handling:
+
+* DEAL LOST — the tracked deal-id is gone from /signal-deals.
+  autofin has no recommendation for the position. The bot CANNOT act
+  on it; the operator must trade it manually. (ABB, TCB)
+
+* LIST LOST — the tracked deal-id still exists and is still OPEN, but
+  only the static holding list dropped it. The augmentation recovers
+  the recomment so the bot CAN still act, but autofin's own dashboard
+  does not show the position. (AAS)
 """
 
 from __future__ import annotations
@@ -27,19 +42,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 def _result(orphan_deals: list[dict]) -> dict:
     return {
-        "tradeDate": "2026-11-04",
+        "tradeDate": "2026-11-05",
         "strategy": "autofin_signal",
         "count": 0,
         "latestOrdersCsv": "/tmp/orders.csv",
         "latestOrdersJson": "/tmp/orders.json",
         "nav_source": "dnse",
         "signals": {
-            "nav": 27_056_277,
+            "nav": 28_240_263,
             "account": "0003937868",
-            "autofin_holding": 26,
-            "autofin_risk": 0,
-            "autofin_closing": 5,
-            "fetched": 3,
+            "autofin_holding": 29,
+            "autofin_risk": 13,
+            "autofin_closing": 50,
+            "fetched": 6,
             "deals_tracked": 27,
             "orphan_deals": orphan_deals,
         },
@@ -60,30 +75,31 @@ def test_no_orphan_notice_when_there_are_none() -> None:
     assert "MANUAL ACTION REQUIRED" not in msg
 
 
-def test_the_orphan_notice_names_every_orphan() -> None:
+def test_deal_lost_positions_are_listed_for_manual_trading() -> None:
+    """The ABB / TCB case — autofin has no deal for us any more."""
     msg = _summary([
         {
             "deal_id": "1789344000:ABB",
             "symbol": "ABB",
             "qty": 100,
-            "reason": "not in /signal-static-holding",
-            "recovered": True,
-            "last_recomment": "🟢 Vùng mua: 12,600 - 13,000",
+            "reason": "autofin no longer has this deal — no recommendation available",
+            "flavour": "detail_lost",
+            "recovered": False,
         },
         {
             "deal_id": "1792627200:TCB",
             "symbol": "TCB",
             "qty": 200,
-            "reason": "no row in /signal-deals for this deal",
+            "reason": "autofin no longer has this deal — no recommendation available",
+            "flavour": "detail_lost",
             "recovered": False,
         },
     ])
 
     assert "ORPHAN DEALS" in msg
-    assert "MANUAL ACTION REQUIRED" in msg
-    assert "Trade them manually" in msg
+    assert "2 position(s) have NO autofin recommendation" in msg
+    assert "TRADE MANUALLY" in msg
 
-    # Both orphans are named, with their deal id and quantity.
     assert "ABB" in msg
     assert "deal#1789344000:ABB" in msg
     assert "qty=100" in msg
@@ -91,233 +107,181 @@ def test_the_orphan_notice_names_every_orphan() -> None:
     assert "deal#1792627200:TCB" in msg
     assert "qty=200" in msg
 
-    # The reason each one is an orphan is shown.
-    assert "not in /signal-static-holding" in msg
-    assert "no row in /signal-deals" in msg
 
-    # The last autofin signal is carried for context.
-    assert "Vùng mua" in msg
-
-
-def test_the_orphan_count_is_shown() -> None:
+def test_list_lost_positions_are_separated_from_deal_lost() -> None:
+    """The AAS case — the deal is intact, only the holding list lost it."""
     msg = _summary([
-        {"deal_id": "1:AAA", "symbol": "AAA", "qty": 10,
-         "reason": "not in /signal-static-holding"},
-        {"deal_id": "2:BBB", "symbol": "BBB", "qty": 20,
-         "reason": "not in /signal-static-holding"},
+        {
+            "deal_id": "1792713600:AAS",
+            "symbol": "AAS",
+            "qty": 300,
+            "reason": "deal still on autofin, but missing from the holding list",
+            "flavour": "list_lost",
+            "recovered": True,
+            "last_recomment": "Khuyến nghị đầu tư",
+        },
     ])
-    assert "ORPHAN DEALS — MANUAL ACTION REQUIRED (2)" in msg
+
+    assert "ORPHAN DEALS" in msg
+    # It is NOT in the "trade manually" bucket.
+    assert "have NO autofin recommendation" not in msg
+    assert "still tradeable by the bot" in msg
+    assert "AAS" in msg
+    assert "qty=300" in msg
+    assert "Khuyến nghị" in msg
 
 
-def test_a_long_orphan_list_is_capped_but_counted() -> None:
+def test_both_flavours_are_shown_in_one_report() -> None:
+    """The real 2026-11-05 report: AAS (list lost) + ABB/TCB (deal lost)."""
+    msg = _summary([
+        {
+            "deal_id": "1792713600:AAS", "symbol": "AAS", "qty": 300,
+            "reason": "deal still on autofin, but missing from the holding list",
+            "flavour": "list_lost", "recovered": True,
+            "last_recomment": "Khuyến nghị đầu tư",
+        },
+        {
+            "deal_id": "1789344000:ABB", "symbol": "ABB", "qty": 100,
+            "reason": "autofin no longer has this deal — no recommendation available",
+            "flavour": "detail_lost", "recovered": False,
+        },
+        {
+            "deal_id": "1792627200:TCB", "symbol": "TCB", "qty": 200,
+            "reason": "autofin no longer has this deal — no recommendation available",
+            "flavour": "detail_lost", "recovered": False,
+        },
+    ])
+
+    assert "ORPHAN DEALS (3)" in msg
+    assert "2 position(s) have NO autofin recommendation" in msg
+    assert "1 position(s) still tradeable by the bot" in msg
+    for sym in ("AAS", "ABB", "TCB"):
+        assert sym in msg
+
+
+def test_the_wording_says_detail_is_lost() -> None:
+    """The operator's definition must be reflected in the wording."""
+    msg = _summary([
+        {
+            "deal_id": "1:AAA", "symbol": "AAA", "qty": 10,
+            "reason": "autofin no longer has this deal — no recommendation available",
+            "flavour": "detail_lost", "recovered": False,
+        },
+    ])
+    assert "can no longer give us detail" in msg
+
+
+def test_a_long_list_is_capped_but_counted() -> None:
     orphans = [
         {"deal_id": f"{i}:SYM{i}", "symbol": f"SYM{i}", "qty": i,
-         "reason": "not in /signal-static-holding"}
+         "reason": "autofin no longer has this deal — no recommendation available",
+         "flavour": "detail_lost", "recovered": False}
         for i in range(20)
     ]
     msg = _summary(orphans)
-    assert "MANUAL ACTION REQUIRED (20)" in msg
+    assert "ORPHAN DEALS (20)" in msg
     assert "+ 5 more" in msg
-    # The first 15 are listed.
     assert "SYM0" in msg
     assert "SYM14" in msg
     assert "SYM15" not in msg
 
 
-def test_the_notice_says_autofin_data_loss_not_a_bot_error() -> None:
-    """The operator's stated cause — make sure the wording matches."""
-    msg = _summary([
-        {"deal_id": "1:AAA", "symbol": "AAA", "qty": 10,
-         "reason": "not in /signal-static-holding"},
-    ])
-    assert "autofin data loss" in msg.lower()
-
-
 # -----------------------------------------------------------------------------
-# the adapter records the orphans
+# the adapter's detection
 # -----------------------------------------------------------------------------
 
-def test_the_adapter_records_orphan_deals() -> None:
-    """``_augment_orphan_deals`` must populate ``_orphan_deals``."""
+class _Client:
+    """A fake autofin client.
+
+    ``deals`` maps a symbol to the list of rows /signal-deals returns
+    for it. Only a row whose ``_id`` matches is a match.
+    """
+
+    def __init__(self, deals: dict[str, list[dict]]) -> None:
+        self.deals = deals
+        self.calls: list[str] = []
+
+    def fetch_deals(self, symbol, page_size=10):
+        self.calls.append(symbol)
+        return list(self.deals.get(symbol, []))
+
+
+def _row(_id: int, symbol: str, recomment: str = "Khuyến nghị đầu tư") -> dict:
+    return {
+        "_id": _id,
+        "symbol": symbol,
+        "lastRecomment": recomment,
+        "hisRecomment": [],
+        "numberOfProfit": 0,
+    }
+
+
+def test_a_deal_that_autofin_no_longer_has_is_detail_lost() -> None:
+    """ABB: our tracked _id is not among autofin's ABB deals."""
     from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
 
-    class _Client:
-        def fetch_deals(self, symbol, page_size=10):
-            # A row matching (_id, symbol) — the orphan IS recoverable.
-            return [{
-                "_id": 1789344000,
-                "symbol": "ABB",
-                "lastRecomment": "🟢 Vùng mua: 12,600 - 13,000",
-                "hisRecomment": [],
-                "numberOfProfit": 0,
-            }]
-
+    client = _Client({
+        "ABB": [_row(1776643200, "ABB", "Đóng DEAL chạm điểm chặn lãi (Lãi: 30.04 %)")],
+    })
     adapter = AutofinSignalAdapter()
-    adapter._our_deals = {
-        "1789344000:ABB": {
-            "symbol": "ABB",
-            "_our_qty": 100,
-            "lastRecomment": "stale",
-        },
-    }
-    # We HOLD the position — it must be reported.
+    adapter._our_deals = {"1789344000:ABB": {"symbol": "ABB", "_our_qty": 0}}
     adapter._positions = {"ABB": 100}
-    # The holding list does NOT contain the deal → it is an orphan.
-    adapter._augment_orphan_deals(_Client(), [])
+    adapter._augment_orphan_deals(client, [])
 
     assert len(adapter._orphan_deals) == 1
     od = adapter._orphan_deals[0]
-    assert od["deal_id"] == "1789344000:ABB"
     assert od["symbol"] == "ABB"
     assert od["qty"] == 100
+    assert od["flavour"] == "detail_lost"
+    assert od["recovered"] is False
+
+
+def test_a_deal_that_still_exists_is_list_lost() -> None:
+    """AAS: our tracked _id IS on autofin, but not in the holding list."""
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    client = _Client({"AAS": [_row(1792713600, "AAS")]})
+    adapter = AutofinSignalAdapter()
+    adapter._our_deals = {"1792713600:AAS": {"symbol": "AAS", "_our_qty": 0}}
+    adapter._positions = {"AAS": 300}
+    adapter._augment_orphan_deals(client, [])
+
+    assert len(adapter._orphan_deals) == 1
+    od = adapter._orphan_deals[0]
+    assert od["symbol"] == "AAS"
+    assert od["qty"] == 300
+    assert od["flavour"] == "list_lost"
     assert od["recovered"] is True
-    assert "Vùng mua" in od["last_recomment"]
+    assert "Khuyến nghị" in od["last_recomment"]
 
 
-def test_an_orphan_we_do_not_hold_is_not_listed() -> None:
-    """Only the orphans we ACTUALLY HOLD are reported.
-
-    The tracked-deal state keeps every deal we ever touched — 27 of
-    them on 2026-11-04, all with ``_our_qty = 0``. Listing them all
-    would bury the two that matter under 25 closed deals.
-    """
+def test_a_position_autofin_holds_normally_is_not_an_orphan() -> None:
     from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
 
-    class _Client:
-        def fetch_deals(self, symbol, page_size=10):
-            return [{
-                "_id": 1789344000,
-                "symbol": "ABB",
-                "lastRecomment": "🟢 Vùng mua: 12,600 - 13,000",
-                "hisRecomment": [],
-                "numberOfProfit": 0,
-            }]
-
+    client = _Client({"AAA": [_row(100, "AAA")]})
     adapter = AutofinSignalAdapter()
-    adapter._our_deals = {
-        "1789344000:ABB": {"symbol": "ABB", "_our_qty": 0},
-    }
-    # We do NOT hold it → nothing to trade manually → not listed.
-    adapter._positions = {}
-    adapter._augment_orphan_deals(_Client(), [])
+    adapter._our_deals = {"100:AAA": {"symbol": "AAA", "_our_qty": 100}}
+    adapter._positions = {"AAA": 100}
+    holding = [{"_id": 100, "symbol": "AAA"}]
+    adapter._augment_orphan_deals(client, holding)
 
     assert adapter._orphan_deals == []
 
 
-def test_an_unrecoverable_orphan_is_recorded_too() -> None:
-    """No matching row in /signal-deals → still listed, marked unrecovered."""
+def test_a_position_with_no_tracked_deal_is_detail_lost() -> None:
     from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
 
-    class _Client:
-        def fetch_deals(self, symbol, page_size=10):
-            # A row for the same symbol but a DIFFERENT _id — must not
-            # be borrowed (the 2026-10-29 VOS fix).
-            return [{
-                "_id": 9999999999,
-                "symbol": "ABB",
-                "lastRecomment": "💰 Chốt lãi lần 1 mức giá 20,000",
-                "hisRecomment": [],
-                "numberOfProfit": 1,
-            }]
-
+    client = _Client({})
     adapter = AutofinSignalAdapter()
-    adapter._our_deals = {
-        "1789344000:ABB": {"symbol": "ABB", "_our_qty": 100},
-    }
-    adapter._positions = {"ABB": 100}
-    adapter._augment_orphan_deals(_Client(), [])
+    adapter._our_deals = {}
+    adapter._positions = {"XYZ": 100}
+    adapter._augment_orphan_deals(client, [])
 
     assert len(adapter._orphan_deals) == 1
     od = adapter._orphan_deals[0]
-    assert od["recovered"] is False
-    assert "no row in /signal-deals" in od["reason"]
-
-
-def test_no_orphans_means_an_empty_list() -> None:
-    """When every tracked deal IS in the holding list, nothing is listed."""
-    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
-
-    class _Client:
-        def fetch_deals(self, symbol, page_size=10):
-            raise AssertionError("must not be called when there are no orphans")
-
-    adapter = AutofinSignalAdapter()
-    adapter._our_deals = {
-        "1789344000:ABB": {"symbol": "ABB", "_our_qty": 100},
-    }
-    adapter._positions = {"ABB": 100}
-    holding = [{"_id": 1789344000, "symbol": "ABB"}]
-    adapter._augment_orphan_deals(_Client(), holding)
-
-    assert adapter._orphan_deals == []
-
-
-# -----------------------------------------------------------------------------
-# symbol-level orphans (the ABB / TCB case)
-# -----------------------------------------------------------------------------
-
-def test_a_held_position_autofin_does_not_list_is_reported() -> None:
-    """A POSITION we hold that autofin does not mention at all.
-
-    2026-11-04 (the ABB case): our tracked deal-id is
-    ``1789344000:ABB`` but autofin's ABB deals are ``1776643200`` /
-    ``1759708800`` / ... — there is NO match. The deal-id walk
-    therefore cannot find it, and the per-symbol dedup means only the
-    first tracked ABB deal is ever examined.
-
-    For the operator's purpose — "I will trade this manually" — what
-    matters is the POSITION, not the deal id. So the check is done at
-    the symbol level against the live positions.
-    """
-    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
-
-    class _Client:
-        def fetch_deals(self, symbol, page_size=10):
-            # autofin has ABB deals, but NOT the one we track.
-            return [{
-                "_id": 1776643200,
-                "symbol": "ABB",
-                "lastRecomment": "Đóng DEAL chạm điểm chặn lãi (Lãi: 30.04 %)",
-                "hisRecomment": [],
-                "numberOfProfit": 4,
-            }]
-
-    adapter = AutofinSignalAdapter()
-    adapter._our_deals = {
-        "1789344000:ABB": {"symbol": "ABB", "_our_qty": 100},
-    }
-    # We hold ABB; autofin's holding list does not mention ABB at all.
-    adapter._positions = {"ABB": 100}
-    adapter._augment_orphan_deals(_Client(), [])
-
-    assert len(adapter._orphan_deals) == 1
-    od = adapter._orphan_deals[0]
-    assert od["symbol"] == "ABB"
-    assert od["qty"] == 100
-    assert od["recovered"] is False
-    # The deal walk refines the reason: autofin has no row for THIS
-    # deal either, which is more specific than "not listed by autofin".
-    assert "no row in /signal-deals" in od["reason"]
-
-
-def test_a_position_autofin_lists_is_not_an_orphan() -> None:
-    """The position check must not fire for a symbol autofin holds."""
-    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
-
-    class _Client:
-        def fetch_deals(self, symbol, page_size=10):
-            return []
-
-    adapter = AutofinSignalAdapter()
-    adapter._our_deals = {
-        "1789344000:ABB": {"symbol": "ABB", "_our_qty": 100},
-    }
-    adapter._positions = {"ABB": 100}
-    # autofin DOES list ABB.
-    holding = [{"_id": 1789344000, "symbol": "ABB"}]
-    adapter._augment_orphan_deals(_Client(), holding)
-
-    assert adapter._orphan_deals == []
+    assert od["symbol"] == "XYZ"
+    assert od["flavour"] == "detail_lost"
+    assert od["deal_id"] == "(untracked):XYZ"
 
 
 def test_a_position_is_reported_only_once() -> None:
@@ -325,51 +289,18 @@ def test_a_position_is_reported_only_once() -> None:
     must not both report the same symbol."""
     from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
 
-    class _Client:
-        def fetch_deals(self, symbol, page_size=10):
-            # A MATCHING row — the deal walk would also report it.
-            return [{
-                "_id": 1792713600,
-                "symbol": "AAS",
-                "lastRecomment": "Khuyến nghị đầu tư",
-                "hisRecomment": [],
-                "numberOfProfit": 0,
-            }]
-
+    client = _Client({"AAS": [_row(1792713600, "AAS")]})
     adapter = AutofinSignalAdapter()
-    adapter._our_deals = {
-        "1792713600:AAS": {"symbol": "AAS", "_our_qty": 300},
-    }
+    adapter._our_deals = {"1792713600:AAS": {"symbol": "AAS", "_our_qty": 300}}
     adapter._positions = {"AAS": 300}
-    adapter._augment_orphan_deals(_Client(), [])
+    adapter._augment_orphan_deals(client, [])
 
     assert len(adapter._orphan_deals) == 1
     od = adapter._orphan_deals[0]
     assert od["symbol"] == "AAS"
     assert od["qty"] == 300
-    # The recovered recomment enriches the single entry.
+    assert od["flavour"] == "list_lost"
     assert od["recovered"] is True
-    assert "Khuyến nghị" in od["last_recomment"]
-
-
-def test_an_untracked_held_position_is_still_reported() -> None:
-    """We hold it but have no tracked deal for it → still an orphan."""
-    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
-
-    class _Client:
-        def fetch_deals(self, symbol, page_size=10):
-            return []
-
-    adapter = AutofinSignalAdapter()
-    adapter._our_deals = {}
-    adapter._positions = {"XYZ": 100}
-    adapter._augment_orphan_deals(_Client(), [])
-
-    assert len(adapter._orphan_deals) == 1
-    od = adapter._orphan_deals[0]
-    assert od["symbol"] == "XYZ"
-    assert od["qty"] == 100
-    assert od["deal_id"] == "(untracked):XYZ"
 
 
 # -----------------------------------------------------------------------------
@@ -400,12 +331,56 @@ def test_the_decision_snapshot_flags_orphans() -> None:
         positions={"AAA": 100, "BBB": 200},
         nav=1_000_000,
         account="0003937868",
-        trade_date="2026-11-04",
+        trade_date="2026-11-05",
         allow_new_entries=True,
         new_entry_top_n=3,
         current_prices={},
+        orphan_deals=[
+            {"deal_id": "2:BBB", "symbol": "BBB", "qty": 200,
+             "flavour": "detail_lost", "recovered": False},
+        ],
     )
 
     by_id = {d["deal_id"]: d for d in summary["deals"]}
     assert by_id["1:AAA"]["is_orphan"] is False
+    assert by_id["2:BBB"]["is_orphan"] is True
+    assert by_id["2:BBB"]["orphan_flavour"] == "detail_lost"
+
+
+def test_the_snapshot_orphan_flag_does_not_depend_on_our_qty() -> None:
+    """2026-11-05: the old definition required ``_our_qty > 0``.
+
+    The tracked state has ``_our_qty = 0`` for EVERY deal we still
+    hold (it is not updated on a live fill), so the flag never fired.
+    """
+    from vietnam_algo.algos.autofin_signal import AutofinSignalAdapter
+
+    adapter = AutofinSignalAdapter()
+    summary = adapter._build_decision_summary(
+        raw_payloads={},
+        holding=[],
+        signals=[],
+        closing=[],
+        risk=[],
+        refresh_report={"refreshed": [], "skipped_fresh": [], "failed": []},
+        all_orders=[],
+        new_orders=[],
+        partial_orders=[],
+        close_orders=[],
+        deals_actioned=[],
+        our_deals={"2:BBB": {"symbol": "BBB", "_our_qty": 0}},
+        positions={"BBB": 200},
+        nav=1_000_000,
+        account="0003937868",
+        trade_date="2026-11-05",
+        allow_new_entries=True,
+        new_entry_top_n=3,
+        current_prices={},
+        orphan_deals=[
+            {"deal_id": "2:BBB", "symbol": "BBB", "qty": 200,
+             "flavour": "detail_lost", "recovered": False},
+        ],
+    )
+
+    by_id = {d["deal_id"]: d for d in summary["deals"]}
     assert by_id["2:BBB"]["is_orphan"] is True

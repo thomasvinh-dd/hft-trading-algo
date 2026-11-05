@@ -3671,6 +3671,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         allow_new_entries: bool,
         new_entry_top_n: int,
         current_prices: dict[str, float],
+        orphan_deals: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Build the human-readable record of what we decided this cycle.
 
@@ -3682,6 +3683,13 @@ class AutofinSignalAdapter(StrategyAdapter):
         """
         # Per-deal view of the recommendation we acted on.
         deal_view: list[dict[str, Any]] = []
+        # 2026-11-05: the orphan set, from the adapter's own detection.
+        _orphan_flavour_by_did: dict[str, str] = {}
+        for _od in (orphan_deals or []):
+            _odid = str(_od.get("deal_id") or "")
+            if _odid:
+                _orphan_flavour_by_did[_odid] = str(_od.get("flavour") or "")
+        _orphan_did_set = set(_orphan_flavour_by_did)
         for did, sig in sorted(our_deals.items()):
             rec = str(sig.get("lastRecomment") or "")
             deal_view.append({
@@ -3700,14 +3708,21 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "rateForNav": sig.get("rateForNav"),
                 "in_holding": _deal_id_in(holding, did),
                 "in_suggest": _deal_id_in(signals, did),
-                # 2026-11-04: an ORPHAN deal — we track it but
-                # autofin's /signal-static-holding does not list it
-                # (autofin data loss). The operator trades these
-                # manually; the EOD report names them.
-                "is_orphan": (
-                    not _deal_id_in(holding, did)
-                    and int(sig.get("_our_qty", 0) or 0) > 0
-                ),
+                # 2026-11-05: an ORPHAN deal — we hold the position but
+                # autofin can no longer give us detail for the DEAL.
+                #
+                # The old definition ("not in the holding list AND
+                # ``_our_qty > 0``") was wrong twice over: the
+                # augmentation injects a synthetic holding entry so
+                # ``in_holding`` is True for a recovered orphan, and
+                # ``_our_qty`` is 0 in the tracked state for every
+                # deal we still hold. It therefore never fired.
+                #
+                # Now the flag comes from the adapter's own orphan
+                # detection, which asks autofin directly whether the
+                # tracked deal-id still exists.
+                "is_orphan": did in _orphan_did_set,
+                "orphan_flavour": _orphan_flavour_by_did.get(did, ""),
             })
 
         # Candidates we could have entered, and why we didn't (if we
@@ -4097,19 +4112,35 @@ class AutofinSignalAdapter(StrategyAdapter):
         self._orphan_deals = []
         live_positions = getattr(self, "_positions", None) or {}
 
-        # 2026-11-04 (symbol-level orphans): a POSITION we hold that
-        # autofin's holding list does not mention AT ALL.
+        # 2026-11-05 (corrected semantics).
         #
-        # The deal-id walk below cannot find these: our tracked
-        # deal-ids do not always correspond to an autofin deal (the
-        # ABB case — we track ``1789344000:ABB`` but autofin's ABB
-        # deals are ``1776643200`` / ``1759708800`` / ...). And the
-        # per-symbol dedup (``seen_orphan_symbols``) means only the
-        # FIRST tracked deal per symbol is ever examined.
+        # The operator clarified what an ORPHAN really means:
         #
-        # For the operator's purpose — "I will trade this manually" —
-        # what matters is the POSITION, not the deal id. So we check
-        # the live positions directly against the holding symbols.
+        #   "the orphan deal mean we can not get detail with that deal
+        #    or ticker anymore, not they are not in static holding list"
+        #
+        # So the test is NOT "is the symbol in /signal-static-holding".
+        # It is: "can autofin still give us DETAIL for the deal we
+        # entered?" — judged by the tracked deal-id, which is the
+        # authoritative link to the autofin deal.
+        #
+        # There are two distinct flavours, and they need different
+        # handling:
+        #
+        #   * DETAIL LOST — the tracked deal-id is gone from
+        #     /signal-deals. autofin has no recommendation for the
+        #     position we hold. The bot CANNOT act on it; the operator
+        #     must trade it manually. (ABB, TCB)
+        #
+        #   * LIST LOST — the tracked deal-id still exists on autofin
+        #     and is still OPEN, but only the static holding list
+        #     dropped it. The augmentation recovers the recomment, so
+        #     the bot CAN still act on it. It is still worth
+        #     reporting, because autofin's own dashboard does not
+        #     show the position. (AAS)
+        #
+        # The symbol-level check below finds the DEAL LOST case by
+        # asking autofin directly whether it still knows the deal.
         holding_symbols = {
             str(h.get("symbol") or "").strip().upper()
             for h in holding
@@ -4117,28 +4148,98 @@ class AutofinSignalAdapter(StrategyAdapter):
             and str(h.get("symbol") or "").strip()
         }
         tracked_by_symbol: dict[str, list[str]] = {}
-        for did in orphan_dids:
-            _sym = str((self._our_deals.get(did) or {}).get("symbol") or "").strip().upper()
+        # ALL tracked deals, not just the orphans: a position we hold
+        # may have a tracked deal that IS in the holding list, and we
+        # must not then report it as "no tracked deal" (the 2026-11-05
+        # test caught exactly that).
+        for did, _sig in self._our_deals.items():
+            _sym = str((_sig or {}).get("symbol") or "").strip().upper()
             if _sym:
                 tracked_by_symbol.setdefault(_sym, []).append(did)
         for sym, qty in sorted(live_positions.items()):
             sym = str(sym or "").strip().upper()
-            if not sym or sym in holding_symbols:
+            if not sym:
                 continue
-            # We hold it and autofin does not list it at all.
             _dids = tracked_by_symbol.get(sym) or []
-            self._orphan_deals.append({
-                "deal_id": _dids[0] if _dids else f"(untracked):{sym}",
-                "symbol": sym,
-                "qty": int(qty or 0),
-                "reason": "held position not listed by autofin",
-                "recovered": False,
-            })
-            print(
-                f"[autofin_signal] orphan POSITION {sym}: holding "
-                f"{qty} shares but autofin does not list it in "
-                f"/signal-static-holding — reporting for manual action"
-            )
+            if not _dids:
+                # We hold it but have no tracked deal at all — autofin
+                # never had one for it.
+                self._orphan_deals.append({
+                    "deal_id": f"(untracked):{sym}",
+                    "symbol": sym,
+                    "qty": int(qty or 0),
+                    "reason": "no autofin deal tracked for this position",
+                    "flavour": "detail_lost",
+                    "recovered": False,
+                })
+                print(
+                    f"[autofin_signal] orphan {sym}: holding {qty} shares "
+                    f"with NO tracked autofin deal — manual action required"
+                )
+                continue
+            if sym in holding_symbols:
+                # autofin's holding list has it — not an orphan.
+                continue
+            # It is not in the holding list. Ask autofin whether it
+            # can still give us detail for OUR deal.
+            _detail_ok = False
+            _last_rec = ""
+            _matched_did = _dids[0]
+            for _did in _dids:
+                try:
+                    _want = int(str(_did).split(":", 1)[0] or 0)
+                except ValueError:
+                    _want = 0
+                try:
+                    _rows = client.fetch_deals(symbol=sym, page_size=10)
+                except Exception:
+                    _rows = []
+                _m = next(
+                    (
+                        d for d in (_rows or [])
+                        if int(d.get("_id", 0) or 0) == _want
+                        and str(d.get("symbol") or "").strip().upper() == sym
+                    ),
+                    None,
+                )
+                if _m is not None:
+                    _detail_ok = True
+                    _matched_did = _did
+                    _last_rec = str(_m.get("lastRecomment") or "")[:200]
+                    break
+            if _detail_ok:
+                # The LIST was lost but the DEAL is intact → the
+                # augmentation below recovers it and the bot can act.
+                self._orphan_deals.append({
+                    "deal_id": _matched_did,
+                    "symbol": sym,
+                    "qty": int(qty or 0),
+                    "reason": "deal still on autofin, but missing from the holding list",
+                    "flavour": "list_lost",
+                    "recovered": True,
+                    "last_recomment": _last_rec,
+                })
+                print(
+                    f"[autofin_signal] orphan {sym}: holding {qty} shares; "
+                    f"the deal is still on autofin but missing from "
+                    f"/signal-static-holding — recovered for trading"
+                )
+            else:
+                # The DEAL is gone → autofin has no recommendation for
+                # the position we hold. Manual action only.
+                self._orphan_deals.append({
+                    "deal_id": _matched_did,
+                    "symbol": sym,
+                    "qty": int(qty or 0),
+                    "reason": "autofin no longer has this deal — no recommendation available",
+                    "flavour": "detail_lost",
+                    "recovered": False,
+                })
+                print(
+                    f"[autofin_signal] orphan {sym}: holding {qty} shares "
+                    f"but autofin no longer has the deal — MANUAL ACTION "
+                    f"REQUIRED (no recommendation to act on)"
+                )
 
         if not orphan_dids:
             return
@@ -4218,9 +4319,9 @@ class AutofinSignalAdapter(StrategyAdapter):
                     f"found in /signal-deals?symbol={sym} — skipping "
                     f"(no fallback to an unrelated row)"
                 )
-                # 2026-11-04: record it for the EOD report. This is
-                # the WORST kind of orphan — autofin has no row for
-                # it at all, so there is no recommendation to act on.
+                # 2026-11-05: the DEAL is gone — autofin has no row
+                # for it, so there is no recommendation to act on.
+                # This is the "detail lost" flavour.
                 _held_qty = int(live_positions.get(sym, 0) or 0)
                 if _held_qty > 0:
                     _existing = next(
@@ -4233,8 +4334,9 @@ class AutofinSignalAdapter(StrategyAdapter):
                     if _existing is not None:
                         # Already reported at the POSITION level.
                         _existing["reason"] = (
-                            "no row in /signal-deals for this deal"
+                            "autofin no longer has this deal — no recommendation available"
                         )
+                        _existing["flavour"] = "detail_lost"
                         _existing["recovered"] = False
                         _existing["deal_id"] = did
                     else:
@@ -4242,7 +4344,8 @@ class AutofinSignalAdapter(StrategyAdapter):
                             "deal_id": did,
                             "symbol": sym,
                             "qty": _held_qty,
-                            "reason": "no row in /signal-deals for this deal",
+                            "reason": "autofin no longer has this deal — no recommendation available",
+                            "flavour": "detail_lost",
                             "recovered": False,
                         })
                 continue
@@ -4304,13 +4407,18 @@ class AutofinSignalAdapter(StrategyAdapter):
                     # the same position.
                     _existing["last_recomment"] = last_rec[:200]
                     _existing["recovered"] = True
+                    _existing["flavour"] = "list_lost"
+                    _existing["reason"] = (
+                        "deal still on autofin, but missing from the holding list"
+                    )
                     _existing["deal_id"] = did
                 else:
                     self._orphan_deals.append({
                         "deal_id": did,
                         "symbol": sym,
                         "qty": _held_qty,
-                        "reason": "not in /signal-static-holding",
+                        "reason": "deal still on autofin, but missing from the holding list",
+                        "flavour": "list_lost",
                         "recovered": True,
                         "last_recomment": last_rec,
                     })
@@ -5127,6 +5235,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             allow_new_entries=allow_new_entries,
             new_entry_top_n=new_entry_top_n,
             current_prices=current_prices,
+            orphan_deals=list(self._orphan_deals),
         )
         self._write_decision_snapshot(
             config.dataDir, raw_payloads, snapshot_summary,
@@ -5302,46 +5411,67 @@ class AutofinSignalAdapter(StrategyAdapter):
             )
             lines.append("")
 
-        # 2026-11-04: the ORPHAN DEALS notice.
+        # 2026-11-05 (corrected): the ORPHAN DEALS notice.
         #
-        # These are positions we track that autofin's
-        # /signal-static-holding no longer lists. The operator
-        # confirmed the cause is autofin DATA LOSS (the deal WAS on
-        # autofin; autofin dropped it) — NOT a bot bug — and will
-        # trade them MANUALLY.
+        # An orphan is a position we hold for a DEAL that autofin can
+        # no longer give us detail for (the operator's definition:
+        # "we cannot get detail with that deal or ticker anymore").
+        # It is NOT simply "missing from the static holding list".
         #
-        # The notice is here because an orphan deal stops being
-        # managed by the bot: autofin no longer publishes a
-        # recommendation for it, so there is nothing for the bot to
-        # act on. Without this line the position silently stops
-        # being tracked and nobody notices until it moves against us.
+        # Two flavours, and they need different handling:
+        #
+        #   * DEAL LOST  — autofin has no recommendation for the
+        #     position. The bot CANNOT act on it. Manual only.
+        #   * LIST LOST  — the deal is still on autofin and still
+        #     open; only the static holding list dropped it. The bot
+        #     recovers it and can still act, but autofin's own
+        #     dashboard does not show the position.
+        #
+        # The notice is here because an orphan stops being visible:
+        # autofin publishes no recommendation for it, so nothing in
+        # the bot's normal output says the position is still open.
         orphan_deals = sig.get("orphan_deals") or []
         if orphan_deals:
+            _lost = [o for o in orphan_deals if not o.get("recovered")]
+            _list = [o for o in orphan_deals if o.get("recovered")]
             lines.append(
-                f"🧩 ORPHAN DEALS — MANUAL ACTION REQUIRED "
-                f"({len(orphan_deals)})"
+                f"🧩 ORPHAN DEALS ({len(orphan_deals)}) — "
+                f"autofin can no longer give us detail for these"
             )
-            lines.append(
-                "   autofin no longer lists these in "
-                "/signal-static-holding (autofin data loss). "
-                "Trade them manually."
-            )
-            for od in orphan_deals[:15]:
-                _sym = od.get("symbol", "?")
-                _did = od.get("deal_id", "?")
-                _qty = int(od.get("qty", 0) or 0)
-                _rec = od.get("last_recomment") or ""
-                _why = od.get("reason", "")
-                _line = f"  • {_sym}  [deal#{_did}]"
-                if _qty:
-                    _line += f"  qty={_qty:,}"
-                if _why:
-                    _line += f"  ({_why})"
-                lines.append(_line)
-                if _rec:
-                    lines.append(f"    last autofin signal: {_rec[:90]}")
-            if len(orphan_deals) > 15:
-                lines.append(f"  + {len(orphan_deals) - 15} more")
+            if _lost:
+                lines.append(
+                    f"   ⚠️ {len(_lost)} position(s) have NO autofin "
+                    f"recommendation — TRADE MANUALLY:"
+                )
+                for od in _lost[:15]:
+                    _sym = od.get("symbol", "?")
+                    _did = od.get("deal_id", "?")
+                    _qty = int(od.get("qty", 0) or 0)
+                    _line = f"  • {_sym}  [deal#{_did}]"
+                    if _qty:
+                        _line += f"  qty={_qty:,}"
+                    _line += f"  — {od.get('reason', 'detail lost')}"
+                    lines.append(_line)
+                if len(_lost) > 15:
+                    lines.append(f"  + {len(_lost) - 15} more")
+            if _list:
+                lines.append(
+                    f"   ℹ️ {len(_list)} position(s) still tradeable by the "
+                    f"bot (the deal exists, only the holding list lost it):"
+                )
+                for od in _list[:15]:
+                    _sym = od.get("symbol", "?")
+                    _did = od.get("deal_id", "?")
+                    _qty = int(od.get("qty", 0) or 0)
+                    _rec = od.get("last_recomment") or ""
+                    _line = f"  • {_sym}  [deal#{_did}]"
+                    if _qty:
+                        _line += f"  qty={_qty:,}"
+                    lines.append(_line)
+                    if _rec:
+                        lines.append(f"    last autofin signal: {_rec[:90]}")
+                if len(_list) > 15:
+                    lines.append(f"  + {len(_list) - 15} more")
             lines.append("")
 
         lines.append(f"📁 Orders file: {result.get('latestOrdersCsv', '?')}")
