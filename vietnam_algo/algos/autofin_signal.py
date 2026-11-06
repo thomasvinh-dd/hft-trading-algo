@@ -2949,6 +2949,29 @@ class AutofinSignalAdapter(StrategyAdapter):
         # the real fill evidence.
         latest_filled_buy_qty_by_did: dict[str, int] = {}
         latest_filled_buy_ts_by_did: dict[str, str] = {}
+        # 2026-11-05 (the "no entry fired" incident): the NET filled
+        # quantity per deal — filled BUYs minus filled SELLs.
+        #
+        # The reconciliation above only looked at the latest FILLED
+        # BUY, so a position we had already SOLD still counted as
+        # held. On 2026-11-05 that put ORS and BAF into
+        # ``already_planned_symbols`` even though we held NONE of
+        # them:
+        #
+        #   deal 1785888000:BAF  filled BUYs=200  filled SELLs=200  net=0
+        #   deal 1792713600:ORS  filled BUYs=200  filled SELLs=200  net=0
+        #   deal 1792627200:VOS  filled BUYs=300  filled SELLs=200  net=100
+        #
+        # ``already_planned_symbols`` is the "we already own this
+        # symbol, don't enter it again" set — so a stale entry there
+        # silently blocks a legitimate new entry. That is why the bot
+        # had 3 in-band entry candidates all day (VLB, BAF, ORS) and
+        # produced ZERO orders: BAF and ORS were skipped as "already
+        # planned", and VLB rounded to 0 board lots.
+        #
+        # The net quantity is the truth: buys open a position, sells
+        # close it. We sum BOTH over the whole deal history.
+        net_filled_qty_by_did: dict[str, int] = {}
         try:
             ledger = load_ledger(data_dir)
         except Exception:
@@ -2984,6 +3007,16 @@ class AutofinSignalAdapter(StrategyAdapter):
                 if ts >= buy_ts:
                     latest_filled_buy_ts_by_did[did] = ts
                     latest_filled_buy_qty_by_did[did] = this_filled
+                # 2026-11-05: net the fills. A BUY adds, a SELL
+                # subtracts.
+                if item.side == "NB":
+                    net_filled_qty_by_did[did] = (
+                        net_filled_qty_by_did.get(did, 0) + this_filled
+                    )
+                elif item.side == "NS":
+                    net_filled_qty_by_did[did] = (
+                        net_filled_qty_by_did.get(did, 0) - this_filled
+                    )
         # 2. Determine which deals we still hold. A deal is "held"
         #    if EITHER ``_our_qty > 0`` (state file says we own) OR
         #    the latest order is ``filled`` with fillQuantity > 0
@@ -2994,6 +3027,11 @@ class AutofinSignalAdapter(StrategyAdapter):
             status = latest_status_by_did.get(did, "")
             filled_qty = latest_filled_by_did.get(did, 0)
             latest_filled_buy_qty = latest_filled_buy_qty_by_did.get(did, 0)
+            # 2026-11-05: the NET filled quantity (buys minus sells).
+            # When we have it, it is the truth about whether the
+            # position is still open — the state file is stale and
+            # "latest filled BUY" ignores the sells that closed it.
+            net_qty = net_filled_qty_by_did.get(did)
             if qty > 0:
                 # State says we hold. Cross-check with the ledger.
                 if status in {"cancelled", "rejected", "expired", "closed", "dry_run", "skipped"}:
@@ -3015,6 +3053,16 @@ class AutofinSignalAdapter(StrategyAdapter):
                         # genuine dry-run pollution case. Reset.
                         sig["_our_qty"] = 0
                 else:
+                    # 2026-11-05: if the ledger says the position
+                    # was fully closed (net filled <= 0), the state
+                    # file is stale — we do NOT hold this any more.
+                    # Trusting the stale state here put the symbol in
+                    # ``already_planned_symbols`` and silently blocked
+                    # a legitimate new entry (the 2026-11-05 ORS/BAF
+                    # case).
+                    if net_qty is not None and net_qty <= 0:
+                        sig["_our_qty"] = 0
+                        continue
                     held_dids.add(did)
                     # Reconcile upward: if the ledger says we filled
                     # more shares than the state file claims, update
@@ -3023,6 +3071,9 @@ class AutofinSignalAdapter(StrategyAdapter):
                     # partially filled at a higher price.
                     if status == "filled" and filled_qty > qty:
                         sig["_our_qty"] = filled_qty
+                    elif net_qty is not None and net_qty < qty:
+                        # We sold part of it — reconcile DOWN.
+                        sig["_our_qty"] = max(0, net_qty)
                     continue
             # State says we don't hold, but the ledger might say
             # otherwise (state is stale, the order filled but the
@@ -3043,8 +3094,18 @@ class AutofinSignalAdapter(StrategyAdapter):
                 # order (filled BUY 100). We really do hold those
                 # 100 shares — the cancellation only voided the
                 # second attempt.
+                #
+                # 2026-11-05: but if the NET filled quantity says the
+                # position was closed (net <= 0), do NOT resurrect it.
+                # The "latest filled BUY" evidence is not enough —
+                # a later SELL closes the position.
+                if net_qty is not None and net_qty <= 0:
+                    sig["_our_qty"] = 0
+                    continue
                 held_dids.add(did)
-                sig["_our_qty"] = latest_filled_buy_qty
+                sig["_our_qty"] = (
+                    net_qty if net_qty is not None else latest_filled_buy_qty
+                )
         # 3. Prune: keep the deal only if we hold it OR the latest
         #    order is non-terminal (open / partial / submitting /
         #    unknown / prepared) or filled. Terminal-without-fill
