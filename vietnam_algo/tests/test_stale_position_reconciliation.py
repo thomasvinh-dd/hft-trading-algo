@@ -178,3 +178,50 @@ def test_a_position_with_no_ledger_history_keeps_its_state_qty(tmp_path) -> None
     adapter._load_state(tmp_path)
 
     assert adapter._our_deals["999:XYZ"]["_our_qty"] == 100
+
+
+def test_a_sold_position_is_not_resurrected_by_its_sell_order(tmp_path) -> None:
+    """The latest filled order for a closed position IS the SELL.
+
+    2026-11-05: the state file said ``_our_qty = 0`` (the deal was
+    closed), but the reconciliation read the latest filled order —
+    which was the SELL — and set ``_our_qty`` to the SELL quantity
+    (200). The position came back from the dead, and the symbol went
+    into ``already_planned_symbols``, blocking a new entry.
+
+    The NET filled quantity (buys minus sells) is the only reliable
+    answer: 0 here.
+    """
+    live = tmp_path / "live"
+    live.mkdir(parents=True, exist_ok=True)
+    (live / "autofin_signal_state.json").write_text(json.dumps({
+        "our_deals": {
+            "1792713600:ORS": {"symbol": "ORS", "_our_qty": 0},
+        },
+        "actioned_deals": ["1792713600:ORS"],
+    }))
+    save_ledger({
+        "2026-10-26:1:ORS:NB": LedgerOrder(
+            runId="2026-10-26", sourceOrderId=1, sourceDate="2026-10-26",
+            symbol="ORS", side="NB", quantity=200, price=14800,
+            reason="autofin_buy:deal#1792713600:ORS:nav15pct:x",
+            status="filled", dnseOrderId="b1",
+            createdAt="2026-10-26T02:00:00Z", updatedAt="2026-10-26T02:30:00Z",
+            lastDetail={"orderStatus": "Filled", "fillQuantity": 200},
+        ),
+        "2026-10-26:2:ORS:NS": LedgerOrder(
+            runId="2026-10-26", sourceOrderId=2, sourceDate="2026-10-26",
+            symbol="ORS", side="NS", quantity=200, price=14400,
+            reason="autofin_user_sl:deal#1792713600:ORS:10%:14400",
+            status="filled", dnseOrderId="b2",
+            createdAt="2026-10-26T03:00:00Z", updatedAt="2026-10-26T03:30:00Z",
+            lastDetail={"orderStatus": "Filled", "fillQuantity": 200},
+        ),
+    }, tmp_path)
+
+    adapter = AutofinSignalAdapter()
+    adapter._load_state(tmp_path)
+
+    assert adapter._our_deals["1792713600:ORS"]["_our_qty"] == 0, (
+        "the SELL order must not resurrect a closed position"
+    )

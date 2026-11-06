@@ -3078,7 +3078,24 @@ class AutofinSignalAdapter(StrategyAdapter):
             # State says we don't hold, but the ledger might say
             # otherwise (state is stale, the order filled but the
             # state file was reset by some other code path).
-            if status == "filled" and filled_qty > 0:
+            #
+            # 2026-11-05: the NET filled quantity decides. The
+            # "latest filled order" is not enough: for a position we
+            # sold, the latest filled order IS the SELL, so
+            # ``filled_qty`` is the SELL quantity and the old code
+            # resurrected the position as "held" (ORS/BAF on
+            # 2026-11-05: bought 200, sold 200, net 0, but the state
+            # ended up claiming 200 held — which put them in
+            # ``already_planned_symbols`` and silently blocked a
+            # legitimate new entry).
+            if net_qty is not None:
+                # We have ledger evidence for this deal — trust the net.
+                if net_qty <= 0:
+                    sig["_our_qty"] = 0
+                    continue
+                held_dids.add(did)
+                sig["_our_qty"] = net_qty
+            elif status == "filled" and filled_qty > 0:
                 held_dids.add(did)
                 # Reconcile the stale state file.
                 sig["_our_qty"] = filled_qty
