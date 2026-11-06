@@ -2886,6 +2886,78 @@ class AutofinSignalAdapter(StrategyAdapter):
             self._notified_event_ids = set()
             self._actioned_deals = set()
 
+    def _reconcile_with_live_positions(
+        self,
+        live_positions: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        """Drop the tracked deals whose symbol we no longer HOLD.
+
+        2026-11-06 (the operator's request)::
+
+            "the above issue remind me a issue, previously we entry
+             BAF and ORS but the system got error when handling sell
+             order so i do it manually, that action is not recorded in
+             our ledger so may cause the issue, i wanna our system to
+             automatically remove the stale order in our ledger in the
+             case that we do not have the stock left in our portfolio"
+
+        The ledger is OUR record of what we sent to DNSE. A MANUAL
+        sell (done in the DNSE app because the bot errored) never
+        appears there, so the ledger still says "we hold 200 BAF" and
+        the reconciliation cannot tell that the position is gone.
+
+        The live DNSE position map IS the truth. This method prunes
+        the tracked state against it:
+
+        * a tracked deal whose symbol is NOT in the live positions at
+          all -> the position is gone (we sold it manually, or the
+          broker liquidated it) -> ``_our_qty = 0``;
+        * a tracked deal whose symbol is held but with FEWER shares
+          than we claim -> reconcile DOWN to the live quantity.
+
+        Without this, the stale symbol lands in
+        ``already_planned_symbols`` and silently blocks a legitimate
+        new entry — exactly what happened to BAF and ORS on
+        2026-11-05 (three in-band candidates, zero orders).
+
+        Safety: this only ever runs when we have a NON-EMPTY live
+        position map. An empty map could mean "we hold nothing" OR
+        "the portfolio fetch failed" — and wiping the tracked state on
+        a transient API failure would be catastrophic (the bot would
+        re-enter every position it owns). So an empty map is treated
+        as "no information" and nothing is pruned.
+
+        Returns the list of pruned entries (for the log/snapshot).
+        """
+        if not live_positions:
+            # No information — do NOT prune. See the safety note above.
+            return []
+        pruned: list[dict[str, Any]] = []
+        for did, sig in list(self._our_deals.items()):
+            claimed = int(sig.get("_our_qty", 0) or 0)
+            if claimed <= 0:
+                continue
+            sym = str(sig.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            live_qty = int(live_positions.get(sym, 0) or 0)
+            if live_qty >= claimed:
+                continue
+            # We hold fewer shares than we thought (or none at all).
+            sig["_our_qty"] = max(0, live_qty)
+            pruned.append({
+                "deal_id": did,
+                "symbol": sym,
+                "claimed_qty": claimed,
+                "live_qty": live_qty,
+            })
+            print(
+                f"[autofin_signal] stale position reconciled: {sym} "
+                f"{claimed} -> {live_qty} (deal {did}) — the ledger "
+                f"had no record of the sell (manual trade?)"
+            )
+        return pruned
+
     @staticmethod
     def _prune_terminal_unfilled_deals(
         actioned: set[str],
@@ -4726,6 +4798,41 @@ class AutofinSignalAdapter(StrategyAdapter):
             positions = {}
             nav = 0.0
             account = "?"
+
+        # 5a. Reconcile the tracked state against the LIVE positions.
+        #
+        # 2026-11-06: a MANUAL sell leaves no trace in our ledger, so
+        # the ledger keeps claiming a position we no longer hold. That
+        # stale claim lands in ``already_planned_symbols`` and blocks
+        # a legitimate new entry (the 2026-11-05 BAF/ORS case).
+        #
+        # The live DNSE position map is the truth — use it.
+        pruned_positions: list[dict[str, Any]] = []
+        if positions:
+            try:
+                pruned_positions = self._reconcile_with_live_positions(
+                    positions,
+                )
+            except Exception as exc:
+                print(
+                    f"[autofin_signal] live-position reconciliation "
+                    f"failed (non-fatal): {type(exc).__name__}: "
+                    f"{str(exc)[:200]}"
+                )
+        if pruned_positions:
+            print(
+                f"[autofin_signal] pruned {len(pruned_positions)} stale "
+                f"position(s) from the tracked state: "
+                + ", ".join(
+                    f"{p['symbol']} {p['claimed_qty']}->{p['live_qty']}"
+                    for p in pruned_positions
+                )
+            )
+            # The pruned deals must not stay in ``actioned_deals`` —
+            # they are re-actionable now that we hold none of them.
+            for _p in pruned_positions:
+                if int(_p.get("live_qty", 0) or 0) <= 0:
+                    self._actioned_deals.discard(_p["deal_id"])
 
         # 5b. MOCK_NAV override — for dry-run testing with funded account
         # but zero balance. Lets us see the order plan without real money.
