@@ -79,6 +79,22 @@ class ExitsConfig:
     scale_out_pct_at_sl_T: float = 0.5
     scale_out_pct_at_midpoint: float = 0.5
     sl_buffer_pct: float = 0.01
+    # Minimum residue (in board lots) a partial exit may leave behind.
+    #
+    # Repeated fractional scale-outs converge on a small stub: a 50%
+    # cut walks 10,700 -> 5,400 -> 2,700 -> 1,400 -> 700 -> 400 -> 200.
+    # Once the position is down to a couple of lots there is no exit
+    # left for it — the profit tiers were never reached (so the
+    # trailing stop never armed) and the price may never revisit the
+    # stop levels again. The stub then sits OPEN forever, blocking
+    # the ticker for months and polluting the dashboard with a
+    # mark-to-market row for a position nobody can exit.
+    #
+    # When a partial exit would leave this many lots or fewer, the
+    # WHOLE remaining position is liquidated at that price instead.
+    # 2 lots = 200 shares at the HOSE board lot of 100.
+    # Set to 0 to disable (keep the old stub-leaving behaviour).
+    min_residual_lots: int = 2
     # Stop-loss placement: anchored to ENTRY price, not the ancient base.
     # The old logic placed stops at (base_low + entry)/2 which could be 30-45%
     # below entry when the stock had already run 5-10x from base before breakout.

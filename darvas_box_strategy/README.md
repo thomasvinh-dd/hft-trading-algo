@@ -157,6 +157,35 @@ comes from the first cut. This is why the worst single-trade loss
 in the backtest is **-13%** (not -18% as a single hard stop would
 imply).
 
+#### Board lots and the residual rule (no stranded stubs)
+
+Every partial exit is rounded **down** to the HOSE board lot of 100
+shares. Repeated 50% cuts therefore converge on a small residue —
+a 10,700-share position walks
+
+```
+10,700 → 5,400 → 2,700 → 1,400 → 700 → 400 → 200
+```
+
+A residue that small has **no exit left**: the profit tiers were
+never reached (so the trailing stop never armed) and the price may
+never revisit `sl_T` / `sl_mid` / `sl_F` again. The stub would then
+stay OPEN forever, blocking the ticker for months and showing up on
+the dashboard as a mark-to-market row for a position that cannot
+be exited.
+
+To prevent this, `ExitsConfig.min_residual_lots` (default **2**)
+sets the smallest residue a partial exit may leave. When a cut would
+leave **2 lots (200 shares) or fewer**, the **whole remaining
+position is liquidated at that price** instead of leaving a stub.
+
+Set `min_residual_lots = 0` to disable the rule and restore the old
+stub-leaving behaviour.
+
+The same rule is applied by all three execution paths — the backtest
+executor, the live `Portfolio`, and the Telegram exit scanner — via
+the shared helper `darvas.executor._scale_out_cut`.
+
 ### Step 6 — Trade management summary
 
 For each bar after entry, the strategy runs this priority order:
@@ -209,6 +238,21 @@ happened.
 | **TIME_STOP** | Time stop fired | `bars_held ≥ max_holding_bars` AND close still below entry | -all remaining |
 | **DIVIDEND** | Cash dividend received | Ticker has a dividend event on this bar | unchanged (income credited) |
 | **EXHAUST** | Backtest ran out of data | No more bars | -all remaining (at last close) |
+| **MARK** | Display-only mark-to-market of a still-open position | The `EXHAUST` fill of a deal that is still open | unchanged (0 shares sold) |
+
+> **MARK** is not a trade. The backtest engine has to close out every
+> simulated deal so its accounting balances, so a position that
+> survives to the end of the price data gets a synthetic `EXHAUST`
+> fill. For a position that is **actually still held** that fill
+> would be a lie, so the web layer rewrites it to `MARK`:
+> `shares = 0`, `remaining` = the shares still held, `pnl_delta = 0`,
+> and the note *"Position still open — N sh marked at last close"*.
+> It is a snapshot, not a sale.
+>
+> After the residual-lot fix (see
+> [Board lots and the residual rule](#board-lots-and-the-residual-rule-no-stranded-stubs))
+> a position should rarely stay open this long — a stub small enough
+> to have no exit left is now liquidated instead of being stranded.
 
 ### Detailed explanation of each event
 
@@ -712,6 +756,7 @@ default 9-tier ladder takes 10% at +6.3%, then 30% at +12.5%, then
 | `use_entry_anchored_stops` | True | Stop is anchored to entry (not base low) |
 | `t_plus_n_bars` | 0 | T+2.5 settlement lock-up (3 = T+2.5) |
 | `max_holding_bars` | 0 | Time stop after N bars underwater (0 = off) |
+| `min_residual_lots` | 2 | Liquidate the whole position when a partial exit would leave ≤ 2 board lots (200 shares) — prevents stranded stubs with no exit left. 0 = disable |
 
 ### Trailing stop (`TrailingConfig`)
 

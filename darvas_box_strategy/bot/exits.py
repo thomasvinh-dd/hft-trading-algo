@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+from ..darvas.executor import _scale_out_cut
 from .positions import LivePosition
 
 log = logging.getLogger("darvas.bot.exits")
@@ -37,13 +38,6 @@ class ExitEvent:
         return f"{self.kind}:{self.tier_index if self.tier_index is not None else ''}"
 
 
-def _round_down_lot(value: float, lot: int) -> int:
-    """Round a share count DOWN to the nearest board lot (HOSE = 100)."""
-    if lot <= 1:
-        return int(value)
-    return (int(value) // lot) * lot
-
-
 def evaluate_exits(
     pos: LivePosition,
     bars: Sequence,
@@ -66,6 +60,9 @@ def evaluate_exits(
     trail_cfg = cfg.trailing
     cost_rate = cfg.backtest.cost_bps / 10_000.0
     lot = cfg.backtest.board_lot if cfg.backtest.board_lot > 0 else 1
+    # Minimum residue a partial exit may leave behind (in board lots).
+    # 0 = disable the residual-liquidation rule.
+    min_residual_lots = getattr(exits_cfg, "min_residual_lots", 0) or 0
     # T+2.5 settlement: the first N-1 bars are locked for exits.
     t_plus_n = (
         max(0, exits_cfg.t_plus_n_bars - 1)
@@ -141,11 +138,8 @@ def evaluate_exits(
             tier_price = entry_price * mult
             if bar.high < tier_price:
                 break
-            # Board-lot rounding: cut DOWN to the nearest lot.
-            tier_shares = _round_down_lot(remaining * pct, lot)
-            # If the cut would strand < 1 lot, sell everything instead.
-            if tier_shares <= 0 or remaining - tier_shares < lot:
-                tier_shares = remaining
+            # Board-lot rounding + residual-liquidation (shared helper).
+            tier_shares = _scale_out_cut(remaining, pct, lot, min_residual_lots)
             if tier_shares <= 0:
                 tier_idx += 1
                 continue
@@ -167,9 +161,9 @@ def evaluate_exits(
 
         # --- 3) Partial-cut stop (sl_T) ---
         if bar.low <= pos.sl_T:
-            cut = _round_down_lot(remaining * exits_cfg.scale_out_pct_at_sl_T, lot)
-            if cut <= 0 or remaining - cut < lot:
-                cut = remaining
+            cut = _scale_out_cut(
+                remaining, exits_cfg.scale_out_pct_at_sl_T, lot, min_residual_lots,
+            )
             ev = _sell("SL_SCALE", cut, pos.sl_T,
                        note=f"partial stop at {pos.sl_T:,.0f} "
                             f"({(pos.sl_T / entry_price - 1) * 100:.1f}%)")
@@ -181,10 +175,9 @@ def evaluate_exits(
         # --- 4) Midpoint stop ---
         sl_mid = pos.sl_midpoint
         if sl_mid and bar.low <= sl_mid and remaining > 0:
-            cut = _round_down_lot(
-                remaining * exits_cfg.scale_out_pct_at_midpoint, lot)
-            if cut <= 0 or remaining - cut < lot:
-                cut = remaining
+            cut = _scale_out_cut(
+                remaining, exits_cfg.scale_out_pct_at_midpoint, lot, min_residual_lots,
+            )
             ev = _sell("SL_SCALE", cut, sl_mid,
                        note=f"mid stop at {sl_mid:,.0f} "
                             f"({(sl_mid / entry_price - 1) * 100:.1f}%)")

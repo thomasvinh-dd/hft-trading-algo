@@ -27,6 +27,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import StrategyConfig
+from .executor import _scale_out_cut
 from .signals import Signal
 
 log = logging.getLogger("darvas.portfolio")
@@ -412,6 +413,9 @@ class Portfolio:
         cost_rate = cfg.backtest.cost_bps / 10_000.0
         lot = cfg.backtest.board_lot if cfg.backtest.board_lot > 0 else 1
         daily_limit = cfg.backtest.daily_price_limit_pct
+        # Minimum residue a partial exit may leave behind (in board lots).
+        # 0 = disable the residual-liquidation rule.
+        min_residual_lots = getattr(exits_cfg, "min_residual_lots", 0) or 0
         # T+2.5 settlement: lock-up first N-1 bars
         t_plus_n = max(0, exits_cfg.t_plus_n_bars - 1) if exits_cfg.t_plus_n_bars > 0 else 0
 
@@ -467,10 +471,9 @@ class Portfolio:
             tier_price = sig.entry_price * mult
             if effective_price < tier_price:
                 break
-            tier_shares = max(int(pos.remaining * pct), 0)
-            # Don't leave orphan shares < lot
-            if pos.remaining - tier_shares < lot:
-                tier_shares = pos.remaining
+            tier_shares = _scale_out_cut(
+                pos.remaining, pct, lot, min_residual_lots,
+            )
             if tier_shares <= 0:
                 pos.tier_idx += 1
                 continue
@@ -492,9 +495,9 @@ class Portfolio:
 
         # Partial-cut stop (sl_T)
         if effective_price <= sig.sl_T:
-            cut = max(int(pos.remaining * exits_cfg.scale_out_pct_at_sl_T), 0)
-            if cut <= 0:
-                cut = pos.remaining
+            cut = _scale_out_cut(
+                pos.remaining, exits_cfg.scale_out_pct_at_sl_T, lot, min_residual_lots,
+            )
             if cut > 0:
                 order = self._sell_partial(
                     pos, sig.sl_T, cut, "SL_SCALE",
@@ -507,9 +510,9 @@ class Portfolio:
         # Midpoint stop
         sl_mid = sig.sl_midpoint
         if effective_price <= sl_mid and pos.remaining > 0:
-            cut = max(int(pos.remaining * exits_cfg.scale_out_pct_at_midpoint), 0)
-            if cut <= 0:
-                cut = pos.remaining
+            cut = _scale_out_cut(
+                pos.remaining, exits_cfg.scale_out_pct_at_midpoint, lot, min_residual_lots,
+            )
             if cut > 0:
                 order = self._sell_partial(
                     pos, sl_mid, cut, "SL_SCALE",

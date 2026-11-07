@@ -60,11 +60,46 @@ def _cap_to_daily_limit(bar, prev_close: float, limit_pct: float) -> float:
     return bar.close
 
 
+def _scale_out_cut(remaining: int, pct: float, lot: int, min_residual_lots: int) -> int:
+    """Size a partial (scale-out) exit, in shares.
+
+    HOSE trades in board lots, so the cut is rounded DOWN to the
+    nearest multiple of ``lot``.
+
+    Two rules decide the final size:
+
+    1. If the cut would leave less than one lot, sell everything
+       (never strand a fractional lot).
+    2. If the cut would leave ``min_residual_lots`` lots or fewer,
+       sell everything instead. A stub that small has no usable exit
+       left: the profit tiers were never hit (so the trailing stop
+       never armed) and the price may never revisit the stop levels.
+       Such a stub would stay OPEN forever and block the ticker.
+
+    ``min_residual_lots=2`` means a residue of 200 shares (2 lots at
+    the HOSE board lot of 100) or less is too small to carry its own
+    exit and is liquidated instead of being stranded.
+
+    Returns the number of shares to sell.
+    """
+    if remaining <= 0:
+        return 0
+    cut = (int(remaining * pct) // lot) * lot
+    if cut <= 0 or remaining - cut < lot:
+        return remaining
+    if min_residual_lots > 0 and (remaining - cut) <= min_residual_lots * lot:
+        return remaining
+    return cut
+
+
 def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_value=None):
     exits_cfg = cfg.exits
     trail_cfg = cfg.trailing
     cost_rate = cfg.backtest.cost_bps / 10_000.0
     lot = cfg.backtest.board_lot if cfg.backtest.board_lot > 0 else 1
+    # Minimum residue a partial exit may leave behind (in board lots).
+    # 0 = disable the residual-liquidation rule.
+    min_residual_lots = getattr(exits_cfg, "min_residual_lots", 0) or 0
     daily_limit = cfg.backtest.daily_price_limit_pct
     # T+2.5 settlement: skip the first N-1 bars for exit logic.
     # 0 = legacy (immediate exit allowed)
@@ -183,11 +218,11 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 break
             # Round the tier cut DOWN to the nearest board lot
             # (HOSE rule: shares traded in 100-share multiples).
-            tier_shares = (int(remaining * pct) // lot) * lot
-            # If rounding leaves < 1 lot remaining, sell all
-            # (don't strand fractional lots).
-            if remaining - tier_shares < lot:
-                tier_shares = remaining
+            # _scale_out_cut also liquidates the whole position when
+            # the cut would leave an un-exitable residue stub.
+            tier_shares = _scale_out_cut(
+                remaining, pct, lot, min_residual_lots,
+            )
             if tier_shares <= 0:
                 tier_idx += 1
                 continue
@@ -213,12 +248,10 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             break
 
         if bar.low <= sl_T:
-            # Round DOWN to the nearest board lot (HOSE rule).
-            cut = (int(remaining * exits_cfg.scale_out_pct_at_sl_T) // lot) * lot
-            # If rounding leaves < 1 lot, sell all remaining
-            # (otherwise the strategy would be stuck with <100 shares).
-            if cut <= 0 or remaining - cut < lot:
-                cut = remaining
+            # Board-lot rounding + residual-liquidation (see _scale_out_cut).
+            cut = _scale_out_cut(
+                remaining, exits_cfg.scale_out_pct_at_sl_T, lot, min_residual_lots,
+            )
             proceeds = cut * sl_T
             pnl = (sl_T - signal.entry_price) * cut
             cost = cut * sl_T * cost_rate * 0.5
@@ -235,10 +268,10 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
                 break
 
         if bar.low <= sl_mid and remaining > 0:
-            # Same board-lot rounding for the mid-stop scale-out.
-            cut = (int(remaining * exits_cfg.scale_out_pct_at_midpoint) // lot) * lot
-            if cut <= 0 or remaining - cut < lot:
-                cut = remaining
+            # Same board-lot rounding + residual rule as the sl_T cut.
+            cut = _scale_out_cut(
+                remaining, exits_cfg.scale_out_pct_at_midpoint, lot, min_residual_lots,
+            )
             proceeds = cut * sl_mid
             pnl = (sl_mid - signal.entry_price) * cut
             cost = cut * sl_mid * cost_rate * 0.5
