@@ -2143,6 +2143,7 @@ def _build_deals_actioned(
     partial_orders: list[dict[str, Any]],
     close_orders: list[dict[str, Any]],
     autofin_holding_by_id: dict[str, dict[str, Any]],
+    autofin_suggest_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Group the planned orders by deal and pair each with the autofin
     signal that triggered it. Used to build a rich Telegram summary.
@@ -2150,8 +2151,15 @@ def _build_deals_actioned(
     For new entries, we extract the signal context from the order
     reason itself (autofin_buy:deal#X:navNpct:<recomment>) so we can
     show it even when the deal isn't in the holding list yet.
+
+    ``autofin_suggest_by_id`` (optional) carries the
+    /signal-static-suggest rows keyed by deal id. They are the
+    AUTHORITATIVE source of ``rateForNav`` for a new entry — autofin's
+    HOLDING rows carry ``rateForNav: null``, so without them the
+    reported rate was 0 % (the 2026-11-07 report).
     """
     deals: list[dict[str, Any]] = []
+    suggest_by_id = autofin_suggest_by_id or {}
 
     new_by_deal: dict[str, list[dict[str, Any]]] = {}
     for o in new_orders:
@@ -2163,16 +2171,33 @@ def _build_deals_actioned(
         h = autofin_holding_by_id.get(did, {})
         rec = str(h.get("lastRecomment") or "")
         rate = float(h.get("rateForNav") or 0)
-        nP = int(h.get("numberOfProfit") or 0)
+        nP = int(h.get("numberOfProfit", 0) or 0)
+        # 2026-11-07 (the "rateForNav=0%" report): the rate was read
+        # ONLY from the holding row, and autofin's holding rows carry
+        # ``rateForNav: null``. The fallback that parses it from the
+        # order reason was gated behind ``if not rec:`` — so when the
+        # holding row DID have a recomment (the normal case) the
+        # fallback never ran and the rate stayed 0.
+        #
+        # The VLB entry on 2026-11-06 04:10 was reported as
+        # ``rateForNav=0%`` when the real rate was 15 %.
+        #
+        # The rate is now resolved INDEPENDENTLY of the recomment:
+        #   1. the suggest row (authoritative for an entry),
+        #   2. the order reason (``nav15pct``),
+        #   3. the holding row.
+        if not rate:
+            _sg = suggest_by_id.get(did) or {}
+            rate = float(_sg.get("rateForNav") or 0)
+        if not rate:
+            rm = re.search(r"nav(\d+)pct", orders[0].get("reason", ""))
+            if rm:
+                rate = int(rm.group(1)) / 100.0
         if not rec:
             # extract from first order's reason: "autofin_buy:deal#X:navNpct:<rec>"
             m = re.search(r"autofin_buy:[^:]+:[^:]+:nav\d+pct:(.+)$", orders[0].get("reason", ""))
             if m:
                 rec = m.group(1).strip()
-                # also pull rate from the reason
-                rm = re.search(r"nav(\d+)pct", orders[0].get("reason", ""))
-                if rm:
-                    rate = int(rm.group(1)) / 100.0
         deals.append({
             "action": "new_entry",
             "symbol": h.get("symbol", orders[0].get("symbol", "?")),
@@ -2783,9 +2808,49 @@ def decide_orders(
         actioned_deals |= actioned_dids
 
     deals_actioned = _build_deals_actioned(
-        new_orders, partial_orders, close_orders, autofin_holding_by_id
+        new_orders, partial_orders, close_orders, autofin_holding_by_id,
+        # 2026-11-07: the SUGGEST rows carry the authoritative
+        # ``rateForNav`` for an entry (the holding rows carry null).
+        autofin_suggest_by_id=_suggest_rows_by_deal_id(signals),
     )
     return all_orders, new_our_deals, deals_actioned
+
+
+def _suggest_rows_by_deal_id(
+    signals: list[Any],
+) -> dict[str, dict[str, Any]]:
+    """Index the /signal-static-suggest rows by deal id.
+
+    2026-11-07: autofin's HOLDING rows carry ``rateForNav: null``, so
+    the entry rate had to come from somewhere else — and the SUGGEST
+    rows are where autofin actually publishes it (``rateForNav:
+    0.15`` / ``0.30``). Without them the Telegram entry report showed
+    ``rateForNav=0%`` for every entry.
+
+    The rows are indexed by the same ``<deal_id>:<SYMBOL>`` composite
+    key the rest of the pipeline uses, so they line up with the
+    holding rows and the order reasons.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for s in signals or []:
+        raw = getattr(s, "raw", None)
+        if not isinstance(raw, dict):
+            continue
+        did = _deal_id(raw)
+        if not did:
+            continue
+        # ``raw`` carries autofin's own field names.
+        rate = raw.get("rateForNav")
+        if rate is None:
+            rate = getattr(s, "rate_for_nav", None)
+        out[did] = {
+            "rateForNav": float(rate or 0.0),
+            "symbol": str(raw.get("symbol") or getattr(s, "symbol", "") or ""),
+            "lastRecomment": str(
+                raw.get("lastRecomment") or getattr(s, "last_recomment", "") or ""
+            ),
+        }
+    return out
 
 
 class AutofinSignalAdapter(StrategyAdapter):
