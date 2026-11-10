@@ -109,6 +109,38 @@ def save_cache(cache: WebCache, path: Path = CACHE_PATH) -> None:
     path.write_text(json.dumps(cache.to_dict(), indent=2, default=str))
 
 
+def cache_age_hours(last_updated: str) -> Optional[float]:
+    """Age of a cache timestamp in hours, or None if it cannot be parsed.
+
+    Used to decide whether the cache needs refreshing and to age out the
+    stale-cache alert. An empty or unparseable timestamp means "unknown
+    age" — the caller should treat that as stale.
+    """
+    if not last_updated:
+        return None
+    try:
+        ts = datetime.fromisoformat(last_updated)
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - ts
+    return delta.total_seconds() / 3600.0
+
+
+def is_cache_stale(last_updated: str, max_age_seconds: int = CACHE_MAX_AGE_SECONDS) -> bool:
+    """Whether the cache is older than ``max_age_seconds``.
+
+    A missing or unparseable timestamp counts as stale — that is the
+    dangerous case, because it means the cache was never written or the
+    write failed.
+    """
+    age = cache_age_hours(last_updated)
+    if age is None:
+        return True
+    return age * 3600.0 > max_age_seconds
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -184,10 +216,7 @@ def get_current_signals(lookback: int = 0,
     filtered = filter_universe(tickers, cfg)
     signals: List[Dict[str, Any]] = []
     for ticker in filtered:
-        path = PRICES_DIR / f"{ticker}.json"
-        if not path.exists():
-            continue
-        bars = _load_bars_safe(path)
+        bars = _load_bars_safe(ticker)
         if len(bars) < cfg.breakout.min_history_days:
             continue
         idx = len(bars) - 1 - lookback
@@ -239,10 +268,7 @@ def get_recent_signals(days: int = 7, cfg=None) -> List[Dict[str, Any]]:
     filtered = filter_universe(tickers, cfg)
     out: List[Dict[str, Any]] = []
     for ticker in filtered:
-        path = PRICES_DIR / f"{ticker}.json"
-        if not path.exists():
-            continue
-        bars = _load_bars_safe(path)
+        bars = _load_bars_safe(ticker)
         if len(bars) < cfg.breakout.min_history_days:
             continue
         # Find the most recent base that ended within the last `days`
@@ -284,7 +310,7 @@ def get_open_positions(cfg=None) -> List[Dict[str, Any]]:
     return load_cache().open_positions
 
 
-def _fills_to_dicts(fills, signal=None) -> List[Dict[str, Any]]:
+def _fills_to_dicts(fills, signal=None, *, is_open: bool = False) -> List[Dict[str, Any]]:
     """Convert a list of FillEvent (or TradeFill) into JSON-safe dicts.
 
     The fill objects come from the executor (FillEvent) or the new
@@ -297,6 +323,13 @@ def _fills_to_dicts(fills, signal=None) -> List[Dict[str, Any]]:
     a proper ENTRY here using the signal's entry_price and shares.
     We also compute cumulative_pnl correctly: sum the per-fill
     realized_pnl values (not the gross proceeds).
+
+    ``is_open=True`` means the deal is still held (the backtest ran
+    out of bars). In that case the executor's terminal EXHAUST fill
+    is NOT a real sale — it is a mark-to-market snapshot taken at the
+    last available bar. We rewrite it so it reads as an open-position
+    marker (0 shares, no sale) instead of "sold everything", which
+    used to contradict the deal's own "OPEN" status.
     """
     out: List[Dict[str, Any]] = []
     # Synthesize ENTRY if the fills list doesn't have one
@@ -339,6 +372,21 @@ def _fills_to_dicts(fills, signal=None) -> List[Dict[str, Any]]:
                 "remaining": int(getattr(f, "remaining", 0)),
                 "note": "",
             }
+        # An open deal's terminal EXHAUST fill is a mark-to-market
+        # snapshot, not a sale. Rewrite it so the timeline does not
+        # claim "sold all shares" on a position that is still held.
+        if is_open and d.get("kind") == "EXHAUST":
+            # The EXHAUST fill records shares=0 remaining because the
+            # executor closed the position to settle the accounting.
+            # The shares actually still held are the ones it sold, so
+            # restore them for display.
+            held = abs(int(d.get("shares") or 0))
+            d["kind"] = "MARK"
+            d["shares"] = 0
+            d["remaining"] = held
+            d["pnl_delta"] = 0.0
+            d["cumulative_pnl"] = running_pnl
+            d["note"] = f"Position still open — {held:,} sh marked at last close"
         out.append(d)
     return out
 
@@ -360,11 +408,7 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
     if ticker in cache.ticker_history:
         return cache.ticker_history[ticker]
 
-    path = PRICES_DIR / f"{ticker}.json"
-    if not path.exists():
-        return {"ticker": ticker, "summary": _empty_summary(), "deals": []}
-
-    bars = _load_bars_safe(path)
+    bars = _load_bars_safe(ticker)
     if len(bars) < cfg.breakout.min_history_days:
         return {"ticker": ticker, "summary": _empty_summary(), "deals": []}
 
@@ -444,16 +488,23 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
             "sl_F": float(sig.sl_F),
             "sl_T": float(sig.sl_T),
             # The bar-by-bar event log — used by the deal-detail modal
-            "fills": _fills_to_dicts(getattr(t, "fills", ()), signal=sig),
+            "fills": _fills_to_dicts(getattr(t, "fills", ()), signal=sig,
+                                     is_open=is_open),
         })
 
         # Update the "last exit date" tracker so the next signal
         # for this ticker is rejected if it falls inside this
-        # trade's holding period. Open deals (no real exit yet)
-        # are treated as still open forever — the next signal
-        # would be rejected.
-        if not is_open:
-            last_exit_date = t.exit_date
+        # trade's holding period.
+        #
+        # Open deals must ALSO advance the tracker: a still-open deal
+        # occupies the ticker until it exits, so any later signal has
+        # to be rejected. (This used to advance the tracker only for
+        # closed deals, which let concurrent open deals pile up —
+        # ABB ended up with 5 open deals at once, GEE with 5.)
+        #
+        # An open deal's exit_date is the last available bar, so it
+        # blocks every subsequent signal on that ticker.
+        last_exit_date = t.exit_date
 
     # Sort by entry date descending — newest first
     deals.sort(key=lambda d: d["entry_date"], reverse=True)
@@ -624,10 +675,17 @@ def get_backtest_summary(cfg=None) -> Dict[str, Any]:
     return _summarize_backtest(result, cfg, filtered)
 
 
-def _load_bars_safe(path: Path):
-    """Wrapper to delay-import the loader (avoid circular)."""
-    from darvas_box_strategy.darvas.data_loader import load_price_bars
-    return load_price_bars(path)
+def _load_bars_safe(ticker: str):
+    """Load a ticker's bars, preferring Postgres over the JSON files.
+
+    The VPS keeps market data in both places. Postgres is the intended
+    source of truth; the JSON files are the fallback for when Postgres
+    is down (and, historically, the only source — which is how a stale
+    JSON copy could mark the dashboard's open deals against an
+    outdated price).
+    """
+    from darvas_box_strategy.darvas.db_prices import load_bars
+    return load_bars(ticker)
 
 
 def refresh_cache(lookback: int = 0) -> WebCache:
@@ -671,10 +729,7 @@ def refresh_cache(lookback: int = 0) -> WebCache:
     #    portfolio's day-by-day loop.
     last_bar_date_by_ticker: Dict[str, Any] = {}
     for ticker in filtered:
-        path = PRICES_DIR / f"{ticker}.json"
-        if not path.exists():
-            continue
-        bars = _load_bars_safe(path)
+        bars = _load_bars_safe(ticker)
         if bars:
             last_bar_date_by_ticker[ticker] = bars[-1].date
 

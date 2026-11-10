@@ -415,6 +415,221 @@ class UrlPrefixTests(unittest.TestCase):
             self.assertEqual(static_url("app.js"), "/static/app.js")
 
 
+class CacheStalenessTests(unittest.TestCase):
+    """The dashboard cache must be detected as stale by AGE, not only by
+    emptiness.
+
+    Regression: the refresh trigger used to be ``if not cache.signals``.
+    A cache that still held signals from an old run therefore never
+    triggered a refresh, so the dashboard served data that was days old
+    with no indication anything was wrong. The cache age is now the
+    trigger, using CACHE_MAX_AGE_SECONDS.
+    """
+
+    def setUp(self):
+        # The "a refresh is already running" flag is module-level state.
+        # A refresh started by an earlier test would otherwise block the
+        # refreshes these tests are trying to observe.
+        from darvas_box_strategy.web import app as app_module
+        app_module._refresh_running = False
+
+    def tearDown(self):
+        from darvas_box_strategy.web import app as app_module
+        app_module._refresh_running = False
+
+    def test_cache_age_hours_parses_iso(self):
+        from darvas_box_strategy.web.data import cache_age_hours
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(
+            timespec="seconds"
+        )
+        age = cache_age_hours(ts)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 3.0, delta=0.1)
+
+    def test_cache_age_hours_empty_is_none(self):
+        from darvas_box_strategy.web.data import cache_age_hours
+        self.assertIsNone(cache_age_hours(""))
+
+    def test_cache_age_hours_garbage_is_none(self):
+        from darvas_box_strategy.web.data import cache_age_hours
+        self.assertIsNone(cache_age_hours("not-a-timestamp"))
+
+    def test_naive_timestamp_treated_as_utc(self):
+        """A timestamp without a timezone must still be comparable."""
+        from darvas_box_strategy.web.data import cache_age_hours
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(
+            tzinfo=None
+        ).isoformat(timespec="seconds")
+        age = cache_age_hours(ts)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 2.0, delta=0.1)
+
+    def test_is_cache_stale_by_age(self):
+        from darvas_box_strategy.web.data import is_cache_stale
+        from datetime import datetime, timezone, timedelta
+        old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(
+            timespec="seconds"
+        )
+        new = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(
+            timespec="seconds"
+        )
+        self.assertTrue(is_cache_stale(old))
+        self.assertFalse(is_cache_stale(new))
+
+    def test_missing_timestamp_counts_as_stale(self):
+        """A missing timestamp is the dangerous case — treat it as stale."""
+        from darvas_box_strategy.web.data import is_cache_stale
+        self.assertTrue(is_cache_stale(""))
+        self.assertTrue(is_cache_stale("garbage"))
+
+    def test_signals_endpoint_triggers_refresh_when_stale(self):
+        """A stale cache with signals in it must still start a refresh."""
+        from darvas_box_strategy.web import app as app_module
+        from darvas_box_strategy.web.data import WebCache
+        from datetime import datetime, timezone, timedelta
+
+        old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(
+            timespec="seconds"
+        )
+        stale_cache = WebCache(
+            last_updated=old,
+            signals=[{"ticker": "MSN"}],  # non-empty — the old bug
+            open_positions=[],
+        )
+
+        app = app_module.create_app()
+        c = app.test_client()
+
+        started = []
+        orig = app_module._safe_refresh
+
+        def _spy():
+            started.append(True)
+
+        app_module._safe_refresh = _spy
+        try:
+            with patch(
+                "darvas_box_strategy.web.app.load_cache", return_value=stale_cache
+            ):
+                c.get("/api/signals")
+        finally:
+            app_module._safe_refresh = orig
+
+        self.assertTrue(
+            started,
+            "a stale cache must trigger a background refresh even when "
+            "it still holds signals",
+        )
+
+    def test_fresh_cache_does_not_trigger_refresh(self):
+        from darvas_box_strategy.web import app as app_module
+        from darvas_box_strategy.web.data import WebCache
+        from datetime import datetime, timezone, timedelta
+
+        new = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(
+            timespec="seconds"
+        )
+        fresh_cache = WebCache(
+            last_updated=new,
+            signals=[{"ticker": "MSN"}],
+            open_positions=[],
+        )
+
+        app = app_module.create_app()
+        c = app.test_client()
+
+        started = []
+        orig = app_module._safe_refresh
+
+        def _spy():
+            started.append(True)
+
+        app_module._safe_refresh = _spy
+        try:
+            with patch(
+                "darvas_box_strategy.web.app.load_cache", return_value=fresh_cache
+            ):
+                c.get("/api/signals")
+        finally:
+            app_module._safe_refresh = orig
+
+        self.assertFalse(started, "a fresh cache must not trigger a refresh")
+
+    def test_health_reports_cache_age(self):
+        """The health endpoint must expose the cache age so staleness is
+        observable without opening the dashboard."""
+        app = app_module_create()
+        c = app.test_client()
+        r = c.get("/api/health")
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertIn("cache_age_hours", data)
+        self.assertIn("cache_stale", data)
+        self.assertIn("cache_max_age_hours", data)
+
+    def test_refresh_lock_prevents_concurrent_refreshes(self):
+        """Two concurrent requests must not start two backtests.
+
+        The refresh is a ~5 minute backtest, so a stampede would be very
+        expensive. The spy below blocks until the test releases it, which
+        keeps the first refresh "running" while the second request arrives.
+        """
+        import threading
+
+        from darvas_box_strategy.web import app as app_module
+        from darvas_box_strategy.web.data import WebCache
+        from datetime import datetime, timezone, timedelta
+
+        old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(
+            timespec="seconds"
+        )
+        stale_cache = WebCache(last_updated=old, signals=[{"ticker": "MSN"}])
+
+        app = app_module.create_app()
+        c = app.test_client()
+
+        started = []
+        started_lock = threading.Lock()
+        release = threading.Event()
+        first_refresh_entered = threading.Event()
+
+        def _spy():
+            with started_lock:
+                started.append(True)
+            first_refresh_entered.set()
+            # Hold the refresh open so the second request sees it running.
+            release.wait(timeout=5)
+
+        orig = app_module._safe_refresh
+        app_module._safe_refresh = _spy
+        try:
+            with patch(
+                "darvas_box_strategy.web.app.load_cache", return_value=stale_cache
+            ):
+                c.get("/api/signals")
+                # Wait until the first refresh is actually in flight.
+                self.assertTrue(
+                    first_refresh_entered.wait(timeout=5),
+                    "the first refresh never started",
+                )
+                c.get("/api/signals")
+        finally:
+            release.set()
+            app_module._safe_refresh = orig
+
+        self.assertEqual(
+            len(started), 1,
+            "only one background refresh may run at a time",
+        )
+
+
+def app_module_create():
+    from darvas_box_strategy.web.app import create_app
+    return create_app()
+
+
 if __name__ == "__main__":
     unittest.main()
 

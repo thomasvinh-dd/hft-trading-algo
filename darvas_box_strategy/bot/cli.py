@@ -25,13 +25,39 @@ from darvas_box_strategy.darvas import (
     run_backtest, load_price_bars, summary_report,
 )
 from darvas_box_strategy.darvas.data_loader import derive_meta, passes_universe
+from darvas_box_strategy.darvas.db_prices import load_bars
 
 from .telegram import TelegramConfig, load_telegram_config, send, send_telegram
+
+
+def _now_iso() -> str:
+    """Current UTC time as an ISO-8601 string with second precision."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 from .report import (
     chunk_message,
     format_backtest_report,
     format_recent_trades,
     format_ticker_breakdown,
+)
+from .positions import (
+    STATE_PATH,
+    LivePosition,
+    find_position_for_ticker,
+    load_state,
+    mark_notified,
+    position_from_signal,
+    remove_position,
+    save_state,
+    upsert_position,
+)
+from .exits import ExitEvent, evaluate_exits
+from .messages import (
+    format_entry_alert,
+    format_exit_event,
+    format_exit_events,
+    format_no_exits_summary,
+    format_positions_summary,
 )
 
 
@@ -91,12 +117,11 @@ def build_default_config() -> StrategyConfig:
 def filter_universe(tickers: List[str], cfg: StrategyConfig,
                      prices_dir: Path = PRICES_DIR) -> List[str]:
     """Filter tickers that have sufficient data for the config."""
+    from darvas_box_strategy.darvas.db_prices import load_bars
+
     out = []
     for t in tickers:
-        path = prices_dir / f"{t}.json"
-        if not path.exists():
-            continue
-        bars = load_price_bars(path)
+        bars = load_bars(t, prices_dir)
         if len(bars) < cfg.breakout.min_history_days:
             continue
         meta = derive_meta(t, bars)
@@ -218,8 +243,7 @@ def cmd_scan_signals(args) -> int:
     as_of_offset = args.lookback  # 0 = today, 1 = yesterday, etc.
     signals = []
     for ticker in filtered:
-        path = PRICES_DIR / f"{ticker}.json"
-        bars = load_price_bars(path)
+        bars = load_bars(ticker)
         if len(bars) < cfg.breakout.min_history_days:
             continue
         idx = len(bars) - 1 - as_of_offset
@@ -237,13 +261,30 @@ def cmd_scan_signals(args) -> int:
             continue
         signals.append(signal)
 
-    if not signals:
-        lines = [f"📭 *Darvas Box: No breakout signals* on last bar"]
+    # Load live position state so we can (a) avoid re-alerting on the
+    # same breakout and (b) start tracking new positions for exit events.
+    positions = load_state(STATE_PATH)
+    existing_tickers = {p.ticker for p in positions.values()}
+
+    new_positions = []
+    fresh_signals = []
+    for s in signals:
+        if s.ticker in existing_tickers:
+            # Already have an open position for this ticker — one active
+            # deal per ticker. Don't re-alert, don't track a duplicate.
+            continue
+        fresh_signals.append(s)
+        pos = position_from_signal(s)
+        upsert_position(positions, pos)
+        new_positions.append((s, pos))
+
+    if not fresh_signals:
+        lines = ["📭 *Darvas Box: No breakout signals* on last bar"]
     else:
-        lines = [f"🚨 *Darvas Box: {len(signals)} breakout signal(s)*"]
+        lines = [f"🚨 *Darvas Box: {len(fresh_signals)} breakout signal(s)*"]
         lines.append(f"_Universe_: HOSE blue chips ({len(filtered)} tickers)")
         lines.append("")
-        for s in sorted(signals, key=lambda x: -x.size_pct):
+        for s in sorted(fresh_signals, key=lambda x: -x.size_pct):
             notional = s.shares * s.entry_price
             lines.append(
                 f"• *{s.ticker}* @ {s.entry_price:,.0f}\n"
@@ -257,11 +298,315 @@ def cmd_scan_signals(args) -> int:
     if args.dry_run:
         print("DRY RUN — would send:")
         print(text)
+        if new_positions:
+            print()
+            print("DRY RUN — would track as new position(s):")
+            for s, pos in new_positions:
+                print(f"  {pos.key}  {pos.shares:,} sh @ {pos.entry_price:,.0f}")
         return 0
+
+    # Persist position state BEFORE sending, so a crash between send and
+    # save doesn't cause a duplicate alert on the next run.
+    if new_positions:
+        save_state(positions, STATE_PATH)
 
     result = send_telegram(config, text)
     print(json.dumps(result, indent=2))
+
+    # Send a separate, richer message per new position so the exit
+    # tracker has the details (TPs, stops) visible on Telegram.
+    for s, pos in new_positions:
+        msg = format_entry_alert(
+            ticker=pos.ticker,
+            entry_price=pos.entry_price,
+            shares=pos.shares,
+            size_pct=pos.size_pct,
+            sl_T=pos.sl_T,
+            sl_F=pos.sl_F,
+            tiers=pos.tiers,
+        )
+        r = send_telegram(config, msg)
+        ok = r.get("ok")
+        print(f"  position {pos.key}: {'sent OK' if ok else 'FAILED'}")
+        if not ok:
+            print(f"    {r}", file=sys.stderr)
+        time.sleep(0.3)
     return 0 if result.get("ok") else 1
+
+
+def _bars_after_entry(ticker: str, entry_date: str) -> list:
+    """Load price bars strictly after the entry date for a ticker."""
+    from darvas_box_strategy.darvas.db_prices import load_bars
+
+    bars = load_bars(ticker)
+    out = []
+    for b in bars:
+        # PriceBar.time is an ISO date string
+        if str(b.time) > str(entry_date):
+            out.append(b)
+    return out
+
+
+def cmd_scan_exits(args) -> int:
+    """Evaluate the exit ladder for tracked positions and notify Telegram.
+
+    This is the counterpart to ``scan-signals``: it walks each open
+    position's price history, applies the TIER / TRAIL / SL_SCALE /
+    SL_HARD rules, and sends a Telegram message for every NEW exit
+    event (deduped so the same event is never sent twice).
+    """
+    config = load_telegram_config(
+        env_path=ROOT / "vietnam_algo" / "env" / ".env.telegram"
+    )
+    if config is None and not args.dry_run:
+        print("ERROR: No Telegram config", file=sys.stderr)
+        return 1
+
+    cfg = build_default_config()
+    positions = load_state(STATE_PATH)
+    if not positions:
+        msg = "📭 *Darvas Box: No open positions tracked*"
+        if args.dry_run:
+            print("DRY RUN — would send:")
+            print(msg)
+            return 0
+        result = send_telegram(config, msg)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 1
+
+    all_events = []   # list of (position, [ExitEvent])
+    closed_keys = []
+
+    for key, pos in list(positions.items()):
+        bars = _bars_after_entry(pos.ticker, pos.entry_date)
+        if not bars:
+            print(f"  {key}: no bars after entry, skipping")
+            continue
+
+        # Only evaluate bars we haven't seen yet. The evaluator walks
+        # the bars in order and updates the running state (peak close,
+        # tier_idx, trailing_active) as it goes, so we must feed it the
+        # NEW bars only — replaying old ones would double-count the
+        # bar counter and could re-fire a deduped event.
+        if pos.last_bar_date:
+            eval_bars = [b for b in bars if str(b.time) > str(pos.last_bar_date)]
+            if not eval_bars:
+                print(f"  {key}: no new bars since {pos.last_bar_date}, skipping")
+                continue
+        else:
+            eval_bars = bars
+
+        already = set(pos.notified)
+        events = evaluate_exits(pos, eval_bars, cfg, already_notified=already)
+        pos.last_bar_date = str(eval_bars[-1].time)
+
+        if events:
+            all_events.append((pos, events))
+            for ev in events:
+                mark_notified(pos, ev.dedupe_key)
+            print(f"  {key}: {len(events)} exit event(s) — "
+                  f"{', '.join(e.kind for e in events)}")
+            if pos.remaining <= 0:
+                closed_keys.append(key)
+        else:
+            print(f"  {key}: no exit events (bar {pos.last_bar_date}, "
+                  f"remaining {pos.remaining:,} sh)")
+
+    # Persist state BEFORE sending so a crash between send and save
+    # cannot cause a duplicate alert on the next run.
+    # A --dry-run must NOT persist: the events have not been sent yet,
+    # so the next real run must still be able to notify them.
+    if not args.dry_run:
+        for key in closed_keys:
+            remove_position(positions, key)
+        if all_events or closed_keys:
+            save_state(positions, STATE_PATH)
+
+    if not all_events:
+        msg = format_no_exits_summary(len(positions))
+        if args.dry_run:
+            print("DRY RUN — would send:")
+            print(msg)
+            return 0
+        result = send_telegram(config, msg)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 1
+
+    failed = 0
+    for pos, events in all_events:
+        text = (format_exit_events(pos, events) if len(events) > 1
+                else format_exit_event(pos, events[0]))
+        if args.dry_run:
+            print("=" * 60)
+            print("DRY RUN — would send:")
+            print("=" * 60)
+            print(text)
+            continue
+        r = send_telegram(config, text)
+        if r.get("ok"):
+            print(f"  {pos.key}: sent OK ({len(events)} event(s))")
+        else:
+            failed += 1
+            print(f"  {pos.key}: FAILED: {r}", file=sys.stderr)
+        time.sleep(0.3)
+    return 0 if failed == 0 else 1
+
+
+def cmd_positions(args) -> int:
+    """Print the tracked open positions (and optionally notify Telegram)."""
+    config = load_telegram_config(
+        env_path=ROOT / "vietnam_algo" / "env" / ".env.telegram"
+    )
+    if config is None and not args.dry_run:
+        print("ERROR: No Telegram config", file=sys.stderr)
+        return 1
+
+    positions = load_state(STATE_PATH)
+    text = format_positions_summary(list(positions.values()))
+    if args.dry_run:
+        print("DRY RUN — would send:")
+        print(text)
+        return 0
+    result = send_telegram(config, text)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+def cmd_refresh_cache(args) -> int:
+    """Rebuild the web dashboard cache (scan + backtest) and persist it.
+
+    This is the scheduled counterpart of the dashboard's "Refresh data"
+    button. The cache is what the web UI reads; without this job it only
+    changes when somebody clicks the button, and the dashboard silently
+    serves stale data.
+
+    The backtest is the expensive part (~5 minutes), so the command is
+    idempotent: if the cache is still fresh enough it exits without doing
+    the work, unless --force is given.
+    """
+    from darvas_box_strategy.web.data import (
+        CACHE_MAX_AGE_SECONDS,
+        CACHE_PATH,
+        cache_age_hours,
+        load_cache,
+        refresh_cache,
+    )
+
+    if not args.force:
+        cache = load_cache()
+        age = cache_age_hours(cache.last_updated)
+        if age is not None and age < CACHE_MAX_AGE_SECONDS / 3600:
+            print(
+                f"cache is fresh ({age:.1f}h old, limit "
+                f"{CACHE_MAX_AGE_SECONDS / 3600:.0f}h) — nothing to do"
+            )
+            return 0
+        if age is not None:
+            print(f"cache is stale ({age:.1f}h old) — refreshing")
+
+    t0 = time.time()
+    try:
+        new_cache = refresh_cache()
+    except Exception as exc:
+        print(f"ERROR: refresh failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"cache refreshed in {time.time() - t0:.1f}s -> {CACHE_PATH} "
+        f"(last_updated={new_cache.last_updated}, "
+        f"signals={len(new_cache.signals)}, "
+        f"positions={len(new_cache.open_positions)})"
+    )
+    return 0
+
+
+def cmd_check_stale(args) -> int:
+    """Alert when the web dashboard cache is too old.
+
+    The existing Vietnam Algo staleness alert covers the *price* data, and
+    that data can be perfectly fresh while the darvas web cache is days
+    old — the cache is only rewritten by the dashboard's refresh button or
+    by the scheduled refresh-cache job. A stale cache means the dashboard
+    silently shows old signals and an old equity curve, so it needs its own
+    alert.
+
+    Exits non-zero when the cache is stale, so a monitoring wrapper can act
+    on it.
+    """
+    from darvas_box_strategy.web.data import (
+        CACHE_MAX_AGE_SECONDS,
+        CACHE_PATH,
+        cache_age_hours,
+        is_cache_stale,
+        load_cache,
+    )
+
+    cache = load_cache()
+    age = cache_age_hours(cache.last_updated)
+    stale = is_cache_stale(cache.last_updated)
+    limit_h = CACHE_MAX_AGE_SECONDS / 3600
+
+    if not stale:
+        print(
+            f"cache OK: {cache.last_updated} "
+            f"({age:.1f}h old, limit {limit_h:.0f}h)"
+        )
+        return 0
+
+    # Once-per-day gating: the alert would otherwise repeat on every cron
+    # run while the cache stays stale.
+    today = date.today().isoformat()
+    alert_state_path = ROOT / "darvas_box_strategy" / "data" / "cache_alert_state.json"
+    alert_state = {}
+    if alert_state_path.exists():
+        try:
+            alert_state = json.loads(alert_state_path.read_text())
+        except Exception:
+            alert_state = {}
+
+    if alert_state.get("staleAlertSentDate") == today and not args.force:
+        print(
+            f"cache is stale but the alert was already sent today "
+            f"({today}) — not sending again"
+        )
+        return 1
+
+    if age is not None:
+        message = (
+            "⚠️ Darvas Box: dashboard cache STALE\n"
+            f"cache: {cache.last_updated}\n"
+            f"age: {age:.1f}h (threshold {limit_h:.0f}h)"
+        )
+    else:
+        message = (
+            "⚠️ Darvas Box: dashboard cache MISSING or unparseable\n"
+            f"cache file: {CACHE_PATH}"
+        )
+    print(message)
+
+    if args.dry_run:
+        print("DRY RUN — would send:")
+        print(message)
+        return 1
+
+    config = load_telegram_config(
+        env_path=ROOT / "vietnam_algo" / "env" / ".env.telegram"
+    )
+    if config is None:
+        print("ERROR: No Telegram config — cannot send the stale alert",
+              file=sys.stderr)
+        return 1
+
+    result = send_telegram(config, message)
+    print(json.dumps(result, indent=2))
+
+    if result.get("ok"):
+        alert_state["staleAlertSentDate"] = today
+        alert_state["lastAlertSentAt"] = _now_iso()
+        alert_state_path.parent.mkdir(parents=True, exist_ok=True)
+        alert_state_path.write_text(json.dumps(alert_state, indent=2))
+
+    return 1
 
 
 def cmd_show_config(args) -> int:
@@ -299,8 +644,43 @@ def main(argv=None) -> int:
                        help="How many bars back to scan (0=today, 1=yesterday)")
     p_scan.set_defaults(func=cmd_scan_signals)
 
+    p_exits = sub.add_parser(
+        "scan-exits",
+        help="Evaluate exit ladder (TIER/TRAIL/SL) for tracked positions "
+             "and notify Telegram")
+    p_exits.add_argument("--dry-run", action="store_true")
+    p_exits.set_defaults(func=cmd_scan_exits)
+
+    p_pos = sub.add_parser(
+        "positions", help="Show tracked open positions")
+    p_pos.add_argument("--dry-run", action="store_true")
+    p_pos.set_defaults(func=cmd_positions)
+
     p_show = sub.add_parser("show-config", help="Print default config")
     p_show.set_defaults(func=cmd_show_config)
+
+    p_refresh = sub.add_parser(
+        "refresh-cache",
+        help="Rebuild the web dashboard cache (scan + backtest) and persist it",
+    )
+    p_refresh.add_argument(
+        "--force",
+        action="store_true",
+        help="Refresh even if the cache is still fresh",
+    )
+    p_refresh.set_defaults(func=cmd_refresh_cache)
+
+    p_stale = sub.add_parser(
+        "check-stale",
+        help="Alert (via Telegram) when the web dashboard cache is too old",
+    )
+    p_stale.add_argument("--dry-run", action="store_true")
+    p_stale.add_argument(
+        "--force",
+        action="store_true",
+        help="Send the alert even if it was already sent today",
+    )
+    p_stale.set_defaults(func=cmd_check_stale)
 
     p_serve = sub.add_parser("serve-web", help="Start the web dashboard (Flask)")
     p_serve.add_argument("--host", default="0.0.0.0")

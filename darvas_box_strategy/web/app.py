@@ -44,8 +44,10 @@ sys.path.insert(0, str(ROOT / "darvas_box_strategy"))
 from darvas_box_strategy.web.data import (
     CACHE_PATH,
     CACHE_MAX_AGE_SECONDS,
+    cache_age_hours,
     get_recent_signals,
     get_ticker_history,
+    is_cache_stale,
     load_cache,
     refresh_cache,
     save_cache,
@@ -125,10 +127,14 @@ def create_app() -> Flask:
     def health():
         cache = load_cache()
         from darvas_box_strategy.darvas.db_prices import db_price_stats
+        age = cache_age_hours(cache.last_updated)
         return jsonify({
             "ok": True,
             "cache_path": str(CACHE_PATH),
             "cache_last_updated": cache.last_updated,
+            "cache_age_hours": round(age, 1) if age is not None else None,
+            "cache_stale": is_cache_stale(cache.last_updated),
+            "cache_max_age_hours": CACHE_MAX_AGE_SECONDS / 3600,
             "cache_exists": CACHE_PATH.exists(),
             # Postgres is the source of truth for market data; the JSON
             # files under vietnam_algo/data/prices/ are the fallback.
@@ -138,9 +144,13 @@ def create_app() -> Flask:
     @app.route("/api/signals")
     def api_signals():
         cache = load_cache()
+        # Refresh when the cache is empty OR stale. Previously only the
+        # empty case triggered a refresh, which let an old cache with
+        # signals in it be served forever.
         if not cache.signals:
-            # First load or stale — trigger refresh in background
-            threading.Thread(target=_safe_refresh, daemon=True).start()
+            _maybe_start_background_refresh(cache, force=True)
+        else:
+            _maybe_start_background_refresh(cache)
         # Also include recent signals (last 7 days) so the UI is
         # useful even when there are no signals on the latest bar.
         recent = get_recent_signals(days=7)
@@ -271,6 +281,56 @@ def _safe_refresh():
         log.info("background refresh done")
     except Exception:
         log.exception("background refresh failed")
+
+
+# Guards against a stampede: several concurrent requests could each start
+# a ~5 minute backtest. One refresh at a time is enough.
+_refresh_lock = threading.Lock()
+_refresh_running = False
+
+
+def _maybe_start_background_refresh(cache, force: bool = False) -> bool:
+    """Start a background refresh if the cache is stale. Returns True if one
+    was started.
+
+    The previous implementation only refreshed when the cache had no
+    signals at all. That meant a cache that was merely old — with signals
+    still in it — was served indefinitely, and the dashboard showed stale
+    data with no indication anything was wrong. The cache age is now the
+    trigger, using CACHE_MAX_AGE_SECONDS.
+
+    ``force`` starts a refresh even when the cache looks fresh. It is used
+    for the empty-cache case, where the file may be missing entirely and
+    there is no timestamp to judge.
+    """
+    global _refresh_running
+
+    if not force and not is_cache_stale(cache.last_updated):
+        return False
+
+    with _refresh_lock:
+        if _refresh_running:
+            return False
+        _refresh_running = True
+
+    def _runner():
+        global _refresh_running
+        try:
+            _safe_refresh()
+        finally:
+            with _refresh_lock:
+                _refresh_running = False
+
+    try:
+        threading.Thread(target=_runner, daemon=True).start()
+    except Exception:
+        # If the thread could not be started the flag would stay set
+        # forever and no refresh would ever run again.
+        log.exception("could not start the background refresh thread")
+        with _refresh_lock:
+            _refresh_running = False
+        return False
+    return True
 
 
 def main():
