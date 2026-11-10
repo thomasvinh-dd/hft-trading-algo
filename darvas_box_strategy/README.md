@@ -231,6 +231,15 @@ Today (next bar after the signal):
   cumulative_pnl = 0
 ```
 
+> **Fixed 2026-11-10.** The code used the *signal bar's close* as the
+> entry price while dating the entry to the next bar. The price was
+> therefore one bar stale, and the stop levels and tier targets were
+> computed from that stale price — so the whole trade was measured
+> against a fill that never happened. Across 3,719 signals the next
+> bar's close differs from the signal bar's close by p75 +1.85%,
+> p90 +4.75%, max +40.93%. The entry price is now the next bar's open,
+> and the stops are anchored to it. See `darvas/signal_generator.py`.
+
 **The trade is now "open" and will be checked on every bar
 until all shares are sold.**
 
@@ -288,8 +297,13 @@ trail_threshold = peak_close × (1 - trail_from_peak_pct)   ← default 10%
 if trail_floor_lock_profit:
     trail_threshold = max(trail_threshold, trail_floor)   ← never below tier 1
 if bar.close ≤ trail_threshold:
-    TRAIL fires — close all remaining at bar.close
+    TRAIL fires — close all remaining at the trail price
 ```
+
+The trail is a **stop order**, so it fills at the trail price, not at
+whatever the close happened to be. The only exception is a gap: if the
+bar's low is below the trail price, the market opened through the stop
+and the fill is the low — we cannot sell above the market.
 
 ```
 Entry = 100,000, peak so far = 130,000
@@ -297,11 +311,22 @@ trail_from_peak_pct = 0.10
 trail_threshold = 130,000 × 0.90 = 117,000
 trail_floor = 106,300 (tier 1 = 1.063 × entry)
 
-If bar.close = 115,000:
+If bar.close = 115,000 and bar.low = 114,500:
   trail_threshold = 117,000
-  115,000 < 117,000 → TRAIL fires
-  remaining shares sold at 115,000
-  pnl_delta = (115,000 - 100,000) × remaining = +15,000 per share
+  115,000 ≤ 117,000 → TRAIL fires
+  the market traded down through 117,000 intraday, so the fill is 117,000
+  remaining shares sold at 117,000
+  pnl_delta = (117,000 - 100,000) × remaining = +17,000 per share
+
+If the bar gapped: bar.low = 112,000 (below the threshold):
+  the stop was opened through, so the fill is 112,000
+```
+
+> **Fixed 2026-11-10.** The trail used to fill at `bar.close`, which gave
+> away more than the stop width on any close below the threshold and up to
+> -20pp on a gap-down. The stop legs (`sl_T` / `sl_mid` / `sl_F`) already
+> filled at their stop price; the trail now does the same. See
+> `darvas/executor.py`, `darvas/portfolio.py` and `bot/exits.py`.
 
 If tier 1 was set higher (say tier 1 = 1.20 = 120,000):
   trail_floor = 120,000
@@ -752,8 +777,8 @@ See `tools/sweep_dd.py` for an automated sweep of these knobs.
 
 ## Telegram Bot (`darvas_box_strategy/bot/`)
 
-Send reports and signal alerts to a Telegram chat. Uses the same
-Telegram bot token from `vietnam_algo/env/.env.telegram`.
+Send reports, **entry alerts** and **exit-event alerts** to a Telegram chat.
+Uses the same Telegram bot token from `vietnam_algo/env/.env.telegram`.
 
 ```bash
 # Send a test message
@@ -762,22 +787,87 @@ python3 -m bot.cli send-test
 # Run backtest on HOSE blue chips and send report to Telegram
 python3 -m bot.cli send-report
 
-# Scan for current breakout signals
+# Scan for current breakout signals (ENTRY alerts)
 python3 -m bot.cli scan-signals --lookback 1
+
+# Scan tracked positions for exit events (TIER / TRAIL / SL notifications)
+python3 -m bot.cli scan-exits
+
+# Show the tracked open positions
+python3 -m bot.cli positions
 
 # All commands accept --dry-run to print instead of send
 python3 -m bot.cli send-report --dry-run
 python3 -m bot.cli scan-signals --dry-run --lookback 5
+python3 -m bot.cli scan-exits --dry-run
 
 # Show the default config
 python3 -m bot.cli show-config
 ```
 
+### Notification types
+
+| Command | Event | Message |
+|---|---|---|
+| `scan-signals` | Breakout entry | 🚨 **BREAKOUT** — buy price, size, stops, TPs |
+| `scan-exits` | Take-profit ladder hit | 🎯 **Take-profit hit** — TP level, shares, realized P&L |
+| `scan-exits` | Trailing stop hit | 📉 **Trailing stop hit** — trail from peak, shares, P&L |
+| `scan-exits` | Partial stop hit (sl_T / sl_mid) | ⚠️ **Partial stop hit** — stop level, shares, P&L |
+| `scan-exits` | Hard stop hit (sl_F) | 🛑 **Hard stop hit** — closes the position |
+| `scan-exits` | Time stop | ⏳ **Time stop** — max-hold bars reached |
+| `positions` | Status summary | 📋 list of open positions with P&L |
+| `send-report` | End-of-day backtest | full performance report |
+
+### Position tracking
+
+Exit notifications require knowing which positions are open, so the bot
+persists them to `darvas_box_strategy/data/positions.json`:
+
+```json
+{
+  "version": 1,
+  "updated_at": "2026-10-31",
+  "positions": {
+    "POW_2025-12-30": {
+      "ticker": "POW",
+      "entry_date": "2025-12-30",
+      "entry_price": 11500.0,
+      "shares": 11500,
+      "remaining": 7300,
+      "sl_T": 10350.0,
+      "sl_F": 9430.0,
+      "tiers": [[1.063, 0.10], [1.125, 0.30]],
+      "tier_idx": 2,
+      "trailing_active": true,
+      "trail_floor": 12937.5,
+      "peak_close": 14800.0,
+      "bars_held": 12,
+      "cumulative_pnl": 4400000.0,
+      "notified": ["TIER:0", "TIER:1"],
+      "last_bar_date": "2026-01-09"
+    }
+  }
+}
+```
+
+- `scan-signals` writes new positions here (skipping tickers that already
+  have an open position — one active deal per ticker).
+- `scan-exits` reads them, evaluates the exit ladder against the latest
+  price bar, sends a message for each NEW event, and updates the state.
+- The `notified` list is the dedupe key: an event is never sent twice.
+- A position is removed from the file once `remaining` reaches 0.
+
+The exit logic in `bot/exits.py` mirrors `darvas/executor.py` exactly —
+including the HOSE 100-share board-lot rounding and the T+2.5
+settlement lock-up. `tests/test_bot_exits.py::ExecutorParityTests`
+runs the same trade through both paths and asserts the fills match.
+
 ### Setup
 
 Telegram credentials are loaded automatically from:
 1. `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` environment variables
-2. `vietnam_algo/env/.env.telegram` file (used by both this bot and the autofin bot)
+2. `darvas_box_strategy/data/bot.env` file (this strategy's dedicated bot)
+3. `vietnam_algo/env/.env.telegram` file (fallback, shared with the autofin bot)
 
 The bot uses the curated **70-ticker HOSE blue chip list** in
 `data/hose_blue_chips.json` (top 70 by 20-day average traded value).
@@ -790,9 +880,19 @@ Add to crontab for end-of-day summary (after VN market close at 15:00 ICT):
 # 09:00 ICT (02:00 UTC) — pre-market signal scan
 0 2 * * 1-5  cd /root/hft-trading-algo && set -a && . /root/hft-trading-algo/vietnam_algo/env/.env.telegram && set +a && PYTHONPATH=/root/hft-trading-algo python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> /root/logs/darvas_signals.log 2>&1
 
+# 09:05 ICT — exit-event scan (picks up TIER / TRAIL / SL fired at the open)
+5 2 * * 1-5  cd /root/hft-trading-algo && set -a && . /root/hft-trading-algo/vietnam_algo/env/.env.telegram && set +a && PYTHONPATH=/root/hft-trading-algo python3 -u -m darvas_box_strategy.bot.cli scan-exits >> /root/logs/darvas_exits.log 2>&1
+
+# 15:25 ICT — exit-event scan (after the close, picks up the day's exits)
+25 8 * * 1-5  cd /root/hft-trading-algo && set -a && . /root/hft-trading-algo/vietnam_algo/env/.env.telegram && set +a && PYTHONPATH=/root/hft-trading-algo python3 -u -m darvas_box_strategy.bot.cli scan-exits >> /root/logs/darvas_exits.log 2>&1
+
 # 16:00 ICT (09:00 UTC) — end-of-day backtest report
 0 9 * * 1-5  cd /root/hft-trading-algo && set -a && . /root/hft-trading-algo/vietnam_algo/env/.env.telegram && set +a && PYTHONPATH=/root/hft-trading-algo python3 -u -m darvas_box_strategy.bot.cli send-report >> /root/logs/darvas_report.log 2>&1
 ```
+
+> **Note:** `scripts/install_cron.sh` installs these entries with
+> timezone-safe wall-clock guards (ICT). The `scan-exits` job runs twice
+> a day so an exit that fires intraday is notified the same day.
 
 ### Report format
 
