@@ -1054,6 +1054,107 @@ Lessons:
 3. **Wider trail (12%) beats tighter (7%)** — let winners compound
 4. **Liquidity filter is essential** — HOSE blue chips only for live
 
+## The 2026 drawdown — what it is, and what it is not
+
+In 2026 the strategy's win rate fell from the historical ~65-75% to
+**36%**, and the stop-out rate doubled from 24% to 52%. This section
+records the investigation, because the conclusion is counter-intuitive
+and it would be easy to "fix" it in the wrong way.
+
+### What the strategy actually returns
+
+| Period | Return | CAGR | Max DD | Win rate |
+|---|---:|---:|---:|---:|
+| 2019-2026 | +142.1% | 12.36% | -26.0% | 65.3% |
+
+Full-universe trade stats:
+
+```
+avg win  +9.54%   (n=167)
+avg loss -9.48%   (n=89)
+payoff    1.006   ← a small edge over break-even (49.8% win rate needed)
+```
+
+The edge is thin but real, and it is **concentrated**: the best 10 trades
+out of 251 produce 53% of all P&L. The median trailing-stop exit is
+only +5.7%, so the strategy depends on a small number of large winners.
+
+### Two execution bugs fixed (2026-11-10)
+
+Both made the backtest disagree with a live order. See the commit
+"Fix two execution bugs in the Darvas Box backtest".
+
+1. **Trailing stop filled at the bar's close** instead of at the trail
+   price. Measured slippage against the intended stop reached -20pp on
+   a single trade.
+2. **Entry price was the signal bar's close** while the entry was dated
+   to the next bar — one bar stale, and the stops were anchored to it.
+
+Together these recovered **+11.3pp** of return (130.8% → 142.1%) and
+moved the payoff ratio from 0.995 to 1.006.
+
+### Hypothesis A — is it the market? YES
+
+The blue-chip universe fell ~17% in 2026 and the strategy lost 7.4%, so
+it **outperformed its benchmark by ~10pp**. The strategy is not failing
+because of a bug; it is losing less than the market does.
+
+The strategy's monthly P&L correlates only **+0.13** with the market's
+monthly return, so it is not simply a market-beta play that fell with
+the index.
+
+### Hypothesis B — can an entry filter fix it? NO
+
+Two candidate explanations were tested:
+
+**B1 — "breakouts fail more in a downtrend, so filter entries by
+regime."** Rejected by the data. Splitting every trade by the market's
+state at entry:
+
+| Market state at entry | n | Win% | Avg | Stop rate |
+|---|---:|---:|---:|---:|
+| Index ABOVE MA50 | 150 | 62.0% | +1.91% | 31.3% |
+| Index BELOW MA50 | 106 | **69.8%** | **+4.37%** | **23.6%** |
+
+Trades taken while the market was **below** its MA performed *better*.
+A regime filter would remove the good trades.
+
+Confirmed by running the filter end-to-end (full 2019-2026):
+
+| Config | Return | CAGR | Max DD | Trades |
+|---|---:|---:|---:|---:|
+| **baseline (no filter)** | **+142.1%** | **12.36%** | -26.0% | 251 |
+| index ABOVE MA50 | +67.8% | 7.06% | -34.4% | 211 |
+| index ABOVE MA100 | +28.3% | 3.34% | -27.4% | 212 |
+| index ABOVE MA200 | +70.0% | 7.24% | -23.8% | 193 |
+| index BELOW MA50 | +103.0% | 9.78% | -29.2% | 150 |
+
+Every variant cuts return. MA200 trades the least and has a slightly
+better drawdown (-23.8% vs -26.0%), but it costs 72pp of return for it.
+This matches the earlier sweep in this file (regime 200-day MA
++186.8% vs baseline +227.0%) — the filter has never helped.
+
+**B2 — "the entries themselves are bad."** Rejected. The 2026 losers
+are not worse *entries*; they are the ordinary ~24% stop rate applied
+to a thinner sample. Only 33 trades were taken in 2026 (vs ~37/year
+over 2020-2025), so a couple of unlucky runs dominate the year's stats.
+
+### Conclusion
+
+There is no config change that fixes 2026, and looking for one would be
+overfitting to a single bad year — the failure mode this file already
+warns about twice ("always run walk-forward before committing to a
+config", and the ML filter's "-37% ret" when it was fitted to
+2023-2026).
+
+The honest reading is that the strategy has a **thin, concentrated edge**
+(1.006 payoff, half the P&L in the top 10 trades) and 2026 was a year
+where the winners did not show up. The -26% drawdown is what that
+structure produces when the tail does not appear.
+
+If the tail risk is unacceptable, the lever is **position sizing**, not
+entry filtering: `size_low` / `size_high` scale the whole curve.
+
 ## Tests
 
 ```bash
