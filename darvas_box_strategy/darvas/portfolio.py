@@ -27,6 +27,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import StrategyConfig
+from .executor import _scale_out_cut
 from .signals import Signal
 
 log = logging.getLogger("darvas.portfolio")
@@ -359,14 +360,21 @@ class Portfolio:
 
     def process_bar(
         self, bar_date, prices_by_ticker: Dict[str, float],
+        lows_by_ticker: Optional[Dict[str, float]] = None,
     ) -> List[Order]:
         """Process one bar of market data.
 
         Updates MTM, runs each open position through the exit logic,
         and returns any sell orders generated. Advances state.
+
+        ``lows_by_ticker`` supplies the bar's low price per ticker. It is
+        used by the trailing stop to model a gap: when the low is below the
+        trail price the market gapped through the stop, so the fill is the
+        low rather than the trail price.
         """
         self._current_date = bar_date
         self._current_prices = dict(prices_by_ticker)
+        lows = dict(lows_by_ticker or {})
         orders: List[Order] = []
 
         # 1) Close any positions whose exit_date has been reached.
@@ -390,7 +398,9 @@ class Portfolio:
             pos.peak_close = max(pos.peak_close, price)
             pos.bars_held += 1
 
-            exit_orders = self._apply_exits(pos, price, bar_date)
+            exit_orders = self._apply_exits(
+                pos, price, bar_date, low=lows.get(ticker),
+            )
             orders.extend(exit_orders)
 
         # 3) Record daily NAV
@@ -398,12 +408,15 @@ class Portfolio:
         return orders
 
     def _apply_exits(
-        self, pos: Position, price: float, bar_date,
+        self, pos: Position, price: float, bar_date, low: Optional[float] = None,
     ) -> List[Order]:
         """Run the signal-level exit logic on one position.
 
         Returns 0 or more sell Orders. Mutates pos in-place.
         The order of checks: trail > tier > sl_T > sl_F > time stop.
+
+        ``low`` is the bar's low price, used by the trailing stop to model
+        a gap through the stop.
         """
         sig = pos.signal
         cfg = self.cfg
@@ -412,6 +425,9 @@ class Portfolio:
         cost_rate = cfg.backtest.cost_bps / 10_000.0
         lot = cfg.backtest.board_lot if cfg.backtest.board_lot > 0 else 1
         daily_limit = cfg.backtest.daily_price_limit_pct
+        # Minimum residue a partial exit may leave behind (in board lots).
+        # 0 = disable the residual-liquidation rule.
+        min_residual_lots = getattr(exits_cfg, "min_residual_lots", 0) or 0
         # T+2.5 settlement: lock-up first N-1 bars
         t_plus_n = max(0, exits_cfg.t_plus_n_bars - 1) if exits_cfg.t_plus_n_bars > 0 else 0
 
@@ -454,8 +470,20 @@ class Portfolio:
             if trail_cfg.trail_floor_lock_profit:
                 trail_threshold = max(trail_threshold, pos.trail_floor)
             if effective_price <= trail_threshold:
+                # The trail is a stop order: fill at the trail price, not at
+                # whatever the close happened to be. See the same fix in
+                # darvas/executor.py — filling at the close let the exit slip
+                # by up to -20pp against the intended stop on gap-downs.
+                #
+                # If the bar's low is below the trail price the market gapped
+                # through the stop, so the fill is the low. Otherwise the
+                # stop was touched intraday and the fill is the trail price.
+                if low is not None and low < trail_threshold:
+                    trail_fill = low
+                else:
+                    trail_fill = trail_threshold
                 order = self._sell_partial(
-                    pos, effective_price, pos.remaining, "TRAIL",
+                    pos, trail_fill, pos.remaining, "TRAIL",
                     bar_date, cost_rate, effective_price,
                 )
                 orders.append(order)
@@ -467,10 +495,9 @@ class Portfolio:
             tier_price = sig.entry_price * mult
             if effective_price < tier_price:
                 break
-            tier_shares = max(int(pos.remaining * pct), 0)
-            # Don't leave orphan shares < lot
-            if pos.remaining - tier_shares < lot:
-                tier_shares = pos.remaining
+            tier_shares = _scale_out_cut(
+                pos.remaining, pct, lot, min_residual_lots,
+            )
             if tier_shares <= 0:
                 pos.tier_idx += 1
                 continue
@@ -492,9 +519,9 @@ class Portfolio:
 
         # Partial-cut stop (sl_T)
         if effective_price <= sig.sl_T:
-            cut = max(int(pos.remaining * exits_cfg.scale_out_pct_at_sl_T), 0)
-            if cut <= 0:
-                cut = pos.remaining
+            cut = _scale_out_cut(
+                pos.remaining, exits_cfg.scale_out_pct_at_sl_T, lot, min_residual_lots,
+            )
             if cut > 0:
                 order = self._sell_partial(
                     pos, sig.sl_T, cut, "SL_SCALE",
@@ -507,9 +534,9 @@ class Portfolio:
         # Midpoint stop
         sl_mid = sig.sl_midpoint
         if effective_price <= sl_mid and pos.remaining > 0:
-            cut = max(int(pos.remaining * exits_cfg.scale_out_pct_at_midpoint), 0)
-            if cut <= 0:
-                cut = pos.remaining
+            cut = _scale_out_cut(
+                pos.remaining, exits_cfg.scale_out_pct_at_midpoint, lot, min_residual_lots,
+            )
             if cut > 0:
                 order = self._sell_partial(
                     pos, sl_mid, cut, "SL_SCALE",

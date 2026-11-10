@@ -35,6 +35,21 @@ from .executor import TradeResult, simulate_trade
 from .signal_generator import generate_signal
 
 
+def _load_bars_db_aware(ticker: str, prices_dir: Path | None = None):
+    """Load a ticker's bars, preferring Postgres over the JSON files.
+
+    The VPS mirrors market data into Postgres (``prices_dnse``), which
+    is the intended source of truth. The JSON files under
+    ``vietnam_algo/data/prices/`` remain the fallback when Postgres is
+    unavailable.
+
+    Set ``DARVAS_PRICES_SOURCE=json`` to force the JSON path (used by
+    the tests, which have no Postgres).
+    """
+    from .db_prices import load_bars
+    return load_bars(ticker, prices_dir)
+
+
 @dataclass
 class BacktestResult:
     trades: list = field(default_factory=list)
@@ -312,8 +327,7 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
     if tickers is not None:
         universe = []
         for t in tickers:
-            path = prices_dir / f"{t.upper()}.json"
-            raw_bars = _load_price_bars(path)
+            raw_bars = _load_bars_db_aware(t.upper(), prices_dir)
             if not raw_bars:
                 continue
             ticker_events = ca_index.get(t.upper(), [])
@@ -477,8 +491,7 @@ def run_backtest_with_portfolio(
     universe = []
     if tickers is not None:
         for t in tickers:
-            path = prices_dir / f"{t.upper()}.json"
-            raw_bars = load_price_bars(path)
+            raw_bars = _load_bars_db_aware(t.upper(), prices_dir)
             if not raw_bars:
                 continue
             ticker_events = ca_index.get(t.upper(), [])
@@ -569,13 +582,15 @@ def run_backtest_with_portfolio(
 
         # 2) Build prices for this bar
         prices: Dict[str, float] = {}
+        lows: Dict[str, float] = {}
         for ticker, bars in bars_by_ticker.items():
             if cursor in date_idx[ticker]:
                 bar_idx = date_idx[ticker][cursor]
                 prices[ticker] = bars[bar_idx].close
+                lows[ticker] = bars[bar_idx].low
 
         # 3) Process the bar (MTM + exits)
-        portfolio.process_bar(cursor, prices)
+        portfolio.process_bar(cursor, prices, lows_by_ticker=lows)
 
         cursor = date.fromordinal(cursor.toordinal() + 1)
 

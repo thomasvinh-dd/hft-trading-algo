@@ -139,7 +139,13 @@ class SignalGeneratorTests(unittest.TestCase):
         # with low conviction.
         self.assertIsNotNone(sig)
         self.assertEqual(sig.ticker, "X")
-        self.assertGreater(sig.entry_price, b.base_high)
+        # The entry price is the NEXT bar's open — the price we would
+        # actually pay when the order is placed at the signal bar's close.
+        # It is deliberately NOT the signal bar's close: that price is no
+        # longer available by the time the order fills.
+        self.assertEqual(sig.signal_date, bars[68].date)
+        self.assertEqual(sig.entry_date, bars[69].date)
+        self.assertEqual(sig.entry_price, bars[69].open)
         # With vol_spike=2.0 and vol_mult=3.0, the breakout is not
         # high enough (2.0 < 3.0) so no signal fires with default config.
         # Verify by setting vol_mult lower:

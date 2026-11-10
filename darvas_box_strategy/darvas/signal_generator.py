@@ -294,24 +294,48 @@ def _generate_pure_signal(bars, base, cfg, *, as_of_idx, upcoming_ca,
     # ATR at signal time (for ATR-based trailing stop and vol-targeting)
     atr_value = _atr(bars[: breakout_idx + 1], window=cfg.trailing.trail_atr_window)
 
+    # Entry price and date.
+    #
+    # The signal fires on the breakout bar, but the position is entered on
+    # the NEXT bar. The fill price is that bar's OPEN — the price we would
+    # actually have paid when the order was placed at the previous close.
+    #
+    # The old code used the breakout bar's CLOSE as the entry price while
+    # dating the entry to the next bar. That is wrong in two ways:
+    #   - it ignores the overnight gap, so entries are recorded at a price
+    #     that was no longer available (measured across 3,719 signals:
+    #     next-bar close vs signal-bar close has p75 +1.85%, p90 +4.75%,
+    #     max +40.93%);
+    #   - the stop levels and tier targets are computed from that
+    #     optimistic price, so the whole trade is measured against a fill
+    #     that never happened.
+    #
+    # Using the next bar's open makes the sizing, the stops and the P&L
+    # all consistent with a real order.
+    if breakout_idx + 1 < len(bars):
+        entry_bar = bars[breakout_idx + 1]
+        entry_date = entry_bar.date
+        entry_price = entry_bar.open
+    else:
+        # No bar after the signal — the position cannot be opened. The
+        # caller skips signals with no room left to trade.
+        entry_date = breakout_bar.date
+        entry_price = breakout_bar.close
+
     sl_buffer = 1.0 - cfg.exits.sl_buffer_pct
     if cfg.exits.use_entry_anchored_stops:
-        sl_F = breakout_bar.close * (1.0 - cfg.exits.sl_F_pct)
-        sl_T = breakout_bar.close * (1.0 - cfg.exits.sl_T_pct)
+        # Anchored to the fill price, not the signal-bar close.
+        sl_F = entry_price * (1.0 - cfg.exits.sl_F_pct)
+        sl_T = entry_price * (1.0 - cfg.exits.sl_T_pct)
     else:
         sl_F = base.base_low * sl_buffer
-        sl_T = (base.base_low + breakout_bar.close) / 2.0
-
-    if breakout_idx + 1 < len(bars):
-        entry_date = bars[breakout_idx + 1].date
-    else:
-        entry_date = breakout_bar.date
+        sl_T = (base.base_low + entry_price) / 2.0
 
     return Signal(
         ticker=base.ticker,
         signal_date=breakout_bar.date,
         entry_date=entry_date,
-        entry_price=breakout_bar.close,
+        entry_price=entry_price,
         base=base,
         sl_F=round(sl_F, 4),
         sl_T=round(sl_T, 4),
