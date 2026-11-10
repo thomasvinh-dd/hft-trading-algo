@@ -144,13 +144,14 @@ def create_app() -> Flask:
     @app.route("/api/signals")
     def api_signals():
         cache = load_cache()
-        # Refresh when the cache is empty OR stale. Previously only the
-        # empty case triggered a refresh, which let an old cache with
-        # signals in it be served forever.
-        if not cache.signals:
-            _maybe_start_background_refresh(cache, force=True)
-        else:
-            _maybe_start_background_refresh(cache)
+        # Refresh when the cache is stale. Previously the trigger was
+        # "cache.signals is empty", which had two problems:
+        #   - a cache that was merely old but still held signals was
+        #     served indefinitely;
+        #   - a cache with no signals on the latest bar (a normal
+        #     condition) triggered a full backtest on every request.
+        # The cache age is the only trigger now.
+        _maybe_start_background_refresh(cache)
         # Also include recent signals (last 7 days) so the UI is
         # useful even when there are no signals on the latest bar.
         recent = get_recent_signals(days=7)
@@ -289,23 +290,20 @@ _refresh_lock = threading.Lock()
 _refresh_running = False
 
 
-def _maybe_start_background_refresh(cache, force: bool = False) -> bool:
+def _maybe_start_background_refresh(cache) -> bool:
     """Start a background refresh if the cache is stale. Returns True if one
     was started.
 
     The previous implementation only refreshed when the cache had no
-    signals at all. That meant a cache that was merely old — with signals
-    still in it — was served indefinitely, and the dashboard showed stale
-    data with no indication anything was wrong. The cache age is now the
-    trigger, using CACHE_MAX_AGE_SECONDS.
-
-    ``force`` starts a refresh even when the cache looks fresh. It is used
-    for the empty-cache case, where the file may be missing entirely and
-    there is no timestamp to judge.
+    signals at all. That had two problems: a cache that was merely old —
+    with signals still in it — was served indefinitely, and a cache with
+    no signals on the latest bar (a normal condition) triggered a full
+    backtest on every request. The cache age is the only trigger now,
+    using CACHE_MAX_AGE_SECONDS.
     """
     global _refresh_running
 
-    if not force and not is_cache_stale(cache.last_updated):
+    if not is_cache_stale(cache.last_updated):
         return False
 
     with _refresh_lock:

@@ -557,6 +557,49 @@ class CacheStalenessTests(unittest.TestCase):
 
         self.assertFalse(started, "a fresh cache must not trigger a refresh")
 
+    def test_fresh_cache_without_signals_does_not_trigger_refresh(self):
+        """A cache with no signals on the latest bar is normal.
+
+        The old trigger was "cache.signals is empty", which made every
+        request start a ~5 minute backtest whenever there was no breakout
+        signal — including right after a service restart.
+        """
+        from darvas_box_strategy.web import app as app_module
+        from darvas_box_strategy.web.data import WebCache
+        from datetime import datetime, timezone, timedelta
+
+        new = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(
+            timespec="seconds"
+        )
+        fresh_cache = WebCache(
+            last_updated=new,
+            signals=[],          # no signals — a normal condition
+            open_positions=[{"ticker": "MSN"}],
+        )
+
+        app = app_module.create_app()
+        c = app.test_client()
+
+        started = []
+        orig = app_module._safe_refresh
+
+        def _spy():
+            started.append(True)
+
+        app_module._safe_refresh = _spy
+        try:
+            with patch(
+                "darvas_box_strategy.web.app.load_cache", return_value=fresh_cache
+            ):
+                c.get("/api/signals")
+        finally:
+            app_module._safe_refresh = orig
+
+        self.assertFalse(
+            started,
+            "a fresh cache with no signals must not trigger a refresh",
+        )
+
     def test_health_reports_cache_age(self):
         """The health endpoint must expose the cache age so staleness is
         observable without opening the dashboard."""
