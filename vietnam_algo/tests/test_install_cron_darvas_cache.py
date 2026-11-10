@@ -96,3 +96,107 @@ def test_new_jobs_are_covered_by_the_removal_filter() -> None:
             f"install_cron.sh removes old entries instead of duplicating "
             f"them. Got: {patterns!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Guard-minute regression (2026-11-10 incident)
+# ---------------------------------------------------------------------------
+# The installer used to emit minute "0" for jobs whose wall-clock guard
+# only accepts ":05" / ":20" / ":25".  Cron schedules on the SYSTEM
+# timezone and ignores CRON_TZ, so the entry fired at minute 0 while the
+# guard demanded minute 5/20/25 -- the two conditions could never both be
+# true.  Those jobs were PERMANENTLY DEAD and failed SILENTLY: no log file
+# was ever created and no error was ever reported.
+#
+#   scan-exits  (guard 09:05 ICT) -> cron minute 0  => never ran
+#   scan-exits  (guard 15:25 ICT) -> cron minute 0  => never ran
+#   check-stale (guard 09:20 ICT) -> cron minute 0  => never ran
+#
+# Every guarded job must therefore use a cron minute equal to its guard's
+# minute.  These tests assert that invariant for the whole schedule, not
+# just the three jobs that happened to break.
+
+
+def _job_lines() -> list[str]:
+    out = _print_crontab()
+    return [
+        ln
+        for ln in out.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+
+
+def _cron_minute(line: str) -> str:
+    return line.split()[0]
+
+
+def _guard_time(line: str) -> str | None:
+    """Return the HH:MM wall-clock guard of a job, or None if unguarded."""
+    m = re.search(r'date \+\%H:\\\%M\)" = "(\d\d:\d\d)"', line)
+    if not m:
+        m = re.search(r'= "(\d\d:\d\d)"', line)
+    return m.group(1) if m else None
+
+
+def test_every_guarded_job_cron_minute_matches_its_guard_minute() -> None:
+    """The cron minute must equal the guard's minute for EVERY guarded job.
+
+    A mismatch makes the job permanently dead without any error: cron only
+    fires the entry during the minute named in the schedule, while the
+    guard only passes during the minute named in its wall-clock comparison.
+    If those two minutes differ, the job can never run.
+    """
+    offenders = []
+    for line in _job_lines():
+        guard = _guard_time(line)
+        if guard is None:
+            continue  # unguarded jobs (e.g. the */5 watchdog) are fine
+        cron_min = _cron_minute(line)
+        if cron_min.startswith("*/"):
+            continue  # step schedule, not a single-minute trigger
+        if int(cron_min) != int(guard.split(":")[1]):
+            offenders.append(
+                f"cron minute {cron_min!r} != guard minute "
+                f"{guard.split(':')[1]!r} (guard {guard}): {line}"
+            )
+    assert not offenders, (
+        "guarded cron jobs whose trigger minute does not match their "
+        "wall-clock guard minute can NEVER run:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_darvas_exit_and_stale_jobs_use_their_intended_minutes() -> None:
+    """The three jobs that were dead must use their intended minutes."""
+    expected = {
+        # marker -> (guard HH:MM, expected cron minute)
+        ("scan-exits", "09:05"): "5",
+        ("scan-exits", "15:25"): "25",
+        ("check-stale", "09:20"): "20",
+        ("scan-signals", "09:00"): "0",
+        ("send-report", "16:00"): "0",
+        ("refresh-cache", "16:05"): "5",
+    }
+    found = {}
+    for line in _job_lines():
+        guard = _guard_time(line)
+        if guard is None:
+            continue
+        for (marker, g), minute in expected.items():
+            if marker in line and guard == g:
+                found[(marker, g)] = _cron_minute(line)
+
+    missing = [k for k in expected if k not in found]
+    assert not missing, f"expected cron entries not found: {missing}"
+
+    wrong = {
+        k: (found[k], expected[k])
+        for k in expected
+        if int(found[k]) != int(expected[k])
+    }
+    assert not wrong, (
+        "cron trigger minutes do not match the intended schedule: "
+        + "; ".join(
+            f"{k[0]} (guard {k[1]}) uses minute {got}, expected {want}"
+            for k, (got, want) in wrong.items()
+        )
+    )
