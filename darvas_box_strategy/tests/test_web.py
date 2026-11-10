@@ -297,13 +297,201 @@ class DealEndpointTests(unittest.TestCase):
         self.assertIn(r.status_code, (200, 404))
 
 
+class UrlPrefixTests(unittest.TestCase):
+    """The dashboard can be served under a path prefix, e.g. /darvas.
+
+    The reverse proxy strips the prefix before forwarding, so Flask still
+    sees its normal routes, but the app must know the prefix in order to
+    generate correct asset and API URLs. Without this the dashboard's CSS,
+    JavaScript and fetch() calls all resolve to the site root and break.
+    """
+
+    def _client(self):
+        from darvas_box_strategy.web.app import create_app
+        return create_app().test_client()
+
+    def test_prefix_from_forwarded_header(self):
+        """X-Forwarded-Prefix sets the prefix."""
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        with c.application.test_request_context(
+            "/", headers={"X-Forwarded-Prefix": "/darvas"}
+        ):
+            self.assertEqual(url_prefix(), "/darvas")
+
+    def test_no_prefix_by_default(self):
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        with c.application.test_request_context("/"):
+            self.assertEqual(url_prefix(), "")
+
+    def test_env_var_fallback(self):
+        """DARVAS_URL_PREFIX is used when no header is present."""
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        with patch.dict(os.environ, {"DARVAS_URL_PREFIX": "/darvas"}):
+            with c.application.test_request_context("/"):
+                self.assertEqual(url_prefix(), "/darvas")
+
+    def test_header_wins_over_env(self):
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        with patch.dict(os.environ, {"DARVAS_URL_PREFIX": "/from-env"}):
+            with c.application.test_request_context(
+                "/", headers={"X-Forwarded-Prefix": "/from-header"}
+            ):
+                self.assertEqual(url_prefix(), "/from-header")
+
+    def test_prefix_is_normalised(self):
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        for raw, expected in (
+            ("darvas", "/darvas"),
+            ("/darvas/", "/darvas"),
+            ("/darvas//", "/darvas"),
+            ("/", ""),
+            ("", ""),
+        ):
+            with self.subTest(raw=raw):
+                with c.application.test_request_context(
+                    "/", headers={"X-Forwarded-Prefix": raw}
+                ):
+                    self.assertEqual(url_prefix(), expected)
+
+    def test_index_renders_base_href(self):
+        """With a prefix the page must carry a <base href> so relative
+        URLs resolve against the prefix."""
+        c = self._client()
+        r = c.get("/", headers={"X-Forwarded-Prefix": "/darvas"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'<base href="/darvas/">', r.data)
+
+    def test_index_without_prefix_has_no_base_href(self):
+        """At the site root there is no prefix and no base tag."""
+        c = self._client()
+        r = c.get("/")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(b"<base href=", r.data)
+
+    def test_static_urls_include_prefix(self):
+        """Asset URLs must be prefixed, otherwise they bypass the mount
+        point and 404."""
+        c = self._client()
+        r = c.get("/", headers={"X-Forwarded-Prefix": "/darvas"})
+        self.assertIn(b'href="/darvas/static/styles.css"', r.data)
+        self.assertIn(b'src="/darvas/static/app.js"', r.data)
+
+    def test_static_urls_unchanged_without_prefix(self):
+        c = self._client()
+        r = c.get("/")
+        self.assertIn(b'href="/static/styles.css"', r.data)
+        self.assertIn(b'src="/static/app.js"', r.data)
+
+    def test_api_routes_still_work_with_prefix(self):
+        """The proxy strips the prefix, so the app's own routes are
+        unchanged — the prefix only affects generated URLs."""
+        c = self._client()
+        r = c.get("/api/health", headers={"X-Forwarded-Prefix": "/darvas"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["ok"])
+
+    def test_js_derives_api_base_from_base_href(self):
+        """The JS must build API URLs from the <base href>, not from a
+        hard-coded site root."""
+        js_path = Path(__file__).resolve().parents[1] / "web" / "static" / "app.js"
+        js = js_path.read_text()
+        self.assertIn("API_BASE", js)
+        self.assertIn('document.querySelector("base")', js)
+        # Every API call must go through the api() helper.
+        self.assertNotIn('fetchJSON("/api/', js)
+        self.assertNotIn("fetchJSON(`/api/", js)
+
+    def test_static_url_helper_outside_request_context(self):
+        """static_url is also reachable from a background thread, where
+        there is no request context — it must not raise."""
+        from darvas_box_strategy.web.app import static_url
+        c = self._client()
+        with c.application.test_request_context("/"):
+            self.assertEqual(static_url("app.js"), "/static/app.js")
+
+
 if __name__ == "__main__":
     unittest.main()
 
 
+class OpenDealExhaustFillTests(unittest.TestCase):
+    """An open deal must not show a terminal 'sold everything' fill.
+
+    The executor emits an EXHAUST fill when the backtest runs out of
+    bars. That fill is a mark-to-market snapshot, NOT a sale — the
+    position is still held. The old timeline rendered it as a full
+    sell ("-2,400 sh, remaining 0") while the deal header said
+    "OPEN", which is self-contradictory.
+
+    Regression: the user saw VNM_2026-08-10 showing "sell all the
+    shares" and asked why the deal was still open.
+    """
+
+    def _fills(self, *, is_open):
+        from darvas_box_strategy.web.data import _fills_to_dicts
+        from darvas_box_strategy.darvas.executor import FillEvent
+        from darvas_box_strategy.darvas.signal_generator import Signal
+        from darvas_box_strategy.darvas.base_detector import Base
+        from datetime import date
+
+        b = Base(ticker="X", base_low=9_800, base_high=10_000, end_idx=0,
+                 days_in_base=10, volume_compression=1.0)
+        sig = Signal(
+            ticker="X", signal_date=date(2026, 1, 1), entry_date=date(2026, 1, 2),
+            entry_price=10_000.0, base=b, sl_F=8_200.0, sl_T=9_000.0,
+            tiers=((1.10, 0.30),), conviction="low", size_pct=0.15,
+            shares=2_400, max_volume=99_999, bars_remaining=10,
+        )
+        fills = [
+            FillEvent(date=date(2026, 1, 3), kind="TIER", level=11_000.0,
+                      shares=-720, proceeds=7_920_000.0, fraction_of_pos=0.30,
+                      cumulative_proceeds=7_920_000.0, realized_pnl=720_000.0,
+                      remaining=1_680),
+            FillEvent(date=date(2026, 1, 4), kind="EXHAUST", level=9_500.0,
+                      shares=-1_680, proceeds=15_960_000.0, fraction_of_pos=1.0,
+                      cumulative_proceeds=23_880_000.0, realized_pnl=-840_000.0,
+                      remaining=0),
+        ]
+        return _fills_to_dicts(fills, signal=sig, is_open=is_open)
+
+    def test_open_deal_exhaust_becomes_mark(self):
+        out = self._fills(is_open=True)
+        last = out[-1]
+        self.assertEqual(last["kind"], "MARK")
+        self.assertEqual(last["shares"], 0,
+                         "open deal must not show a sell of the remaining shares")
+        self.assertEqual(last["pnl_delta"], 0.0)
+        self.assertIn("still open", last["note"].lower())
+        # The shares still held must be shown in the remaining column
+        self.assertEqual(last["remaining"], 1_680)
+        self.assertIn("1,680", last["note"])
+
+    def test_open_deal_still_shows_real_exits(self):
+        out = self._fills(is_open=True)
+        kinds = [f["kind"] for f in out]
+        self.assertIn("ENTRY", kinds)
+        self.assertIn("TIER", kinds)
+        # The real TIER exit keeps its negative share count
+        tier = next(f for f in out if f["kind"] == "TIER")
+        self.assertEqual(tier["shares"], -720)
+        self.assertEqual(tier["remaining"], 1_680)
+
+    def test_closed_deal_keeps_exhaust_sell(self):
+        """A CLOSED deal's EXHAUST fill is a real sale — keep it."""
+        out = self._fills(is_open=False)
+        last = out[-1]
+        self.assertEqual(last["kind"], "EXHAUST")
+        self.assertEqual(last["shares"], -1_680)
+        self.assertNotEqual(last["shares"], 0)
+
+
 class MakeDealIdTests(unittest.TestCase):
     """Tests for the deal_id generator."""
-
     def test_basic_format(self):
         from darvas_box_strategy.web.data import _make_deal_id
         from datetime import date
@@ -457,22 +645,38 @@ class NoConcurrentPositionsTests(unittest.TestCase):
                         )
 
     def test_real_tickers_have_no_concurrent_deals(self):
-        """For a sample of HOSE blue chips, get_ticker_history should
-        never return two deals on the same ticker that overlap in
-        time. (Live trading can't have two open positions on one
-        ticker at once.)"""
+        """For HOSE blue chips, get_ticker_history should never return
+        two deals on the same ticker that overlap in time. (Live
+        trading can't have two open positions on one ticker at once.)
+
+        This used to sample only 5 tickers, and ABB — which had 5
+        concurrent open deals — wasn't one of them. The sample is now
+        the full 70-ticker universe plus every ticker that regressed.
+        """
         from darvas_box_strategy.bot.cli import build_default_config
         from darvas_box_strategy.web.data import get_ticker_history
         cfg = build_default_config()
-        # Try the first 5 blue chips — enough to catch a regression
-        # without making the test slow.
-        for ticker in ["MSN", "VCB", "VHM", "PLX", "GEE"]:
+        # The tickers that actually regressed, plus the historical sample.
+        tickers = ["MSN", "VCB", "VHM", "PLX", "GEE", "ABB", "ORS"]
+        try:
+            from darvas_box_strategy.bot.cli import load_blue_chips
+            tickers = sorted(set(tickers) | set(load_blue_chips()))
+        except Exception:
+            pass
+        for ticker in tickers:
             with self.subTest(ticker=ticker):
                 hist = get_ticker_history(ticker, cfg=cfg)
                 self.assertEqual(hist["ticker"], ticker)
                 deals = hist["deals"]
                 if not deals:
                     continue
+                # At most ONE open deal per ticker.
+                opens = [d for d in deals if d.get("is_open")]
+                self.assertLessEqual(
+                    len(opens), 1,
+                    f"{ticker}: {len(opens)} concurrent open deals: "
+                    f"{[d['deal_id'] for d in opens]}",
+                )
                 # Walk through chronologically — each entry_date
                 # must be > the previous exit_date
                 sorted_deals = sorted(deals, key=lambda d: d["entry_date"])

@@ -9,16 +9,33 @@ Routes:
   POST /api/refresh      — re-run scan + backtest (slow; ~3 min)
 
 Run: python3 -m darvas_box_strategy.web.app
+
+URL prefix
+----------
+The dashboard can be served under a path prefix, e.g. ``/darvas``, when it is
+reverse-proxied by a server that forwards the prefix as a stripped path. Set
+the environment variable ``DARVAS_URL_PREFIX`` to that prefix (with a leading
+slash, no trailing slash) and the app adapts:
+
+  - ``url_for`` produces prefixed URLs for the static assets.
+  - The template renders a ``<base href>`` so relative API calls resolve
+    against the prefix.
+  - The JS reads its API base from that ``<base href>`` instead of assuming
+    the app is mounted at the site root.
+
+The reverse proxy is expected to rewrite the prefix away before forwarding
+the request, so Flask still sees its normal routes.
 """
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, has_request_context, jsonify, render_template, request
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -37,6 +54,48 @@ from darvas_box_strategy.web.data import (
 log = logging.getLogger("darvas.web")
 
 
+def url_prefix() -> str:
+    """The URL prefix the app is served under, e.g. ``/darvas``.
+
+    The prefix is taken from the ``X-Forwarded-Prefix`` header that the
+    reverse proxy sets, falling back to the ``DARVAS_URL_PREFIX`` environment
+    variable. The header wins because it reflects how the request actually
+    arrived, which matters when the proxy strips the prefix before
+    forwarding.
+
+    The value is normalised: a leading slash is added if missing, and a
+    trailing slash is stripped. An empty value means the app is mounted at
+    the site root.
+    """
+    raw = ""
+    # request is only available inside a request context; outside one (e.g. a
+    # background thread) fall back to the environment variable.
+    if has_request_context():
+        raw = (request.headers.get("X-Forwarded-Prefix") or "").strip()
+    if not raw:
+        raw = (os.environ.get("DARVAS_URL_PREFIX") or "").strip()
+    if not raw or raw == "/":
+        return ""
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    return raw.rstrip("/")
+
+
+def static_url(filename: str) -> str:
+    """URL for a static asset, including the URL prefix when one is set.
+
+    ``url_for('static', ...)`` returns an absolute path from the site root
+    (``/static/app.js``), which would bypass the prefix. This joins the
+    prefix in front of it instead.
+    """
+    from flask import url_for
+
+    path = url_for("static", filename=filename)
+    prefix = url_prefix()
+    return f"{prefix}{path}" if prefix else path
+
+
+
 def create_app() -> Flask:
     app = Flask(
         __name__,
@@ -44,6 +103,10 @@ def create_app() -> Flask:
         static_folder=str(Path(__file__).parent / "static"),
     )
     app.config["JSON_SORT_KEYS"] = False
+
+    # Make the prefix and the static-asset helper available to templates.
+    app.jinja_env.globals["url_prefix"] = url_prefix
+    app.jinja_env.globals["static_url"] = static_url
 
     # Ensure we have a cache on disk; if not, run a refresh in the background
     # so the first GET / returns something useful instead of 503.
@@ -53,16 +116,23 @@ def create_app() -> Flask:
 
     @app.route("/")
     def index():
-        return render_template("index.html")
+        # The base href makes relative URLs in the page resolve against the
+        # prefix, so the static assets and the API calls keep working when
+        # the app is served from a sub-path.
+        return render_template("index.html", url_prefix=url_prefix())
 
     @app.route("/api/health")
     def health():
         cache = load_cache()
+        from darvas_box_strategy.darvas.db_prices import db_price_stats
         return jsonify({
             "ok": True,
             "cache_path": str(CACHE_PATH),
             "cache_last_updated": cache.last_updated,
             "cache_exists": CACHE_PATH.exists(),
+            # Postgres is the source of truth for market data; the JSON
+            # files under vietnam_algo/data/prices/ are the fallback.
+            "price_source": db_price_stats(),
         })
 
     @app.route("/api/signals")

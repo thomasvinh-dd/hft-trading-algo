@@ -4,7 +4,12 @@
 <meta charset="utf-8">
 <title>Darvas Box — Strategy Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+{%- if url_prefix %}
+<!-- Relative URLs resolve against this base, so the page works when it is
+     served from a sub-path such as /darvas. -->
+<base href="{{ url_prefix }}/">
+{%- endif %}
+<link rel="stylesheet" href="{{ static_url('styles.css') }}">
 </head>
 <body>
 <header>
@@ -297,6 +302,6 @@
   </div>
 </div>
 
-<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script src="{{ static_url('app.js') }}"></script>
 </body>
 </html>
