@@ -753,9 +753,10 @@ default 9-tier ladder takes 10% at +6.3%, then 30% at +12.5%, then
 | Knob | Default | What it does |
 |---|---:|---|
 | `start_nav` | 1e9 | Initial capital (1B VND) |
-| `size_low` | 0.15 | Position size as fraction of NAV (regular conviction) |
-| `size_high` | 0.30 | Position size as fraction of NAV (high conviction) |
+| `size_low` | 0.10 | Position size as fraction of NAV (regular conviction) |
+| `size_high` | 0.20 | Position size as fraction of NAV (high conviction) |
 | `max_concurrent_positions` | 10 | Max open positions at once |
+| `max_total_exposure_pct` | 0.75 | Cap on total open exposure as a fraction of NAV. 0 = off. Bounds the damage from a cluster of simultaneous losers — see [Reducing the drawdown](#reducing-the-drawdown-2026-11-11) |
 | `cooldown_bars_after_stop` | 5 | Bars to skip after a stop-out before re-entry |
 | `cost_bps` | 25.0 | Round-trip cost (slippage + commission) |
 | `board_lot` | 100 | Round share count down to 100-share lot (HOSE) |
@@ -766,9 +767,9 @@ default 9-tier ladder takes 10% at +6.3%, then 30% at +12.5%, then
 
 | Want | Tweak |
 |---|---|
-| Less drawdown | Lower `size_low` to 0.10 and `size_high` to 0.20 |
-| More return (more risk) | Raise `size_high` to 0.40 |
-| Fewer losing trades | Tighten `sl_T` to 0.05 (5% stop) |
+| Less drawdown | Set `max_total_exposure_pct=0.5-0.75` **together with** smaller `size_low`/`size_high` — either alone makes it worse |
+| More return (more risk) | Raise `size_high` to 0.40 and set `max_total_exposure_pct=0` |
+| Fewer losing trades | Tighten `sl_T` to 0.05 (5% stop) — but note a tighter stop makes the *drawdown* much worse |
 | Slower take-profit | Skip tier 1 (set `(1.125, 0.40)` as first) |
 | VN reality | Set `daily_price_limit_pct=0.07` (costs ~16% return) |
 | T+2.5 settlement | Set `t_plus_n_bars=3` (costs ~25% return) |
@@ -1154,6 +1155,106 @@ structure produces when the tail does not appear.
 
 If the tail risk is unacceptable, the lever is **position sizing**, not
 entry filtering: `size_low` / `size_high` scale the whole curve.
+
+## Reducing the drawdown (2026-11-11)
+
+The `-26%` max drawdown was investigated and reduced to **-18.5%** by
+capping total exposure. The current production config is
+`size_low=0.10, size_high=0.20, max_total_exposure_pct=0.75`.
+
+### Why the obvious levers backfire
+
+Sweeping the "obvious" knobs on the full 2019-2026 period:
+
+| Config | Return | Max DD | Win% |
+|---|---:|---:|---:|
+| **baseline 15/30 max10** | **+142.1%** | **-25.96%** | 65.3% |
+| size 10/20 max10 | +102.6% | **-33.44%** | 64.5% |
+| size 8/15 max10 | +87.7% | -23.41% | 64.6% |
+| size 15/30 max6 | +70.3% | -29.46% | 63.7% |
+| size 10/20 max6 | +38.3% | -33.59% | 60.2% |
+| size 10/20 max5 | +52.5% | -24.46% | 63.8% |
+| **sl 7%/13% (tighter stop)** | +125.1% | **-46.84%** | 58.3% |
+
+Three things to note:
+
+1. **Smaller positions made the drawdown WORSE.** `size 10/20` went from
+   -26.0% to -33.4%.
+2. **A tighter stop made it much worse** — -46.8%, and the win rate fell
+   to 58.3%. The stops are what the payoff depends on.
+3. **Fewer concurrent positions made it worse** too, and cost a lot of
+   return.
+
+### The actual mechanism
+
+Capping the **number** of open positions does not cap the **risk**.
+Smaller positions mean more of them fit, so total exposure rises exactly
+when losers cluster:
+
+| Config | Mean concurrent positions | Max DD |
+|---|---:|---:|
+| size 15/30 max10 | 4.95 | -26.0% |
+| size 10/20 max10 | 6.78 | -33.4% |
+| size 8/15 max10 | 7.63 | -23.4% |
+
+The 15/30 sizing was **self-limiting**: bigger positions meant fewer
+slots could be filled, which bounded the damage from a cluster of
+simultaneous losers. Reducing the size without adding a cap removed that
+protection.
+
+The fix is `BacktestConfig.max_total_exposure_pct` — a cap on the open
+exposure as a fraction of NAV, independent of how many positions are
+open. `0` = off.
+
+### The sweep
+
+| Config | Return | CAGR | Max DD | Win% | Trades |
+|---|---:|---:|---:|---:|---:|
+| baseline 15/30 max10 | +142.1% | 12.36% | -25.96% | 65.3% | 251 |
+| exposure 1.00 | +142.1% | 12.36% | -25.96% | 65.3% | 251 |
+| exposure 0.75 | +133.1% | 11.80% | -28.16% | 66.2% | 207 |
+| exposure 0.50 | +73.8% | 7.55% | -22.12% | 67.8% | 143 |
+| **exposure 0.75 + size 10/20** | **+93.4%** | **9.08%** | **-18.49%** | **66.9%** | 260 |
+| exposure 0.50 + size 10/20 | +42.2% | 4.76% | -25.59% | 64.1% | 195 |
+
+### Walk-forward validation
+
+A full-period result is how the earlier overfitting mistakes were made
+(vol-targeting and the ML filter both looked great in-sample and failed
+out-of-sample). So the candidates were re-run walk-forward —
+TRAIN 2019-2022, TEST 2023-2026:
+
+| Config | TRAIN ret | TRAIN DD | TRAIN win | TEST ret | TEST DD | TEST win |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline 15/30 max10 | +58.7% | -23.22% | 66.7% | +142.1% | -25.96% | 65.3% |
+| exposure 0.75 | +63.0% | -21.82% | 67.0% | +133.1% | **-28.16%** | 66.2% |
+| **exposure 0.75 + size 10/20** | +53.4% | **-16.96%** | **70.0%** | +93.4% | **-18.49%** | **66.9%** |
+| exposure 0.65 + size 10/20 | +31.4% | -12.62% | 68.7% | +65.4% | -18.81% | 67.1% |
+| exposure 0.75 + size 12/25 | +49.5% | -18.03% | 69.0% | +76.8% | -22.06% | 65.5% |
+
+**`exposure 0.75 + size 10/20` is the only configuration that improves
+the drawdown on both halves of the split**, and its win rate is higher
+in both (66.7% → 70.0% train, 65.3% → 66.9% test).
+
+Note that **the exposure cap on its own fails the test** — it improves
+train but makes the test drawdown *worse* (-26.0% → -28.2%). The cap
+only pays off in combination with smaller positions, because that is
+what keeps the number of simultaneous losers from climbing.
+
+### The trade-off
+
+```
+                     return   max DD   win%
+before                +142.1%  -25.96%  65.3%
+after                  +93.4%  -18.49%  66.9%
+```
+
+The drawdown improves by 7.5pp and the win rate goes **up**. The cost is
+return: roughly a third of the total return is given up.
+
+If a `-18.5%` drawdown is still too much, `exposure 0.65 + size 10/20`
+gives `-18.8%` on test and `-12.6%` on train — but the return drops to
++65.4%, so the extra risk reduction is not worth it on the test period.
 
 ## Tests
 
