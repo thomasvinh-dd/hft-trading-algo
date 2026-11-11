@@ -126,11 +126,16 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(cfg.backtest.max_concurrent_positions, 10)
         self.assertEqual(cfg.backtest.cooldown_bars_after_stop, 5)
         self.assertEqual(cfg.backtest.vol_target_pct, 0.0)  # OFF: fixed sizing wins
-        # size_low=0.15, size_high=0.30 — see tools/sweep_dd.py
-        # (was 0.20/0.40; reduced to lower drawdown without
-        #  sacrificing return; see README for the trade-off table)
-        self.assertEqual(cfg.backtest.size_low, 0.15)
-        self.assertEqual(cfg.backtest.size_high, 0.30)
+        # size_low=0.10, size_high=0.20 + max_total_exposure_pct=0.75
+        # (2026-11-11) — the drawdown cap. Capping the NUMBER of open
+        # positions does not cap the risk: smaller positions mean more of
+        # them fit, so exposure rises exactly when losers cluster. With
+        # the exposure cap the max drawdown falls on BOTH halves of the
+        # walk-forward split (TRAIN -23.2% -> -17.0%, TEST -26.0%
+        # -> -18.5%). See README "Reducing the drawdown".
+        self.assertEqual(cfg.backtest.size_low, 0.10)
+        self.assertEqual(cfg.backtest.size_high, 0.20)
+        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.75)
         self.assertEqual(cfg.trailing.trail_mode, "pct")
         self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.10)  # trail after partial cut
         self.assertTrue(cfg.exits.use_entry_anchored_stops)

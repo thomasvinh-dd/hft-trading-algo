@@ -504,10 +504,20 @@ class PortfolioExposureCapTests(unittest.TestCase):
             extra={"avg_vol": 10_000_000},
         )
 
-    def test_cap_off_is_the_default(self):
+    def test_cap_is_enabled_in_the_production_config(self):
+        """The production config caps exposure at 75% of NAV.
+
+        This is the setting that brings the max drawdown under -20% on
+        both halves of the walk-forward split.
+        """
         from darvas_box_strategy.bot.cli import build_default_config
         cfg = build_default_config()
-        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.0)
+        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.75)
+
+    def test_cap_zero_disables_the_check(self):
+        """A cap of 0 means 'off' — the dataclass default."""
+        from darvas_box_strategy.darvas.config import BacktestConfig
+        self.assertEqual(BacktestConfig().max_total_exposure_pct, 0.0)
 
     def test_signal_skipped_when_cap_would_be_exceeded(self):
         """With a 25% cap, one 20%-of-NAV position fits but a second does

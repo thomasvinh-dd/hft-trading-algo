@@ -78,7 +78,9 @@ def build_default_config() -> StrategyConfig:
     OOS validation on 70 HOSE blue chips (TRAIN 2019-2022, TEST 2023-2026):
     - vol_target=0% (off) — fixed 2x sizing beats vol-targeting
     - trail=10% — let winners compound after partial cut
-    - size 0.20/0.40 — 2x conviction sizing
+    - size 0.10/0.20 + max_total_exposure_pct=0.75 — caps the drawdown
+      on BOTH halves of the split (TRAIN -23.2% → -17.0%, TEST -26.0%
+      → -18.5%) at the cost of return
     - sl_T=10%, sl_F=18% — entry-anchored stops (was base-anchored, buggy)
     - board_lot=100 — HOSE 100-share lots; small signals dropped
     - t_plus_n_bars=0 (off) — opt-in: T+2.5 settlement costs ~25% return
@@ -104,7 +106,24 @@ def build_default_config() -> StrategyConfig:
             max_concurrent_positions=10,
             cooldown_bars_after_stop=5,
             cost_bps=25.0,
-            size_low=0.15, size_high=0.30,
+            # Sizing + total-exposure cap (2026-11-11).
+            #
+            # Capping the NUMBER of open positions does not cap the risk:
+            # smaller positions mean more of them fit, so exposure rises
+            # exactly when losers cluster. Measured mean concurrent
+            # positions (2019-2026):
+            #   size 15/30 max10 -> 4.95 concurrent -> max DD -26.0%
+            #   size 10/20 max10 -> 6.78 concurrent -> max DD -33.4%
+            # The 15/30 sizing was self-limiting; reducing it without a
+            # cap made the drawdown WORSE, not better.
+            #
+            # With the exposure cap the drawdown falls on both halves of
+            # the walk-forward split:
+            #   TRAIN 2019-2022  DD -23.22% -> -16.96%, win 66.7% -> 70.0%
+            #   TEST  2023-2026  DD -25.96% -> -18.49%, win 65.3% -> 66.9%
+            # The cost is return: +142.1% -> +93.4% on the test period.
+            size_low=0.10, size_high=0.20,
+            max_total_exposure_pct=0.75,
             vol_target_pct=0.0,  # OFF: fixed sizing beats vol-targeting
             vol_target_floor=0.05, vol_target_ceiling=0.30,
             board_lot=100,  # HOSE board lot: shares rounded down to 100s
