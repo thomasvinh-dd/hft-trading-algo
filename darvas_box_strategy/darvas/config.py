@@ -79,6 +79,22 @@ class ExitsConfig:
     scale_out_pct_at_sl_T: float = 0.5
     scale_out_pct_at_midpoint: float = 0.5
     sl_buffer_pct: float = 0.01
+    # Minimum residue (in board lots) a partial exit may leave behind.
+    #
+    # Repeated fractional scale-outs converge on a small stub: a 50%
+    # cut walks 10,700 -> 5,400 -> 2,700 -> 1,400 -> 700 -> 400 -> 200.
+    # Once the position is down to a couple of lots there is no exit
+    # left for it — the profit tiers were never reached (so the
+    # trailing stop never armed) and the price may never revisit the
+    # stop levels again. The stub then sits OPEN forever, blocking
+    # the ticker for months and polluting the dashboard with a
+    # mark-to-market row for a position nobody can exit.
+    #
+    # When a partial exit would leave this many lots or fewer, the
+    # WHOLE remaining position is liquidated at that price instead.
+    # 2 lots = 200 shares at the HOSE board lot of 100.
+    # Set to 0 to disable (keep the old stub-leaving behaviour).
+    min_residual_lots: int = 2
     # Stop-loss placement: anchored to ENTRY price, not the ancient base.
     # The old logic placed stops at (base_low + entry)/2 which could be 30-45%
     # below entry when the stock had already run 5-10x from base before breakout.
@@ -155,6 +171,19 @@ class BacktestConfig:
     size_high: float = 0.30
     cost_bps: float = 25.0  # round-trip cost (slippage + commission); applied at exit
     max_concurrent_positions: int = 10
+    max_total_exposure_pct: float = 0.0  # cap on total open exposure as a fraction of NAV.
+                                       # 0 = off (only max_concurrent_positions applies).
+                                       #
+                                       # Why this exists: capping the NUMBER of open
+                                       # positions does not cap the RISK. Smaller
+                                       # positions mean more of them fit, so total
+                                       # exposure rises exactly when losers cluster.
+                                       # Measured on the 70 blue chips (2019-2026):
+                                       #   size 15/30, max 10 -> mean 4.95 concurrent, max DD -26.0%
+                                       #   size 10/20, max 10 -> mean 6.78 concurrent, max DD -33.4%
+                                       # A total-exposure cap bounds the damage from a
+                                       # cluster of simultaneous losers regardless of
+                                       # how many positions are open.
     cooldown_bars_after_stop: int = 5  # bars to skip after SL_HARD/SL_SCALE exit
     max_holding_bars: int = 0  # time stop: close if not profitable after N bars; 0 = off
     vol_target_pct: float = 0.0  # OFF: fixed 2x sizing (size_low/size_high) beats vol-targeting

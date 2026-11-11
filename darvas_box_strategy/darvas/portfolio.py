@@ -269,6 +269,17 @@ class Portfolio:
     def get_open_positions(self) -> List[Position]:
         return list(self.open_positions.values())
 
+    def get_open_exposure(self) -> float:
+        """Market value of the open positions."""
+        return sum(p.shares * p.last_close for p in self.open_positions.values())
+
+    def get_exposure_pct(self) -> float:
+        """Open exposure as a fraction of NAV."""
+        nav = self.get_nav()
+        if nav <= 0:
+            return 0.0
+        return self.get_open_exposure() / nav
+
     def get_history(self) -> List[Trade]:
         return list(self.history)
 
@@ -316,6 +327,18 @@ class Portfolio:
             return None
 
         cost = shares * signal.entry_price
+
+        # Total-exposure cap. Capping the NUMBER of open positions does not
+        # cap the risk: smaller positions mean more of them fit, so exposure
+        # rises exactly when losers cluster. This bounds the damage from a
+        # cluster of simultaneous losers regardless of the position count.
+        exposure_cap = getattr(self.cfg.backtest, "max_total_exposure_pct", 0.0) or 0.0
+        if exposure_cap > 0 and nav > 0:
+            current_exposure = self.get_open_exposure()
+            if current_exposure + cost > exposure_cap * nav:
+                self.skipped_signals += 1
+                return None
+
         if cost > self.cash:
             self.skipped_signals += 1
             return None
