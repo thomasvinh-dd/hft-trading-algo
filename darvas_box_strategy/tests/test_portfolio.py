@@ -111,7 +111,7 @@ class PortfolioSizePositionTests(unittest.TestCase):
             volume_compression: float = 1.0
         cfg = StrategyConfig(
             base=BaseConfig(), breakout=BreakoutConfig(),
-            exits=ExitsConfig(), trailing=TrailingConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0), trailing=TrailingConfig(),
             universe=UniverseConfig(),
             backtest=BacktestConfig(
                 start_nav=1e9, size_low=0.20, size_high=0.40,
@@ -149,7 +149,7 @@ class PortfolioSizePositionTests(unittest.TestCase):
             volume_compression: float = 1.0
         cfg = StrategyConfig(
             base=BaseConfig(), breakout=BreakoutConfig(),
-            exits=ExitsConfig(), trailing=TrailingConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0), trailing=TrailingConfig(),
             universe=UniverseConfig(),
             backtest=BacktestConfig(
                 start_nav=10_000.0, size_low=0.20, size_high=0.40,
@@ -179,7 +179,7 @@ class PortfolioBasicTests(unittest.TestCase):
         self.cfg = StrategyConfig(
             base=BaseConfig(),
             breakout=BreakoutConfig(),
-            exits=ExitsConfig(tiers=((1.10, 1.0),)),  # 10% TP, 100% sell
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=((1.10, 1.0),)),  # 10% TP, 100% sell
             trailing=TrailingConfig(),
             universe=UniverseConfig(),
             backtest=BacktestConfig(
@@ -362,7 +362,7 @@ class TradeFillsTests(unittest.TestCase):
             base=BaseConfig(),
             breakout=BreakoutConfig(),
             # Three TP tiers: 5%, 10%, 20% — for testing tier exits
-            exits=ExitsConfig(tiers=((1.05, 0.30), (1.10, 0.30), (1.20, 0.40))),
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=((1.05, 0.30), (1.10, 0.30), (1.20, 0.40))),
             trailing=TrailingConfig(),
             universe=UniverseConfig(),
             backtest=BacktestConfig(
@@ -445,6 +445,106 @@ class TradeFillsTests(unittest.TestCase):
             self.assertEqual(trade.fills[-1].kind, "TIER")
             self.assertEqual(trade.fills[-1].remaining, 0)
             self.assertGreater(trade.cumulative_pnl, 0)
+
+
+class PortfolioExposureCapTests(unittest.TestCase):
+    """The total-exposure cap bounds the risk from simultaneous losers.
+
+    Capping the NUMBER of open positions does not cap the risk: smaller
+    positions mean more of them fit, so exposure rises exactly when
+    losers cluster. The exposure cap bounds the total regardless of how
+    many positions are open.
+    """
+
+    def setUp(self):
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        from dataclasses import dataclass
+
+        @dataclass
+        class FakeBase:
+            ticker: str = "X"
+            base_low: float = 9_800
+            base_high: float = 10_000
+            end_idx: int = 0
+            days_in_base: int = 5
+            volume_compression: float = 1.0
+        self.FakeBase = FakeBase
+
+    def _cfg(self, exposure, max_concurrent=10):
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        return StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=((1.10, 1.0),)),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(
+                start_nav=1e9, size_low=0.20, size_high=0.40,
+                cost_bps=0.0, board_lot=100,
+                max_concurrent_positions=max_concurrent,
+                max_total_exposure_pct=exposure,
+            ),
+        )
+
+    def _make_signal(self, ticker, price=10_000):
+        from darvas_box_strategy.darvas.signals import Signal
+        return Signal(
+            ticker=ticker, signal_date=date(2026, 1, 9),
+            entry_date=date(2026, 1, 10), entry_price=price,
+            base=self.FakeBase(),
+            sl_F=price * 0.8, sl_T=price * 0.9,
+            tiers=((1.10, 1.0),), conviction="low",
+            atr_value=None, bars_remaining=100,
+            extra={"avg_vol": 10_000_000},
+        )
+
+    def test_cap_off_is_the_default(self):
+        from darvas_box_strategy.bot.cli import build_default_config
+        cfg = build_default_config()
+        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.0)
+
+    def test_signal_skipped_when_cap_would_be_exceeded(self):
+        """With a 25% cap, one 20%-of-NAV position fits but a second does
+        not."""
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(exposure=0.25), start_nav=1e9)
+        first = portfolio.process_signal(self._make_signal("A"))
+        second = portfolio.process_signal(self._make_signal("B"))
+        self.assertIsNotNone(first, "the first position should be allowed")
+        self.assertIsNone(second, "the second position must be rejected by the cap")
+        self.assertEqual(len(portfolio.open_positions), 1)
+
+    def test_cap_allows_positions_that_fit(self):
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(exposure=0.90), start_nav=1e9)
+        for t in ("A", "B", "C"):
+            portfolio.process_signal(self._make_signal(t))
+        # 3 x 20% = 60% exposure, under the 90% cap.
+        self.assertEqual(len(portfolio.open_positions), 3)
+
+    def test_exposure_pct_is_reported(self):
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(exposure=0.0), start_nav=1e9)
+        self.assertEqual(portfolio.get_exposure_pct(), 0.0)
+        portfolio.process_signal(self._make_signal("A"))
+        self.assertAlmostEqual(portfolio.get_exposure_pct(), 0.20, delta=0.01)
+
+    def test_max_concurrent_still_applies_alongside_the_cap(self):
+        """The exposure cap is an addition to the position-count cap, not
+        a replacement for it."""
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(exposure=0.99, max_concurrent=1),
+                              start_nav=1e9)
+        first = portfolio.process_signal(self._make_signal("A"))
+        second = portfolio.process_signal(self._make_signal("B"))
+        self.assertIsNotNone(first)
+        self.assertIsNone(second, "max_concurrent_positions must still be enforced")
 
 
 if __name__ == "__main__":
