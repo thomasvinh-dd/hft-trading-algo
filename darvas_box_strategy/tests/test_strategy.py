@@ -128,6 +128,116 @@ class SignalGeneratorTests(unittest.TestCase):
             backtest=BacktestConfig(start_nav=1_000_000_000),
         )
 
+
+class MarketVolatilityFilterTests(unittest.TestCase):
+    """The market-volatility entry filter.
+
+    A screen over 256 trades (2019-2026) split each trade by market
+    feature and compared the buckets. Market VOLATILITY is the only
+    feature whose separation runs in the expected direction:
+
+        feature                 low win%  high win%   low avg   high avg
+        index vs MA50            69.8%      62.0%     +4.37%    +1.91%
+        index momentum 20/60     65.6%      64.8%     +3.24%    +2.62%
+        index drawdown from peak 69.2%      62.5%     +3.59%    +2.38%
+        breadth % above MA50     67.2%      63.3%     +4.08%    +1.78%
+        index volatility 20/60   62.5%      68.0%     +2.53%    +3.32%  <- this one
+
+    Every trend/level feature separated the WRONG way for a "trade only
+    in a strong market" filter.
+    """
+
+    def _cfg(self, **breakout_kw):
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        return StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(**breakout_kw),
+            exits=ExitsConfig(),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(),
+        )
+
+    def _market_bars(self, daily_pct):
+        """Build index bars whose daily moves alternate up/down by
+        ``daily_pct``.
+
+        A CONSTANT daily move would have a standard deviation of zero —
+        the volatility of a perfectly smooth trend. Real volatility needs
+        the direction to alternate, so the returns vary.
+        """
+        from datetime import date, timedelta
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        bars = []
+        level = 1000.0
+        d = date(2026, 1, 1)
+        for i in range(40):
+            bars.append(PriceBar(time=d.isoformat(), open=level, high=level,
+                                  low=level, close=level, volume=0))
+            sign = 1 if i % 2 == 0 else -1
+            level *= (1 + sign * daily_pct / 100.0)
+            d += timedelta(days=1)
+        return bars
+
+    def test_filter_is_off_by_default(self):
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg()
+        bars = self._market_bars(0.1)
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        bar = bars[-1]
+        self.assertTrue(_market_volatility_ok(bar, cfg, bars))
+
+    def test_calm_market_is_rejected(self):
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(min_market_volatility_pct=1.4)
+        bars = self._market_bars(0.1)   # 0.1% daily moves -> vol ~0.1%
+        self.assertFalse(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_volatile_market_is_allowed(self):
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(min_market_volatility_pct=1.4)
+        bars = self._market_bars(3.0)   # 3% daily moves -> vol ~3%
+        self.assertTrue(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_max_volatility_is_enforced(self):
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(max_market_volatility_pct=1.4)
+        bars = self._market_bars(3.0)
+        self.assertFalse(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_missing_market_data_allows_trading(self):
+        """Not enough index history must not silently block every trade."""
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(min_market_volatility_pct=1.4)
+        bars = self._market_bars(0.1)[:3]
+        self.assertTrue(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_volatility_is_point_in_time(self):
+        """The filter must only use bars up to the signal date."""
+        from datetime import timedelta
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_pct
+        bars = self._market_bars(3.0)
+        vol_at_20 = _market_volatility_pct(bars, bars[20].date, 20)
+
+        # Append calmer bars AFTER the signal date. The value at bar 20
+        # must not change, because later bars must not be visible yet.
+        calm = []
+        level = bars[20].close
+        d = bars[20].date + timedelta(days=1)
+        for i in range(10):
+            calm.append(PriceBar(time=d.isoformat(), open=level, high=level,
+                                  low=level, close=level, volume=0))
+            sign = 1 if i % 2 == 0 else -1
+            level *= (1 + sign * 0.01)
+            d += timedelta(days=1)
+        mixed = bars + calm
+        vol_mixed = _market_volatility_pct(mixed, bars[20].date, 20)
+        self.assertAlmostEqual(vol_at_20, vol_mixed, places=6)
+
     def test_breakout_with_volume_fires(self):
         bars = make_bars(100, date(2025, 1, 1), base_range=(9900, 10100), base_days=8, base_idx=60,
                           breakout_jump=200, vol_spike=2.0)

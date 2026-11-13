@@ -52,6 +52,33 @@ class BreakoutConfig:
     regime_index_path: str = ""      # path to market index JSON; "" = off
     regime_ma_window: int = 50       # MA window for regime check
     regime_require_above_ma: bool = True  # require index > MA at signal time
+    # Separate path for the volatility filter. It is deliberately NOT
+    # shared with regime_index_path: the regime filter is harmful (it
+    # removes the good trades) and must stay off independently.
+    volatility_index_path: str = ""  # path to market index JSON; "" = off
+    # Market VOLATILITY filter. 0 = off.
+    #
+    # This is the only market feature whose separation runs in the
+    # expected direction. A feature screen over 256 trades (2019-2026)
+    # split each trade by market feature and compared the buckets:
+    #
+    #   feature                 low win%  high win%   low avg   high avg
+    #   index vs MA50            69.8%      62.0%     +4.37%    +1.91%
+    #   index momentum 20/60     65.6%      64.8%     +3.24%    +2.62%
+    #   index drawdown peak      69.2%      62.5%     +3.59%    +2.38%
+    #   breadth % above MA50     67.2%      63.3%     +4.08%    +1.78%
+    #   index volatility 20/60   62.5%      68.0%     +2.53%    +3.32%  <- only one
+    #
+    # Every trend/level feature had the separation running the WRONG way:
+    # trades taken in a WEAKER market did better, so a "trade only when the
+    # market is strong" filter removes the good trades. Market volatility
+    # is the exception — breakouts work better in a moving market.
+    #
+    # The threshold is the index's daily stdev over the window, as a
+    # percentage (1.4 = 1.4% daily standard deviation).
+    min_market_volatility_pct: float = 0.0
+    max_market_volatility_pct: float = 0.0  # 0 = no upper bound
+    market_volatility_window: int = 20       # bars for the volatility calc
     sector_data_path: str = ""       # path to symbols.json with sectorName; "" = off
     sector_momentum_window: int = 60  # days for sector momentum calculation
     sector_min_momentum: float = 0.0  # filter: only trade sectors with momentum > this

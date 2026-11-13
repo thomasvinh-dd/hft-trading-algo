@@ -13,6 +13,7 @@ shares) is defined here for backward compat.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -70,6 +71,46 @@ def _conviction(volume, avg_vol, cfg):
     if volume >= cfg.high_conviction_mult * avg_vol:
         return "high"
     return "low"
+
+
+def _market_volatility_pct(market_bars, target_date, window):
+    """Realized daily volatility of the index at ``target_date``, in percent.
+
+    Returns None when there is not enough history.
+    """
+    if not market_bars:
+        return None
+    relevant = [b for b in market_bars if b.date <= target_date]
+    if len(relevant) < window + 1:
+        return None
+    rets = []
+    for i in range(len(relevant) - window, len(relevant)):
+        prev, cur = relevant[i - 1].close, relevant[i].close
+        if prev > 0:
+            rets.append(cur / prev - 1)
+    if len(rets) < window - 1:
+        return None
+    return statistics.pstdev(rets) * 100
+
+
+def _market_volatility_ok(breakout_bar, cfg, market_bars):
+    """Require the market to be volatile enough (and not too volatile).
+
+    Off unless ``min_market_volatility_pct`` (or the max) is set.
+    """
+    min_pct = getattr(cfg.breakout, "min_market_volatility_pct", 0.0) or 0.0
+    max_pct = getattr(cfg.breakout, "max_market_volatility_pct", 0.0) or 0.0
+    if min_pct <= 0 and max_pct <= 0:
+        return True
+    window = getattr(cfg.breakout, "market_volatility_window", 20) or 20
+    vol = _market_volatility_pct(market_bars, breakout_bar.date, window)
+    if vol is None:
+        return True  # not enough data — allow trading
+    if min_pct > 0 and vol < min_pct:
+        return False
+    if max_pct > 0 and vol > max_pct:
+        return False
+    return True
 
 
 def _regime_ok(breakout_bar, cfg, market_bars):
@@ -171,7 +212,8 @@ def _vol_targeted_size_pct(atr_value, entry_price, cfg, conviction):
 
 
 def generate_signal(bars, base, *args, as_of_idx=None, upcoming_ca=None,
-                    market_bars=None, sector_momentum_by_date=None,
+                    market_bars=None, volatility_bars=None,
+                    sector_momentum_by_date=None,
                     ml_model=None, nav=None, cfg=None):
     """Generate a Signal.
 
@@ -214,6 +256,7 @@ def generate_signal(bars, base, *args, as_of_idx=None, upcoming_ca=None,
     sig = _generate_pure_signal(
         bars, base, cfg, as_of_idx=as_of_idx,
         upcoming_ca=upcoming_ca, market_bars=market_bars,
+        volatility_bars=volatility_bars,
         sector_momentum_by_date=sector_momentum_by_date,
         ml_model=ml_model,
     )
@@ -229,7 +272,8 @@ def generate_signal(bars, base, *args, as_of_idx=None, upcoming_ca=None,
 
 
 def _generate_pure_signal(bars, base, cfg, *, as_of_idx, upcoming_ca,
-                           market_bars, sector_momentum_by_date, ml_model):
+                           market_bars, volatility_bars,
+                           sector_momentum_by_date, ml_model):
     """Pure signal: no sizing, just the opportunity with exit levels."""
     breakout_idx = base.end_idx + 1
     if as_of_idx is None:
@@ -266,6 +310,11 @@ def _generate_pure_signal(bars, base, cfg, *, as_of_idx, upcoming_ca,
 
     # Market regime filter
     if not _regime_ok(breakout_bar, cfg, market_bars):
+        return None
+
+    # Market volatility filter. Off by default; see BreakoutConfig for
+    # why volatility is the one market feature that helps.
+    if not _market_volatility_ok(breakout_bar, cfg, volatility_bars):
         return None
 
     # Sector rotation filter

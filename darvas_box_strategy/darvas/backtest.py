@@ -85,7 +85,8 @@ class BacktestResult:
 
 
 def _scan_ticker(bars, ticker, cfg, *, dividend_per_share=None, upcoming_ca=None,
-                  market_bars=None, sector_momentum_by_date=None,
+                  market_bars=None, volatility_bars=None,
+                  sector_momentum_by_date=None,
                   ml_model=None):
     """Yield simulated TradeResults for every signal in the bars."""
     if len(bars) < cfg.breakout.min_history_days:
@@ -99,6 +100,7 @@ def _scan_ticker(bars, ticker, cfg, *, dividend_per_share=None, upcoming_ca=None
         signal = generate_signal(
             bars, base, nav=nav, cfg=cfg, as_of_idx=i,
             upcoming_ca=upcoming_ca, market_bars=market_bars,
+            volatility_bars=volatility_bars,
             sector_momentum_by_date=sector_momentum_by_date,
             ml_model=ml_model,
         )
@@ -295,12 +297,21 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
         adjust_prices = False
     result.ca_applied = bool(adjust_prices)
 
-    # Load market index bars if regime filter is configured
+    # Load market index bars if any market filter is configured.
+    # The regime filter and the market-volatility filter have SEPARATE
+    # paths: the regime filter is harmful and must be switchable without
+    # affecting the volatility filter.
     market_bars = None
     if cfg.breakout.regime_index_path:
         path = Path(cfg.breakout.regime_index_path)
         if path.exists():
             market_bars = load_price_bars(path)
+
+    volatility_bars = None
+    if cfg.breakout.volatility_index_path:
+        vpath = Path(cfg.breakout.volatility_index_path)
+        if vpath.exists():
+            volatility_bars = load_price_bars(vpath)
 
     # Build sector momentum map if sector filter is configured
     sector_momentum_by_date = None
@@ -376,6 +387,7 @@ def run_backtest(cfg, *, prices_dir=DEFAULT_PRICES_DIR, tickers=None,
             dividend_per_share=dividend_per_share,
             upcoming_ca=ticker_events,
             market_bars=market_bars,
+            volatility_bars=volatility_bars,
             sector_momentum_by_date=sector_momentum_by_date,
             ml_model=ml_model,
         ):
@@ -460,12 +472,21 @@ def run_backtest_with_portfolio(
     if adjust_prices is ...:
         adjust_prices = False
 
-    # Load market index bars if regime filter is configured
+    # Load market index bars if any market filter is configured.
+    # The regime filter and the market-volatility filter have SEPARATE
+    # paths: the regime filter is harmful and must be switchable without
+    # affecting the volatility filter.
     market_bars = None
     if cfg.breakout.regime_index_path:
         path = Path(cfg.breakout.regime_index_path)
         if path.exists():
             market_bars = load_price_bars(path)
+
+    volatility_bars = None
+    if cfg.breakout.volatility_index_path:
+        vpath = Path(cfg.breakout.volatility_index_path)
+        if vpath.exists():
+            volatility_bars = load_price_bars(vpath)
 
     # Build sector momentum map
     sector_momentum_by_date = None
@@ -573,6 +594,7 @@ def run_backtest_with_portfolio(
                 bars, base, cfg, as_of_idx=bar_idx,
                 upcoming_ca=ticker_events_by_ticker.get(ticker),
                 market_bars=market_bars,
+                volatility_bars=volatility_bars,
                 sector_momentum_by_date=sector_momentum_by_date,
                 ml_model=ml_model,
             )
