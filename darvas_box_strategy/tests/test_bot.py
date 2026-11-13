@@ -142,6 +142,46 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(cfg.exits.sl_T_pct, 0.10)
         self.assertEqual(cfg.exits.sl_F_pct, 0.18)
 
+    def test_default_config_enables_the_market_volatility_filter(self):
+        """The market-volatility filter is ON in production.
+
+        It is the only market feature whose separation runs the
+        expected direction, and on the corrected NAV accounting it
+        raises the return AND cuts the drawdown on both halves of the
+        walk-forward split:
+
+            config          TEST ret   TEST dd   TRAIN dd   win%
+            without filter    +80.8%   -17.78%    -11.00%   63.1%
+            with filter      +110.6%   -15.01%     -8.99%   66.8%
+        """
+        from darvas_box_strategy.bot.cli import build_default_config
+        cfg = build_default_config()
+        self.assertEqual(cfg.breakout.min_market_volatility_pct, 1.2)
+        self.assertEqual(cfg.breakout.market_volatility_window, 20)
+        self.assertTrue(
+            cfg.breakout.volatility_index_path,
+            "the volatility filter needs an index to read",
+        )
+
+    def test_default_config_does_not_enable_the_harmful_regime_filter(self):
+        """The regime filter (index above its MA) removes the GOOD trades.
+
+        A feature screen over 256 trades found the separation running
+        the wrong way for every trend/level feature: trades taken in a
+        WEAKER market did better. It must stay off, and it must stay
+        independently switchable from the volatility filter.
+        """
+        from darvas_box_strategy.bot.cli import build_default_config
+        cfg = build_default_config()
+        self.assertEqual(cfg.breakout.regime_index_path, "")
+
+    def test_the_market_index_file_exists(self):
+        """The volatility filter reads the index from disk."""
+        from pathlib import Path
+        from darvas_box_strategy.bot.cli import build_default_config
+        cfg = build_default_config()
+        self.assertTrue(Path(cfg.breakout.volatility_index_path).exists())
+
 
 class ReportFormatTests(unittest.TestCase):
     """Tests for report formatting (without full backtest)."""

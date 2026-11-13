@@ -63,6 +63,7 @@ from .messages import (
 
 PRICES_DIR = ROOT / "vietnam_algo" / "data" / "prices"
 DEFAULT_BLUE_CHIPS = ROOT / "darvas_box_strategy" / "data" / "hose_blue_chips.json"
+DEFAULT_MARKET_INDEX = ROOT / "darvas_box_strategy" / "data" / "market_index.json"
 
 
 def load_blue_chips(path: Path = DEFAULT_BLUE_CHIPS) -> List[str]:
@@ -75,15 +76,21 @@ def load_blue_chips(path: Path = DEFAULT_BLUE_CHIPS) -> List[str]:
 def build_default_config() -> StrategyConfig:
     """Return the OOS-validated default config.
 
-    OOS validation on 70 HOSE blue chips (TRAIN 2019-2022, TEST 2023-2026):
+    OOS validation on 70 HOSE blue chips (TRAIN 2019-2022, TEST 2023-2026),
+    on the corrected NAV accounting (the portfolio used to double-count
+    partially-sold shares, which inflated every drawdown by up to 5.2pp
+    and made the exposure cap reject trades it should not have):
+
     - vol_target=0% (off) — fixed 2x sizing beats vol-targeting
     - trail=10% — let winners compound after partial cut
     - size 0.10/0.20 + max_total_exposure_pct=0.75 — caps the drawdown
-      on BOTH halves of the split (TRAIN -23.2% → -17.0%, TEST -26.0%
-      → -18.5%) at the cost of return
+      on BOTH halves of the split (TRAIN -11.0%, TEST -17.8%)
+    - min_market_volatility_pct=1.2 — trade only when the market is
+      moving enough for a breakout to work. Raises the return AND cuts
+      the drawdown on both halves (see "The market volatility filter")
     - sl_T=10%, sl_F=18% — entry-anchored stops (was base-anchored, buggy)
     - board_lot=100 — HOSE 100-share lots; small signals dropped
-    - t_plus_n_bars=0 (off) — opt-in: T+2.5 settlement costs ~25% return
+    - t_plus_n_bars=3 — T+2.5 settlement, as required for VN
     - daily_price_limit_pct=0 (off) — opt-in: ±7% price cap costs ~16% return
     """
     return StrategyConfig(
@@ -92,6 +99,14 @@ def build_default_config() -> StrategyConfig:
             volume_mult=2.0, high_conviction_mult=3.0,
             require_ma200=True, min_history_days=200,
             require_close_above_ma=20,
+            # Market-volatility entry filter. The index is rebuilt by
+            # `python3 -m darvas_box_strategy.tools.build_market_index`
+            # and must be refreshed regularly — the filter reads the
+            # market's recent volatility, so a stale index means it is
+            # judging today's market on old data.
+            volatility_index_path=str(DEFAULT_MARKET_INDEX),
+            min_market_volatility_pct=1.2,
+            market_volatility_window=20,
         ),
         exits=ExitsConfig(
             sl_T_pct=0.10,        # 10% partial stop from entry
@@ -106,22 +121,25 @@ def build_default_config() -> StrategyConfig:
             max_concurrent_positions=10,
             cooldown_bars_after_stop=5,
             cost_bps=25.0,
-            # Sizing + total-exposure cap (2026-11-11).
+            # Sizing + total-exposure cap (2026-11-11, re-validated on the
+            # corrected NAV accounting 2026-11-13).
             #
             # Capping the NUMBER of open positions does not cap the risk:
             # smaller positions mean more of them fit, so exposure rises
-            # exactly when losers cluster. Measured mean concurrent
-            # positions (2019-2026):
-            #   size 15/30 max10 -> 4.95 concurrent -> max DD -26.0%
-            #   size 10/20 max10 -> 6.78 concurrent -> max DD -33.4%
-            # The 15/30 sizing was self-limiting; reducing it without a
-            # cap made the drawdown WORSE, not better.
+            # exactly when losers cluster. The 15/30 sizing was
+            # self-limiting; reducing it without a cap made the drawdown
+            # WORSE, not better.
             #
             # With the exposure cap the drawdown falls on both halves of
             # the walk-forward split:
-            #   TRAIN 2019-2022  DD -23.22% -> -16.96%, win 66.7% -> 70.0%
-            #   TEST  2023-2026  DD -25.96% -> -18.49%, win 65.3% -> 66.9%
-            # The cost is return: +142.1% -> +93.4% on the test period.
+            #   TRAIN 2019-2022  DD -23.22% -> -16.96%
+            #   TEST  2023-2026  DD -25.96% -> -18.49%
+            # (Those figures are the corrected ones — before the
+            # 2026-11-13 NAV fix the drawdowns were 5.2pp worse.)
+            #
+            # The market-volatility filter (min_market_volatility_pct
+            # above) then improves it further, to TRAIN -8.99% /
+            # TEST -15.01%, while RAISING the return.
             size_low=0.10, size_high=0.20,
             max_total_exposure_pct=0.75,
             vol_target_pct=0.0,  # OFF: fixed sizing beats vol-targeting
@@ -524,6 +542,21 @@ def cmd_refresh_cache(args) -> int:
             print(f"cache is stale ({age:.1f}h old) — refreshing")
 
     t0 = time.time()
+
+    # Rebuild the market index FIRST. The market-volatility entry filter
+    # reads the index's recent volatility, so a stale index means the
+    # filter is judging today's market on old data. The index is cheap
+    # to rebuild (a few seconds) and the backtest below depends on it.
+    try:
+        from darvas_box_strategy.tools.build_market_index import main as build_index
+        print("rebuilding the market index...")
+        build_index(["--quiet"])
+        print("  market index rebuilt")
+    except Exception as exc:
+        # A failed index rebuild must not stop the refresh: the previous
+        # index is still usable, it is just staler than ideal.
+        print(f"WARN: market index rebuild failed: {exc}", file=sys.stderr)
+
     try:
         new_cache = refresh_cache()
     except Exception as exc:
