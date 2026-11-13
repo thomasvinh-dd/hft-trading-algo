@@ -715,9 +715,13 @@ weaker setups.
 | `high_conviction_mult` | 3.0 | Volume mult above which conviction is "high" |
 | `require_ma200` | True | Require close > 200-day MA |
 | `require_close_above_ma` | 20 | Require close > 20-day MA |
-| `regime_index_path` | "" | Optional path to a market index for regime filter |
+| `regime_index_path` | "" | Optional path to a market index for regime filter. **Off** — this filter removes the good trades, see [The market volatility filter](#the-market-volatility-filter-2026-11-13) |
 | `regime_ma_window` | 50 | MA window for the regime filter |
 | `regime_require_above_ma` | True | Only allow signals when index > MA |
+| `volatility_index_path` | `data/market_index.json` | Path to the market index the volatility filter reads |
+| `min_market_volatility_pct` | 1.2 | Only trade when the market's daily volatility is at least this (%). 0 = off |
+| `max_market_volatility_pct` | 0.0 | Reject trades above this volatility. 0 = no upper bound |
+| `market_volatility_window` | 20 | Bars used for the volatility calculation |
 
 ### Profit-taking (`ExitsConfig.tiers`)
 
@@ -1312,6 +1316,95 @@ return is a more honest number too.
 Six regression tests in `PortfolioNavTests` cover the round trip, the
 partial sale, the exposure and the mark-to-market. They were checked
 against the pre-fix code: the NAV test detects a 110,000,000 error.
+
+## The market volatility filter (2026-11-13)
+
+The production config trades only when the market is **moving enough for
+a breakout to work**:
+
+```python
+breakout=BreakoutConfig(
+    volatility_index_path="darvas_box_strategy/data/market_index.json",
+    min_market_volatility_pct=1.2,   # daily stdev of the index, in %
+    market_volatility_window=20,
+)
+```
+
+The threshold is the index's realised daily volatility over 20 bars. It
+is **point-in-time** — only bars up to the signal date are used — and a
+missing index leaves trading unrestricted rather than silently blocking
+every signal.
+
+### Why volatility and not "is the market strong?"
+
+The obvious filter is "only trade when the market is up". A screen over
+256 trades (2019-2026) split every trade by market feature and compared
+the two halves:
+
+| feature | low win% | high win% | low avg | high avg |
+|---|---:|---:|---:|---:|
+| index vs MA50 | 69.8% | 62.0% | +4.37% | +1.91% |
+| index momentum 20/60 | 65.6% | 64.8% | +3.24% | +2.62% |
+| index drawdown from peak | 69.2% | 62.5% | +3.59% | +2.38% |
+| breadth, % above MA50 | 67.2% | 63.3% | +4.08% | +1.78% |
+| **index volatility 20/60** | **62.5%** | **68.0%** | **+2.53%** | **+3.32%** |
+
+For **every trend and level feature the separation runs the wrong way**:
+the trades taken in the *weaker* market did better. A "trade only in a
+strong market" filter removes the good trades — running it end to end
+cost 39-114pp of return. Volatility is the only feature where the
+separation points the way the intuition expects.
+
+That makes sense mechanically: a breakout needs movement. A quiet
+market gives false breakouts that stop out, while a moving market lets
+the winners run.
+
+### Walk-forward validation
+
+70 HOSE blue chips, TRAIN 2019-2022 / TEST 2023-2026, on the corrected
+NAV accounting:
+
+| config | TEST ret | TEST DD | TRAIN DD | win% | trades |
+|---|---:|---:|---:|---:|---:|
+| 10/20 exp0.75 (no filter) | +80.8% | -17.78% | -11.00% | 63.1% | 344 |
+| **+ minvol 1.2** | **+110.6%** | **-15.01%** | **-8.99%** | **66.8%** | 217 |
+| + minvol 1.3 | +107.0% | -16.79% | -9.00% | 66.8% | 208 |
+| + minvol 1.2 + exp0.60 | +98.7% | -13.74% | -7.52% | 68.5% | 187 |
+| + minvol 1.0 | +93.3% | -14.58% | -11.68% | 63.8% | 243 |
+| + minvol 1.4 | +63.5% | -13.78% | -9.01% | 63.7% | 179 |
+
+`minvol 1.2` is the only variant that does all three at once:
+
+- **return +29.8pp** (+80.8% → +110.6%)
+- **drawdown 2.8pp better** (-17.78% → -15.01%), and better on the
+  train half too (-11.00% → -8.99%)
+- **win rate +3.7pp** (63.1% → 66.8%)
+
+`minvol 1.4` gives the best drawdown but costs 17pp of return, and
+`minvol 1.0` improves the test drawdown while making the train drawdown
+worse — so neither passes the walk-forward rule.
+
+### The index has to be fresh
+
+The filter reads the market's *recent* volatility, so a stale index
+means it judges today's market on old data. The index is rebuilt by:
+
+```bash
+python3 -m darvas_box_strategy.tools.build_market_index
+```
+
+The `refresh-cache` command runs this before the backtest, and a daily
+cron job (17:20 ICT) rebuilds it. The bundled index is the equal-weight
+mean close of the 70 blue chips, on every date where at least 30 of
+them have a bar.
+
+### The regime filter stays off
+
+The regime filter (`regime_index_path`) is the "index above its MA"
+filter, and it is the one that **hurts**. It stays off, and it reads
+its **own** index path (`regime_index_path` vs
+`volatility_index_path`) so it can be switched on without affecting
+the volatility filter.
 
 ## Tests
 
