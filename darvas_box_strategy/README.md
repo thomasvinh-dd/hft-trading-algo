@@ -1256,6 +1256,63 @@ If a `-18.5%` drawdown is still too much, `exposure 0.65 + size 10/20`
 gives `-18.8%` on test and `-12.6%` on train — but the return drops to
 +65.4%, so the extra risk reduction is not worth it on the test period.
 
+## The NAV double-counting bug (2026-11-13)
+
+Every drawdown number above this section was **too pessimistic**. The
+portfolio overstated its NAV by up to **207M (21% of NAV)**, which made
+the reported max drawdown `-18.49%` when the real one was `-13.25%`.
+
+### What was wrong
+
+`Portfolio.get_nav()` computed
+
+```python
+cash + sum(p.shares * p.last_close for p in open_positions.values())
+```
+
+using the **original** share count — while the proceeds of the shares
+already sold by the take-profit ladder were only credited to `cash`
+when the position **fully** closed. Until then:
+
+- `cash` still had the whole entry cost debited, and
+- the shares already sold were still counted at the current price.
+
+So every partially-sold position was counted **twice**: once as a
+mark-to-market position and once via the cash that had not yet been
+credited. The longer a position ran through the tier ladder, the bigger
+the phantom NAV.
+
+`get_open_exposure()` had the same defect, so the total-exposure cap
+was binding against an overstated exposure — it was rejecting valid
+trades early. That is why the trade count jumped from 260 to 344 once
+the bug was fixed.
+
+### The fix
+
+- `_sell_partial` credits the cash as each sale happens, so the entry
+  cost and the sale proceeds are never both missing or both counted.
+- `_archive_position` no longer credits `cumulative_proceeds` a second
+  time.
+- `get_nav()` and `get_open_exposure()` use `p.remaining`, not `p.shares`.
+
+### What it changes
+
+| | before the fix | after the fix |
+|---|---:|---:|
+| return (2019-2026) | +92.7% | +80.8% |
+| max DD (2019-2026) | -18.49% | **-17.78%** |
+| max DD (train 2019-2022) | -16.96% | **-11.00%** |
+| trades | 260 | 344 |
+
+The return falls because the exposure cap was rejecting trades it should
+not have rejected, and because a position that is partly sold is now
+marked correctly — the strategy is taking slightly more risk, so the
+return is a more honest number too.
+
+Six regression tests in `PortfolioNavTests` cover the round trip, the
+partial sale, the exposure and the mark-to-market. They were checked
+against the pre-fix code: the NAV test detects a 110,000,000 error.
+
 ## Tests
 
 ```bash
