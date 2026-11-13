@@ -276,6 +276,22 @@ def cmd_scan_signals(args) -> int:
     from darvas_box_strategy.darvas.base_detector import BaseScanner
     from darvas_box_strategy.darvas.signal_generator import generate_signal
 
+    # Load the market index so the entry filters see the same market
+    # context the backtest does. Without this the scan would alert
+    # signals that the volatility filter would reject.
+    market_bars = None
+    volatility_bars = None
+    if cfg.breakout.regime_index_path:
+        from darvas_box_strategy.darvas.data_loader import load_price_bars
+        p = Path(cfg.breakout.regime_index_path)
+        if p.exists():
+            market_bars = load_price_bars(p)
+    if cfg.breakout.volatility_index_path:
+        from darvas_box_strategy.darvas.data_loader import load_price_bars
+        p = Path(cfg.breakout.volatility_index_path)
+        if p.exists():
+            volatility_bars = load_price_bars(p)
+
     # Scan the last few bars for breakout signals
     as_of_offset = args.lookback  # 0 = today, 1 = yesterday, etc.
     signals = []
@@ -293,6 +309,8 @@ def cmd_scan_signals(args) -> int:
         signal = generate_signal(
             bars, base, nav=cfg.backtest.start_nav, cfg=cfg,
             as_of_idx=idx,
+            market_bars=market_bars,
+            volatility_bars=volatility_bars,
         )
         if signal is None:
             continue

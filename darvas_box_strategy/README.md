@@ -1398,6 +1398,14 @@ cron job (17:20 ICT) rebuilds it. The bundled index is the equal-weight
 mean close of the 70 blue chips, on every date where at least 30 of
 them have a bar.
 
+> **Operational note.** A failed `refresh-cache` leaves the previous
+> cache in place, so the dashboard keeps serving the old numbers. The
+> `check-stale` job (09:20 ICT) alerts on Telegram when that happens —
+> it fired once on 2026-11-13 when a refresh failed mid-edit. If the
+> dashboard shows old numbers after a config change, check
+> `/root/logs/darvas_cache.log` before assuming the change did not
+> work.
+
 ### The regime filter stays off
 
 The regime filter (`regime_index_path`) is the "index above its MA"
@@ -1405,6 +1413,13 @@ filter, and it is the one that **hurts**. It stays off, and it reads
 its **own** index path (`regime_index_path` vs
 `volatility_index_path`) so it can be switched on without affecting
 the volatility filter.
+
+> The `web/data.py` scan and position paths call `generate_signal`
+> without the index bars, so the filter does not apply to the
+> *dashboard's* current-signal list — only to the backtest. The signal
+> count on the dashboard can therefore be higher than the number of
+> trades the backtest would take. That is a reporting difference, not a
+> strategy difference.
 
 ## Tests
 

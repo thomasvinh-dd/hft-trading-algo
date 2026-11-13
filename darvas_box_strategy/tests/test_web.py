@@ -198,6 +198,66 @@ class WebCacheTests(unittest.TestCase):
         self.assertEqual(c.backtest, {})
 
 
+class MarketIndexInScanTests(unittest.TestCase):
+    """The web scan paths must apply the same market filters as the
+    backtest.
+
+    The scan paths call generate_signal() directly. Without the index
+    bars the market-volatility filter is a no-op there, so the dashboard
+    would report signals the backtest would never take — and the
+    Telegram entry alerts would fire on trades the strategy would not
+    have made.
+    """
+
+    def test_load_market_index_bars_returns_the_volatility_index(self):
+        from darvas_box_strategy.bot.cli import build_default_config
+        from darvas_box_strategy.web.data import load_market_index_bars
+        cfg = build_default_config()
+        market_bars, volatility_bars = load_market_index_bars(cfg)
+        self.assertIsNone(market_bars,
+                          "the regime filter is off, so no regime index is loaded")
+        self.assertIsNotNone(volatility_bars,
+                             "the volatility filter needs the index")
+        self.assertGreater(len(volatility_bars), 100)
+
+    def test_load_market_index_bars_handles_a_missing_file(self):
+        """A missing index must not raise — it just leaves the filter off."""
+        from darvas_box_strategy.bot.cli import build_default_config
+        from darvas_box_strategy.web.data import load_market_index_bars
+        from dataclasses import replace
+        cfg = build_default_config()
+        br = replace(cfg.breakout, volatility_index_path="/nonexistent/x.json")
+        cfg = replace(cfg, breakout=br)
+        market_bars, volatility_bars = load_market_index_bars(cfg)
+        self.assertIsNone(volatility_bars)
+
+    def test_every_generate_signal_call_passes_the_index(self):
+        """Guard against a new call site forgetting the index bars."""
+        import ast
+        from pathlib import Path
+        src = Path("darvas_box_strategy/web/data.py").read_text()
+        tree = ast.parse(src)
+
+        calls = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "id", None) or getattr(func, "attr", None)
+            if name != "generate_signal":
+                continue
+            calls.append(node)
+
+        self.assertGreaterEqual(len(calls), 3,
+                                "expected the three scan call sites")
+        for call in calls:
+            kws = {k.arg for k in call.keywords}
+            self.assertIn("market_bars", kws,
+                          "generate_signal() call is missing market_bars")
+            self.assertIn("volatility_bars", kws,
+                          "generate_signal() call is missing volatility_bars")
+
+
 class SignalToDictTests(unittest.TestCase):
     """Validate the _signal_to_dict shape — this dict is consumed by the
     frontend and breaking it would silently break the UI."""
