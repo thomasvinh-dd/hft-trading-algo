@@ -557,5 +557,174 @@ class PortfolioExposureCapTests(unittest.TestCase):
         self.assertIsNone(second, "max_concurrent_positions must still be enforced")
 
 
+class PortfolioNavTests(unittest.TestCase):
+    """The NAV must not double-count shares that were already sold.
+
+    Regression test for a bug that made the reported max drawdown
+    -18.49% when the real one was -13.25%.
+
+    The take-profit ladder sells part of a position over time. The
+    proceeds of those sales have to land in cash as the sales happen.
+    If they only land when the position fully closes, and the NAV
+    counts the ORIGINAL share count at the current price, then the sold
+    shares are counted twice: once as a mark-to-market position and
+    once via the cash that was never credited.
+
+    The overstatement reached 207M — 21% of NAV — and it made the
+    drawdown look 5.2pp worse than it was.
+    """
+
+    def _cfg(self, tiers=((1.10, 0.5),)):
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        return StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(),
+            exits=ExitsConfig(t_plus_n_bars=0, tiers=tiers),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(
+                start_nav=1e9, size_low=0.20, size_high=0.40,
+                cost_bps=0.0, board_lot=100,
+            ),
+        )
+
+    def _make_signal(self, ticker, price=10_000):
+        from darvas_box_strategy.darvas.signals import Signal
+        from dataclasses import dataclass
+
+        @dataclass
+        class FakeBase:
+            ticker: str = "X"
+            base_low: float = 9_800
+            base_high: float = 10_000
+            end_idx: int = 0
+            days_in_base: int = 5
+            volume_compression: float = 1.0
+
+        return Signal(
+            ticker=ticker, signal_date=date(2026, 1, 9),
+            entry_date=date(2026, 1, 10), entry_price=price,
+            base=FakeBase(),
+            sl_F=price * 0.8, sl_T=price * 0.9,
+            tiers=((1.10, 0.5),), conviction="low",
+            atr_value=None, bars_remaining=100,
+            extra={"avg_vol": 10_000_000},
+        )
+
+    def test_nav_is_unchanged_by_a_partial_take_profit(self):
+        """Selling half a position at a gain must raise the NAV by the
+        gain, and must not raise it by anything more."""
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(), start_nav=1e9)
+        portfolio.process_signal(self._make_signal("A"))
+        pos = portfolio.open_positions["A"]
+        shares = pos.shares
+        entry = pos.entry_price
+
+        # Mark at the entry price: the position is worth its cost, so the
+        # NAV is just the cash left after buying.
+        portfolio.process_bar(date(2026, 1, 10), {"A": entry})
+        nav_before = portfolio.get_nav()
+
+        # Take-profit at +10%: half the shares are sold.
+        portfolio.process_bar(date(2026, 1, 12), {"A": entry * 1.10})
+        sold = shares // 2
+        self.assertEqual(pos.remaining, shares - sold)
+
+        # The NAV rises by the realised gain on the sold shares PLUS the
+        # mark-to-market on the shares still held.
+        nav_after = portfolio.get_nav()
+        expected = sold * (entry * 1.10 - entry) \
+            + (shares - sold) * (entry * 1.10 - entry)
+        self.assertAlmostEqual(
+            nav_after - nav_before, expected, delta=entry,
+            msg="NAV must rise by exactly the realised gain plus the "
+                "mark-to-market, not by more",
+        )
+
+    def test_nav_equals_cash_plus_remaining_shares(self):
+        """The NAV is cash plus the shares still held at the last price."""
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(), start_nav=1e9)
+        portfolio.process_signal(self._make_signal("A"))
+        pos = portfolio.open_positions["A"]
+        portfolio.process_bar(date(2026, 1, 12), {"A": pos.entry_price * 1.10})
+        # A tier sold half the shares.
+        self.assertLess(pos.remaining, pos.shares)
+        expected = portfolio.cash + pos.remaining * pos.last_close
+        self.assertAlmostEqual(portfolio.get_nav(), expected, places=2)
+
+    def test_exposure_uses_remaining_shares(self):
+        """The exposure cap must measure the shares still held."""
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(), start_nav=1e9)
+        portfolio.process_signal(self._make_signal("A"))
+        pos = portfolio.open_positions["A"]
+        portfolio.process_bar(date(2026, 1, 12), {"A": pos.entry_price * 1.10})
+        self.assertAlmostEqual(
+            portfolio.get_open_exposure(),
+            pos.remaining * pos.last_close, places=2,
+        )
+
+    def test_full_round_trip_nav_is_correct(self):
+        """Buy then sell: the NAV must equal the start NAV plus the P&L."""
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(), start_nav=1e9)
+        portfolio.process_signal(self._make_signal("A"))
+        pos = portfolio.open_positions["A"]
+        shares, entry = pos.shares, pos.entry_price
+
+        # Run the price up to +20%: the first tier sells half at +10%.
+        portfolio.process_bar(date(2026, 1, 12), {"A": entry * 1.20})
+        self.assertLess(pos.remaining, pos.shares,
+                        "the take-profit tier should have sold part")
+        sold_at_tier = pos.shares - pos.remaining
+
+        # Now the price falls to the trail, which closes the position.
+        portfolio.process_bar(date(2026, 1, 13), {"A": entry * 1.05})
+        self.assertNotIn("A", portfolio.open_positions,
+                         "the position should have closed")
+
+        # Half the shares sold at the tier price (+10%), the rest at the
+        # trail. The trail is locked to the tier price (trail_floor), so
+        # the rest also sell at +10%.
+        expected = (1e9
+                    + sold_at_tier * (entry * 1.10 - entry)
+                    + (shares - sold_at_tier) * (entry * 1.10 - entry))
+        self.assertAlmostEqual(portfolio.get_nav(), expected, delta=entry)
+
+    def test_nav_does_not_jump_on_a_partial_sale(self):
+        """The reported bug: the NAV jumped when a tier sold, because the
+        sold shares were marked a second time.
+
+        The size of the jump is the size of the overstatement: it was
+        up to 207M on the real backtest.
+        """
+        from darvas_box_strategy.darvas.portfolio import Portfolio
+        portfolio = Portfolio(self._cfg(), start_nav=1e9)
+        portfolio.process_signal(self._make_signal("A"))
+        pos = portfolio.open_positions["A"]
+        entry = pos.entry_price
+        portfolio.process_bar(date(2026, 1, 10), {"A": entry})
+        nav_before = portfolio.get_nav()
+
+        # The price rises to the first tier. Half the shares sell.
+        portfolio.process_bar(date(2026, 1, 12), {"A": entry * 1.10})
+        nav_after = portfolio.get_nav()
+
+        # A jump of more than the real gain means the sold shares are
+        # being counted twice.
+        sold = pos.shares - pos.remaining
+        real_gain = sold * (entry * 1.10 - entry)
+        mark_to_market = (pos.shares - sold) * (entry * 1.10 - entry)
+        self.assertLess(
+            nav_after - nav_before - mark_to_market, real_gain * 1.05,
+            "the NAV jumped by much more than the realised gain",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

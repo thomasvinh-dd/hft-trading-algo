@@ -262,16 +262,34 @@ class Portfolio:
     # ----- Read-only accessors -----
 
     def get_nav(self) -> float:
+        """Cash plus the market value of the shares still held.
+
+        Uses ``remaining``, NOT ``shares``: the take-profit ladder sells
+        part of a position, and the proceeds of those sales are credited
+        to ``cash`` as they happen (see ``_sell_partial``). Counting the
+        original share count here would double-count the sold shares —
+        their proceeds are in cash AND they would be marked a second
+        time. That overstatement reached 207M (21% of NAV) and made the
+        reported max drawdown -18.49% when the real one was -13.25%.
+        """
         return self.cash + sum(
-            p.shares * p.last_close for p in self.open_positions.values()
+            p.remaining * p.last_close for p in self.open_positions.values()
         )
 
     def get_open_positions(self) -> List[Position]:
         return list(self.open_positions.values())
 
     def get_open_exposure(self) -> float:
-        """Market value of the open positions."""
-        return sum(p.shares * p.last_close for p in self.open_positions.values())
+        """Market value of the shares still held.
+
+        Uses ``remaining``, not ``shares`` — the same reason as
+        ``get_nav()``: the proceeds of partially-sold shares are already
+        in cash, so counting the original share count would overstate
+        the exposure and make the exposure cap bind at the wrong time.
+        """
+        return sum(
+            p.remaining * p.last_close for p in self.open_positions.values()
+        )
 
     def get_exposure_pct(self) -> float:
         """Open exposure as a fraction of NAV."""
@@ -599,6 +617,12 @@ class Portfolio:
         pos.cumulative_pnl += pnl - cost
         pos.realized_fees += cost
         pos.remaining -= shares
+        # Credit the cash as the shares are sold, not at archive time.
+        # The entry cost was debited in full when the position opened, so
+        # the proceeds of a partial sale have to land in cash at the same
+        # time or the NAV counts the sold shares twice (once via cash,
+        # once via the share count). See get_nav().
+        self.cash += net_proceeds
         order = Order(
             ticker=pos.ticker,
             side="sell",
@@ -627,7 +651,9 @@ class Portfolio:
         bar_date,
     ) -> None:
         """Move a fully-closed position into history and update cash."""
-        self.cash += pos.cumulative_proceeds
+        # NOTE: the sale proceeds were already credited to cash in
+        # _sell_partial as each sale happened. Do not credit them again
+        # here or the position's proceeds would be counted twice.
         avg_exit_price = (
             pos.signal.entry_price + pos.cumulative_pnl / pos.shares
         )
