@@ -1384,6 +1384,63 @@ NAV accounting:
 `minvol 1.0` improves the test drawdown while making the train drawdown
 worse — so neither passes the walk-forward rule.
 
+### The threshold has to sit on a smooth surface
+
+A threshold picked on one split can be a spike fitted to noise. Moving
+the threshold by 0.1 at the **15/30** sizing swings the drawdown from
+-12% to -21% and the return from +81% to +169%:
+
+| minvol (15/30) | return | max DD | win% |
+|---|---:|---:|---:|
+| 1.0 | +104.2% | -21.17% | 65.3% |
+| 1.1 | +153.3% | -15.72% | 69.7% |
+| 1.2 | +148.1% | -14.57% | 68.7% |
+| 1.3 | +169.1% | -20.13% | 69.1% |
+| 1.4 | +81.0% | -12.13% | 67.7% |
+
+That surface is spiky, and the 15/30 sizing also fails the walk-forward
+rule on alternative splits (its train-half drawdown is *worse* than the
+10/20 sizing on splits A, B and C). So 15/30 was rejected despite
+looking better on the primary split.
+
+### Validation on alternative splits
+
+The adopted config was tuned on TRAIN 2019-2022 / TEST 2023-2026, so
+the threshold has to survive splits it was not tuned on. Each split
+below truncates the price data, so the test half really is a test.
+
+The filter improves the **drawdown in every window** (13 of 13 across
+both sizings):
+
+| window | 10/20 no filter | 10/20 with filter | Δret | Δdd |
+|---|---:|---:|---:|---:|
+| FULL 2019-2026 | +80.4% / -17.78% | +110.4% / -15.01% | +30.0pp | +2.77pp |
+| A train ≤2020 | +15.2% / -8.90% | +13.6% / -6.07% | -1.6pp | +2.83pp |
+| A test ≥2021 | +21.9% / -19.08% | +64.4% / -13.65% | +42.5pp | +5.43pp |
+| B train ≤2021 | +43.2% / -8.90% | +27.9% / -6.45% | -15.3pp | +2.45pp |
+| B test ≥2022 | +21.3% / -17.81% | +36.6% / -13.34% | +15.3pp | +4.47pp |
+| C train ≤2023 | +42.6% / -13.17% | +43.8% / -10.07% | +1.2pp | +3.10pp |
+| C test ≥2024 | +8.8% / -16.37% | +38.0% / -13.35% | +29.2pp | +3.02pp |
+| D test ≥2020 | +49.3% / -20.91% | +60.8% / -13.23% | +11.5pp | +7.68pp |
+
+The filter costs some return on the short train windows (there are only
+33-62 trades there, so a handful of filtered trades is a large share)
+and makes a lot on the test windows.
+
+### Why 15/30 sizing was rejected
+
+`15/30 + exp0.75 + minvol 1.2` looks better on the primary split
+(+148.1% / -14.57% vs +110.4% / -15.01%). It was still rejected:
+
+- its **train-half drawdown is worse** than the 10/20 sizing on splits
+  A (-7.60% vs -6.07%), B (-7.60% vs -6.45%) and C (-12.90% vs
+  -10.07%) — it fails the same rule the exposure cap had to pass;
+- its threshold surface is spiky (above), so the result is more likely
+  fitted to noise.
+
+The 10/20 sizing with the filter is the config that survives every
+check.
+
 ### The index has to be fresh
 
 The filter reads the market's *recent* volatility, so a stale index
