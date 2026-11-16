@@ -1386,22 +1386,35 @@ worse — so neither passes the walk-forward rule.
 
 ### The threshold has to sit on a smooth surface
 
-A threshold picked on one split can be a spike fitted to noise. Moving
-the threshold by 0.1 at the **15/30** sizing swings the drawdown from
--12% to -21% and the return from +81% to +169%:
+A threshold picked on one split can be a spike fitted to noise. The
+surface at the adopted **10/20** sizing:
 
-| minvol (15/30) | return | max DD | win% |
-|---|---:|---:|---:|
-| 1.0 | +104.2% | -21.17% | 65.3% |
-| 1.1 | +153.3% | -15.72% | 69.7% |
-| 1.2 | +148.1% | -14.57% | 68.7% |
-| 1.3 | +169.1% | -20.13% | 69.1% |
-| 1.4 | +81.0% | -12.13% | 67.7% |
+| minvol | FULL return | FULL DD | FULL win% | TRAIN DD | TRAIN win% |
+|---|---:|---:|---:|---:|---:|
+| no filter | +80.4% | -17.78% | 63.1% | -11.00% | 65.4% |
+| 0.9 | +67.0% | -15.46% | 61.6% | -11.49% | 63.2% |
+| 1.0 | +92.6% | -14.58% | 63.8% | -11.68% | 67.7% |
+| 1.05 | +76.0% | -17.17% | 63.0% | -11.49% | 64.6% |
+| 1.1 | +93.1% | -17.54% | 64.8% | -9.68% | 67.9% |
+| 1.15 | +95.7% | -15.99% | 66.8% | -9.21% | 67.3% |
+| **1.2** | **+110.4%** | **-15.01%** | **66.8%** | **-8.99%** | 66.0% |
+| 1.25 | +97.2% | -14.88% | 66.8% | -8.99% | 70.3% |
+| 1.3 | +106.8% | -16.79% | 66.8% | -9.00% | 68.5% |
+| 1.35 | +68.8% | -13.95% | 63.8% | -8.96% | 64.1% |
+| 1.4 | +63.3% | -13.78% | 63.7% | -9.01% | 65.8% |
 
-That surface is spiky, and the 15/30 sizing also fails the walk-forward
-rule on alternative splits (its train-half drawdown is *worse* than the
-10/20 sizing on splits A, B and C). So 15/30 was rejected despite
-looking better on the primary split.
+`1.2` sits on a plateau rather than a spike: 1.15 / 1.2 / 1.25 all beat
+the no-filter baseline on the drawdown, the win rate is flat at 66.8%
+across 1.15-1.3, and the train-half drawdown is flat at -8.99% to -9.21%
+across 1.15-1.4. Moving the threshold by 0.05 around 1.2 does not
+change the character of the result.
+
+The same sweep at **15/30** is spiky (the drawdown swings from -12.13%
+to -21.17% and the return from +81% to +169% as the threshold moves by
+0.1), and the 15/30 sizing also fails the walk-forward rule on
+alternative splits (its train-half drawdown is *worse* than the 10/20
+sizing on splits A, B and C). So 15/30 was rejected despite looking
+better on the primary split.
 
 ### Validation on alternative splits
 
