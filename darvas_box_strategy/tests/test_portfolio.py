@@ -505,14 +505,17 @@ class PortfolioExposureCapTests(unittest.TestCase):
         )
 
     def test_cap_is_enabled_in_the_production_config(self):
-        """The production config caps exposure at 75% of NAV.
+        """The production config caps exposure at 50% of NAV.
 
-        This is the setting that brings the max drawdown under -20% on
-        both halves of the walk-forward split.
+        This is the setting that brings the max drawdown down on both
+        halves of the walk-forward split. It was re-tuned from 75% to
+        50% on 2026-11-23, when the volatility band filter was adopted:
+        the band filter takes more trades (270 vs 217), so it needs a
+        tighter cap to hold the drawdown.
         """
         from darvas_box_strategy.bot.cli import build_default_config
         cfg = build_default_config()
-        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.75)
+        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.50)
 
     def test_cap_zero_disables_the_check(self):
         """A cap of 0 means 'off' — the dataclass default."""

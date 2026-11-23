@@ -126,16 +126,14 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(cfg.backtest.max_concurrent_positions, 10)
         self.assertEqual(cfg.backtest.cooldown_bars_after_stop, 5)
         self.assertEqual(cfg.backtest.vol_target_pct, 0.0)  # OFF: fixed sizing wins
-        # size_low=0.10, size_high=0.20 + max_total_exposure_pct=0.75
-        # (2026-11-11) — the drawdown cap. Capping the NUMBER of open
-        # positions does not cap the risk: smaller positions mean more of
-        # them fit, so exposure rises exactly when losers cluster. With
-        # the exposure cap the max drawdown falls on BOTH halves of the
-        # walk-forward split (TRAIN -23.2% -> -17.0%, TEST -26.0%
-        # -> -18.5%). See README "Reducing the drawdown".
+        # size_low=0.10, size_high=0.20 + max_total_exposure_pct=0.50
+        # (2026-11-11, re-tuned 2026-11-23) — the drawdown cap. Capping
+        # the NUMBER of open positions does not cap the risk: smaller
+        # positions mean more of them fit, so exposure rises exactly when
+        # losers cluster. See README "Reducing the drawdown".
         self.assertEqual(cfg.backtest.size_low, 0.10)
         self.assertEqual(cfg.backtest.size_high, 0.20)
-        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.75)
+        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.50)
         self.assertEqual(cfg.trailing.trail_mode, "pct")
         self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.10)  # trail after partial cut
         self.assertTrue(cfg.exits.use_entry_anchored_stops)
@@ -147,16 +145,28 @@ class DefaultConfigTests(unittest.TestCase):
 
         It is the only market feature whose separation runs the
         expected direction, and on the corrected NAV accounting it
-        raises the return AND cuts the drawdown on both halves of the
-        walk-forward split:
+        raises the return AND cuts the drawdown.
 
-            config          TEST ret   TEST dd   TRAIN dd   win%
-            without filter    +80.8%   -17.78%    -11.00%   63.1%
-            with filter      +110.6%   -15.01%     -8.99%   66.8%
+        It is a BAND filter, not a one-sided minimum. Bucketing all 350
+        unfiltered trades by the market volatility at entry:
+
+            regime              n    win%   sum ret%
+            <0.8 (dead)        65   78.5%        +4%
+            0.8-1.2 (calm)    100   46.0%        -1%   <- the only loser
+            1.2-1.6 (normal)   87   63.2%        +1%
+            >=1.6 (wild)       98   70.4%        +3%
+
+        The danger zone is a BAND, not a low level. A one-sided minimum
+        of 1.2 went silent for 48 consecutive bars and blocked every
+        signal, while throwing away the 78%-win-rate trades below 0.8.
         """
         from darvas_box_strategy.bot.cli import build_default_config
         cfg = build_default_config()
-        self.assertEqual(cfg.breakout.min_market_volatility_pct, 1.2)
+        self.assertEqual(
+            tuple(cfg.breakout.market_volatility_avoid_band_pct), (0.7, 1.3),
+        )
+        self.assertEqual(cfg.breakout.min_market_volatility_pct, 0.0,
+                         "the one-sided minimum must be OFF")
         self.assertEqual(cfg.breakout.market_volatility_window, 20)
         self.assertTrue(
             cfg.breakout.volatility_index_path,

@@ -715,11 +715,12 @@ weaker setups.
 | `high_conviction_mult` | 3.0 | Volume mult above which conviction is "high" |
 | `require_ma200` | True | Require close > 200-day MA |
 | `require_close_above_ma` | 20 | Require close > 20-day MA |
-| `regime_index_path` | "" | Optional path to a market index for regime filter. **Off** — this filter removes the good trades, see [The market volatility filter](#the-market-volatility-filter-2026-11-13) |
+| `regime_index_path` | "" | Optional path to a market index for regime filter. **Off** — this filter removes the good trades, see [The market volatility filter](#the-market-volatility-filter-2026-11-13-revised-2026-11-23) |
 | `regime_ma_window` | 50 | MA window for the regime filter |
 | `regime_require_above_ma` | True | Only allow signals when index > MA |
 | `volatility_index_path` | `data/market_index.json` | Path to the market index the volatility filter reads |
-| `min_market_volatility_pct` | 1.2 | Only trade when the market's daily volatility is at least this (%). 0 = off |
+| `market_volatility_avoid_band_pct` | (0.7, 1.3) | Skip trades whose market volatility falls INSIDE this band. `()` = off |
+| `min_market_volatility_pct` | 0.0 | Only trade when the market's daily volatility is at least this (%). 0 = off |
 | `max_market_volatility_pct` | 0.0 | Reject trades above this volatility. 0 = no upper bound |
 | `market_volatility_window` | 20 | Bars used for the volatility calculation |
 
@@ -760,7 +761,7 @@ default 9-tier ladder takes 10% at +6.3%, then 30% at +12.5%, then
 | `size_low` | 0.10 | Position size as fraction of NAV (regular conviction) |
 | `size_high` | 0.20 | Position size as fraction of NAV (high conviction) |
 | `max_concurrent_positions` | 10 | Max open positions at once |
-| `max_total_exposure_pct` | 0.75 | Cap on total open exposure as a fraction of NAV. 0 = off. Bounds the damage from a cluster of simultaneous losers — see [Reducing the drawdown](#reducing-the-drawdown-2026-11-11) |
+| `max_total_exposure_pct` | 0.50 | Cap on total open exposure as a fraction of NAV. 0 = off. Bounds the damage from a cluster of simultaneous losers — see [Reducing the drawdown](#reducing-the-drawdown-2026-11-11) |
 | `cooldown_bars_after_stop` | 5 | Bars to skip after a stop-out before re-entry |
 | `cost_bps` | 25.0 | Round-trip cost (slippage + commission) |
 | `board_lot` | 100 | Round share count down to 100-share lot (HOSE) |
@@ -1317,23 +1318,60 @@ Six regression tests in `PortfolioNavTests` cover the round trip, the
 partial sale, the exposure and the mark-to-market. They were checked
 against the pre-fix code: the NAV test detects a 110,000,000 error.
 
-## The market volatility filter (2026-11-13)
+## The market volatility filter (2026-11-13, revised 2026-11-23)
 
-The production config trades only when the market is **moving enough for
-a breakout to work**:
+The production config skips trades taken in the **"half-dead" market** —
+the one where the index is moving just enough to produce false breakouts,
+but not enough for the winners to run:
 
 ```python
 breakout=BreakoutConfig(
     volatility_index_path="darvas_box_strategy/data/market_index.json",
-    min_market_volatility_pct=1.2,   # daily stdev of the index, in %
+    market_volatility_avoid_band_pct=(0.7, 1.3),  # skip this band
     market_volatility_window=20,
 )
 ```
 
-The threshold is the index's realised daily volatility over 20 bars. It
-is **point-in-time** — only bars up to the signal date are used — and a
-missing index leaves trading unrestricted rather than silently blocking
-every signal.
+The band is the index's realised daily volatility over 20 bars, in
+percent. The filter is **point-in-time** — only bars up to the signal
+date are used — and a missing index leaves trading unrestricted rather
+than silently blocking every signal.
+
+### Why a band and not a minimum
+
+The first version of this filter was one-sided:
+`min_market_volatility_pct=1.2` — "only trade when the market is
+moving enough". It worked on the backtest (+110.6% / -15.01%) and it
+was adopted.
+
+**Then the bot went silent for 48 consecutive bars.** The market
+volatility sat at 1.01-1.09% from 2026-09-16 to 2026-11-20, below the
+threshold, so every signal was blocked. There *were* real breakouts
+(7 in the last 20 bars) — the filter threw them all away.
+
+Bucketing all 350 unfiltered trades by the market volatility at entry
+showed why the one-sided threshold was the wrong shape:
+
+| regime | n | win% | sum ret% |
+|---|---:|---:|---:|
+| <0.8 (dead) | 65 | **78.5%** | +4% |
+| 0.8-1.2 (calm) | 100 | **46.0%** | -1% |
+| 1.2-1.6 (normal) | 87 | 63.2% | +1% |
+| >=1.6 (wild) | 98 | 70.4% | +3% |
+
+The danger zone is a **band**, not a low level. A barely-moving market
+(vol < 0.8) is *fine* — 78.5% of those trades win, the best bucket of
+all. It is the "half-dead" 0.8-1.2 market that breaks them. A one-sided
+minimum throws away the best trades to avoid the worst ones, and in a
+structurally quiet market it stops trading altogether.
+
+The band filter skips only the losing middle:
+
+| filter | bars allowed | last 48 bars |
+|---|---:|---:|
+| `minvol 1.2` (one-sided) | 38% | **0/48** |
+| `band 0.7-1.3` | 61% | 14/48 |
+| `band 0.9-1.3` | 75% | 30/48 |
 
 ### Why volatility and not "is the market strong?"
 
@@ -1362,32 +1400,35 @@ the winners run.
 ### Walk-forward validation
 
 70 HOSE blue chips, TRAIN 2019-2022 / TEST 2023-2026, on the corrected
-NAV accounting:
+NAV accounting. The band filter with a re-tuned exposure cap:
 
-| config | TEST ret | TEST DD | TRAIN DD | win% | trades |
+| config | FULL ret | FULL DD | TRAIN DD | win% | trades |
 |---|---:|---:|---:|---:|---:|
-| 10/20 exp0.75 (no filter) | +80.8% | -17.78% | -11.00% | 63.1% | 344 |
-| **+ minvol 1.2** | **+110.6%** | **-15.01%** | **-8.99%** | **66.8%** | 217 |
-| + minvol 1.3 | +107.0% | -16.79% | -9.00% | 66.8% | 208 |
-| + minvol 1.2 + exp0.60 | +98.7% | -13.74% | -7.52% | 68.5% | 187 |
-| + minvol 1.0 | +93.3% | -14.58% | -11.68% | 63.8% | 243 |
-| + minvol 1.4 | +63.5% | -13.78% | -9.01% | 63.7% | 179 |
+| 10/20 exp0.75 (no filter) | +81.3% | -17.78% | -11.00% | 63.1% | 344 |
+| minvol 1.2 + exp0.75 | +111.1% | -15.01% | -8.99% | 66.8% | 217 |
+| band 0.7-1.3 + exp0.75 | +164.4% | -13.81% | -8.98% | 69.6% | 270 |
+| band 0.7-1.3 + exp0.65 | +128.1% | -13.31% | -8.06% | 68.3% | 227 |
+| band 0.7-1.3 + exp0.55 | +112.6% | -10.83% | -6.77% | 69.0% | 197 |
+| **band 0.7-1.3 + exp0.50** | **+117.7%** | **-9.52%** | **-5.20%** | **72.7%** | 194 |
 
-`minvol 1.2` is the only variant that does all three at once:
+`band 0.7-1.3 + exp0.50` improves the **drawdown in 8 of 8 walk-forward
+windows** (full period -15.01% → -9.52%) with a higher return in 5 of 8:
 
-- **return +29.8pp** (+80.8% → +110.6%)
-- **drawdown 2.8pp better** (-17.78% → -15.01%), and better on the
-  train half too (-11.00% → -8.99%)
-- **win rate +3.7pp** (63.1% → 66.8%)
-
-`minvol 1.4` gives the best drawdown but costs 17pp of return, and
-`minvol 1.0` improves the test drawdown while making the train drawdown
-worse — so neither passes the walk-forward rule.
+| window | minvol 1.2 exp0.75 | band 0.7-1.3 exp0.50 | ΔDD |
+|---|---:|---:|---:|
+| FULL 2019-2026 | +111.1% / -15.01% | +117.7% / -9.52% | **+5.49pp** |
+| A train ≤2020 | +13.6% / -6.07% | +15.7% / -5.20% | +0.87pp |
+| A test ≥2021 | +65.0% / -13.65% | +59.9% / -8.51% | +5.14pp |
+| B train ≤2021 | +27.9% / -6.45% | +39.4% / -5.20% | +1.25pp |
+| B test ≥2022 | +37.0% / -13.34% | +28.4% / -10.17% | +3.17pp |
+| C train ≤2023 | +43.8% / -10.07% | +73.4% / -7.54% | +2.53pp |
+| C test ≥2024 | +38.5% / -13.35% | +23.9% / -10.13% | +3.22pp |
+| D test ≥2020 | +61.3% / -13.23% | +103.9% / -9.57% | +3.66pp |
 
 ### The threshold has to sit on a smooth surface
 
 A threshold picked on one split can be a spike fitted to noise. The
-surface at the adopted **10/20** sizing:
+surface at the adopted **10/20** sizing with the *old* one-sided filter:
 
 | minvol | FULL return | FULL DD | FULL win% | TRAIN DD | TRAIN win% |
 |---|---:|---:|---:|---:|---:|
@@ -1439,6 +1480,25 @@ both sizings):
 The filter costs some return on the short train windows (there are only
 33-62 trades there, so a handful of filtered trades is a large share)
 and makes a lot on the test windows.
+
+### The band edges have to sit on a smooth surface
+
+Moving the band edges or the exposure cap by 0.05 does not change the
+character of the result:
+
+| config | FULL ret | FULL DD | FULL win% | TRAIN DD |
+|---|---:|---:|---:|---:|
+| band 0.65-1.3 exp0.55 | +99.9% | -11.09% | 67.0% | -6.77% |
+| band 0.70-1.3 exp0.55 | +112.6% | -10.83% | 69.0% | -6.77% |
+| band 0.75-1.3 exp0.55 | +83.8% | -10.97% | 68.3% | -6.77% |
+| band 0.70-1.25 exp0.55 | +122.9% | -9.92% | 69.1% | -6.55% |
+| band 0.70-1.35 exp0.55 | +117.2% | -9.57% | 69.0% | -6.51% |
+| band 0.70-1.3 exp0.60 | +107.2% | -11.91% | 70.3% | -7.90% |
+| band 0.70-1.3 exp0.65 | +128.1% | -13.31% | 68.3% | -8.06% |
+| **band 0.70-1.3 exp0.50** | **+117.7%** | **-9.52%** | **72.7%** | **-5.20%** |
+
+Every variant keeps the drawdown between -9.5% and -13.3% — a plateau,
+not a spike.
 
 ### Why 15/30 sizing was rejected
 

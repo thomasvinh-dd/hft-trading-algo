@@ -238,6 +238,117 @@ class MarketVolatilityFilterTests(unittest.TestCase):
         vol_mixed = _market_volatility_pct(mixed, bars[20].date, 20)
         self.assertAlmostEqual(vol_at_20, vol_mixed, places=6)
 
+
+class MarketVolatilityBandFilterTests(unittest.TestCase):
+    """The market-volatility BAND filter (the production setting).
+
+    A one-sided minimum threshold assumes "more volatility is always
+    better". Bucketing all 350 unfiltered trades by the market
+    volatility at entry says otherwise:
+
+        regime              n    win%   sum ret%
+        <0.8 (dead)        65   78.5%        +4%
+        0.8-1.2 (calm)    100   46.0%        -1%   <- the only loser
+        1.2-1.6 (normal)   87   63.2%        +1%
+        >=1.6 (wild)       98   70.4%        +3%
+
+    The danger zone is a BAND, not a low level. A barely-moving market
+    (vol < 0.8) is fine — 78.5% of those trades win. It is the
+    "half-dead" middle that breaks them.
+
+    This matters operationally: the one-sided minimum of 1.2 went SILENT
+    for 48 consecutive bars (the market sat at 1.01-1.09%), blocking
+    every signal while throwing away the good trades below 0.8.
+    """
+
+    def _cfg(self, **breakout_kw):
+        from darvas_box_strategy.darvas.config import (
+            StrategyConfig, BaseConfig, BreakoutConfig, BacktestConfig,
+            ExitsConfig, TrailingConfig, UniverseConfig,
+        )
+        return StrategyConfig(
+            base=BaseConfig(),
+            breakout=BreakoutConfig(**breakout_kw),
+            exits=ExitsConfig(),
+            trailing=TrailingConfig(),
+            universe=UniverseConfig(),
+            backtest=BacktestConfig(),
+        )
+
+    def _market_bars(self, daily_pct, n=40):
+        """Index bars whose daily moves alternate up/down by ``daily_pct``."""
+        from datetime import date, timedelta
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        bars = []
+        level = 1000.0
+        d = date(2026, 1, 1)
+        for i in range(n):
+            bars.append(PriceBar(time=d.isoformat(), open=level, high=level,
+                                  low=level, close=level, volume=0))
+            sign = 1 if i % 2 == 0 else -1
+            level *= (1 + sign * daily_pct / 100.0)
+            d += timedelta(days=1)
+        return bars
+
+    def test_band_is_off_by_default(self):
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg()
+        bars = self._market_bars(1.0)
+        self.assertTrue(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_inside_the_band_is_rejected(self):
+        """The "half-dead" middle is where the losing trades are."""
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(market_volatility_avoid_band_pct=(0.7, 1.3))
+        bars = self._market_bars(1.0)   # ~1% daily -> vol ~1%
+        self.assertFalse(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_below_the_band_is_allowed(self):
+        """A barely-moving market is FINE — 78.5% of those trades win.
+
+        This is the case the one-sided minimum threshold threw away.
+        """
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(market_volatility_avoid_band_pct=(0.7, 1.3))
+        bars = self._market_bars(0.3)   # ~0.3% daily -> vol ~0.3%
+        self.assertTrue(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_above_the_band_is_allowed(self):
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(market_volatility_avoid_band_pct=(0.7, 1.3))
+        bars = self._market_bars(3.0)   # ~3% daily -> vol ~3%
+        self.assertTrue(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_band_and_minimum_can_both_apply(self):
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(market_volatility_avoid_band_pct=(0.7, 1.3),
+                        min_market_volatility_pct=2.0)
+        bars = self._market_bars(1.0)
+        self.assertFalse(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_missing_market_data_allows_trading(self):
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_ok
+        cfg = self._cfg(market_volatility_avoid_band_pct=(0.7, 1.3))
+        bars = self._market_bars(1.0)[:3]
+        self.assertTrue(_market_volatility_ok(bars[-1], cfg, bars))
+
+    def test_band_is_point_in_time(self):
+        from datetime import timedelta
+        from darvas_box_strategy.darvas.data_loader import PriceBar
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_pct
+        bars = self._market_bars(1.0)
+        vol_at_20 = _market_volatility_pct(bars, bars[20].date, 20)
+        calm = []
+        level = bars[20].close
+        d = bars[20].date + timedelta(days=1)
+        for i in range(10):
+            calm.append(PriceBar(time=d.isoformat(), open=level, high=level,
+                                  low=level, close=level, volume=0))
+            level *= (1 + (1 if i % 2 == 0 else -1) * 0.01)
+            d += timedelta(days=1)
+        vol_mixed = _market_volatility_pct(bars + calm, bars[20].date, 20)
+        self.assertAlmostEqual(vol_at_20, vol_mixed, places=6)
+
     def test_breakout_with_volume_fires(self):
         bars = make_bars(100, date(2025, 1, 1), base_range=(9900, 10100), base_days=8, base_idx=60,
                           breakout_jump=200, vol_spike=2.0)

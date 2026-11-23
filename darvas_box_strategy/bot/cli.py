@@ -83,11 +83,11 @@ def build_default_config() -> StrategyConfig:
 
     - vol_target=0% (off) — fixed 2x sizing beats vol-targeting
     - trail=10% — let winners compound after partial cut
-    - size 0.10/0.20 + max_total_exposure_pct=0.75 — caps the drawdown
-      on BOTH halves of the split (TRAIN -11.0%, TEST -17.8%)
-    - min_market_volatility_pct=1.2 — trade only when the market is
-      moving enough for a breakout to work. Raises the return AND cuts
-      the drawdown on both halves (see "The market volatility filter")
+    - size 0.10/0.20 + max_total_exposure_pct=0.55 — caps the drawdown
+      on BOTH halves of the split
+    - market_volatility_avoid_band_pct=(0.7, 1.3) — skip trades in the
+      "half-dead" market, keep them everywhere else. Raises the return
+      AND cuts the drawdown (see "The market volatility filter")
     - sl_T=10%, sl_F=18% — entry-anchored stops (was base-anchored, buggy)
     - board_lot=100 — HOSE 100-share lots; small signals dropped
     - t_plus_n_bars=3 — T+2.5 settlement, as required for VN
@@ -105,9 +105,13 @@ def build_default_config() -> StrategyConfig:
             # market's recent volatility, so a stale index means it is
             # judging today's market on old data.
             volatility_index_path=str(DEFAULT_MARKET_INDEX),
-            min_market_volatility_pct=1.2,
-            market_volatility_window=20,
-        ),
+            # Skip the "half-dead" market, keep the calm and the wild
+            # ones. A one-sided minimum threshold (this used to be
+            # min_market_volatility_pct=1.2) went silent for 48
+            # consecutive bars and blocked every signal while throwing
+            # away the 78%-win-rate trades taken below 0.8.
+            market_volatility_avoid_band_pct=(0.7, 1.3),
+            market_volatility_window=20,        ),
         exits=ExitsConfig(
             sl_T_pct=0.10,        # 10% partial stop from entry
             sl_F_pct=0.18,        # 18% hard stop from entry
@@ -122,7 +126,8 @@ def build_default_config() -> StrategyConfig:
             cooldown_bars_after_stop=5,
             cost_bps=25.0,
             # Sizing + total-exposure cap (2026-11-11, re-validated on the
-            # corrected NAV accounting 2026-11-13).
+            # corrected NAV accounting 2026-11-13, and again with the
+            # volatility band filter on 2026-11-23).
             #
             # Capping the NUMBER of open positions does not cap the risk:
             # smaller positions mean more of them fit, so exposure rises
@@ -130,18 +135,18 @@ def build_default_config() -> StrategyConfig:
             # self-limiting; reducing it without a cap made the drawdown
             # WORSE, not better.
             #
-            # With the exposure cap the drawdown falls on both halves of
-            # the walk-forward split:
-            #   TRAIN 2019-2022  DD -23.22% -> -16.96%
-            #   TEST  2023-2026  DD -25.96% -> -18.49%
-            # (Those figures are the corrected ones — before the
-            # 2026-11-13 NAV fix the drawdowns were 5.2pp worse.)
+            # The cap was re-tuned with the volatility band filter on,
+            # because that filter takes a different set of trades, so it
+            # needs a different cap to hold the drawdown:
+            #   band 0.7-1.3 + exp0.75  -> FULL +164.4% / -13.81%
+            #   band 0.7-1.3 + exp0.55  -> FULL +112.6% / -10.83%
+            #   band 0.7-1.3 + exp0.50  -> FULL +117.7% /  -9.52%
             #
-            # The market-volatility filter (min_market_volatility_pct
-            # above) then improves it further, to TRAIN -8.99% /
-            # TEST -15.01%, while RAISING the return.
+            # exp0.50 has a BETTER drawdown in 8 of 8 walk-forward windows
+            # (full period -15.01% -> -9.52%) and a higher return in 5
+            # of 8.
             size_low=0.10, size_high=0.20,
-            max_total_exposure_pct=0.75,
+            max_total_exposure_pct=0.50,
             vol_target_pct=0.0,  # OFF: fixed sizing beats vol-targeting
             vol_target_floor=0.05, vol_target_ceiling=0.30,
             board_lot=100,  # HOSE board lot: shares rounded down to 100s

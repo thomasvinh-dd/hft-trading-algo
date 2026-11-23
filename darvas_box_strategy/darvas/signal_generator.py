@@ -97,10 +97,16 @@ def _market_volatility_ok(breakout_bar, cfg, market_bars):
     """Require the market to be volatile enough (and not too volatile).
 
     Off unless ``min_market_volatility_pct`` (or the max) is set.
+
+    ``market_volatility_avoid_band_pct`` is the opposite shape: it
+    REJECTS trades whose volatility falls INSIDE the band. That is the
+    shape the data actually supports — the losing trades cluster in the
+    "half-dead" middle, not at the low end.
     """
     min_pct = getattr(cfg.breakout, "min_market_volatility_pct", 0.0) or 0.0
     max_pct = getattr(cfg.breakout, "max_market_volatility_pct", 0.0) or 0.0
-    if min_pct <= 0 and max_pct <= 0:
+    band = getattr(cfg.breakout, "market_volatility_avoid_band_pct", ()) or ()
+    if min_pct <= 0 and max_pct <= 0 and not band:
         return True
     window = getattr(cfg.breakout, "market_volatility_window", 20) or 20
     vol = _market_volatility_pct(market_bars, breakout_bar.date, window)
@@ -110,6 +116,10 @@ def _market_volatility_ok(breakout_bar, cfg, market_bars):
         return False
     if max_pct > 0 and vol > max_pct:
         return False
+    if band:
+        low, high = band[0], band[1]
+        if low <= vol <= high:
+            return False
     return True
 
 

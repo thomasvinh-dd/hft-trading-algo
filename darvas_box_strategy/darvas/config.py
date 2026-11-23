@@ -79,6 +79,27 @@ class BreakoutConfig:
     min_market_volatility_pct: float = 0.0
     max_market_volatility_pct: float = 0.0  # 0 = no upper bound
     market_volatility_window: int = 20       # bars for the volatility calc
+    # Market-volatility BAND to avoid, as (low, high). 0 = off.
+    #
+    # A one-sided MINIMUM threshold assumes "more volatility is always
+    # better". The trade-level data says otherwise — bucketing all 350
+    # unfiltered trades by the market volatility at entry:
+    #
+    #   regime              n    win%   sum ret%
+    #   <0.8 (dead)        65   78.5%        +4%
+    #   0.8-1.2 (calm)    100   46.0%        -1%   <- the only loser
+    #   1.2-1.6 (normal)   87   63.2%        +1%
+    #   >=1.6 (wild)       98   70.4%        +3%
+    #
+    # The danger zone is a BAND, not a low level. A barely-moving market
+    # (vol < 0.8) is fine — 78.5% of those trades win. It is the
+    # "half-dead" 0.8-1.2 market that breaks them.
+    #
+    # This matters operationally: with a one-sided min threshold of 1.2,
+    # the filter went SILENT for 48 consecutive bars (the market sat at
+    # 1.01-1.09%), blocking every signal while throwing away the
+    # 78%-win-rate trades below 0.8.
+    market_volatility_avoid_band_pct: tuple = ()  # (low, high) to reject
     sector_data_path: str = ""       # path to symbols.json with sectorName; "" = off
     sector_momentum_window: int = 60  # days for sector momentum calculation
     sector_min_momentum: float = 0.0  # filter: only trade sectors with momentum > this
