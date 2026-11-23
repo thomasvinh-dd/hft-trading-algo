@@ -262,6 +262,50 @@ def cmd_send_test(args) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _report_no_signals(cfg, filtered, n_no_base, n_filtered,
+                       market_bars, volatility_bars) -> None:
+    """Explain WHY a scan produced no signals.
+
+    A silent scan is ambiguous: it can mean the market has no breakouts
+    (fine) or that an entry filter is blocking everything (a problem).
+    On 2026-11-23 the volatility filter had been blocking every signal
+    for 48 consecutive sessions and the only symptom was a daily
+    "No breakout signals" message.
+
+    This prints the breakdown so the cause is visible in the log.
+    """
+    from darvas_box_strategy.darvas.signal_generator import _market_volatility_pct
+
+    print("No signals. Breakdown:")
+    print(f"  tickers scanned           : {len(filtered)}")
+    print(f"  no base found              : {n_no_base}")
+    print(f"  base found but filtered out: {n_filtered}")
+
+    band = tuple(getattr(cfg.breakout, "market_volatility_avoid_band_pct", ()) or ())
+    min_pct = getattr(cfg.breakout, "min_market_volatility_pct", 0.0) or 0.0
+    max_pct = getattr(cfg.breakout, "max_market_volatility_pct", 0.0) or 0.0
+    window = getattr(cfg.breakout, "market_volatility_window", 20) or 20
+
+    if volatility_bars:
+        last = volatility_bars[-1]
+        vol = _market_volatility_pct(volatility_bars, last.date, window)
+        print(f"  market volatility          : "
+              f"{vol:.3f}% (as of {last.date})" if vol is not None
+              else "  market volatility          : unknown")
+        if vol is not None:
+            if band and band[0] <= vol <= band[1]:
+                print(f"  -> BLOCKED by the volatility band {band}: "
+                      f"the market is in the 'half-dead' zone")
+            if min_pct > 0 and vol < min_pct:
+                print(f"  -> BLOCKED by min_market_volatility_pct={min_pct}: "
+                      f"the market is too quiet")
+            if max_pct > 0 and vol > max_pct:
+                print(f"  -> BLOCKED by max_market_volatility_pct={max_pct}: "
+                      f"the market is too wild")
+    if cfg.breakout.regime_index_path:
+        print("  note: the regime filter is also enabled")
+
+
 def cmd_scan_signals(args) -> int:
     """Scan the most recent bar for breakout signals and send alerts."""
     config = load_telegram_config(
@@ -300,6 +344,11 @@ def cmd_scan_signals(args) -> int:
     # Scan the last few bars for breakout signals
     as_of_offset = args.lookback  # 0 = today, 1 = yesterday, etc.
     signals = []
+    # Count WHY there were no signals, so a silent scan is explainable
+    # instead of just reporting "No breakout signals". A filter that
+    # blocks everything looks identical to a market with no breakouts.
+    n_no_base = 0
+    n_filtered = 0
     for ticker in filtered:
         bars = load_bars(ticker)
         if len(bars) < cfg.breakout.min_history_days:
@@ -310,6 +359,7 @@ def cmd_scan_signals(args) -> int:
         scanner = BaseScanner(bars, cfg.base, ticker=ticker)
         base = scanner.find_base(as_of_idx=idx)
         if base is None or base.end_idx >= idx:
+            n_no_base += 1
             continue
         signal = generate_signal(
             bars, base, nav=cfg.backtest.start_nav, cfg=cfg,
@@ -318,8 +368,13 @@ def cmd_scan_signals(args) -> int:
             volatility_bars=volatility_bars,
         )
         if signal is None:
+            n_filtered += 1
             continue
         signals.append(signal)
+
+    if not signals:
+        _report_no_signals(cfg, filtered, n_no_base, n_filtered,
+                           market_bars, volatility_bars)
 
     # Load live position state so we can (a) avoid re-alerting on the
     # same breakout and (b) start tracking new positions for exit events.
@@ -340,6 +395,27 @@ def cmd_scan_signals(args) -> int:
 
     if not fresh_signals:
         lines = ["📭 *Darvas Box: No breakout signals* on last bar"]
+        # Say WHY, so a filter that is blocking everything does not look
+        # like a market with no breakouts.
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_pct
+        band = tuple(getattr(cfg.breakout, "market_volatility_avoid_band_pct", ()) or ())
+        min_pct = getattr(cfg.breakout, "min_market_volatility_pct", 0.0) or 0.0
+        window = getattr(cfg.breakout, "market_volatility_window", 20) or 20
+        if volatility_bars:
+            last = volatility_bars[-1]
+            vol = _market_volatility_pct(volatility_bars, last.date, window)
+            if vol is not None:
+                if band and band[0] <= vol <= band[1]:
+                    lines.append(
+                        f"_Market volatility {vol:.2f}% is inside the "
+                        f"blocked band {band[0]}-{band[1]}% — the market is "
+                        f"in the half-dead zone, so entries are skipped_"
+                    )
+                elif min_pct > 0 and vol < min_pct:
+                    lines.append(
+                        f"_Market volatility {vol:.2f}% is below the "
+                        f"minimum {min_pct}% — entries are skipped_"
+                    )
     else:
         lines = [f"🚨 *Darvas Box: {len(fresh_signals)} breakout signal(s)*"]
         lines.append(f"_Universe_: HOSE blue chips ({len(filtered)} tickers)")
