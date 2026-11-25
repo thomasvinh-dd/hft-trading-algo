@@ -40,6 +40,7 @@ from vietnam_algo.libs.notifier import (
 )
 from vietnam_algo.libs.order_ledger import (
     LedgerOrder,
+    T2_REJECTED_STATUS,
     TERMINAL_LEDGER_STATUSES,
     filled_quantity,
     load_ledger,
@@ -50,7 +51,9 @@ from vietnam_algo.libs.order_ledger import (
 from vietnam_algo.libs.schedule import (
     TradingSchedule,
     TradingSession,
+    VIETNAM_TZ,
     current_session,
+    is_auction_session,
     local_date,
     order_type_for_session,
     should_poll_strategy,
@@ -133,6 +136,143 @@ def _mirror_daily_report(
         )
     except Exception as exc:  # pragma: no cover
         print(f"[daily_reports] write '{source}' failed: {exc}")
+
+
+def _stop_is_confirmed_live(row: Any) -> bool:
+    """True when DNSE has CONFIRMED a protective STOP is live.
+
+    2026-11-02 (TVN incident). The duplicate-STOP guard used to count
+    any STOP row with status ``submitted`` as "already protected". But
+    ``submitted`` only means WE sent the order — DNSE may still
+    reject it a moment later.
+
+    TVN's stop was submitted at 09:18:09 and rejected by DNSE at
+    09:19:29 with ``INVALID_PRICE_LOT``. The ledger row stayed
+    ``submitted`` until the order monitor polled it, so the next T+2
+    retry pass (09:49) concluded "300 shares already protected —
+    skipping" and the position was left with NO stop-loss.
+
+    The order monitor writes the DNSE order-detail payload into
+    ``lastDetail`` after a successful poll. A live stop therefore has
+    a ``lastDetail`` whose order status is one of the LIVE statuses
+    (``New``, ``PartiallyFilled``, ``PendingNew``). A row with no
+    detail, or with a terminal detail status, is NOT confirmed.
+
+    Rows whose ledger status is already ``open`` or ``partial`` were
+    themselves written by the monitor from a live detail, so they are
+    trusted without re-reading the detail.
+    """
+    status = str(getattr(row, "status", "") or "").lower()
+    if status in ("open", "partial"):
+        # The monitor only writes these from a live DNSE detail.
+        return True
+
+    detail = getattr(row, "lastDetail", None)
+    if not isinstance(detail, dict):
+        return False
+
+    raw = ""
+    for key in ("orderStatus", "status", "state"):
+        val = detail.get(key)
+        if val not in (None, ""):
+            raw = str(val)
+            break
+    if not raw:
+        return False
+
+    # Normalise camelCase → UPPER_SNAKE (same as the order ledger).
+    import re as _re
+    snake = _re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw).upper()
+
+    live_statuses = {
+        "NEW",
+        "PARTIALLY_FILLED",
+        "PARTIAL",
+        "PENDING_NEW",
+        "PENDING_REPLACE",
+        "PENDING_CANCEL",
+        "OPEN",
+        "SUBMITTED",
+    }
+    return snake in live_statuses
+
+
+def _notify_stale_token_if_blocking(
+    data_dir,
+    account_no: str,
+    deals_actioned: list | None,
+    now=None,
+    alert_state: dict | None = None,
+) -> bool:
+    """Notify the operator when a STALE trading token will BLOCK an order.
+
+    2026-10-31. The user reported the "DNSE trading token is STALE"
+    alert firing at 22:46 on a Saturday — no trading session, no
+    order to send. The token is only renewed lazily (when a new order
+    is planned), so a stale token is only ACTIONABLE at the moment it
+    would block a submit.
+
+    The alert therefore fires only when ALL of these hold:
+
+    1. There is at least one order to send (``deals_actioned`` is
+       non-empty).
+    2. We are inside a live trading session (a trading day, and
+       within the 09:00-15:00 ICT window).
+    3. The shared token is actually stale (not merely absent).
+
+    It is still throttled to once per ICT day so a missed 08:30-ICT
+    cron does not spam.
+
+    Returns True when the alert was sent.
+    """
+    from vietnam_algo.libs.schedule import is_main_trading_phase
+
+    # (1) Only when there is an order to send.
+    if not deals_actioned:
+        return False
+
+    # (2) Only inside a live trading session.
+    moment = now if now is not None else vietnam_now()
+    if not is_main_trading_phase(moment):
+        return False
+
+    # (3) The token must actually be stale.
+    shared = load_shared_trading_token(data_dir)
+    if not shared:
+        return False
+    issued = str(shared.get("issued_at") or "?")
+    from vietnam_algo.libs.dnse.auth import is_token_fresh
+    if is_token_fresh(shared.get("token"), issued_at=shared.get("issued_at")):
+        return False
+
+    # Throttle: at most once per ICT day.
+    today = local_date(moment)
+    if alert_state is not None:
+        if alert_state.get("date") == today:
+            return False
+        alert_state["date"] = today
+
+    _n_orders = sum(
+        1 for d in (deals_actioned or []) for _ in (d.get("dnse_orders") or [])
+    )
+    _symbols = sorted({
+        str(d.get("symbol") or "?") for d in (deals_actioned or [])
+    })
+    notify(
+        "🚨 Vietnam Algo: DNSE trading token is STALE — ORDERS BLOCKED\n"
+        f"account: {account_no}\n"
+        f"issued_at: {issued}\n"
+        f"orders waiting: {_n_orders} ({', '.join(_symbols[:8])})"
+        + (f" +{len(_symbols) - 8} more" if len(_symbols) > 8 else "")
+        + "\nThe 08:30-ICT get_otp cron may have missed its window. "
+        "These orders will be SKIPPED (not sent with a bad token) until "
+        "the token refreshes."
+    )
+    print(
+        f"[{moment.isoformat()}] stale-token ALERT sent: "
+        f"{_n_orders} order(s) blocked ({', '.join(_symbols[:8])})"
+    )
+    return True
 
 
 def _hydrate_shared_token_into_state(state, data_dir) -> bool:
@@ -573,7 +713,7 @@ def _extract_best_ask_in_vnd(quote: object) -> int | None:
     return int(round(v * 1000.0))
 
 
-def _hose_price_tick(price_vnd: int) -> int:
+def _hose_price_tick(price_vnd: int, market_id: str | None = None) -> int:
     """Return the HOSE tick size for a stock price, in VND.
 
     Per HOSE market rules, the minimum price increment depends on
@@ -599,11 +739,46 @@ def _hose_price_tick(price_vnd: int) -> int:
     always executes (down-rounded but the SELL is marketable;
     the 1% ``AUTOFIN_SELL_BID_DISCOUNT_PCT`` already gives a
     buffer for the bid to tick down).
+
+    2026-11-02 (TVN incident): ``market_id`` matters. The banded
+    ladder above is the HOSE (STO) ladder. UPCOM (UPX) stocks use a
+    FLAT 100-VND tick at EVERY price level — the 10-VND band below
+    10,000 VND does not apply.
+
+    TVN is a UPCOM stock. Its protective stop at 9,360 produced a
+    generated limit of ``round(9360 × 0.995) = 9313`` → rounded with
+    the HOSE ladder to **9,310** (a multiple of 10). DNSE rejected it
+    with ``INVALID_PRICE_LOT|Invalid price lot`` — UPCOM requires a
+    100-VND multiple, so the correct limit is **9,300**.
+
+    The live order book confirms the ladders::
+
+        TVN  (UPX) bid 9.3, 9.2, 9.1, 9.0, 8.9   → 100-VND tick
+        ABB  (UPX) bid 17.3, 17.2, 17.1, 17.0, 16.9 → 100-VND tick
+        TCB  (STO) bid 21.35, 21.3, 21.25          → 50-VND tick
+        VOS  (STO) bid 10.3, 10.25, 10.2           → 50-VND tick
+
+    NOTE: ABB's stop was accepted at 15,850 only by luck — 15,850 is
+    a multiple of 50 (the HOSE ladder) AND happens to be a multiple
+    of 10. It is NOT a multiple of 100, so a UPCOM-correct price for
+    ABB would be 15,800. Passing ``market_id`` makes this explicit
+    instead of accidental.
     """
     p = int(price_vnd)
     if p <= 0:
         return 0
-    if p < 10_000:
+    # 2026-11-02: UPCOM (UPX) uses a flat 100-VND tick at every
+    # price level. HNX also uses 100.
+    #
+    # 2026-11-16 (CTP incident): DNSE labels HNX equities ``STX``,
+    # not ``HNX``. The old set therefore never matched HNX symbols,
+    # so CTP below 10,000 VND used the HOSE 10-VND ladder and sent
+    # 6,630. HNX requires a multiple of 100 at every price level, so
+    # the correct sell price is 6,600.
+    mid = str(market_id or "").strip().upper()
+    if mid in ("UPX", "HNX", "STX", "UNKNOWN_100"):
+        tick = 100
+    elif p < 10_000:
         tick = 10
     elif p < 50_000:
         tick = 50
@@ -659,6 +834,42 @@ def _extract_best_bid_in_vnd(quote: object) -> int | None:
     return int(round(v * 1000.0))
 
 
+def settlement_deferred_message(
+    submit_result: dict,
+    trade_date: str,
+    label: str = "autofin",
+) -> str | None:
+    """Telegram message for SELLS deferred by the T+2.5 settlement gate.
+
+    2026-10-31 (the VOS case): the shares bought on Friday
+    2026-10-29 are not sellable until 12:00 ICT on Monday
+    2026-11-02. The trim is deferred (not submitted) and planned
+    again on the next cycle.
+
+    The operator needs to see this: without it, a reduce that
+    autofin published would look like nothing happened, and the
+    position would stay un-trimmed until the next trading session.
+    """
+    deferred = (submit_result or {}).get("settlement_deferred") or []
+    if not deferred:
+        return None
+    lines = [
+        f"⏳ Vietnam Algo: autofin SELL deferred (T+2.5 settlement)",
+        f"date: {trade_date}",
+        "reason: the shares are not settled yet — the sell is re-planned "
+        "on a later cycle.",
+    ]
+    for d in deferred[:10]:
+        lines.append(
+            f"  {d.get('symbol', '?')}: {d.get('quantity', 0):,} shares "
+            f"(bought {d.get('buy_date', '?')}, settles "
+            f"{d.get('settles_on', '?')})"
+        )
+    if len(deferred) > 10:
+        lines.append(f"  + {len(deferred) - 10} more")
+    return "\n".join(lines)
+
+
 def _submit_autofin_deals_to_dnse(
     deals_actioned: list[dict],
     *,
@@ -669,7 +880,7 @@ def _submit_autofin_deals_to_dnse(
     data_dir: "Path",
     trade_date: str,
     loan_package_id_by_symbol: dict[str, int] | None = None,
-    live_quote_tolerance_pct: float = 0.03,
+    live_quote_tolerance_pct: float | None = None,
 ) -> dict:
     """Convert autofin adapter's ``deals_actioned`` into ``DnseOrder``
     records and submit them to DNSE via ``execute_orders_with_ledger``.
@@ -718,9 +929,20 @@ def _submit_autofin_deals_to_dnse(
     trade_date:
         ISO date used as ``sourceDate`` on every order in this batch.
     live_quote_tolerance_pct:
-        Per-side tolerance (default 5 %) for the live-quote gate.
+        Per-side tolerance for the live-quote gate.
         ``supply_T * (1 + tol)`` and ``supply_F * (1 - tol)`` form the
         upper / lower edges the live best-ask must stay within.
+
+        2026-10-31: this is the SUBMIT-TIME re-check of the same buy
+        zone the strategy used at planning time. It MUST match the
+        planning tolerance (``AUTOFIN_BUY_ZONE_TOLERANCE_PCT``,
+        default 1 %) — otherwise the effective buy window would still
+        be 3 % wide, because a plan accepted at +2 % would be dropped
+        at submit and a plan accepted at -2 % would pass here but
+        have been planned outside the tighter band.
+
+        ``None`` means "use the configured tolerance". Pass an
+        explicit value to override it in a test.
 
     Returns
     -------
@@ -733,8 +955,33 @@ def _submit_autofin_deals_to_dnse(
     from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
     from vietnam_algo.libs.trading_engine import DnseOrder
 
+    # 2026-10-31: the submit-time live-quote gate uses the SAME
+    # tolerance as the planning-time zone gate. They must match —
+    # otherwise the effective buy window is whichever is wider, and
+    # the user asked for a tight 1 % band.
+    if live_quote_tolerance_pct is None:
+        from vietnam_algo.algos.autofin_signal import buy_zone_tolerance_pct
+        _tol_above, _tol_below = buy_zone_tolerance_pct()
+        # The live gate is symmetric — it uses the WIDER of the two
+        # sides so an asymmetric planning tolerance can never make
+        # the submit gate stricter than the plan it is checking.
+        live_quote_tolerance_pct = max(_tol_above, _tol_below)
+
+    # 2026-10-31: SELLS deferred because the shares have not settled
+    # yet (T+2.5). Declared here so every result dict can reference
+    # it, including the early returns below.
+    settlement_deferred: list[dict] = []
+
     if not deals_actioned:
-        return {"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}
+        # 2026-10-30: nothing reached DNSE.
+        return {
+            "submitted": [],
+            "submitted_symbols": [],
+            "skipped_existing": 0,
+            "unknown": 0,
+            "total": 0,
+            "settlement_deferred": settlement_deferred,
+        }
 
     # 2026-10-07: filter new_entry deals whose LIVE best-ask has moved
     # out of the supply zone since planning. ``out_of_zone`` collects
@@ -802,6 +1049,8 @@ def _submit_autofin_deals_to_dnse(
             # to send a Telegram summary combining submit + out_of_zone.
             return {
                 "submitted": [],
+                # 2026-10-30: nothing reached DNSE.
+                "submitted_symbols": [],
                 "skipped_existing": 0,
                 "unknown": 0,
                 "rejected": 0,
@@ -809,6 +1058,9 @@ def _submit_autofin_deals_to_dnse(
                 "rejected_details": [],
                 "total": 0,
                 "out_of_zone": out_of_zone,
+                # 2026-10-31: SELLS deferred because the shares have
+                # not settled yet (T+2.5).
+                "settlement_deferred": settlement_deferred,
             }
 
     # Build a stable sourceOrderId for each (deal, side, price, kind) tuple
@@ -859,6 +1111,8 @@ def _submit_autofin_deals_to_dnse(
         )
         return {
             "submitted": [],
+            # 2026-10-30: nothing reached DNSE.
+            "submitted_symbols": [],
             "skipped_existing": 0,
             "unknown": 0,
             "rejected": 0,
@@ -866,12 +1120,76 @@ def _submit_autofin_deals_to_dnse(
             "rejected_details": [],
             "total": 0,
             "out_of_zone": out_of_zone,
+            # 2026-10-31: SELLS deferred because the shares have not
+            # settled yet (T+2.5).
+            "settlement_deferred": settlement_deferred,
             "skipped_off_hours": sum(
                 1 for d in deals_actioned for _ in (d.get("dnse_orders") or [])
             ),
         }
     session_order_type = order_type_for_session(session)
-    is_auction = session in (TradingSession.ATO, TradingSession.ATC)
+    is_auction = is_auction_session(session)
+
+    # 2026-10-31: NO orders in the ATO / ATC auction windows.
+    #
+    # The user asked for this explicitly ("we should not do trade in
+    # ato and atc session"), and the live ledger shows why it
+    # matters:
+    #
+    #   2026-10-26 09:01:08  ORS  BUY  price=0  [session=ATO]
+    #   2026-10-29 09:01:17  VOS  BUY  price=0  [session=ATO]
+    #
+    # An auction order is submitted with ``price=0`` — the fill price
+    # is decided by the auction, not by us. The VOS BUY filled at
+    # 11,800 (the ATO price) while the continuous-market bid was
+    # ~10,800; we paid the auction premium and had no say in it.
+    #
+    # Worse, ``price=0`` on a BUY means "buy at ANY price" to DNSE —
+    # an unbounded risk rather than a bounded one.
+    #
+    # The block covers ALL orders, including protective STOPs (the
+    # user's explicit choice). A stop planned during the window is
+    # deferred to the next continuous session by the re-arm logic.
+    #
+    # Post-close (14:45-15:00) is NOT an auction — it is a normal LO
+    # session on HOSE (PLO) with a real price — so it stays
+    # tradeable.
+    if is_auction:
+        _auction_orders = sum(
+            1 for d in deals_actioned for _ in (d.get("dnse_orders") or [])
+        )
+        notify(
+            "\n".join([
+                f"⚠️ Vietnam Algo: autofin LIVE submit SKIPPED "
+                f"({session.value} auction)",
+                f"date: {trade_date}",
+                f"orders: {_auction_orders}",
+                f"reason: the bot does not trade in the {session.value} "
+                f"auction window (09:00-09:15 / 14:30-14:45) — an "
+                f"auction order is sent with price=0, so the fill price "
+                f"is decided by the auction.",
+                "next attempt: the next continuous session "
+                "(09:15-11:30 / 13:00-14:30).",
+            ])
+        )
+        return {
+            "submitted": [],
+            # 2026-10-30: nothing reached DNSE.
+            "submitted_symbols": [],
+            "skipped_existing": 0,
+            "unknown": 0,
+            "rejected": 0,
+            "token_rejected": 0,
+            "t2_rejected": 0,
+            "rejected_details": [],
+            "total": 0,
+            "out_of_zone": out_of_zone,
+            # 2026-10-31: SELLS deferred because the shares have not
+            # settled yet (T+2.5).
+            "settlement_deferred": settlement_deferred,
+            # 2026-10-31: the orders held back by the auction gate.
+            "skipped_auction": _auction_orders,
+        }
 
     # 2026-10-12: the DNSE server REQUIRES ``loanPackageId`` in every
     # place_stock_order body, and treats ``0`` as "no value" (rejected
@@ -909,24 +1227,91 @@ def _submit_autofin_deals_to_dnse(
     market_cache: dict[str, str] = {}
     market_lookup_errors: list[str] = []
 
+    # 2026-10-31 (the VOS T+2.5 case): a SELL cannot be submitted
+    # before the position has SETTLED. Vietnam settles T+2.5, and the
+    # SELL is only accepted from 12:00 ICT on the 2nd TRADING day
+    # after the buy.
+    #
+    # The VOS case: bought Friday 2026-10-29, autofin published the
+    # reduce on the same day. The bot planned the trim, but on Monday
+    # 2026-11-02 (the first trading day after the weekend) the shares
+    # were still NOT settled — settlement clears at 12:00 that day.
+    # Submitting at 09:00 produced DNSE's
+    # ``TRADE_QUANTITY_NOT_ENOUGH`` rejection, which (being HTTP 400)
+    # was classified as a TERMINAL "rejected" ledger row — so the trim
+    # was silently lost forever.
+    #
+    # We now defer such a SELL to the next cycle instead of submitting
+    # an order that cannot be accepted. The deferral is reported to
+    # the operator and the action is re-armed by the caller, so the
+    # trim is planned again once settlement clears.
+    #
+    # The BUY date comes from the order ledger (the filled BUY's
+    # ``sourceDate``). When we cannot determine it we DO NOT block —
+    # a missing date must not prevent an exit.
+    _buy_date_by_symbol: dict[str, str] = {}
+    _settlement_holidays: set[str] = set()
+    try:
+        from vietnam_algo.libs.market_calendar import load_market_holidays
+        _settlement_holidays = load_market_holidays(data_dir)
+    except Exception:
+        _settlement_holidays = set()
+    try:
+        from vietnam_algo.libs.order_ledger import load_ledger as _load_led
+        _led = _load_led(data_dir)
+        for _it in _led.values():
+            if _it.side != "NB" or _it.status != "filled":
+                continue
+            if not _it.sourceDate:
+                continue
+            _sym = str(_it.symbol or "").upper()
+            _prev = _buy_date_by_symbol.get(_sym)
+            # Keep the LATEST filled BUY — that is the one whose
+            # settlement clock matters for the shares we still hold.
+            if _prev is None or _it.sourceDate > _prev:
+                _buy_date_by_symbol[_sym] = _it.sourceDate
+    except Exception as exc:
+        print(
+            f"[autofin_settlement_gate] could not read the ledger for "
+            f"BUY dates: {type(exc).__name__}: {str(exc)[:160]} — "
+            f"the gate will not block any SELL"
+        )
+
+    def _market_id_for(sym: str) -> str:
+        """Resolve and cache DNSE's market id for ``sym``.
+
+        This must run before board-dependent price rounding. Previously
+        the SELL-at-market override read ``market_cache`` before this
+        lookup happened, so the first order for every symbol could use
+        the wrong exchange price ladder.
+        """
+        if sym in market_cache:
+            return market_cache[sym]
+        try:
+            market_id = str(client.get_market_id(sym) or "").strip().upper()
+        except Exception as exc:
+            market_lookup_errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:200]}")
+            print(
+                f"[autofin_market_id] {sym}: market lookup failed "
+                f"({type(exc).__name__}: {str(exc)[:200]}); using the "
+                f"conservative 100-VND price ladder"
+            )
+            # UNKNOWN is deliberately handled by the conservative flat
+            # 100-VND ladder. Guessing the HOSE 10-VND grid here caused
+            # the CTP INVALID_PRICE_LOT rejection on 2026-11-16.
+            market_id = "UNKNOWN_100"
+        market_cache[sym] = market_id
+        return market_id
+
     def _order_type_for_symbol(sym: str, default_otype: str) -> str:
         """Return the orderType DNSE will accept for this symbol+session.
         UPCOM always uses ``LO`` (no auction support).
         """
-        if sym in market_cache:
-            market_id = market_cache[sym]
-        else:
-            try:
-                market_id = client.get_market_id(sym)
-                market_cache[sym] = market_id
-            except Exception as exc:
-                market_lookup_errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:200]}")
-                market_cache[sym] = "UNKNOWN"
-                market_id = "UNKNOWN"
+        market_id = _market_id_for(sym)
         if market_id == "UPX":
             # UPCOM only supports LO. Send LO with the signal price.
             return "LO"
-        if market_id == "HNX" and default_otype == "ATO":
+        if market_id in ("HNX", "STX") and default_otype == "ATO":
             # HNX doesn't have an opening auction; downgrade to LO.
             return "LO"
         return default_otype
@@ -961,6 +1346,42 @@ def _submit_autofin_deals_to_dnse(
             # the position instead of protecting it.
             reason = str(o.get("reason") or f"autofin:{deal.get('action', '?')}")
             is_protective_leg = _is_protective_reason(reason)
+            # 2026-10-31 (the VOS T+2.5 case): defer a SELL whose
+            # shares have not settled yet. Submitting it produces
+            # DNSE's TRADE_QUANTITY_NOT_ENOUGH rejection, which is an
+            # HTTP 400 and therefore classified as a TERMINAL
+            # "rejected" ledger row — the trim would be silently lost.
+            # Deferring keeps the action pending so the next cycle
+            # (after settlement clears) submits it.
+            #
+            # PROTECTIVE legs are exempt: a stop-loss must rest at the
+            # broker immediately, and DNSE accepts a conditional STOP
+            # order for unsettled shares (it only rejects the
+            # generated sell when the trigger fires).
+            if side == "NS" and not is_protective_leg:
+                _buy_date = _buy_date_by_symbol.get(sym)
+                if _buy_date:
+                    _now_t = vietnam_now().time()
+                    if not _buy_settled_by_t2(
+                        _buy_date, trade_date, now_time=_now_t,
+                        holidays=_settlement_holidays,
+                    ):
+                        _settle_on = _t2_settlement_date(
+                            _buy_date, _settlement_holidays
+                        )
+                        settlement_deferred.append({
+                            "symbol": sym,
+                            "quantity": quantity,
+                            "buy_date": _buy_date,
+                            "settles_on": _settle_on,
+                            "reason": reason,
+                        })
+                        print(
+                            f"[autofin_settlement_gate] {sym}: deferring a "
+                            f"SELL of {quantity} — bought {_buy_date}, "
+                            f"settles {_settle_on or '?'} (T+2.5)"
+                        )
+                        continue
             if is_auction:
                 # Will be re-evaluated after we know the market
                 price = 0
@@ -1003,6 +1424,9 @@ def _submit_autofin_deals_to_dnse(
             # TP/SL price) when the live quote is unavailable, so
             # network blips don't block the SELL.
             sell_price = signal_price  # default
+            # Resolve the symbol's market before any board-dependent
+            # price rounding. DNSE returns HNX equities as ``STX``.
+            market_id = _market_id_for(sym)
             # Env-var kill switch: setting AUTOFIN_SELL_AT_MARKET=0
             # reverts to the pre-2026-10-13 behavior (use autofin's
             # recomment price, no live-bid override). Default enabled.
@@ -1031,7 +1455,13 @@ def _submit_autofin_deals_to_dnse(
                         # so DNSE doesn't reject with
                         # ``INVALID_PRICE_LOT``. See ``_hose_price_tick``
                         # for the rule table.
-                        sell_price = _hose_price_tick(raw_sell_price)
+                        #
+                        # 2026-11-02 (TVN): the ladder depends on the
+                        # BOARD — UPCOM uses a flat 100-VND tick even
+                        # below 10,000 VND, so we pass the market id.
+                        sell_price = _hose_price_tick(
+                            raw_sell_price, market_id,
+                        )
                         print(
                             f"[autofin_sell_at_market] {sym} SELL price "
                             f"override: signal={signal_price} → "
@@ -1087,7 +1517,17 @@ def _submit_autofin_deals_to_dnse(
                     )
                     continue
                 otype = "LO"
-                price = _hose_price_tick(int(round(stop_level * 0.995))) or stop_level
+                # 2026-11-02 (TVN): the price ladder depends on the
+                # BOARD. UPCOM (UPX) uses a flat 100-VND tick even
+                # below 10,000 VND — the TVN stop's limit of 9,310
+                # was a multiple of 10 (HOSE ladder) but NOT of 100,
+                # so DNSE rejected it with ``INVALID_PRICE_LOT``.
+                price = (
+                    _hose_price_tick(
+                        int(round(stop_level * 0.995)), market_cache.get(sym),
+                    )
+                    or stop_level
+                )
                 stop_fields = {
                     "orderCategory": "STOP",
                     "stopPrice": stop_level,
@@ -1111,9 +1551,18 @@ def _submit_autofin_deals_to_dnse(
     if not orders:
         result = {
             "submitted": [],
+            # 2026-10-30: nothing reached DNSE.
+            "submitted_symbols": [],
             "skipped_existing": 0,
             "unknown": 0,
+            "rejected": 0,
+            "token_rejected": 0,
+            "t2_rejected": 0,
+            "rejected_details": [],
             "total": 0,
+            # 2026-10-31: the SELLS that were deferred because the
+            # shares have not settled yet (T+2.5).
+            "settlement_deferred": settlement_deferred,
         }
         if out_of_zone:
             result["out_of_zone"] = out_of_zone
@@ -1139,10 +1588,18 @@ def _submit_autofin_deals_to_dnse(
     print(f"[submit-debug] execute_orders_with_ledger returned {len(results)} results: {[(r.get('status'), _sym(r)) for r in results]}")
 
     submitted_ids: list[str] = []
+    # 2026-10-30 (VOS incident): the SYMBOLS whose orders actually
+    # reached DNSE. The caller uses this to re-arm the action markers
+    # for partial closes that were planned but NOT submitted (off-hours
+    # / token rejection) so they are planned again next cycle.
+    submitted_symbols: list[str] = []
     skipped_existing = 0
     unknown = 0
     rejected = 0
     token_rejected = 0
+    # 2026-10-31: SELLs DNSE refused because the shares are not
+    # settled yet (T+2.5). Retryable, not permanent.
+    t2_rejected = 0
     # 2026-10-27 (issue A): keep the DETAIL of every declined order
     # so the Telegram path can name the symbol, the leg and the DNSE
     # error. Previously only a bare counter was returned and NO
@@ -1198,6 +1655,17 @@ def _submit_autofin_deals_to_dnse(
             d = _detail(r)
             d["status"] = status
             rejected_details.append(d)
+        elif status == T2_REJECTED_STATUS:
+            # 2026-10-31 (the VOS T+2.5 case): the shares are not
+            # settled yet. The order is NOT permanently dead — it
+            # becomes valid once the settlement clears, so it gets
+            # its own counter and its own ledger status (neither
+            # terminal nor unsafe). The strategy re-arms the action
+            # so the next cycle plans it again.
+            t2_rejected += 1
+            d = _detail(r)
+            d["status"] = status
+            rejected_details.append(d)
         elif status == "token_rejected":
             # 2026-10-27: ``token_rejected`` is deliberately
             # non-terminal so the order can be retried after the
@@ -1218,6 +1686,9 @@ def _submit_autofin_deals_to_dnse(
                     dnse_id = resp.get("id") or resp.get("orderId")
             if dnse_id:
                 submitted_ids.append(str(dnse_id))
+                _s = _detail(r).get("symbol")
+                if _s:
+                    submitted_symbols.append(str(_s).strip().upper())
         elif status == "skipped_existing_ledger":
             skipped_existing += 1
         elif status in ("unknown",):
@@ -1225,13 +1696,23 @@ def _submit_autofin_deals_to_dnse(
 
     return {
         "submitted": submitted_ids,
+        # 2026-10-30: which symbols actually reached DNSE.
+        "submitted_symbols": sorted(set(submitted_symbols)),
         "skipped_existing": skipped_existing,
         "unknown": unknown,
         "rejected": rejected,
         "token_rejected": token_rejected,
+        # 2026-10-31: T+2.5 settlement rejections (retryable).
+        "t2_rejected": t2_rejected,
         "rejected_details": rejected_details,
         "total": len(orders),
         "out_of_zone": out_of_zone,
+        # 2026-10-31: SELLS deferred because the shares have not
+        # settled yet (T+2.5).
+        "settlement_deferred": settlement_deferred,
+        # Surface market-id lookup failures instead of silently falling
+        # back to a possibly invalid exchange price ladder.
+        "market_lookup_errors": market_lookup_errors,
     }
 
 
@@ -1420,6 +1901,28 @@ def _is_t2_rejection(error: str) -> bool:
     return any(code in error for code in _T2_REJECT_CODES)
 
 
+# DNSE price-validation errors. A rejected SELL carrying one of these
+# codes can often be recovered by re-pricing it against the live best
+# bid using the correct exchange price lot.
+_PRICE_REJECT_CODES = (
+    "INVALID_PRICE_LOT",
+    "INVALID_PRICE",
+    "INVALID_PRICE_FOR_SYMBOL",
+)
+
+# Provenance marker for the one-shot marketable-SELL fallback. It is
+# stripped before deriving the retry id so repeated passes converge on
+# the same ledger key instead of creating an endless retry chain.
+_PRICE_RETRY_MARKER_RE = re.compile(r"\s*\[price-retry from [^\]]+\]")
+
+
+def _is_price_rejection(error: str) -> bool:
+    """Return True when DNSE rejected an order because of its price."""
+    if not error:
+        return False
+    return any(code in error for code in _PRICE_REJECT_CODES)
+
+
 def _extract_deal_id_from_reason(reason: str) -> str | None:
     """Pull the ``deal#NNNNNNNNNN:SYM`` token from a reason string.
 
@@ -1435,10 +1938,227 @@ def _extract_deal_id_from_reason(reason: str) -> str | None:
     return m.group(1) if m else None
 
 
+def retry_price_rejected_sell_orders(
+    client: Any,
+    account_no: str,
+    trading_token: str,
+    data_dir: Path,
+    today_iso: str,
+    *,
+    loan_package_id: int = 0,
+    loan_package_id_by_symbol: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Retry price-rejected discretionary SELLs at the live market price.
+
+    A synchronous DNSE rejection such as ``INVALID_PRICE_LOT`` is
+    terminal in the normal ledger. For a discretionary exit (TP, reduce
+    or full close), however, the action can safely be retried once as a
+    marketable limit SELL using the current best bid and the symbol's
+    exchange price lot.
+
+    Safety rules:
+      * SELL orders only; BUY orders are never retried here.
+      * Protective STOP legs are never converted into a market sell.
+      * A rejected order must have no DNSE order id, so it never reached
+        the exchange and cannot duplicate an existing order.
+      * One retry per symbol/reason per day; the retry marker makes the
+        operation idempotent across bot cycles and restarts.
+      * The retry quantity is capped by the live DNSE position.
+    """
+    from vietnam_algo.libs.order_ledger import (
+        load_ledger as _load_led,
+        save_ledger as _save_led,
+    )
+
+    summary: dict[str, Any] = {
+        "retried": [],
+        "skipped": [],
+        "failed": [],
+        "total": 0,
+    }
+    try:
+        ledger = _load_led(data_dir)
+    except Exception as exc:
+        summary["failed"].append({"error": f"load_ledger failed: {exc}"})
+        return summary
+
+    # A synchronous rejection has no DNSE order id. A row with an id
+    # may still be live at the broker, so retrying it could over-sell.
+    candidates: list[Any] = []
+    for item in ledger.values():
+        if item.side != "NS" or item.status != "rejected":
+            continue
+        if item.dnseOrderId:
+            continue
+        if not _is_price_rejection(item.error or ""):
+            continue
+        if str(item.orderCategory or "NORMAL").upper() == "STOP":
+            continue
+        if _is_protective_reason(item.reason):
+            continue
+        if _PRICE_RETRY_MARKER_RE.search(item.reason or ""):
+            continue
+        if item.strategy not in ("", "autofin_signal"):
+            continue
+        candidates.append(item)
+
+    if not candidates:
+        return summary
+
+    # Multiple strategy legs can describe the same action (for example
+    # ``autofin_partial:`` and ``autofin_partial_event:`` for the same
+    # CTP deal). Only retry one candidate per symbol and cap the total
+    # quantity by the live holding.
+    market_cache: dict[str, str] = {}
+    cash_pkg_cache: dict[str, int] = dict(loan_package_id_by_symbol or {})
+    seen_symbols: set[str] = set()
+    today_marker = f"[price-retry from {today_iso}]"
+
+    for item in candidates:
+        sym = str(item.symbol or "").upper().strip()
+        if not sym or sym in seen_symbols:
+            continue
+        seen_symbols.add(sym)
+
+        quote = None
+        try:
+            quote = client.get_latest_quote(sym)
+        except Exception as exc:
+            summary["failed"].append({
+                "symbol": sym,
+                "error": f"get_latest_quote failed: {type(exc).__name__}: {str(exc)[:160]}",
+            })
+            continue
+        bid = _extract_best_bid_in_vnd(quote)
+        if not bid or bid <= 0:
+            summary["skipped"].append({"symbol": sym, "reason": "no live best bid"})
+            continue
+
+        if sym in market_cache:
+            market_id = market_cache[sym]
+        else:
+            try:
+                market_id = str(client.get_market_id(sym) or "").strip().upper()
+            except Exception as exc:
+                market_id = "UNKNOWN_100"
+                summary["failed"].append({
+                    "symbol": sym,
+                    "error": f"get_market_id failed: {type(exc).__name__}: {str(exc)[:160]}",
+                })
+            market_cache[sym] = market_id
+
+        discount = float(os.environ.get("AUTOFIN_SELL_BID_DISCOUNT_PCT", "0.99"))
+        raw_price = int(round(bid * discount))
+        price = _hose_price_tick(raw_price, market_id)
+        if price <= 0:
+            summary["skipped"].append({"symbol": sym, "reason": "invalid rounded market price"})
+            continue
+
+        # Do not retry more shares than the account currently holds.
+        quantity = int(item.quantity or 0)
+        held: int | None = None
+        try:
+            positions = client.get_positions(account_no)
+            rows = positions.get("positions") if isinstance(positions, dict) else None
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("symbol") or "").upper().strip() != sym:
+                    continue
+                held = int(row.get("openQuantity") or 0)
+                break
+        except Exception as exc:
+            summary["failed"].append({
+                "symbol": sym,
+                "error": f"get_positions failed: {type(exc).__name__}: {str(exc)[:160]}",
+            })
+            continue
+        if held is None or held <= 0:
+            summary["skipped"].append({"symbol": sym, "reason": "no live position"})
+            continue
+        quantity = min(quantity, held)
+        if quantity <= 0:
+            summary["skipped"].append({"symbol": sym, "reason": "live position is zero"})
+            continue
+
+        if sym in cash_pkg_cache:
+            loan_package = cash_pkg_cache[sym]
+        else:
+            try:
+                loan_package = int(client.get_cash_loan_package_id(account_no, sym))
+            except Exception:
+                loan_package = int(loan_package_id or 0)
+            cash_pkg_cache[sym] = loan_package
+
+        base_reason = _PRICE_RETRY_MARKER_RE.sub("", item.reason or "").strip()
+        import hashlib
+        source_id = int(hashlib.sha1(
+            f"price-retry|{today_iso}|{sym}|{quantity}|{base_reason}".encode("utf-8")
+        ).hexdigest()[:12], 16)
+
+        from vietnam_algo.libs.trading_engine import DnseOrder
+        retry_order = DnseOrder(
+            symbol=sym,
+            side="NS",
+            quantity=quantity,
+            price=price,
+            loanPackageId=loan_package,
+            orderType="LO",
+            sourceOrderId=source_id,
+            sourceDate=today_iso,
+            reason=f"{base_reason} {today_marker}",
+        )
+
+        try:
+            from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
+            results, _, _ = execute_orders_with_ledger(
+                client=client,
+                account_no=account_no,
+                trading_token=trading_token,
+                orders=[retry_order],
+                data_dir=data_dir,
+                run_id=today_iso,
+                strategy="autofin_signal",
+            )
+        except Exception as exc:
+            summary["failed"].append({
+                "symbol": sym,
+                "error": f"retry submit failed: {type(exc).__name__}: {str(exc)[:200]}",
+            })
+            continue
+
+        result = results[0] if results else {}
+        status = str(result.get("status") or "")
+        if status == "submitted":
+            summary["retried"].append({
+                "symbol": sym,
+                "quantity": quantity,
+                "price": price,
+                "market_id": market_id,
+                "bid": bid,
+            })
+            print(
+                f"[price-retry] {sym}: SELL retried at market price "
+                f"{price:,.0f} VND ({market_id}, bid {bid:,.0f}), "
+                f"qty={quantity}"
+            )
+        else:
+            error = str(result.get("error") or status)
+            summary["failed"].append({"symbol": sym, "error": error[:240]})
+            print(
+                f"[price-retry] {sym}: retry was not submitted "
+                f"(status={status}, err={error[:180]})"
+            )
+
+    summary["total"] = len(summary["retried"]) + len(summary["failed"])
+    return summary
+
+
 def _buy_settled_by_t2(
     buy_source_date: str,
     today_iso: str,
     now_time: "_time | None" = None,
+    holidays: "set[str] | None" = None,
 ) -> bool:
     """Return True if the BUY's T+2.5 settlement has cleared.
 
@@ -1446,13 +2166,28 @@ def _buy_settled_by_t2(
     from the user: "vn stock market using t+2.5"). The BUY
     at T+0 settles by T+2.5, meaning the SELL order for the
     position is accepted starting from 12:00 PM (noon) on
-    T+2. So:
-      - If today is buy_date + 3 or more: settled (T+3 onward).
-      - If today is buy_date + 2 and current time >= 12:00:
-        settled (T+2.5 reached).
-      - If today is buy_date + 2 and current time < 12:00: NOT
-        settled yet — wait until noon.
-      - If today is buy_date + 1 or earlier: NOT settled.
+    T+2 — where T+2 means the **second TRADING day** after the buy,
+    not the second calendar day.
+
+      - On the 3rd trading day or later: settled.
+      - On the 2nd trading day, at or after 12:00: settled.
+      - On the 2nd trading day, before 12:00: NOT settled — wait
+        until noon.
+      - On the buy day or the 1st trading day: NOT settled.
+
+    2026-10-31 (the VOS case): the old implementation counted
+    CALENDAR days. A position bought on Friday 2026-10-29 was
+    therefore considered settled from Sunday 2026-10-31 12:00 —
+    a non-trading day — and, worse, "settled" on Monday
+    2026-11-02 09:00, i.e. before the T+2.5 cutoff. DNSE rejects
+    such a SELL with TRADE_QUANTITY_NOT_ENOUGH, and because that
+    rejection was classified as a terminal "rejected" ledger row,
+    the trim was permanently lost.
+
+    With TRADING days the same position settles on
+    2026-11-02 (Monday) at 12:00 ICT:
+        trading days: 10-29 (T+0), 10-30 (T+1), 11-02 (T+2)
+    (10-31/11-01 are the weekend and do not count.)
 
     The half-day logic is important: empirically, DNSE rejected
     the simulated T+2 retry on 2026-10-15 (Thu, 2 calendar days
@@ -1463,22 +2198,74 @@ def _buy_settled_by_t2(
     When ``now_time`` is None, we assume it's already past noon
     (the conservative default — over-retrying one half-day is
     safer than under-retrying and leaving the user unprotected).
+
+    ``holidays`` is the optional set of non-trading HOSE holiday
+    dates (YYYY-MM-DD). It is applied on top of the weekend rule.
     """
-    from datetime import date as _date, time as _time
+    from datetime import date as _date_cls, time as _time, timedelta as _td
     try:
-        buy_date = _date.fromisoformat(buy_source_date)
-        today = _date.fromisoformat(today_iso)
+        buy_date = _date_cls.fromisoformat(buy_source_date)
+        today = _date_cls.fromisoformat(today_iso)
     except ValueError:
         return False
-    days_diff = (today - buy_date).days
-    if days_diff >= 3:
+
+    # 2026-10-31: count TRADING days, not calendar days. Weekends
+    # and holidays do not advance the settlement clock.
+    from vietnam_algo.libs.market_calendar import trading_dates_between
+
+    holiday_set = holidays or set()
+    # Build the trading-day ladder from the buy date forward. We
+    # need at most 3 trading days, but we ask for more so the
+    # helper can walk over holidays.
+    ladder = trading_dates_between(
+        buy_date.isoformat(),
+        (buy_date + _td(days=20)).isoformat(),
+        holiday_set,
+    )
+    if len(ladder) < 2:
+        # Fewer than 2 trading days known (should not happen) —
+        # treat as not settled.
+        return False
+    t_plus_2 = ladder[2] if len(ladder) > 2 else None
+    if t_plus_2 is None:
+        return False
+
+    if today.isoformat() > t_plus_2:
         return True
-    if days_diff == 2:
+    if today.isoformat() == t_plus_2:
         cutoff = _time(12, 0)
         if now_time is None:
             return True  # assume past noon
         return now_time >= cutoff
     return False
+
+
+def _t2_settlement_date(
+    buy_source_date: str,
+    holidays: "set[str] | None" = None,
+) -> str:
+    """The date on which a BUY's T+2.5 settlement clears (YYYY-MM-DD).
+
+    This is the 2nd TRADING day after the buy; the SELL is accepted
+    from 12:00 ICT on that date. See ``_buy_settled_by_t2`` for the
+    weekend / holiday handling.
+
+    Returns "" when the ladder cannot be built.
+    """
+    from datetime import date as _date_cls, timedelta as _td
+    try:
+        buy_date = _date_cls.fromisoformat(buy_source_date)
+    except ValueError:
+        return ""
+    from vietnam_algo.libs.market_calendar import trading_dates_between
+    ladder = trading_dates_between(
+        buy_date.isoformat(),
+        (buy_date + _td(days=20)).isoformat(),
+        holidays or set(),
+    )
+    if len(ladder) < 3:
+        return ""
+    return ladder[2]
 
 
 def _buy_filled_and_matches_sl(buy: Any, sl_quantity: int) -> bool:
@@ -1510,6 +2297,7 @@ def retry_t2_settlement_sl_orders(
     now_time: "_time | None" = None,
     loan_package_id_by_symbol: dict[str, int] | None = None,
     loan_package_id: int = 0,
+    holidays: "set[str] | None" = None,
 ) -> dict:
     """Re-submit SL SELL orders that were rejected due to T+2.5 settlement.
 
@@ -1573,7 +2361,35 @@ def retry_t2_settlement_sl_orders(
         # protected (topped up). See the duplicate-STOP guard below.
         "already_protected": [],
         "partially_protected": [],
+        # 2026-10-31: the auction gate. The T+2 retry places real
+        # orders, so it must respect the same "no orders in ATO/ATC"
+        # rule as the main submit path (the user's explicit choice
+        # was to block ALL orders, stops included).
+        "skipped_auction": 0,
     }
+
+    # 2026-10-31: never place an order in the ATO / ATC auction
+    # windows. See ``_submit_autofin_deals_to_dnse`` for the full
+    # rationale (an auction order is sent with price=0, so the fill
+    # price is decided by the auction).
+    if now_time is not None:
+        _sch = TradingSchedule()
+        _session_now = (
+            TradingSession.ATO
+            if _sch.atoStart <= now_time < _sch.atoEnd
+            else (
+                TradingSession.ATC
+                if _sch.atcStart <= now_time < _sch.atcEnd
+                else None
+            )
+        )
+        if _session_now is not None:
+            summary["skipped_auction"] = 1
+            print(
+                f"[t2-sl-retry] skipped: the {_session_now.value} auction "
+                f"window does not accept bot orders"
+            )
+            return summary
 
     # Cache of symbol -> held qty so a position appearing multiple
     # times in the ledger (several SL variants per deal) only costs
@@ -1686,11 +2502,39 @@ def retry_t2_settlement_sl_orders(
     # Only CONFIRMED-working statuses count. "unknown" is excluded on
     # purpose: it means the broker state could not be read, and
     # skipping on that basis could leave a position unprotected.
+    #
+    # 2026-11-02 (TVN incident): the guard ALSO requires that the
+    # broker has CONFIRMED the stop is live. A row that is merely
+    # ``submitted`` has NOT been validated by DNSE yet — DNSE can
+    # still reject it (TVN's was rejected with INVALID_PRICE_LOT a
+    # minute after the submit).
+    #
+    # The TVN sequence:
+    #   09:18:09  retry submits the STOP   → ledger status "submitted"
+    #   09:19:29  DNSE rejects it          → ledger STILL says "submitted"
+    #   09:49:47  next retry pass          → guard sees "submitted" and
+    #              says "300 shares already protected — skipping"
+    #              → the position is left with NO stop-loss at all.
+    #
+    # The confirmation comes from ``lastDetail``: the order monitor
+    # writes the DNSE order-detail payload there after a successful
+    # poll. Only a row whose detail shows a LIVE order status
+    # (New / PartiallyFilled / PendingNew) counts as protected.
     protected_qty_by_deal: dict[tuple[str, str], int] = {}
     for _row in ledger.values():
         if (getattr(_row, "orderCategory", "NORMAL") or "NORMAL").upper() != "STOP":
             continue
         if _row.status not in ("submitted", "open", "partial", "prepared", "submitting"):
+            continue
+        # 2026-11-02: require broker confirmation. Without it a
+        # just-submitted (and possibly already-rejected) stop would
+        # block the retry and leave the position unprotected.
+        if not _stop_is_confirmed_live(_row):
+            summary.setdefault("unconfirmed_stops", []).append(
+                f"{_row.symbol}: STOP {_row.dnseOrderId or '(no id)'} is "
+                f"{_row.status!r} but not confirmed live by the broker yet "
+                f"— the T+2 retry may still place one"
+            )
             continue
         _row_did = _extract_deal_id_from_reason(_row.reason or "")
         if not _row_did:
@@ -1758,7 +2602,11 @@ def retry_t2_settlement_sl_orders(
     for item in ledger.values():
         if item.side != "NS":
             continue
-        if item.status != "rejected":
+        # 2026-10-31: a T+2 rejection now lands in its own
+        # ``t2_rejected`` status (not the terminal "rejected"), so the
+        # retry must scan BOTH — the old rows still carry "rejected",
+        # the new ones carry "t2_rejected".
+        if item.status not in ("rejected", T2_REJECTED_STATUS):
             continue
         if not _is_t2_rejection(item.error or ""):
             continue
@@ -1772,8 +2620,15 @@ def retry_t2_settlement_sl_orders(
             # No matching BUY found — the BUY is also rejected/never
             # placed, so there's nothing to SELL. Skip.
             continue
-        if not _buy_settled_by_t2(buy.sourceDate or "", today_iso, now_time=now_time):
+        if not _buy_settled_by_t2(
+            buy.sourceDate or "", today_iso, now_time=now_time,
+            holidays=holidays,
+        ):
             summary["t2_pending"] += 1
+            summary.setdefault("t2_pending_details", []).append(
+                f"{item.symbol}: settles on "
+                f"{_t2_settlement_date(buy.sourceDate or '', holidays) or '?'}"
+            )
             continue
         sl_candidates_by_did.setdefault(did, []).append((item, buy))
 
@@ -1961,6 +2816,31 @@ def retry_t2_settlement_sl_orders(
         cash_pkg_cache[sym] = int(pkg or 0)
         return cash_pkg_cache[sym]
 
+    # 2026-11-02 (TVN incident): the price ladder depends on the
+    # BOARD, and UPCOM (UPX) uses a flat 100-VND tick at every price
+    # level — the HOSE "below 10,000 → 10 VND" band does NOT apply.
+    #
+    # TVN is a UPCOM stock. Its stop at 9,360 produced a generated
+    # limit of 9,310 (a multiple of 10, per the HOSE ladder) and DNSE
+    # rejected it with ``INVALID_PRICE_LOT|Invalid price lot``. The
+    # correct UPCOM limit is 9,300.
+    #
+    # We look the market id up once per symbol and cache it.
+    market_id_cache: dict[str, str] = {}
+
+    def _resolve_market_id(sym: str) -> str:
+        if sym in market_id_cache:
+            return market_id_cache[sym]
+        try:
+            mid = client.get_market_id(sym)
+        except Exception as exc:
+            summary.setdefault("market_lookup_errors", []).append(
+                f"{sym}: {type(exc).__name__}: {str(exc)[:160]}"
+            )
+            mid = ""
+        market_id_cache[sym] = str(mid or "").upper()
+        return market_id_cache[sym]
+
     orders_to_resubmit: list[DnseOrder] = []
     for sl, buy, sl_qty in candidates:
         # 2026-10-23 fix (unbounded retry loop): strip any
@@ -2092,7 +2972,13 @@ def retry_t2_settlement_sl_orders(
             )
         # The generated NORMAL order's limit: just below the trigger
         # so it crosses the book as soon as the stop fires.
-        generated_limit = _hose_price_tick(int(round(stop_level * 0.995)))
+        #
+        # 2026-11-02 (TVN): the ladder is BOARD-dependent — UPCOM uses
+        # a flat 100-VND tick. The old HOSE-banded helper produced
+        # 9,310 for TVN, which DNSE rejected with INVALID_PRICE_LOT.
+        generated_limit = _hose_price_tick(
+            int(round(stop_level * 0.995)), _resolve_market_id(sl.symbol),
+        )
         if generated_limit <= 0:
             generated_limit = stop_level
         # GTD expiry: 30 days out, ISO 8601 in Vietnam time.
@@ -2431,6 +3317,26 @@ def _maybe_reprice_stale_order(
     if item.side not in ("NB", "NS"):
         summary["reason"] = f"side {item.side!r} is not BUY or SELL"
         return summary
+    # 2026-10-31: the bot does not trade in the ATO / ATC auction
+    # windows — no orders at all, re-prices included. The re-pricer
+    # cancels the old order and places a new one, so it is a submit.
+    #
+    # The time comes from ``now_epoch`` (the caller's clock), which
+    # the runner sets to ICT. ``datetime.now()`` would be UTC on the
+    # VPS and the auction windows would never match.
+    _sch = TradingSchedule()
+    _now_t = datetime.fromtimestamp(now_epoch, tz=VIETNAM_TZ).time()
+    if (
+        _sch.atoStart <= _now_t < _sch.atoEnd
+        or _sch.atcStart <= _now_t < _sch.atcEnd
+    ):
+        summary["reason"] = (
+            f"re-price skipped: the auction window "
+            f"({_sch.atoStart}-{_sch.atoEnd} / "
+            f"{_sch.atcStart}-{_sch.atcEnd}) does not accept bot orders"
+        )
+        summary["action"] = "skipped"
+        return summary
     # 2026-10-28: a protective STOP order must NEVER be re-priced.
     # The re-pricer moves a SELL's limit toward the live bid and, past
     # the 3% cap, CANCELS the order — on a protective stop that would
@@ -2563,6 +3469,19 @@ def _maybe_reprice_stale_order(
         # default or skip the re-price.
         cash_pkg_id = 0
 
+    # Round the replacement price to the symbol's exchange price lot.
+    # A raw best bid/ask is not necessarily a valid HOSE/HNX/UPCOM
+    # price and DNSE rejects it with INVALID_PRICE_LOT.
+    try:
+        market_id = str(client.get_market_id(item.symbol) or "").strip().upper()
+    except Exception as exc:
+        summary["reason"] = f"get_market_id failed: {type(exc).__name__}: {str(exc)[:120]}"
+        return summary
+    replacement_price = _hose_price_tick(market_price, market_id)
+    if replacement_price <= 0:
+        summary["reason"] = "invalid replacement price after tick rounding"
+        return summary
+
     try:
         new_resp = client.place_stock_order(
             account_no=account_no,
@@ -2570,7 +3489,7 @@ def _maybe_reprice_stale_order(
             symbol=item.symbol,
             side=item.side,
             quantity=item.quantity,
-            price=market_price,
+            price=replacement_price,
             loan_package_id=cash_pkg_id,
             order_type="LO",
         )
@@ -2586,7 +3505,7 @@ def _maybe_reprice_stale_order(
         new_order_status = normalize_ledger_status(str(new_order_status_raw))
 
     summary["action"] = "replaced"
-    summary["new_price"] = market_price
+    summary["new_price"] = replacement_price
     summary["new_dnse_order_id"] = new_order_id
     summary["new_status"] = new_order_status
     return summary
@@ -2646,11 +3565,17 @@ def _format_status_change_message(
     ]
     if isinstance(detail, dict):
         # Show extras that operators care about.
+        #
+        # 2026-11-02 (TVN): ``errorMessage`` is the field DNSE actually
+        # uses for a rejected order ("INVALID_PRICE_LOT|Invalid price
+        # lot"). It was NOT in this list, so the rejection reason was
+        # invisible to the operator even when a message was sent.
         for key in (
             "filledQuantity", "fillQuantity", "matchedQuantity",
             "averagePrice", "fillPrice", "lastPrice",
             "canceledQuantity", "leaveQuantity",
             "rejectReason", "cancelReason", "rejectedReason", "errorReason",
+            "errorMessage", "message",
         ):
             value = detail.get(key)
             if value is not None and value != "":
@@ -3025,11 +3950,16 @@ def run_auto_bot(
     # ACTUALLY changes (the cron writes a new token at 08:30 ICT, so
     # we want one line, not one per minute).
     # ``_last_stale_token_warn_min`` throttles the "token is STALE"
-    # warning to once per hour, and ``_stale_token_alert_date``
-    # ensures the Telegram alert fires at most once per ICT day.
+    # LOG LINE to once per hour.
+    #
+    # 2026-10-31: the Telegram ALERT moved into
+    # ``_notify_stale_token_if_blocking``, which fires only when a
+    # stale token actually blocks an order in a live trading session.
+    # ``_stale_token_alert_state`` carries the once-per-ICT-day
+    # throttle for it.
     _last_adopted_token_issued_at: str | None = None
     _last_stale_token_warn_min: int | None = None
-    _stale_token_alert_date: str = ""
+    _stale_token_alert_state: dict = {}
     while True:
         if not first_iter:
             time.sleep(sleep_seconds)
@@ -3095,6 +4025,28 @@ def run_auto_bot(
                                 f"token hydration failed: {_exc}"
                             )
                 else:
+                    # 2026-10-31: the STALE-token ALERT moved out of
+                    # this block.
+                    #
+                    # This block runs on EVERY cycle (every ~60 s), all
+                    # day and all night. The operator was getting the
+                    # "DNSE trading token is STALE" Telegram alert at
+                    # 22:46 on a SATURDAY — when there was no trading
+                    # session and no order to send.
+                    #
+                    # The user's rule: the alert should only fire in a
+                    # LIVE TRADING SESSION, and only when we actually
+                    # have an ORDER to send with it. The token is only
+                    # renewed lazily — when a new order is planned — so
+                    # a stale token is only actionable at the moment
+                    # it would block a submit.
+                    #
+                    # The log line below stays (it is cheap, throttled to
+                    # once an hour, and useful for post-mortems), but
+                    # the Telegram notification now happens in
+                    # ``_notify_stale_token_if_blocking`` — called from
+                    # the mid-day poll and the EOD submit, only when
+                    # there are orders to send and the market is open.
                     _sh = load_shared_trading_token(engine_config.dataDir)
                     if _sh:
                         _issued = str(_sh.get("issued_at") or "?")
@@ -3110,19 +4062,6 @@ def run_auto_bot(
                                 f"08:30-ICT get_otp cron may have missed its "
                                 f"window; orders will be skipped until it "
                                 f"refreshes"
-                            )
-                        # Notify at most once per ICT day so a missed
-                        # cron is visible without spamming.
-                        if _stale_token_alert_date != today:
-                            _stale_token_alert_date = today
-                            notify(
-                                "🚨 Vietnam Algo: DNSE trading token is STALE\n"
-                                f"account: {account_no}\n"
-                                f"issued_at: {_issued}\n"
-                                "The 08:30-ICT get_otp cron may have missed "
-                                "its window. Orders will be SKIPPED (not "
-                                "sent with a bad token) until the token "
-                                "refreshes."
                             )
             except Exception as exc:
                 print(
@@ -3832,6 +4771,33 @@ def run_auto_bot(
                                 f"token hydrate failed: "
                                 f"{type(exc).__name__}: {str(exc)[:200]}"
                             )
+                    # 2026-10-31: the stale-token ALERT.
+                    #
+                    # This is the ONLY place (besides the EOD submit)
+                    # where it belongs: we are in a live trading
+                    # session and we have orders to send, so a stale
+                    # token actually BLOCKS them.
+                    #
+                    # It is checked independently of ``token`` — a
+                    # stale token can be present in the state (so
+                    # ``token`` is truthy) and still be past its
+                    # 12-hour validity window.
+                    if live_submit:
+                        try:
+                            _notify_stale_token_if_blocking(
+                                engine_config.dataDir,
+                                account_no,
+                                (poll_result.get("deals_actioned") or [])
+                                if isinstance(poll_result, dict) else [],
+                                now=now,
+                                alert_state=_stale_token_alert_state,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[{now.isoformat()}] stale-token alert "
+                                f"failed: {type(exc).__name__}: "
+                                f"{str(exc)[:200]}"
+                            )
                     # Live mode: actually submit the planned orders to
                     # DNSE via execute_orders_with_ledger. We do this
                     # BEFORE the dry-run apply so the dry-run state
@@ -3861,9 +4827,74 @@ def run_auto_bot(
                                 f"{submit_result['skipped_existing']} skipped-existing, "
                                 f"{submit_result['unknown']} unknown, "
                                 f"{submit_result.get('rejected', 0)} rejected, "
-                                f"{submit_result.get('token_rejected', 0)} token-rejected "
+                                f"{submit_result.get('token_rejected', 0)} token-rejected, "
+                                f"{submit_result.get('t2_rejected', 0)} t2-rejected, "
+                                f"{submit_result.get('skipped_auction', 0)} skipped-auction, "
+                                f"{submit_result.get('settlement_deferred') and len(submit_result['settlement_deferred']) or 0} settlement-deferred "
                                 f"(of {submit_result['total']} planned)"
                             )
+                            # 2026-11-16: if DNSE rejected a discretionary
+                            # SELL because of its price (for example
+                            # INVALID_PRICE_LOT), retry it once as a
+                            # marketable limit SELL using the live best
+                            # bid and the correct exchange price lot.
+                            # Protective STOP legs are excluded by the
+                            # retry helper itself.
+                            if submit_result.get("rejected", 0) and token:
+                                try:
+                                    price_retry = retry_price_rejected_sell_orders(
+                                        client,
+                                        account_no,
+                                        token,
+                                        engine_config.dataDir,
+                                        today,
+                                        loan_package_id=loan_package_id,
+                                    )
+                                    if price_retry.get("retried"):
+                                        print(
+                                            f"[{now.isoformat()}] price-retry: "
+                                            f"{len(price_retry['retried'])} SELL order(s) "
+                                            f"retried at the live market price"
+                                        )
+                                except Exception as exc:
+                                    print(
+                                        f"[{now.isoformat()}] price-retry failed: "
+                                        f"{type(exc).__name__}: {str(exc)[:200]}"
+                                    )
+                            # 2026-10-30 (VOS incident): the strategy
+                            # marks a partial close as "fired" when it
+                            # PLANS it, before we know whether it
+                            # reached DNSE. If the submit was skipped
+                            # (off-hours, no token) or rejected, the
+                            # marker would say "already done" and the
+                            # trim would never be retried — leaving the
+                            # position un-trimmed indefinitely.
+                            # Re-arm the actions that did not make it.
+                            try:
+                                _rearm = strategy_adapter.rearm_unsubmitted_actions(
+                                    poll_result.get("deals_actioned") or [],
+                                    set(
+                                        str(s).strip().upper()
+                                        for s in (submit_result.get("submitted_symbols") or [])
+                                    ),
+                                )
+                                if _rearm:
+                                    # Persist the re-armed state so the
+                                    # next cycle sees the action as
+                                    # pending, not done.
+                                    strategy_adapter._save_state(
+                                        engine_config.dataDir
+                                    )
+                                    print(
+                                        f"[{now.isoformat()}] re-armed "
+                                        f"unsubmitted partial closes: "
+                                        f"{', '.join(_rearm)}"
+                                    )
+                            except Exception as exc:
+                                print(
+                                    f"[{now.isoformat()}] re-arm failed: "
+                                    f"{type(exc).__name__}: {str(exc)[:200]}"
+                                )
                             if submit_result["submitted"]:
                                 notify(
                                     "Vietnam Algo: autofin mid-day SUBMITTED to DNSE\n"
@@ -3932,6 +4963,15 @@ def run_auto_bot(
                                 if len(out_of_zone) > 10:
                                     lines.append(f"  + {len(out_of_zone) - 10} more")
                                 notify("\n".join(lines))
+                            # 2026-10-31: tell the operator about the
+                            # SELLS deferred by the T+2.5 settlement
+                            # gate — a reduce that autofin published
+                            # must not look like nothing happened.
+                            _defer_msg = settlement_deferred_message(
+                                submit_result, today, "autofin mid-day",
+                            )
+                            if _defer_msg:
+                                notify(_defer_msg)
                         except Exception as exc:
                             notify(
                                 "\n".join([
@@ -3980,12 +5020,49 @@ def run_auto_bot(
                                 print(f"[{now.isoformat()}] t2-sl-retry (mid-day): {_note}")
                             for _note in t2_summary.get("partially_protected", []) or []:
                                 print(f"[{now.isoformat()}] t2-sl-retry (mid-day): {_note}")
-                                if t2_summary.get("resubmitted"):
-                                    notify(
-                                        "🔁 Vietnam Algo: T+2 SL retry (mid-day)\n"
-                                        f"resubmitted: {t2_summary['resubmitted']}\n"
-                                        f"dnseOrderIds: {t2_summary['resubmit_dnse_ids']}"
-                                    )
+                            if t2_summary.get("resubmitted"):
+                                notify(
+                                    "🔁 Vietnam Algo: T+2 SL retry (mid-day)\n"
+                                    f"resubmitted: {t2_summary['resubmitted']}\n"
+                                    f"dnseOrderIds: {t2_summary['resubmit_dnse_ids']}"
+                                )
+                            # 2026-11-02 (TVN incident): the mid-day T+2
+                            # retry path NEVER notified on errors — only
+                            # the start-of-day path did. The TVN stop was
+                            # rejected by DNSE with
+                            # ``INVALID_PRICE_LOT|Invalid price lot``
+                            # and the operator got NO Telegram message:
+                            # the position silently lost its stop-loss.
+                            #
+                            # This is the alert the operator asked for.
+                            if t2_summary.get("resubmit_errors"):
+                                notify(
+                                    "🚨 Vietnam Algo: T+2 SL retry FAILED "
+                                    "(mid-day) — the position may be "
+                                    "UNPROTECTED\n"
+                                    f"date: {today}\n"
+                                    + "\n".join(t2_summary["resubmit_errors"][:5])
+                                )
+                            # 2026-11-02: a stop that could not be placed
+                            # at all (no recoverable price) leaves the
+                            # position with NO protection. Say so loudly.
+                            if t2_summary.get("no_price"):
+                                notify(
+                                    "🚨 Vietnam Algo: T+2 SL retry could NOT "
+                                    "place a stop-loss (no price)\n"
+                                    "The position is UNPROTECTED — place the "
+                                    "SL manually:\n"
+                                    + "\n".join(t2_summary["no_price"][:5])
+                                )
+                            # 2026-11-02 (TVN): a stop that was submitted
+                            # but NOT yet confirmed live by the broker.
+                            # It may still be rejected (TVN's was, with
+                            # INVALID_PRICE_LOT). The retry will not
+                            # stack a second one until the monitor
+                            # confirms the first — so this is the
+                            # operator's window to notice.
+                            for _note in t2_summary.get("unconfirmed_stops", []) or []:
+                                print(f"[{now.isoformat()}] t2-sl-retry (mid-day): {_note}")
                         except Exception as exc:
                             print(f"[{now.isoformat()}] t2-sl-retry mid-day crashed: {type(exc).__name__}: {str(exc)[:200]}")
                     # Mid-day polls also need to apply the planned orders
@@ -4226,6 +5303,63 @@ def run_auto_bot(
             # by (run_id, sourceOrderId, symbol, side) so the same
             # logical order can't be double-submitted if the bot
             # restarts mid-day and the EOD replans it.
+            #
+            # 2026-10-31: the EOD path hydrates its own token from the
+            # shared file. It used to rely on the loop-scoped ``token``,
+            # which is only set by the ``should_submit_orders`` block —
+            # and that block is SKIPPED for autofin_signal (it is a
+            # mid-day/EOD strategy, see the comment there). So the EOD
+            # submit was silently skipped whenever the bot had not
+            # happened to run the submit cycle that day.
+            if live_submit and isinstance(result, dict) and result.get("deals_actioned"):
+                _eod_deals = result.get("deals_actioned") or []
+                if not token:
+                    try:
+                        shared = load_shared_trading_token(
+                            engine_config.dataDir,
+                        )
+                        from vietnam_algo.libs.dnse.auth import (
+                            is_token_fresh as _is_fresh,
+                        )
+                        if shared and shared.get("token") and _is_fresh(
+                            shared.get("token"),
+                            issued_at=shared.get("issued_at"),
+                        ):
+                            token = str(shared["token"])
+                            print(
+                                f"[{now.isoformat()}] eod submit hydrated "
+                                f"trading token from shared file "
+                                f"(issued_at={shared.get('issued_at','?')})"
+                            )
+                        elif shared and shared.get("token"):
+                            print(
+                                f"[{now.isoformat()}] eod submit: shared "
+                                f"trading token is STALE (issued_at="
+                                f"{shared.get('issued_at','?')}) — orders "
+                                f"will be skipped rather than rejected "
+                                f"with INVALID_TRADING_TOKEN"
+                            )
+                    except Exception as exc:
+                        print(
+                            f"[{now.isoformat()}] eod submit token hydrate "
+                            f"failed: {type(exc).__name__}: {str(exc)[:200]}"
+                        )
+                # 2026-10-31: the stale-token ALERT. Same rule as the
+                # mid-day poll — a live session, orders to send, and a
+                # token that is genuinely stale.
+                try:
+                    _notify_stale_token_if_blocking(
+                        engine_config.dataDir,
+                        account_no,
+                        _eod_deals,
+                        now=now,
+                        alert_state=_stale_token_alert_state,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[{now.isoformat()}] stale-token alert failed: "
+                        f"{type(exc).__name__}: {str(exc)[:200]}"
+                    )
             if (
                 live_submit
                 and isinstance(result, dict)
@@ -4248,9 +5382,61 @@ def run_auto_bot(
                         f"{submit_result['skipped_existing']} skipped-existing, "
                         f"{submit_result['unknown']} unknown, "
                         f"{submit_result.get('rejected', 0)} rejected, "
-                        f"{submit_result.get('token_rejected', 0)} token-rejected "
+                        f"{submit_result.get('token_rejected', 0)} token-rejected, "
+                        f"{submit_result.get('t2_rejected', 0)} t2-rejected, "
+                        f"{submit_result.get('skipped_auction', 0)} skipped-auction "
                         f"(of {submit_result['total']} planned)"
                     )
+                    # 2026-11-16: recover price-rejected discretionary
+                    # SELLs with one marketable-price retry.
+                    if submit_result.get("rejected", 0) and token:
+                        try:
+                            price_retry = retry_price_rejected_sell_orders(
+                                client,
+                                account_no,
+                                token,
+                                engine_config.dataDir,
+                                today,
+                                loan_package_id=loan_package_id,
+                            )
+                            if price_retry.get("retried"):
+                                print(
+                                    f"[{now.isoformat()}] eod price-retry: "
+                                    f"{len(price_retry['retried'])} SELL order(s) "
+                                    f"retried at the live market price"
+                                )
+                        except Exception as exc:
+                            print(
+                                f"[{now.isoformat()}] eod price-retry failed: "
+                                f"{type(exc).__name__}: {str(exc)[:200]}"
+                            )
+                    # 2026-10-30 (VOS incident): re-arm the partial
+                    # closes that were planned but NOT submitted, so
+                    # they are planned again on the next cycle instead
+                    # of being silently swallowed by the "already
+                    # fired" marker.
+                    try:
+                        _rearm = strategy_adapter.rearm_unsubmitted_actions(
+                            result.get("deals_actioned") or [],
+                            set(
+                                str(s).strip().upper()
+                                for s in (submit_result.get("submitted_symbols") or [])
+                            ),
+                        )
+                        if _rearm:
+                            strategy_adapter._save_state(
+                                engine_config.dataDir
+                            )
+                            print(
+                                f"[{now.isoformat()}] eod re-armed "
+                                f"unsubmitted partial closes: "
+                                f"{', '.join(_rearm)}"
+                            )
+                    except Exception as exc:
+                        print(
+                            f"[{now.isoformat()}] eod re-arm failed: "
+                            f"{type(exc).__name__}: {str(exc)[:200]}"
+                        )
                     if submit_result["submitted"]:
                         notify(
                             "Vietnam Algo: autofin EOD SUBMITTED to DNSE\n"
@@ -4299,6 +5485,12 @@ def run_auto_bot(
                         if len(out_of_zone) > 10:
                             lines.append(f"  + {len(out_of_zone) - 10} more")
                         notify("\n".join(lines))
+                    # 2026-10-31: the T+2.5 settlement deferrals.
+                    _defer_msg = settlement_deferred_message(
+                        submit_result, today, "autofin EOD",
+                    )
+                    if _defer_msg:
+                        notify(_defer_msg)
                 except Exception as exc:
                     notify(
                         "\n".join([

@@ -48,6 +48,7 @@ from vietnam_algo.libs.schedule import (
     TradingSchedule,
     TradingSession,
     current_session,
+    is_auction_session,
     local_date,
     order_type_for_session,
     should_poll_strategy,
@@ -742,7 +743,56 @@ def _submit_autofin_deals_to_dnse(
             ),
         }
     session_order_type = order_type_for_session(session)
-    is_auction = session in (TradingSession.ATO, TradingSession.ATC)
+    is_auction = is_auction_session(session)
+
+    # 2026-10-31: NO orders in the ATO / ATC auction windows.
+    #
+    # The user asked for this explicitly ("we should not do trade in
+    # ato and atc session"). An auction order is submitted with
+    # ``price=0`` — the fill price is decided by the auction, not by
+    # us. The live ledger shows the damage: the VOS BUY submitted at
+    # 2026-10-29 09:01:17 was an ATO order and filled at 11,800 while
+    # the continuous-market bid was ~10,800. Worse, ``price=0`` on a
+    # BUY means "buy at ANY price" to DNSE.
+    #
+    # The block covers ALL orders, including protective STOPs. A stop
+    # planned during the window is deferred to the next continuous
+    # session by the re-arm logic.
+    #
+    # Post-close (14:45-15:00) is NOT an auction — it is a normal LO
+    # session on HOSE (PLO) with a real price — so it stays
+    # tradeable.
+    if is_auction:
+        _auction_orders = sum(
+            1 for d in deals_actioned for _ in (d.get("dnse_orders") or [])
+        )
+        notify(
+            "\n".join([
+                f"⚠️ Vietnam Algo: autofin LIVE submit SKIPPED "
+                f"({session.value} auction)",
+                f"date: {trade_date}",
+                f"orders: {_auction_orders}",
+                f"reason: the bot does not trade in the {session.value} "
+                f"auction window (09:00-09:15 / 14:30-14:45) — an "
+                f"auction order is sent with price=0, so the fill price "
+                f"is decided by the auction.",
+                "next attempt: the next continuous session "
+                "(09:15-11:30 / 13:00-14:30).",
+            ])
+        )
+        return {
+            "submitted": [],
+            "submitted_symbols": [],
+            "skipped_existing": 0,
+            "unknown": 0,
+            "rejected": 0,
+            "token_rejected": 0,
+            "t2_rejected": 0,
+            "rejected_details": [],
+            "total": 0,
+            "out_of_zone": out_of_zone,
+            "skipped_auction": _auction_orders,
+        }
 
     # 2026-10-12: the DNSE server REQUIRES ``loanPackageId`` in every
     # place_stock_order body, and treats ``0`` as "no value" (rejected

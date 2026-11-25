@@ -37,6 +37,7 @@ from typing import Any
 
 from vietnam_algo.libs.autofin_signals import (
     RECOMMENT_KIND_ENTRY,
+    RECOMMENT_KIND_UNKNOWN,
     AutofinClient,
     AutofinSignal,
     classify_recomment,
@@ -57,6 +58,60 @@ from .base import StrategyAdapter
 
 
 DEFAULT_BOARD_LOT = 100
+
+# 2026-10-29 (VOS incident): how old a cached ``lastRecomment`` may be
+# before we re-fetch it from autofin's /signal-deals endpoint. The bot
+# cycles every 60 s, so 15 minutes bounds the per-cycle API cost to
+# roughly one refresh per tracked deal per 15 minutes.
+DEFAULT_STALE_RECOMMENT_MAX_AGE_SECONDS = 900
+
+# How long to wait before retrying a refresh that FAILED. Some tracked
+# deals can never be refreshed (their ``_id`` is absent from autofin's
+# /signal-deals history), and without a backoff they would cost one API
+# call every cycle forever.
+_FAILED_REFRESH_BACKOFF_SECONDS = 3600
+
+
+def _age_seconds(stamp: Any) -> float | None:
+    """Age of an ISO timestamp in seconds, or None if unknown/unparseable."""
+    if not stamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
+def _mark_refresh_attempt(sig: dict[str, Any]) -> None:
+    """Record a FAILED refresh attempt so we don't retry every cycle.
+
+    Some tracked deals can never be refreshed — e.g. their ``_id`` is
+    not present in autofin's /signal-deals history at all (old closed
+    deals, or an id mapping that autofin no longer exposes). Without a
+    backoff those would cost one API call per cycle forever.
+
+    We stamp the attempt time and treat the deal as "recently tried"
+    for ``_FAILED_REFRESH_BACKOFF_SECONDS`` (default 1 hour).
+    """
+    sig["_last_refresh_attempt_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _deal_id_in(rows: list[dict[str, Any]], did: str) -> bool:
+    """True if ``did`` appears in the ``_id`` of any row in ``rows``.
+
+    Handles both raw dicts (holding/suggest payloads) and
+    ``AutofinSignal`` objects (which carry the raw dict in ``.raw``).
+    """
+    for r in rows:
+        raw = getattr(r, "raw", None)
+        if not isinstance(raw, dict):
+            raw = r if isinstance(r, dict) else {}
+        if _deal_id(raw) == did:
+            return True
+    return False
 
 
 def _load_env_credentials() -> tuple[str, str]:
@@ -86,6 +141,63 @@ def _env_partial_close_fraction() -> float | None:
     return None
 
 
+# 2026-10-31: the buy-zone tolerance.
+#
+# The bot used to accept an entry when the live price was within
+# +-3 % of either edge of autofin's declared supply zone
+# ("Vùng mua"). The user tightened it to +-1 %
+# ("i wanna change the buy window from +- 3% to +-1%").
+#
+# A tighter band means we only enter when the price is essentially
+# inside the zone autofin published — we do not chase a price that
+# has run away from the recommended entry band.
+#
+# Tunable per environment via ``AUTOFIN_BUY_ZONE_TOLERANCE_PCT``
+# (a fraction, e.g. ``0.01`` for 1 %). ``AUTOFIN_BUY_ZONE_TOLERANCE_ABOVE_PCT``
+# / ``_BELOW_PCT`` override the two sides independently.
+DEFAULT_BUY_ZONE_TOLERANCE_PCT = 0.01
+
+
+def buy_zone_tolerance_pct() -> tuple[float, float]:
+    """Return the (above, below) buy-zone tolerances as fractions.
+
+    2026-10-31: was +-3 % on both sides; the user asked for +-1 %.
+    The two sides can be overridden independently, but by default they
+    are symmetric.
+    """
+    raw = os.environ.get("AUTOFIN_BUY_ZONE_TOLERANCE_PCT", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = DEFAULT_BUY_ZONE_TOLERANCE_PCT
+    else:
+        value = DEFAULT_BUY_ZONE_TOLERANCE_PCT
+    # A tolerance must be non-negative and sane (< 100 %).
+    if not (0.0 <= value < 1.0):
+        value = DEFAULT_BUY_ZONE_TOLERANCE_PCT
+
+    above = value
+    raw_above = os.environ.get("AUTOFIN_BUY_ZONE_TOLERANCE_ABOVE_PCT", "").strip()
+    if raw_above:
+        try:
+            above = float(raw_above)
+        except ValueError:
+            pass
+    below = value
+    raw_below = os.environ.get("AUTOFIN_BUY_ZONE_TOLERANCE_BELOW_PCT", "").strip()
+    if raw_below:
+        try:
+            below = float(raw_below)
+        except ValueError:
+            pass
+    if not (0.0 <= above < 1.0):
+        above = value
+    if not (0.0 <= below < 1.0):
+        below = value
+    return above, below
+
+
 def _round_to_lots(quantity: int, board_lot: int = DEFAULT_BOARD_LOT) -> int:
     if quantity <= 0:
         return 0
@@ -99,10 +211,21 @@ def _round_up_to_lots(quantity: int, board_lot: int = DEFAULT_BOARD_LOT) -> int:
     position", ``10% × 600 = 60`` shares but Vietnamese boards trade
     in lots of 100. Rounding down would skip the order entirely;
     rounding up emits the smallest lot that exceeds the desired qty.
+
+    2026-10-30 (VOS incident): the old formula
+    ``((quantity + board_lot - 1) // board_lot) * board_lot`` rounded
+    EXACT multiples up by a whole extra lot — 150 became 200 and 100
+    became 200. On the VOS reduce (50 % of 300 = 150 shares) that
+    oversold by 50 shares, and a 100-share trim would have doubled
+    it. The fix rounds up only when the quantity is NOT already a
+    multiple of the lot.
     """
     if quantity <= 0:
         return 0
-    return ((quantity + board_lot - 1) // board_lot) * board_lot
+    remainder = quantity % board_lot
+    if remainder == 0:
+        return quantity
+    return quantity + (board_lot - remainder)
 
 
 def _extract_partial_fraction(
@@ -684,7 +807,8 @@ def _expand_signals_with_held_unentered(
     holding: list[dict[str, Any]],
     our_deals: dict[str, dict[str, Any]],
     current_prices: dict[str, float],
-    above_zone_tolerance_pct: float = 0.03,
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+    above_zone_tolerance_pct: float = DEFAULT_BUY_ZONE_TOLERANCE_PCT,
 ) -> list[AutofinSignal]:
     """Augment ``signals`` with held-but-not-entered deals that are
     currently in the buy zone.
@@ -707,6 +831,32 @@ def _expand_signals_with_held_unentered(
     the upper and lower bounds — i.e. a price more than 5 % below
     ``supply_from`` is also rejected as out-of-zone. De-duplicated
     against existing ``signals`` by deal_id so fresh signals win.
+
+    2026-10-29 (VOS incident): this function now ALSO gates on the
+    deal's current RECOMMENDATION KIND.
+
+    Before this fix the function only checked ``isClosed`` and
+    ``_our_qty``, so it could propose a BUY for a deal autofin was
+    actively telling us to trim. On 2026-10-29 the bot opened a NEW
+    position on VOS even though autofin's recommendation for that
+    deal had already moved to "⚠️ Hạ tỷ trọng lần 2" (reduce weight)
+    four days after the deal opened.
+
+    The gate is deliberately narrow:
+
+    - ``entry`` → allowed (this is a fresh entry recommendation).
+    - ``unknown`` → allowed. autofin publishes the "Ngày khuyến nghị"
+      entry card on some endpoints and an empty/other headline on
+      others; refusing to enter on an unrecognised headline would
+      silently stop the bot from trading at all.
+    - ``reduce`` / ``tp`` / ``capital_protect`` / ``close`` → BLOCKED.
+      These all mean autofin wants us to SELL, not buy. Entering here
+      would fight autofin's own recommendation.
+
+    Note the recommendation text used for the gate is taken from the
+    HOLDING row when present, and otherwise from our cached deal state
+    (which the caller refreshes from /signal-deals — see
+    ``_refresh_stale_deal_recomments``).
     """
     seen_ids: set[str] = {_deal_id(s.raw) for s in signals if s.symbol}
     out: list[AutofinSignal] = list(signals)
@@ -728,6 +878,18 @@ def _expand_signals_with_held_unentered(
         except Exception:
             continue
         if not sig.symbol:
+            continue
+        # 2026-10-29 (VOS incident): gate on the recommendation KIND.
+        # A deal whose current autofin recommendation is a TP / SL /
+        # reduce / close must never become a BUY candidate — autofin is
+        # telling us to SELL that position, not to open one.
+        rec_kind = classify_recomment(sig.last_recomment)
+        if rec_kind not in (RECOMMENT_KIND_ENTRY, RECOMMENT_KIND_UNKNOWN):
+            print(
+                f"[autofin_signal] held-deal candidate skipped "
+                f"{sig.symbol} ({did}): recommendation kind="
+                f"{rec_kind!r} rec={sig.last_recomment[:60]!r}"
+            )
             continue
         cur = current_prices.get(sig.symbol, 0)
         if cur <= 0:
@@ -766,12 +928,16 @@ def _plan_orders_for_new_positions(
     min_order_value_vnd: float = 1_000_000,
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
-    above_zone_tolerance_pct: float = 0.03,
-    below_zone_tolerance_pct: float = 0.03,
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %). The
+    # user tightened the band so we only enter when the live price is
+    # essentially inside the zone autofin published.
+    above_zone_tolerance_pct: float = DEFAULT_BUY_ZONE_TOLERANCE_PCT,
+    below_zone_tolerance_pct: float = DEFAULT_BUY_ZONE_TOLERANCE_PCT,
     already_planned_symbols: set[str] | None = None,
     available_cash_vnd: float | None = None,
     new_entry_min_cash_pct: float = 0.05,
-    top_n: int = 1,
+    # 2026-10-29: up to 3 qualifying entries per day (was 1).
+    top_n: int = 3,
 ) -> list[dict[str, Any]]:
     """Emit BUY + TP + SL bracket orders for **new** positions only.
 
@@ -808,10 +974,13 @@ def _plan_orders_for_new_positions(
         we skip ALL new entries for this cycle. This prevents
         tiny dust entries when the portfolio is already nearly
         fully invested.
-      - ``top_n`` (default 1) — only the top-N signals (in the
+      - ``top_n`` (default 3) — at most the top-N signals (in the
         order returned by the caller, typically autofin's
         ``/signal-static-suggest`` ordering) can produce entries.
-        This enforces "only the top suggestion" per user spec.
+        Counts ENTRIES MADE, not candidates examined: a candidate
+        that fails the price zone, the recomment classification or
+        the cash/lot-sizing gate does not consume a slot
+        (2026-10-28 fix). User request 2026-10-29: "let use top 3".
 
     Per user feedback (2026-09-09): also accept ``already_planned_symbols`` —
     a set of symbols that are already in the bot's persistent
@@ -1313,6 +1482,51 @@ def _parse_percent(s: str) -> float:
     return float(s.replace(",", "").strip() or "0")
 
 
+def _partial_close_step_key(action: "PartialCloseAction") -> str:
+    """A stable identity for a partial-close STEP.
+
+    2026-10-30 (VOS incident): autofin re-publishes the SAME reduce
+    recommendation with an incremented "lần" number as the loss
+    deepens. The VOS deal has TWO such events:
+
+        [VOS] ⚠️ Hạ 50 % tỉ trọng lần 1 Giá: 11,100 - Nắm giữ: 4 ngày Lỗ: -8.68 %
+        [VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 11,100 - Nắm giữ: 4 ngày Lỗ: -9.09 %
+
+    Same price, same 50 % fraction, same holding period — only the
+    loss % differs. It is ONE recommendation re-published, NOT two
+    independent 50 % trims. autofin's own ``numberOfProfit`` is still
+    0 for this deal, which confirms it (a genuine TP lap increments
+    that counter — see HDB, whose numberOfProfit is 2 for its 2 TP
+    laps).
+
+    Acting on the raw TEXT therefore sold the position twice: lap 1
+    sold 200 of 300 shares, lap 2 sold the remaining 100 — a 100 %
+    exit from what autofin asked to be a 50 % trim.
+
+    Genuine TP steps DO stack: each TP lap has a DIFFERENT (higher)
+    target price ("Chốt lãi lần 1 mức giá 22,100" then "lần 2 mức
+    giá 23,400"). So the step identity for a TP includes the price.
+
+    The identity rules:
+      - take_profit_lap → action + PRICE (a new price = a new step)
+      - reduce_lap      → action + FRACTION + PRICE (a re-published
+                          reduce keeps the same fraction and price, so
+                          it is the same step and must not fire again)
+      - capital_protect → action + PRICE
+      - full_close      → action
+    """
+    if action.action == "take_profit_lap":
+        return f"{action.action}@{int(action.price)}"
+    if action.action == "reduce_lap":
+        return (
+            f"{action.action}@{int(round(action.percent))}pct"
+            f"@{int(action.price)}"
+        )
+    if action.action == "capital_protect":
+        return f"{action.action}@{int(action.price)}"
+    return action.action
+
+
 def _parse_partial_close(recomment: str) -> PartialCloseAction:
     """Parse the Vietnamese `lastRecomment` text into a typed action.
 
@@ -1378,6 +1592,7 @@ def _plan_partial_close_orders(
     our_positions: dict[str, int] | None = None,
     board_lot: int = DEFAULT_BOARD_LOT,
     autofin_fractions: dict[str, float] | None = None,
+    autofin_event_texts: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Emit partial SELL orders for deals we hold that autofin still holds
     but whose ``numberOfProfit`` has increased since the previous cycle.
@@ -1412,6 +1627,30 @@ def _plan_partial_close_orders(
     don't pass it), fall back to ``_our_qty`` from the deal dict so the
     historical test suite keeps working.
 
+    ``autofin_event_texts`` (2026-10-30, the VOS incident) maps a deal
+    id to the FULL text of its most recent actionable recommendation
+    event, as published in autofin's ``hisRecomment`` history.
+
+    This matters because autofin's SHORT ``lastRecomment`` headline is
+    often not parseable as an action. For VOS on 2026-10-30 the
+    headline was::
+
+        "⚠️ Hạ tỷ trọng lần 2"
+
+    which carries NO percentage, NO price and NO parseable reduce
+    pattern — ``_parse_partial_close`` returns ``unknown`` and the
+    partial-close path skipped the deal entirely. The actionable text
+    only exists in ``hisRecomment``::
+
+        "[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 11,100 - Nắm giữ: 4 ngày"
+
+    which parses as ``reduce_lap`` lap 2, price 11,100, 50 %. We were
+    holding 300 VOS shares and the bot never trimmed a single one.
+
+    So when the short headline does not parse, we fall back to the
+    full event text. The headline still wins when it parses, because
+    it is the most recent state.
+
     Mutates the deal dicts in-place to update ``_last_numberOfProfit``
     so the next cycle plans from the correct baseline.
     """
@@ -1441,6 +1680,39 @@ def _plan_partial_close_orders(
         h = autofin_by_id[did]
         rec = str(h.get("lastRecomment") or "")
         action = _parse_partial_close(rec)
+        # 2026-10-30 (VOS incident): autofin's SHORT headline is often
+        # not parseable as an action, even though the FULL event text
+        # in hisRecomment is. For VOS the headline was
+        # "⚠️ Hạ tỷ trọng lần 2" — no percentage, no price, no
+        # parseable reduce pattern — so ``action.action`` was
+        # "unknown" and the partial-close path skipped the deal.
+        # We were holding 300 shares and never trimmed one.
+        #
+        # The full text ("[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2 Giá: 11,100
+        # - Nắm giữ: 4 ngày") parses as reduce_lap lap 2 @ 11,100,
+        # 50 %. So when the headline does not parse, fall back to the
+        # most recent actionable event text.
+        #
+        # The headline still WINS when it parses — it is the most
+        # recent state. Only "unknown" triggers the fallback.
+        event_text = ""
+        if action.action == "unknown":
+            event_text = str((autofin_event_texts or {}).get(did) or "")
+            if event_text:
+                fallback_action = _parse_partial_close(event_text)
+                if fallback_action.action not in (
+                    "unknown", "full_close", "stop_loss_close",
+                ):
+                    print(
+                        f"[autofin_signal] {sig.get('symbol')} ({did}): "
+                        f"short recomment {rec[:40]!r} is not actionable — "
+                        f"using the full event text "
+                        f"{event_text[:60]!r} -> "
+                        f"{fallback_action.action} lap "
+                        f"{fallback_action.lap} @ {fallback_action.price:,.0f} "
+                        f"({fallback_action.percent:.0f}%)"
+                    )
+                    action = fallback_action
         # "stop_loss_close" → 100% sell at autofin's suggested price;
         # handled by ``_plan_close_orders`` because it doesn't depend
         # on ``numberOfProfit``. "full_close" (Đóng DEAL) → handled
@@ -1449,7 +1721,16 @@ def _plan_partial_close_orders(
             continue
 
         cur_nP = int(h.get("numberOfProfit") or 0)
-        last_nP = int(sig.get("_last_numberOfProfit", -1))
+        # 2026-10-30 (VOS incident): the state can hold an explicit
+        # ``None`` for ``_last_numberOfProfit`` (not just a missing
+        # key), and ``int(None)`` raises TypeError — which aborted the
+        # whole partial-close planning pass for EVERY deal in the
+        # cycle. Normalise both cases to -1 ("never seen").
+        _raw_last_nP = sig.get("_last_numberOfProfit", -1)
+        try:
+            last_nP = int(_raw_last_nP) if _raw_last_nP is not None else -1
+        except (TypeError, ValueError):
+            last_nP = -1
         last_rec = str(sig.get("_last_recomment") or "")
         # 2026-10-20 BAF incident: when an orphan deal is freshly
         # injected (``_orphan_injected=True``) we have NEVER seen
@@ -1471,14 +1752,39 @@ def _plan_partial_close_orders(
         # is set after each fire (line 1575-1576) so ``last_rec``
         # reflects the most recent FIRED recomment, not the most
         # recent seen recomment.
+        # 2026-10-30 (VOS incident): the dedup key must identify the
+        # STEP, not the raw text. autofin re-publishes the SAME reduce
+        # recommendation with an incremented "lần" number as the loss
+        # deepens (VOS has "lần 1" and "lần 2" at the SAME price
+        # 11,100 and the SAME 50 %). Keying on the raw text treated
+        # that re-publish as a new step and sold the position twice.
+        #
+        # ``_partial_close_step_key`` collapses a re-published reduce to
+        # the same identity (action + fraction + price) while keeping
+        # genuinely new TP steps distinct (their price differs).
+        effective_rec = event_text if event_text else rec
+        step_key = _partial_close_step_key(action)
+        last_step_key = str(sig.get("_last_partial_step_key") or "")
+        if last_step_key:
+            # We have a recorded step identity → compare identities.
+            # This is what stops a re-published reduce ("Hạ 50 % ...
+            # lần 2" after "lần 1", same price, same fraction) from
+            # selling the position a second time.
+            step_changed = step_key != last_step_key
+        else:
+            # Legacy state (no step key recorded): fall back to the
+            # text comparison so an unchanged announcement still does
+            # not re-fire.
+            step_changed = bool(effective_rec) and effective_rec != last_rec
         is_orphan_fresh = bool(h.get("_orphan_injected")) and \
             action.action in (
                 "capital_protect", "take_profit_lap", "reduce_lap",
             ) and \
-            rec != last_rec
+            step_changed
         if last_nP < 0 and not is_orphan_fresh:
             sig["_last_numberOfProfit"] = cur_nP
-            sig["_last_recomment"] = rec
+            sig["_last_recomment"] = effective_rec
+            sig["_last_partial_step_key"] = step_key
             continue
         # Fire when EITHER:
         #   (a) ``numberOfProfit`` incremented (TP1 → TP2 → TP3 steps), OR
@@ -1501,7 +1807,11 @@ def _plan_partial_close_orders(
         #       seen step but the latest fraction differs from the
         #       one we last sold at.
         nP_changed = cur_nP > last_nP
-        recomment_changed = bool(rec) and rec != last_rec
+        # 2026-10-30 (VOS incident): a new STEP is what triggers the
+        # fire — not a change in the raw text. A re-published reduce
+        # ("Hạ 50 % ... lần 2" after "lần 1", same price, same
+        # fraction) is the SAME step and must not sell again.
+        recomment_changed = step_changed
         # Orphan-fresh deals: force nP_changed=True so the
         # ``nP_changed or recomment_changed or fraction_changed``
         # gate below is satisfied. The fresh recomment is itself
@@ -1656,11 +1966,23 @@ def _plan_partial_close_orders(
             "kind": order_kind,
             "reason": (
                 f"autofin_partial:deal#{did}:{action.action}:"
-                f"lap{action.lap}:pct{int(round(action.percent * 100))}:{rec[:60]}"
+                # 2026-10-30 (VOS incident): ``action.percent`` is a
+                # PERCENTAGE (50.0), not a fraction. The old code
+                # multiplied by 100 again and wrote "pct5000" for a
+                # 50 % trim — misleading in the ledger and the
+                # Telegram message.
+                f"lap{action.lap}:pct{int(round(action.percent))}:"
+                f"{effective_rec[:60]}"
             ),
         })
         sig["_last_numberOfProfit"] = cur_nP
-        sig["_last_recomment"] = rec
+        # 2026-10-30 (VOS incident): record the text we ACTED ON so the
+        # next cycle's change-detection compares like with like, and the
+        # STEP KEY so a re-published reduce (same fraction + price, new
+        # "lần" number) is recognised as the SAME step and does not
+        # sell the position a second time.
+        sig["_last_recomment"] = effective_rec
+        sig["_last_partial_step_key"] = step_key
         sig["_our_qty"] = max(0, our_qty - delta)
         # Track the fraction we sold at so the next cycle can detect
         # an autofin-side lag where the recomment text was published
@@ -1795,7 +2117,10 @@ def _event_to_partial_orders(
         "kind": order_kind,
         "reason": (
             f"autofin_partial_event:{our_match_id}:{action.action}:"
-            f"lap{action.lap}:pct{int(round(action.percent * 100))}:"
+            # 2026-10-30: ``action.percent`` is a PERCENTAGE (50.0),
+            # not a fraction — the old code multiplied by 100 again
+            # and wrote "pct5000" for a 50 % trim.
+            f"lap{action.lap}:pct{int(round(action.percent))}:"
             f"{(event_title or '')[:60]}"
         ),
     }]
@@ -1818,6 +2143,7 @@ def _build_deals_actioned(
     partial_orders: list[dict[str, Any]],
     close_orders: list[dict[str, Any]],
     autofin_holding_by_id: dict[str, dict[str, Any]],
+    autofin_suggest_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Group the planned orders by deal and pair each with the autofin
     signal that triggered it. Used to build a rich Telegram summary.
@@ -1825,8 +2151,15 @@ def _build_deals_actioned(
     For new entries, we extract the signal context from the order
     reason itself (autofin_buy:deal#X:navNpct:<recomment>) so we can
     show it even when the deal isn't in the holding list yet.
+
+    ``autofin_suggest_by_id`` (optional) carries the
+    /signal-static-suggest rows keyed by deal id. They are the
+    AUTHORITATIVE source of ``rateForNav`` for a new entry — autofin's
+    HOLDING rows carry ``rateForNav: null``, so without them the
+    reported rate was 0 % (the 2026-11-07 report).
     """
     deals: list[dict[str, Any]] = []
+    suggest_by_id = autofin_suggest_by_id or {}
 
     new_by_deal: dict[str, list[dict[str, Any]]] = {}
     for o in new_orders:
@@ -1838,16 +2171,33 @@ def _build_deals_actioned(
         h = autofin_holding_by_id.get(did, {})
         rec = str(h.get("lastRecomment") or "")
         rate = float(h.get("rateForNav") or 0)
-        nP = int(h.get("numberOfProfit") or 0)
+        nP = int(h.get("numberOfProfit", 0) or 0)
+        # 2026-11-07 (the "rateForNav=0%" report): the rate was read
+        # ONLY from the holding row, and autofin's holding rows carry
+        # ``rateForNav: null``. The fallback that parses it from the
+        # order reason was gated behind ``if not rec:`` — so when the
+        # holding row DID have a recomment (the normal case) the
+        # fallback never ran and the rate stayed 0.
+        #
+        # The VLB entry on 2026-11-06 04:10 was reported as
+        # ``rateForNav=0%`` when the real rate was 15 %.
+        #
+        # The rate is now resolved INDEPENDENTLY of the recomment:
+        #   1. the suggest row (authoritative for an entry),
+        #   2. the order reason (``nav15pct``),
+        #   3. the holding row.
+        if not rate:
+            _sg = suggest_by_id.get(did) or {}
+            rate = float(_sg.get("rateForNav") or 0)
+        if not rate:
+            rm = re.search(r"nav(\d+)pct", orders[0].get("reason", ""))
+            if rm:
+                rate = int(rm.group(1)) / 100.0
         if not rec:
             # extract from first order's reason: "autofin_buy:deal#X:navNpct:<rec>"
             m = re.search(r"autofin_buy:[^:]+:[^:]+:nav\d+pct:(.+)$", orders[0].get("reason", ""))
             if m:
                 rec = m.group(1).strip()
-                # also pull rate from the reason
-                rm = re.search(r"nav(\d+)pct", orders[0].get("reason", ""))
-                if rm:
-                    rate = int(rm.group(1)) / 100.0
         deals.append({
             "action": "new_entry",
             "symbol": h.get("symbol", orders[0].get("symbol", "?")),
@@ -2096,8 +2446,16 @@ def decide_orders(
     data_dir: "Path | None" = None,
     autofin_closing_ids: set[str] | None = None,
     autofin_fractions: dict[str, float] | None = None,
+    # 2026-10-30 (VOS incident): deal_id → FULL text of the most
+    # recent actionable recommendation event, from autofin's
+    # ``hisRecomment`` history. Used as the fallback when the short
+    # ``lastRecomment`` headline is not parseable as an action (VOS's
+    # "⚠️ Hạ tỷ trọng lần 2" carries no % / price / pattern).
+    autofin_event_texts: dict[str, str] | None = None,
     new_entry_min_cash_pct: float = 0.05,
-    new_entry_top_n: int = 1,
+    # 2026-10-29: top 3 autofin suggestions may produce entries per
+    # day (was 1). Counts ENTRIES MADE, not candidates examined.
+    new_entry_top_n: int = 3,
     available_cash_vnd_override: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Pure-functional decision function for the autofin mirror strategy.
@@ -2183,6 +2541,49 @@ def decide_orders(
         if did:
             autofin_holding_by_id[did] = dict(d)
 
+    # 1a-bis. Refresh the cached ``lastRecomment`` for EVERY tracked deal
+    # that appears in a fresh holding or suggest response.
+    #
+    # 2026-10-29 (VOS incident): the cached recomment for a tracked
+    # deal was written once (when the deal first entered ``our_deals``)
+    # and only refreshed for deals we HOLD (inside
+    # ``_plan_partial_close_orders``). A tracked-but-not-held deal —
+    # exactly the shape of the VOS row at 09:01 on 2026-10-29 — kept
+    # its original entry-card text forever. The bot then read the
+    # stale "Khuyến nghị đầu tư" as an entry recommendation and opened
+    # a new position on a deal autofin had already told us to reduce.
+    #
+    # The entry gate in ``_expand_signals_with_held_unentered`` relies on
+    # this text, so it must be fresh BEFORE the gate runs. Doing the
+    # refresh here (before step 2) guarantees that.
+    _fresh_rec_by_did: dict[str, str] = {}
+    for _row in list(holding) + list(signals):
+        # ``holding`` rows are raw dicts; ``signals`` are
+        # AutofinSignal objects — normalise both to the raw dict.
+        _raw = getattr(_row, "raw", None)
+        if not isinstance(_raw, dict):
+            _raw = _row if isinstance(_row, dict) else {}
+        _did = _deal_id(_raw)
+        if not _did:
+            continue
+        _rec = str(_raw.get("lastRecomment") or "").strip()
+        if not _rec:
+            continue
+        _fresh_rec_by_did[_did] = _rec
+    for _did, _rec in _fresh_rec_by_did.items():
+        _sig = our_deals.get(_did)
+        if _sig is None:
+            continue
+        _old = str(_sig.get("lastRecomment") or "")
+        if _old != _rec:
+            print(
+                f"[decide_orders] refreshed cached recommendation for "
+                f"{_did}: {_old[:40]!r} -> {_rec[:40]!r} "
+                f"(kind={classify_recomment(_rec)})"
+            )
+        _sig["lastRecomment"] = _rec
+        _sig["_last_recomment_at"] = datetime.now(timezone.utc).isoformat()
+
     # 1a. Determine the cash budget for new BUYs.
     #
     # Two paths:
@@ -2230,8 +2631,11 @@ def decide_orders(
     # /signal-static-holding.
     augmented_signals = signals
     if current_prices:
+        # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+        _tol_above, _tol_below = buy_zone_tolerance_pct()
         augmented_signals = _expand_signals_with_held_unentered(
             signals, holding, our_deals, current_prices,
+            above_zone_tolerance_pct=_tol_above,
         )
 
     # 2b. Filter out signals for deals we've ALREADY actioned (entry,
@@ -2267,10 +2671,14 @@ def decide_orders(
     # for partial-close / full-close detection only.
 
     # 5. Compute orders
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+    _tol_above, _tol_below = buy_zone_tolerance_pct()
     new_orders = _plan_orders_for_new_positions(
         selected, nav, our_positions,
         board_lot=board_lot, user_sl_pct=user_sl_pct,
         current_prices=current_prices,
+        above_zone_tolerance_pct=_tol_above,
+        below_zone_tolerance_pct=_tol_below,
         already_planned_symbols=already_planned_symbols,
         available_cash_vnd=available_cash_vnd,
         new_entry_min_cash_pct=new_entry_min_cash_pct,
@@ -2282,6 +2690,9 @@ def decide_orders(
         our_positions=our_positions,
         board_lot=board_lot,
         autofin_fractions=autofin_fractions,
+        # 2026-10-30 (VOS incident): the full event text is the
+        # fallback when the short headline is not actionable.
+        autofin_event_texts=autofin_event_texts,
     )
     # Filter to deals we actually hold — use our_positions (DNSE /
     # dry-run state) as ground truth. _our_qty in our_deals can be
@@ -2358,6 +2769,14 @@ def decide_orders(
         if did not in new_our_deals:
             new_our_deals[did] = dict(s.raw)
         new_our_deals[did].setdefault("_our_qty", 0)
+        # 2026-10-29: stamp when the cached recomment was last refreshed
+        # so ``_refresh_stale_deal_recomments`` can tell a fresh cached
+        # text from a stale one. Without this stamp every tracked deal
+        # looks infinitely stale and we would re-fetch all of them on
+        # every cycle.
+        new_our_deals[did].setdefault(
+            "_last_recomment_at", datetime.now(timezone.utc).isoformat(),
+        )
         # Intentionally do NOT set ``_our_qty`` from the planned
         # order quantity. See the comment above.
     # for each close, mark the deal closed (qty=0) but KEEP it in the
@@ -2389,9 +2808,49 @@ def decide_orders(
         actioned_deals |= actioned_dids
 
     deals_actioned = _build_deals_actioned(
-        new_orders, partial_orders, close_orders, autofin_holding_by_id
+        new_orders, partial_orders, close_orders, autofin_holding_by_id,
+        # 2026-11-07: the SUGGEST rows carry the authoritative
+        # ``rateForNav`` for an entry (the holding rows carry null).
+        autofin_suggest_by_id=_suggest_rows_by_deal_id(signals),
     )
     return all_orders, new_our_deals, deals_actioned
+
+
+def _suggest_rows_by_deal_id(
+    signals: list[Any],
+) -> dict[str, dict[str, Any]]:
+    """Index the /signal-static-suggest rows by deal id.
+
+    2026-11-07: autofin's HOLDING rows carry ``rateForNav: null``, so
+    the entry rate had to come from somewhere else — and the SUGGEST
+    rows are where autofin actually publishes it (``rateForNav:
+    0.15`` / ``0.30``). Without them the Telegram entry report showed
+    ``rateForNav=0%`` for every entry.
+
+    The rows are indexed by the same ``<deal_id>:<SYMBOL>`` composite
+    key the rest of the pipeline uses, so they line up with the
+    holding rows and the order reasons.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for s in signals or []:
+        raw = getattr(s, "raw", None)
+        if not isinstance(raw, dict):
+            continue
+        did = _deal_id(raw)
+        if not did:
+            continue
+        # ``raw`` carries autofin's own field names.
+        rate = raw.get("rateForNav")
+        if rate is None:
+            rate = getattr(s, "rate_for_nav", None)
+        out[did] = {
+            "rateForNav": float(rate or 0.0),
+            "symbol": str(raw.get("symbol") or getattr(s, "symbol", "") or ""),
+            "lastRecomment": str(
+                raw.get("lastRecomment") or getattr(s, "last_recomment", "") or ""
+            ),
+        }
+    return out
 
 
 class AutofinSignalAdapter(StrategyAdapter):
@@ -2405,6 +2864,13 @@ class AutofinSignalAdapter(StrategyAdapter):
         self._client: AutofinClient | None = None
         # Persistent state (loaded by the bot each cycle)
         self._our_deals: dict[str, dict[str, Any]] = {}  # deal_id → original signal
+        # 2026-11-04: the deals we track that autofin's
+        # /signal-static-holding no longer lists ("orphan" deals).
+        #
+        # The operator confirmed these are an autofin DATA-LOSS case —
+        # the deal was on autofin, but autofin lost it. The operator
+        # trades them MANUALLY, so the EOD report must name them.
+        self._orphan_deals: list[dict[str, Any]] = []
         # Order-key set already sent to Telegram — used to de-dupe per-order
         # notifications so we don't spam the chat every poll.
         self._notified_order_keys: set[str] = set()
@@ -2485,6 +2951,78 @@ class AutofinSignalAdapter(StrategyAdapter):
             self._notified_event_ids = set()
             self._actioned_deals = set()
 
+    def _reconcile_with_live_positions(
+        self,
+        live_positions: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        """Drop the tracked deals whose symbol we no longer HOLD.
+
+        2026-11-06 (the operator's request)::
+
+            "the above issue remind me a issue, previously we entry
+             BAF and ORS but the system got error when handling sell
+             order so i do it manually, that action is not recorded in
+             our ledger so may cause the issue, i wanna our system to
+             automatically remove the stale order in our ledger in the
+             case that we do not have the stock left in our portfolio"
+
+        The ledger is OUR record of what we sent to DNSE. A MANUAL
+        sell (done in the DNSE app because the bot errored) never
+        appears there, so the ledger still says "we hold 200 BAF" and
+        the reconciliation cannot tell that the position is gone.
+
+        The live DNSE position map IS the truth. This method prunes
+        the tracked state against it:
+
+        * a tracked deal whose symbol is NOT in the live positions at
+          all -> the position is gone (we sold it manually, or the
+          broker liquidated it) -> ``_our_qty = 0``;
+        * a tracked deal whose symbol is held but with FEWER shares
+          than we claim -> reconcile DOWN to the live quantity.
+
+        Without this, the stale symbol lands in
+        ``already_planned_symbols`` and silently blocks a legitimate
+        new entry — exactly what happened to BAF and ORS on
+        2026-11-05 (three in-band candidates, zero orders).
+
+        Safety: this only ever runs when we have a NON-EMPTY live
+        position map. An empty map could mean "we hold nothing" OR
+        "the portfolio fetch failed" — and wiping the tracked state on
+        a transient API failure would be catastrophic (the bot would
+        re-enter every position it owns). So an empty map is treated
+        as "no information" and nothing is pruned.
+
+        Returns the list of pruned entries (for the log/snapshot).
+        """
+        if not live_positions:
+            # No information — do NOT prune. See the safety note above.
+            return []
+        pruned: list[dict[str, Any]] = []
+        for did, sig in list(self._our_deals.items()):
+            claimed = int(sig.get("_our_qty", 0) or 0)
+            if claimed <= 0:
+                continue
+            sym = str(sig.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            live_qty = int(live_positions.get(sym, 0) or 0)
+            if live_qty >= claimed:
+                continue
+            # We hold fewer shares than we thought (or none at all).
+            sig["_our_qty"] = max(0, live_qty)
+            pruned.append({
+                "deal_id": did,
+                "symbol": sym,
+                "claimed_qty": claimed,
+                "live_qty": live_qty,
+            })
+            print(
+                f"[autofin_signal] stale position reconciled: {sym} "
+                f"{claimed} -> {live_qty} (deal {did}) — the ledger "
+                f"had no record of the sell (manual trade?)"
+            )
+        return pruned
+
     @staticmethod
     def _prune_terminal_unfilled_deals(
         actioned: set[str],
@@ -2548,6 +3086,29 @@ class AutofinSignalAdapter(StrategyAdapter):
         # the real fill evidence.
         latest_filled_buy_qty_by_did: dict[str, int] = {}
         latest_filled_buy_ts_by_did: dict[str, str] = {}
+        # 2026-11-05 (the "no entry fired" incident): the NET filled
+        # quantity per deal — filled BUYs minus filled SELLs.
+        #
+        # The reconciliation above only looked at the latest FILLED
+        # BUY, so a position we had already SOLD still counted as
+        # held. On 2026-11-05 that put ORS and BAF into
+        # ``already_planned_symbols`` even though we held NONE of
+        # them:
+        #
+        #   deal 1785888000:BAF  filled BUYs=200  filled SELLs=200  net=0
+        #   deal 1792713600:ORS  filled BUYs=200  filled SELLs=200  net=0
+        #   deal 1792627200:VOS  filled BUYs=300  filled SELLs=200  net=100
+        #
+        # ``already_planned_symbols`` is the "we already own this
+        # symbol, don't enter it again" set — so a stale entry there
+        # silently blocks a legitimate new entry. That is why the bot
+        # had 3 in-band entry candidates all day (VLB, BAF, ORS) and
+        # produced ZERO orders: BAF and ORS were skipped as "already
+        # planned", and VLB rounded to 0 board lots.
+        #
+        # The net quantity is the truth: buys open a position, sells
+        # close it. We sum BOTH over the whole deal history.
+        net_filled_qty_by_did: dict[str, int] = {}
         try:
             ledger = load_ledger(data_dir)
         except Exception:
@@ -2583,6 +3144,16 @@ class AutofinSignalAdapter(StrategyAdapter):
                 if ts >= buy_ts:
                     latest_filled_buy_ts_by_did[did] = ts
                     latest_filled_buy_qty_by_did[did] = this_filled
+                # 2026-11-05: net the fills. A BUY adds, a SELL
+                # subtracts.
+                if item.side == "NB":
+                    net_filled_qty_by_did[did] = (
+                        net_filled_qty_by_did.get(did, 0) + this_filled
+                    )
+                elif item.side == "NS":
+                    net_filled_qty_by_did[did] = (
+                        net_filled_qty_by_did.get(did, 0) - this_filled
+                    )
         # 2. Determine which deals we still hold. A deal is "held"
         #    if EITHER ``_our_qty > 0`` (state file says we own) OR
         #    the latest order is ``filled`` with fillQuantity > 0
@@ -2593,6 +3164,11 @@ class AutofinSignalAdapter(StrategyAdapter):
             status = latest_status_by_did.get(did, "")
             filled_qty = latest_filled_by_did.get(did, 0)
             latest_filled_buy_qty = latest_filled_buy_qty_by_did.get(did, 0)
+            # 2026-11-05: the NET filled quantity (buys minus sells).
+            # When we have it, it is the truth about whether the
+            # position is still open — the state file is stale and
+            # "latest filled BUY" ignores the sells that closed it.
+            net_qty = net_filled_qty_by_did.get(did)
             if qty > 0:
                 # State says we hold. Cross-check with the ledger.
                 if status in {"cancelled", "rejected", "expired", "closed", "dry_run", "skipped"}:
@@ -2614,6 +3190,16 @@ class AutofinSignalAdapter(StrategyAdapter):
                         # genuine dry-run pollution case. Reset.
                         sig["_our_qty"] = 0
                 else:
+                    # 2026-11-05: if the ledger says the position
+                    # was fully closed (net filled <= 0), the state
+                    # file is stale — we do NOT hold this any more.
+                    # Trusting the stale state here put the symbol in
+                    # ``already_planned_symbols`` and silently blocked
+                    # a legitimate new entry (the 2026-11-05 ORS/BAF
+                    # case).
+                    if net_qty is not None and net_qty <= 0:
+                        sig["_our_qty"] = 0
+                        continue
                     held_dids.add(did)
                     # Reconcile upward: if the ledger says we filled
                     # more shares than the state file claims, update
@@ -2622,11 +3208,31 @@ class AutofinSignalAdapter(StrategyAdapter):
                     # partially filled at a higher price.
                     if status == "filled" and filled_qty > qty:
                         sig["_our_qty"] = filled_qty
+                    elif net_qty is not None and net_qty < qty:
+                        # We sold part of it — reconcile DOWN.
+                        sig["_our_qty"] = max(0, net_qty)
                     continue
             # State says we don't hold, but the ledger might say
             # otherwise (state is stale, the order filled but the
             # state file was reset by some other code path).
-            if status == "filled" and filled_qty > 0:
+            #
+            # 2026-11-05: the NET filled quantity decides. The
+            # "latest filled order" is not enough: for a position we
+            # sold, the latest filled order IS the SELL, so
+            # ``filled_qty`` is the SELL quantity and the old code
+            # resurrected the position as "held" (ORS/BAF on
+            # 2026-11-05: bought 200, sold 200, net 0, but the state
+            # ended up claiming 200 held — which put them in
+            # ``already_planned_symbols`` and silently blocked a
+            # legitimate new entry).
+            if net_qty is not None:
+                # We have ledger evidence for this deal — trust the net.
+                if net_qty <= 0:
+                    sig["_our_qty"] = 0
+                    continue
+                held_dids.add(did)
+                sig["_our_qty"] = net_qty
+            elif status == "filled" and filled_qty > 0:
                 held_dids.add(did)
                 # Reconcile the stale state file.
                 sig["_our_qty"] = filled_qty
@@ -2642,8 +3248,18 @@ class AutofinSignalAdapter(StrategyAdapter):
                 # order (filled BUY 100). We really do hold those
                 # 100 shares — the cancellation only voided the
                 # second attempt.
+                #
+                # 2026-11-05: but if the NET filled quantity says the
+                # position was closed (net <= 0), do NOT resurrect it.
+                # The "latest filled BUY" evidence is not enough —
+                # a later SELL closes the position.
+                if net_qty is not None and net_qty <= 0:
+                    sig["_our_qty"] = 0
+                    continue
                 held_dids.add(did)
-                sig["_our_qty"] = latest_filled_buy_qty
+                sig["_our_qty"] = (
+                    net_qty if net_qty is not None else latest_filled_buy_qty
+                )
         # 3. Prune: keep the deal only if we hold it OR the latest
         #    order is non-terminal (open / partial / submitting /
         #    unknown / prepared) or filled. Terminal-without-fill
@@ -3161,6 +3777,69 @@ class AutofinSignalAdapter(StrategyAdapter):
 
         return new_orders
 
+    def rearm_unsubmitted_actions(
+        self,
+        deals_actioned: list[dict[str, Any]],
+        submitted_symbols: set[str],
+    ) -> list[str]:
+        """Re-arm the action markers for partial closes that were NOT
+        submitted, so they fire again on the next cycle.
+
+        2026-10-30 (VOS incident): ``_plan_partial_close_orders`` records
+        ``_last_recomment`` / ``_last_numberOfProfit`` on the deal the
+        moment it PLANS the order — before the runner has submitted it
+        to DNSE. If the submit then fails (off-hours, token rejected,
+        DNSE rejection), the marker says "already fired" and the trim
+        is never retried. The position stays un-trimmed forever.
+
+        That is exactly what happened to VOS: the reduce was planned
+        at 23:13 ICT (off-hours), the submit was skipped, and the
+        marker was written anyway — so on the next trading session the
+        bot would have seen "already fired" and skipped the trim.
+
+        The runner calls this after the submit and passes the set of
+        symbols that actually reached DNSE. For every planned partial
+        close whose symbol is not in that set, the marker is rolled
+        back so the next cycle plans it again.
+
+        Returns the list of re-armed symbols (for the log).
+        """
+        rearmed: list[str] = []
+        for deal in deals_actioned or []:
+            sym = str(deal.get("symbol") or "").strip().upper()
+            if not sym or sym in submitted_symbols:
+                continue
+            did = str(deal.get("deal_id") or "")
+            sig = self._our_deals.get(did)
+            if sig is None:
+                continue
+            # Only re-arm partial closes — a planned BUY or full close
+            # is re-planned by its own path (the actioned-deals /
+            # ledger dedup), and re-arming those could double-buy.
+            orders = deal.get("dnse_orders") or []
+            kinds = {str(o.get("kind") or "") for o in orders}
+            reasons = " ".join(str(o.get("reason") or "") for o in orders)
+            is_partial = (
+                kinds & {"partial_close", "close_event"}
+                or "autofin_partial" in reasons
+                or "autofin_partial_event" in reasons
+            )
+            if not is_partial:
+                continue
+            # Roll the marker back to "never fired" so the next cycle
+            # plans the same step again.
+            sig.pop("_last_recomment", None)
+            sig.pop("_last_numberOfProfit", None)
+            sig.pop("_last_partial_fraction", None)
+            sig.pop("_last_partial_step_key", None)
+            rearmed.append(sym)
+            print(
+                f"[autofin_signal] re-armed {sym} ({did}): the partial "
+                f"close was planned but NOT submitted — it will be "
+                f"planned again on the next cycle"
+            )
+        return rearmed
+
     def _notify_new_orders(self, deals_actioned: list[dict[str, Any]]) -> None:
         """Send a short Telegram message for any deal-actioned entry that
         hasn't been notified yet. Updates ``self._notified_order_keys`` so
@@ -3184,6 +3863,406 @@ class AutofinSignalAdapter(StrategyAdapter):
             except Exception as exc:
                 print(f"[autofin_signal] per-order notify failed: {exc}")
             self._notified_order_keys |= keys
+
+    def _build_decision_summary(
+        self,
+        *,
+        raw_payloads: dict[str, Any],
+        holding: list[dict[str, Any]],
+        signals: list[dict[str, Any]],
+        closing: list[dict[str, Any]],
+        risk: list[dict[str, Any]],
+        refresh_report: dict[str, Any],
+        all_orders: list[dict[str, Any]],
+        new_orders: list[dict[str, Any]],
+        partial_orders: list[dict[str, Any]],
+        close_orders: list[dict[str, Any]],
+        deals_actioned: list[dict[str, Any]],
+        our_deals: dict[str, dict[str, Any]],
+        positions: dict[str, int],
+        nav: float,
+        account: str,
+        trade_date: str,
+        allow_new_entries: bool,
+        new_entry_top_n: int,
+        current_prices: dict[str, float],
+        orphan_deals: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Build the human-readable record of what we decided this cycle.
+
+        The point (2026-10-29) is auditability: for every candidate we
+        record (a) what autofin said, (b) how we classified it, and
+        (c) what we did about it. When a position turns out wrong we
+        can then tell whether autofin sent bad data or we misread good
+        data.
+        """
+        # Per-deal view of the recommendation we acted on.
+        deal_view: list[dict[str, Any]] = []
+        # 2026-11-05: the orphan set, from the adapter's own detection.
+        _orphan_flavour_by_did: dict[str, str] = {}
+        for _od in (orphan_deals or []):
+            _odid = str(_od.get("deal_id") or "")
+            if _odid:
+                _orphan_flavour_by_did[_odid] = str(_od.get("flavour") or "")
+        _orphan_did_set = set(_orphan_flavour_by_did)
+        for did, sig in sorted(our_deals.items()):
+            rec = str(sig.get("lastRecomment") or "")
+            deal_view.append({
+                "deal_id": did,
+                "symbol": sig.get("symbol"),
+                "our_qty": int(sig.get("_our_qty", 0) or 0),
+                "recommendation": rec,
+                "recommendation_kind": classify_recomment(rec),
+                "recommendation_age_seconds": _age_seconds(
+                    sig.get("_last_recomment_at")
+                ),
+                "supply_F": sig.get("supply_F"),
+                "supply_T": sig.get("supply_T"),
+                "sl_F": sig.get("sL_F"),
+                "tp_F": sig.get("tP_F"),
+                "rateForNav": sig.get("rateForNav"),
+                "in_holding": _deal_id_in(holding, did),
+                "in_suggest": _deal_id_in(signals, did),
+                # 2026-11-05: an ORPHAN deal — we hold the position but
+                # autofin can no longer give us detail for the DEAL.
+                #
+                # The old definition ("not in the holding list AND
+                # ``_our_qty > 0``") was wrong twice over: the
+                # augmentation injects a synthetic holding entry so
+                # ``in_holding`` is True for a recovered orphan, and
+                # ``_our_qty`` is 0 in the tracked state for every
+                # deal we still hold. It therefore never fired.
+                #
+                # Now the flag comes from the adapter's own orphan
+                # detection, which asks autofin directly whether the
+                # tracked deal-id still exists.
+                "is_orphan": did in _orphan_did_set,
+                "orphan_flavour": _orphan_flavour_by_did.get(did, ""),
+            })
+
+        # Candidates we could have entered, and why we didn't (if we
+        # didn't). This is the part that was invisible before.
+        entry_candidates: list[dict[str, Any]] = []
+        entered_symbols = {o.get("symbol") for o in new_orders}
+        for did, sig in sorted(our_deals.items()):
+            sym = str(sig.get("symbol") or "")
+            if not sym:
+                continue
+            rec = str(sig.get("lastRecomment") or "")
+            kind = classify_recomment(rec)
+            entry_candidates.append({
+                "deal_id": did,
+                "symbol": sym,
+                "recommendation": rec,
+                "recommendation_kind": kind,
+                "our_qty": int(sig.get("_our_qty", 0) or 0),
+                "held_on_dnse": int(positions.get(sym, 0) or 0),
+                "current_price": current_prices.get(sym),
+                "entered_this_cycle": sym in entered_symbols,
+                "eligible_for_entry": (
+                    kind in (RECOMMENT_KIND_ENTRY, RECOMMENT_KIND_UNKNOWN)
+                    and int(positions.get(sym, 0) or 0) <= 0
+                ),
+            })
+
+        return {
+            "capturedAt": datetime.now(timezone.utc).isoformat(),
+            "tradeDate": trade_date,
+            "account": account,
+            "nav": nav,
+            "positions": positions,
+            "counts": {
+                "holding": len(holding),
+                "suggest": len(signals),
+                "closing": len(closing),
+                "risk": len(risk),
+                "trackedDeals": len(our_deals),
+                "allOrders": len(all_orders),
+                "newOrders": len(new_orders),
+                "partialOrders": len(partial_orders),
+                "closeOrders": len(close_orders),
+            },
+            "entryGate": {
+                "allowNewEntries": allow_new_entries,
+                "newEntryTopN": new_entry_top_n,
+            },
+            "staleRecommentRefresh": refresh_report,
+            "deals": deal_view,
+            "entryCandidates": entry_candidates,
+            "orders": [
+                {
+                    "symbol": o.get("symbol"),
+                    "side": o.get("side"),
+                    "price": o.get("price"),
+                    "quantity": o.get("quantity"),
+                    "kind": o.get("kind"),
+                    "reason": o.get("reason"),
+                }
+                for o in all_orders
+            ],
+            "dealsActioned": deals_actioned,
+            "rawPayloadSizes": {
+                k: (len(v) if isinstance(v, (list, dict)) else 1)
+                for k, v in raw_payloads.items()
+            },
+        }
+
+    def _write_decision_snapshot(
+        self,
+        data_dir: Path,
+        raw_payloads: dict[str, Any],
+        summary: dict[str, Any],
+    ) -> Path | None:
+        """Write the raw payload bundle + the decision summary."""
+        try:
+            from vietnam_algo.libs.autofin_snapshot import write_snapshot
+            return write_snapshot(data_dir, raw_payloads, summary)
+        except Exception as exc:
+            print(
+                f"[autofin_signal] decision snapshot failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+    def _log_decision_summary(self, summary: dict[str, Any]) -> None:
+        """Print a structured, greppable decision log line.
+
+        One line per cycle so an operator can answer "why did the bot
+        enter / not enter X?" from the log alone, without opening the
+        snapshot files.
+        """
+        counts = summary.get("counts", {})
+        gate = summary.get("entryGate", {})
+        refresh = summary.get("staleRecommentRefresh", {})
+        refreshed = refresh.get("refreshed", []) or []
+        failed = refresh.get("failed", []) or []
+        entered = [
+            c for c in summary.get("entryCandidates", [])
+            if c.get("entered_this_cycle")
+        ]
+        blocked = [
+            c for c in summary.get("entryCandidates", [])
+            if not c.get("entered_this_cycle")
+            and c.get("recommendation_kind") not in (
+                RECOMMENT_KIND_ENTRY, RECOMMENT_KIND_UNKNOWN,
+            )
+        ]
+        parts = [
+            "[autofin_decision]",
+            f"trade_date={summary.get('tradeDate')}",
+            f"nav={summary.get('nav', 0):,.0f}",
+            f"holding={counts.get('holding')}",
+            f"suggest={counts.get('suggest')}",
+            f"tracked={counts.get('trackedDeals')}",
+            f"orders={counts.get('allOrders')}"
+            f"(new={counts.get('newOrders')}"
+            f",partial={counts.get('partialOrders')}"
+            f",close={counts.get('closeOrders')})",
+            f"entries_allowed={gate.get('allowNewEntries')}",
+            f"top_n={gate.get('newEntryTopN')}",
+            f"refreshed={len(refreshed)}",
+            f"refresh_failed={len(failed)}",
+            f"entered={','.join(c['symbol'] for c in entered) or '-'}",
+        ]
+        if blocked:
+            parts.append(
+                "blocked_non_entry="
+                + ",".join(
+                    f"{c['symbol']}({c['recommendation_kind']})"
+                    for c in blocked
+                )
+            )
+        for r in refreshed:
+            if r.get("changed"):
+                parts.append(
+                    f"rec_changed:{r.get('symbol')}"
+                    f"({r.get('old_recommendation', '')[:24]!r}->"
+                    f"{r.get('new_recommendation', '')[:24]!r})"
+                )
+        print(" ".join(parts))
+
+    def _refresh_stale_deal_recomments(
+        self,
+        client: "AutofinClient",
+        holding: list[dict[str, Any]],
+        suggest: list[dict[str, Any]],
+        raw_payloads: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Refresh the cached ``lastRecomment`` for tracked deals whose
+        cached copy has gone stale.
+
+        2026-10-29 (VOS incident): our cached ``lastRecomment`` for a
+        tracked deal is written once, when the deal first enters
+        ``our_deals`` (see ``new_our_deals[did] = dict(s.raw)``), and
+        is NOT refreshed afterwards unless the deal happens to reappear
+        in a fresh holding/suggest response.
+
+        For VOS that meant the bot kept acting on the 22/10 entry card
+        ("Khuyến nghị đầu tư" → an entry recommendation) for seven days
+        after autofin had moved the deal to "⚠️ Hạ tỷ trọng lần 2"
+        (reduce weight). The bot entered a NEW VOS position on
+        2026-10-29 on the strength of that stale text.
+
+        Mechanism: for every tracked deal whose cached recomment is
+        older than ``_stale_recomment_max_age_seconds`` (default 900
+        = 15 min) AND which is not already covered by a fresh
+        holding/suggest row, fetch ``/signal-deals?symbol=<sym>``, find
+        the row matching the canonical ``_id``, and overwrite the cached
+        ``lastRecomment`` (and ``numberOfProfit``) with the fresh
+        values.
+
+        We deliberately refresh only STALE rows so the per-cycle API
+        cost stays bounded (a handful of calls per cycle, not ~21).
+
+        Returns a small report dict for the decision summary:
+        ``{"refreshed": [...], "skipped_fresh": [...], "failed": [...]}``
+        """
+        report: dict[str, Any] = {
+            "refreshed": [], "skipped_fresh": [], "failed": [],
+        }
+        max_age = self._stale_recomment_max_age_seconds()
+        now = datetime.now(timezone.utc).timestamp()
+
+        # Deals already covered by a fresh response need no refresh.
+        fresh_dids: set[str] = set()
+        for row in list(holding) + list(suggest):
+            raw = getattr(row, "raw", None)
+            if not isinstance(raw, dict):
+                raw = row if isinstance(row, dict) else {}
+            did = _deal_id(raw)
+            if did:
+                fresh_dids.add(did)
+
+        for did, sig in list(self._our_deals.items()):
+            sym = str(sig.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            if did in fresh_dids:
+                # Still present upstream — the caller merges the fresh
+                # row into the deal state further down the cycle.
+                continue
+            # Age of the cached recomment.
+            stamp = sig.get("_last_recomment_at")
+            if stamp:
+                try:
+                    age = now - datetime.fromisoformat(str(stamp)).timestamp()
+                except (TypeError, ValueError):
+                    age = max_age + 1.0  # unparseable → treat as stale
+            else:
+                # Never stamped (pre-fix state files) → stale.
+                age = max_age + 1.0
+            if age < max_age:
+                report["skipped_fresh"].append(did)
+                continue
+            # Failure backoff: a deal whose refresh keeps failing (e.g.
+            # its _id is not in autofin's /signal-deals history at all)
+            # must not cost an API call on every single cycle.
+            attempt_stamp = sig.get("_last_refresh_attempt_at")
+            if attempt_stamp:
+                try:
+                    since = now - datetime.fromisoformat(
+                        str(attempt_stamp)).timestamp()
+                except (TypeError, ValueError):
+                    since = 0.0
+                if since < _FAILED_REFRESH_BACKOFF_SECONDS:
+                    report["skipped_fresh"].append(did)
+                    continue
+            try:
+                deals = client.fetch_deals(symbol=sym, page_size=10)
+            except Exception as exc:
+                _mark_refresh_attempt(sig)
+                report["failed"].append({
+                    "deal_id": did, "symbol": sym,
+                    "error": f"{type(exc).__name__}: {str(exc)[:120]}",
+                })
+                continue
+            # 2026-10-29: keep the raw payload for the snapshot.
+            if raw_payloads is not None:
+                bucket = raw_payloads.setdefault("signal_deals", {})
+                bucket[str(sym).upper()] = deals
+            if not deals:
+                _mark_refresh_attempt(sig)
+                report["failed"].append({
+                    "deal_id": did, "symbol": sym, "error": "no rows",
+                })
+                continue
+            try:
+                want_id = int(str(did).split(":", 1)[0])
+            except ValueError:
+                want_id = 0
+            # 2026-10-29 (VOS incident): match on (_id, symbol).
+            # autofin's ``_id`` is the deal's open-time timestamp, NOT
+            # a globally unique id — VOS, MSB, ABB, TCB, FRT and SCL
+            # all share ``_id=1792627200``. Matching on ``_id`` alone
+            # can therefore select ANOTHER symbol's row and copy its
+            # recommendation onto this deal (that is how a "reduce"
+            # deal ended up carrying MSB's "Khuyến nghị đầu tư" entry
+            # text). If no row matches this exact (id, symbol) pair we
+            # report the failure instead of borrowing a foreign row.
+            match = next(
+                (
+                    d for d in deals
+                    if int(d.get("_id", 0) or 0) == want_id
+                    and str(d.get("symbol") or "").strip().upper() == sym
+                ),
+                None,
+            )
+            if match is None:
+                _mark_refresh_attempt(sig)
+                report["failed"].append({
+                    "deal_id": did, "symbol": sym,
+                    "error": "deal not found in /signal-deals",
+                })
+                continue
+            fresh_rec = str(match.get("lastRecomment") or "").strip()
+            if not fresh_rec:
+                _mark_refresh_attempt(sig)
+                report["failed"].append({
+                    "deal_id": did, "symbol": sym,
+                    "error": "empty lastRecomment",
+                })
+                continue
+            old_rec = str(sig.get("lastRecomment") or "")
+            changed = fresh_rec != old_rec
+            sig["lastRecomment"] = fresh_rec
+            sig["_last_recomment_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            if "_last_numberOfProfit" in sig or match.get("numberOfProfit") is not None:
+                sig["_last_numberOfProfit"] = int(
+                    match.get("numberOfProfit") or 0
+                )
+            report["refreshed"].append({
+                "deal_id": did,
+                "symbol": sym,
+                "changed": changed,
+                "old_recommendation": old_rec[:80],
+                "new_recommendation": fresh_rec[:80],
+                "new_kind": classify_recomment(fresh_rec),
+            })
+            if changed:
+                print(
+                    f"[autofin_signal] refreshed stale recomment "
+                    f"{did} ({sym}): {old_rec[:40]!r} -> {fresh_rec[:40]!r} "
+                    f"(kind={classify_recomment(fresh_rec)})"
+                )
+        return report
+
+    def _stale_recomment_max_age_seconds(self) -> int:
+        """How old a cached ``lastRecomment`` may be before we refresh it.
+
+        Read from ``AUTOFIN_STALE_RECOMMENT_MAX_AGE_SECONDS``; default
+        900 (15 minutes). The bot's cycle is 60 s, so this bounds the
+        per-cycle API cost to roughly one refresh per tracked deal per
+        15 minutes.
+        """
+        raw = os.environ.get("AUTOFIN_STALE_RECOMMENT_MAX_AGE_SECONDS", "").strip()
+        if raw:
+            try:
+                return max(0, int(float(raw)))
+            except ValueError:
+                pass
+        return DEFAULT_STALE_RECOMMENT_MAX_AGE_SECONDS
 
     def _augment_orphan_deals(
         self,
@@ -3225,14 +4304,176 @@ class AutofinSignalAdapter(StrategyAdapter):
         orphan_dids = [
             did for did in self._our_deals if did not in holding_dids
         ]
+        # 2026-11-04: record the ORPHAN DEALS for the EOD report.
+        #
+        # The operator confirmed these are NOT a bot bug: the deal WAS
+        # on autofin, but autofin's data for it was lost, so
+        # /signal-static-holding no longer lists it. The operator
+        # will trade them MANUALLY.
+        #
+        # So the EOD report must name them — otherwise a position
+        # silently stops being managed by the bot and nobody notices
+        # until it moves against us.
+        #
+        # IMPORTANT: only the orphans we ACTUALLY HOLD are listed. The
+        # tracked-deal state keeps every deal we ever touched (27 of
+        # them on 2026-11-04) and their ``_our_qty`` is 0 — we do not
+        # hold them. Listing all of them would bury the two that
+        # matter under 25 closed deals.
+        #
+        # ``self._positions`` is the authoritative live DNSE position
+        # map (symbol -> qty). It is set earlier in ``generate_orders``
+        # from the live portfolio snapshot.
+        self._orphan_deals = []
+        live_positions = getattr(self, "_positions", None) or {}
+
+        # 2026-11-05 (corrected semantics).
+        #
+        # The operator clarified what an ORPHAN really means:
+        #
+        #   "the orphan deal mean we can not get detail with that deal
+        #    or ticker anymore, not they are not in static holding list"
+        #
+        # So the test is NOT "is the symbol in /signal-static-holding".
+        # It is: "can autofin still give us DETAIL for the deal we
+        # entered?" — judged by the tracked deal-id, which is the
+        # authoritative link to the autofin deal.
+        #
+        # There are two distinct flavours, and they need different
+        # handling:
+        #
+        #   * DETAIL LOST — the tracked deal-id is gone from
+        #     /signal-deals. autofin has no recommendation for the
+        #     position we hold. The bot CANNOT act on it; the operator
+        #     must trade it manually. (ABB, TCB)
+        #
+        #   * LIST LOST — the tracked deal-id still exists on autofin
+        #     and is still OPEN, but only the static holding list
+        #     dropped it. The augmentation recovers the recomment, so
+        #     the bot CAN still act on it. It is still worth
+        #     reporting, because autofin's own dashboard does not
+        #     show the position. (AAS)
+        #
+        # The symbol-level check below finds the DEAL LOST case by
+        # asking autofin directly whether it still knows the deal.
+        holding_symbols = {
+            str(h.get("symbol") or "").strip().upper()
+            for h in holding
+            if not (h.get("_orphan_injected") or False)
+            and str(h.get("symbol") or "").strip()
+        }
+        tracked_by_symbol: dict[str, list[str]] = {}
+        # ALL tracked deals, not just the orphans: a position we hold
+        # may have a tracked deal that IS in the holding list, and we
+        # must not then report it as "no tracked deal" (the 2026-11-05
+        # test caught exactly that).
+        for did, _sig in self._our_deals.items():
+            _sym = str((_sig or {}).get("symbol") or "").strip().upper()
+            if _sym:
+                tracked_by_symbol.setdefault(_sym, []).append(did)
+        for sym, qty in sorted(live_positions.items()):
+            sym = str(sym or "").strip().upper()
+            if not sym:
+                continue
+            _dids = tracked_by_symbol.get(sym) or []
+            if not _dids:
+                # We hold it but have no tracked deal at all — autofin
+                # never had one for it.
+                self._orphan_deals.append({
+                    "deal_id": f"(untracked):{sym}",
+                    "symbol": sym,
+                    "qty": int(qty or 0),
+                    "reason": "no autofin deal tracked for this position",
+                    "flavour": "detail_lost",
+                    "recovered": False,
+                })
+                print(
+                    f"[autofin_signal] orphan {sym}: holding {qty} shares "
+                    f"with NO tracked autofin deal — manual action required"
+                )
+                continue
+            if sym in holding_symbols:
+                # autofin's holding list has it — not an orphan.
+                continue
+            # It is not in the holding list. Ask autofin whether it
+            # can still give us detail for OUR deal.
+            _detail_ok = False
+            _last_rec = ""
+            _matched_did = _dids[0]
+            for _did in _dids:
+                try:
+                    _want = int(str(_did).split(":", 1)[0] or 0)
+                except ValueError:
+                    _want = 0
+                try:
+                    _rows = client.fetch_deals(symbol=sym, page_size=10)
+                except Exception:
+                    _rows = []
+                _m = next(
+                    (
+                        d for d in (_rows or [])
+                        if int(d.get("_id", 0) or 0) == _want
+                        and str(d.get("symbol") or "").strip().upper() == sym
+                    ),
+                    None,
+                )
+                if _m is not None:
+                    _detail_ok = True
+                    _matched_did = _did
+                    _last_rec = str(_m.get("lastRecomment") or "")[:200]
+                    break
+            if _detail_ok:
+                # The LIST was lost but the DEAL is intact → the
+                # augmentation below recovers it and the bot can act.
+                self._orphan_deals.append({
+                    "deal_id": _matched_did,
+                    "symbol": sym,
+                    "qty": int(qty or 0),
+                    "reason": "deal still on autofin, but missing from the holding list",
+                    "flavour": "list_lost",
+                    "recovered": True,
+                    "last_recomment": _last_rec,
+                })
+                print(
+                    f"[autofin_signal] orphan {sym}: holding {qty} shares; "
+                    f"the deal is still on autofin but missing from "
+                    f"/signal-static-holding — recovered for trading"
+                )
+            else:
+                # The DEAL is gone → autofin has no recommendation for
+                # the position we hold. Manual action only.
+                self._orphan_deals.append({
+                    "deal_id": _matched_did,
+                    "symbol": sym,
+                    "qty": int(qty or 0),
+                    "reason": "autofin no longer has this deal — no recommendation available",
+                    "flavour": "detail_lost",
+                    "recovered": False,
+                })
+                print(
+                    f"[autofin_signal] orphan {sym}: holding {qty} shares "
+                    f"but autofin no longer has the deal — MANUAL ACTION "
+                    f"REQUIRED (no recommendation to act on)"
+                )
+
         if not orphan_dids:
             return
+        # 2026-11-04: symbols already reported by the position-level
+        # check above must not be reported TWICE (the operator only
+        # needs one line per position) — but the deal walk must still
+        # RUN for them, because it is what injects the synthetic
+        # holding entry that lets the bot act on a recoverable orphan.
+        _already_reported = {
+            str(od.get("symbol") or "").strip().upper()
+            for od in self._orphan_deals
+        }
         seen_orphan_symbols: set[str] = set()
         for did in orphan_dids:
             sig = self._our_deals.get(did) or {}
             sym = str(sig.get("symbol", "") or "")
             if not sym or sym in seen_orphan_symbols:
                 continue
+            seen_orphan_symbols.add(sym)
             # The downstream ``_plan_partial_close_orders`` already
             # gates on ``our_positions.get(symbol, 0) > 0`` (line
             # 1429), so stale ``_our_qty`` here is fine — the
@@ -3254,6 +4495,25 @@ class AutofinSignalAdapter(StrategyAdapter):
             # endpoint may return several deals for the same
             # symbol (different windows). ``_id`` is the deal's
             # open-time Unix-ts, so it's stable across pages.
+            #
+            # 2026-10-29 (VOS incident): autofin's ``_id`` is NOT
+            # unique across symbols — it is only the deal's open-time
+            # timestamp, so several symbols opened on the same day
+            # share it (VOS, MSB, ABB, TCB, FRT and SCL all have
+            # ``_id=1792627200``). The match must therefore also
+            # require the SYMBOL to match.
+            #
+            # The old code fell back to ``deals[0]`` (the most recent
+            # deal for the symbol) when the ``_id`` was absent, and
+            # then OVERWROTE the tracked deal's cached recommendation
+            # with that row's text. Because ``_id`` collisions are
+            # common, the fallback could copy ANOTHER symbol's
+            # recommendation — e.g. MSB's "Khuyến nghị đầu tư" (an
+            # entry) onto VOS's row, which is exactly how a reduce
+            # deal looked like an entry recommendation.
+            #
+            # Fix: match on (_id, symbol); if no row matches, do NOT
+            # fall back to an unrelated row — skip the deal instead.
             try:
                 want_id = int(str(did).split(":", 1)[0])
             except ValueError:
@@ -3262,9 +4522,48 @@ class AutofinSignalAdapter(StrategyAdapter):
                 (
                     d for d in deals
                     if int(d.get("_id", 0) or 0) == want_id
+                    and str(d.get("symbol") or "").strip().upper() == sym
                 ),
-                deals[0],  # fallback: most recent for this sym
+                None,
             )
+            if match is None:
+                # 2026-10-29: no row for THIS deal for THIS symbol.
+                # Do not borrow another row's recommendation.
+                print(
+                    f"[autofin_signal] orphan deal {did} ({sym}) not "
+                    f"found in /signal-deals?symbol={sym} — skipping "
+                    f"(no fallback to an unrelated row)"
+                )
+                # 2026-11-05: the DEAL is gone — autofin has no row
+                # for it, so there is no recommendation to act on.
+                # This is the "detail lost" flavour.
+                _held_qty = int(live_positions.get(sym, 0) or 0)
+                if _held_qty > 0:
+                    _existing = next(
+                        (
+                            od for od in self._orphan_deals
+                            if str(od.get("symbol") or "").strip().upper() == sym
+                        ),
+                        None,
+                    )
+                    if _existing is not None:
+                        # Already reported at the POSITION level.
+                        _existing["reason"] = (
+                            "autofin no longer has this deal — no recommendation available"
+                        )
+                        _existing["flavour"] = "detail_lost"
+                        _existing["recovered"] = False
+                        _existing["deal_id"] = did
+                    else:
+                        self._orphan_deals.append({
+                            "deal_id": did,
+                            "symbol": sym,
+                            "qty": _held_qty,
+                            "reason": "autofin no longer has this deal — no recommendation available",
+                            "flavour": "detail_lost",
+                            "recovered": False,
+                        })
+                continue
             # 2026-10-21 BAF fix: ``lastRecomment`` is the SHORT
             # headline (e.g. ``🛡️ Chốt lãi -1.75 % bảo toàn vốn``)
             # while the FULL text including ``tại P`` (e.g.
@@ -3303,6 +4602,41 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "lastRecomment": last_rec,
                 "_orphan_injected": True,
             })
+            # 2026-11-04: record it for the EOD report. The deal IS
+            # recoverable (autofin still publishes a recomment for it
+            # via /signal-deals) but it is NOT in the holding list,
+            # so autofin's own dashboard does not show it — the
+            # operator needs to know it is still a live position.
+            _held_qty = int(live_positions.get(sym, 0) or 0)
+            if _held_qty > 0:
+                _existing = next(
+                    (
+                        od for od in self._orphan_deals
+                        if str(od.get("symbol") or "").strip().upper() == sym
+                    ),
+                    None,
+                )
+                if _existing is not None:
+                    # Already reported at the POSITION level — enrich
+                    # that entry rather than adding a second line for
+                    # the same position.
+                    _existing["last_recomment"] = last_rec[:200]
+                    _existing["recovered"] = True
+                    _existing["flavour"] = "list_lost"
+                    _existing["reason"] = (
+                        "deal still on autofin, but missing from the holding list"
+                    )
+                    _existing["deal_id"] = did
+                else:
+                    self._orphan_deals.append({
+                        "deal_id": did,
+                        "symbol": sym,
+                        "qty": _held_qty,
+                        "reason": "deal still on autofin, but missing from the holding list",
+                        "flavour": "list_lost",
+                        "recovered": True,
+                        "last_recomment": last_rec,
+                    })
             # Repair the cached recomment on our tracked deal
             # too so subsequent cycles see the latest text even
             # if the orphan path doesn't fire again.
@@ -3331,18 +4665,27 @@ class AutofinSignalAdapter(StrategyAdapter):
         client = self._client_lazy()
         self._load_state(config.dataDir)
 
+        # 2026-10-29: collect the RAW autofin payloads used for this
+        # cycle's decision so we can snapshot them. When something goes
+        # wrong we need to be able to answer "did autofin send us bad
+        # data, or did we misread good data?" — which is impossible
+        # without the raw responses (the VOS incident).
+        raw_payloads: dict[str, Any] = {}
+
         # 1. /signal-static-holding — autofin currently open positions
         try:
             holding = client.fetch_holding(page_size=50)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_holding failed: {exc}")
             holding = []
+        raw_payloads["holding"] = holding
         # 2. /signal-static-suggest — latest recommended signals
         try:
             signals = client.fetch_signals(page_size=20)
         except Exception as exc:
             notify(f"⚠️ autofin fetch_signals failed: {exc}")
             signals = []
+        raw_payloads["suggest"] = signals
         # 3. /closing-signals — recently closed
         try:
             closing = client.fetch_closing(page_size=50)
@@ -3356,6 +4699,7 @@ class AutofinSignalAdapter(StrategyAdapter):
             # libs/autofin_signals.py:_request_with_token_refresh.
             notify(f"⚠️ autofin fetch_closing failed: {exc}")
             closing = []
+        raw_payloads["closing"] = closing
         # 3b. CATCH-UP: if the bot has been down for more than
         # ``_catchup_threshold_seconds`` (default 24h) since its last
         # poll, scan every held+closed deal's ``hisRecomment``
@@ -3389,6 +4733,7 @@ class AutofinSignalAdapter(StrategyAdapter):
         except Exception as exc:
             notify(f"⚠️ autofin fetch_risk failed: {exc}")
             risk = []
+        raw_payloads["risk"] = risk
         # 4b. Fetch each holding's full recomment history so partial
         # closes can honour autofin's per-step "Tỷ trọng X %" fraction
         # (the live /signal-static-holding endpoint only returns a
@@ -3397,24 +4742,72 @@ class AutofinSignalAdapter(StrategyAdapter):
         # Without this, partial closes fall back to the 1/3 default
         # which is wrong for ASP today (autofin says 10%).
         autofin_fractions: dict[str, float] = {}
+        # 2026-10-30 (VOS incident): the FULL text of the most recent
+        # actionable event, per deal. The short ``lastRecomment``
+        # headline is often not parseable as an action — VOS's was
+        # "⚠️ Hạ tỷ trọng lần 2", which carries no percentage, no
+        # price and no parseable reduce pattern — while the full
+        # ``hisRecomment`` text ("[VOS] ⚠️ Hạ 50 % tỉ trọng lần 2
+        # Giá: 11,100 ...") parses perfectly. Without this map the
+        # partial-close path skipped the reduce and we held 300 VOS
+        # shares untouched.
+        autofin_event_texts: dict[str, str] = {}
+        deals_by_symbol: dict[str, Any] = {}
+        # The set of symbols we need the history for: every holding
+        # row PLUS every tracked deal we actually hold. VOS is NOT in
+        # /signal-static-holding (it is an orphan — autofin dropped it
+        # from the holding list), so iterating over ``holding`` alone
+        # would never have fetched its history.
+        symbols_needed: dict[str, str] = {}
         for h in holding:
             sym = h.get("symbol") or h.get("stockCode")
-            if not sym:
-                continue
+            if sym:
+                symbols_needed[str(sym).upper()] = _deal_id(h)
+        for did, sig in self._our_deals.items():
+            sym = str(sig.get("symbol") or "").strip().upper()
+            if sym and sym not in symbols_needed:
+                symbols_needed[sym] = did
+        for sym, did in symbols_needed.items():
             try:
                 deals = client.fetch_deals(symbol=sym, page_size=5)
             except Exception as exc:
                 print(f"[autofin_signal] fetch_deals({sym}) failed: {exc}")
                 continue
+            # 2026-10-29: keep the raw payload for the snapshot.
+            deals_by_symbol[str(sym).upper()] = deals
             if not deals:
                 continue
-            result = latest_partial_close_fraction(deals[0])
+            # Match the deal by (_id, symbol) — autofin's ``_id`` is
+            # only the open-time timestamp and collides across
+            # symbols (2026-10-29).
+            want_id = 0
+            if did:
+                try:
+                    want_id = int(str(did).split(":", 1)[0])
+                except ValueError:
+                    want_id = 0
+            match = next(
+                (
+                    d for d in deals
+                    if int(d.get("_id", 0) or 0) == want_id
+                    and str(d.get("symbol") or "").strip().upper() == sym
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            result = latest_partial_close_fraction(match)
             if result is None:
                 continue
-            frac, _raw_text = result
-            did = _deal_id(h)
-            if did:
-                autofin_fractions[did] = frac
+            frac, raw_text = result
+            deal_id = _deal_id(match) or did
+            if deal_id:
+                autofin_fractions[deal_id] = frac
+                # Keep the full event text so the partial-close path
+                # can fall back to it when the headline is not
+                # actionable.
+                if raw_text:
+                    autofin_event_texts[deal_id] = raw_text
         # 4c. ORPHAN DEAL AUGMENTATION (2026-10-20 BAF incident):
         # /signal-static-holding sometimes drops deals that we still
         # hold on DNSE — typically when an operator manually closes
@@ -3431,6 +4824,28 @@ class AutofinSignalAdapter(StrategyAdapter):
         # BAF was not in /signal-static-holding → bot reported
         # "0 orders planned" and never placed the SELL. See
         # ``_augment_orphan_deals`` for the full mechanism.
+        #
+        # 4d. REFRESH STALE RECOMMENDATIONS (2026-10-29, VOS incident).
+        # Our cached ``lastRecomment`` for a tracked deal is written
+        # once and never refreshed unless the deal reappears in a fresh
+        # holding/suggest response. For VOS that meant acting on the
+        # 22/10 entry card ("Khuyến nghị đầu tư") for seven days after
+        # autofin had moved the deal to "⚠️ Hạ tỷ trọng lần 2" — and
+        # the bot opened a NEW VOS position on 2026-10-29 because of
+        # it. This refreshes any tracked deal whose cached text has
+        # gone stale. Runs BEFORE the orphan augmentation so both the
+        # entry gate and the partial-close path see fresh text.
+        try:
+            refresh_report = self._refresh_stale_deal_recomments(
+                client, holding, signals, raw_payloads,
+            )
+        except Exception as exc:
+            print(
+                f"[autofin_signal] stale recomment refresh failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            refresh_report = {"refreshed": [], "skipped_fresh": [],
+                              "failed": [{"error": str(exc)[:200]}]}
         self._augment_orphan_deals(client, holding)
         # 5. fetch our current DNSE positions for sizing
         try:
@@ -3448,6 +4863,41 @@ class AutofinSignalAdapter(StrategyAdapter):
             positions = {}
             nav = 0.0
             account = "?"
+
+        # 5a. Reconcile the tracked state against the LIVE positions.
+        #
+        # 2026-11-06: a MANUAL sell leaves no trace in our ledger, so
+        # the ledger keeps claiming a position we no longer hold. That
+        # stale claim lands in ``already_planned_symbols`` and blocks
+        # a legitimate new entry (the 2026-11-05 BAF/ORS case).
+        #
+        # The live DNSE position map is the truth — use it.
+        pruned_positions: list[dict[str, Any]] = []
+        if positions:
+            try:
+                pruned_positions = self._reconcile_with_live_positions(
+                    positions,
+                )
+            except Exception as exc:
+                print(
+                    f"[autofin_signal] live-position reconciliation "
+                    f"failed (non-fatal): {type(exc).__name__}: "
+                    f"{str(exc)[:200]}"
+                )
+        if pruned_positions:
+            print(
+                f"[autofin_signal] pruned {len(pruned_positions)} stale "
+                f"position(s) from the tracked state: "
+                + ", ".join(
+                    f"{p['symbol']} {p['claimed_qty']}->{p['live_qty']}"
+                    for p in pruned_positions
+                )
+            )
+            # The pruned deals must not stay in ``actioned_deals`` —
+            # they are re-actionable now that we hold none of them.
+            for _p in pruned_positions:
+                if int(_p.get("live_qty", 0) or 0) <= 0:
+                    self._actioned_deals.discard(_p["deal_id"])
 
         # 5b. MOCK_NAV override — for dry-run testing with funded account
         # but zero balance. Lets us see the order plan without real money.
@@ -3525,19 +4975,34 @@ class AutofinSignalAdapter(StrategyAdapter):
             )
         except ValueError:
             new_entry_min_cash_pct = 0.05
+        # 2026-10-29: the entry budget is now the top 3 autofin
+        # suggestions (was 1). User request: "currently we are using
+        # top 1 when check entry, let use top 3".
+        #
+        # The count is of ENTRIES MADE, not candidates examined (see
+        # the 2026-10-28 fix in ``_plan_orders_for_new_positions``):
+        # a candidate that fails the price zone, the recomment
+        # classification or the cash/lot-sizing gate no longer burns a
+        # slot. So "top 3" means up to 3 qualifying entries per day.
+        #
+        # The cash budget still binds: each entry is sized at
+        # ``nav * rate_for_nav`` and the entries share the remaining
+        # cash, so 3 entries can only be placed if the cash and the
+        # board-lot rounding allow it.
         try:
             new_entry_top_n = int(
-                os.environ.get("AUTOFIN_NEW_ENTRY_TOP_N", "1") or "1"
+                os.environ.get("AUTOFIN_NEW_ENTRY_TOP_N", "3") or "3"
             )
         except ValueError:
-            new_entry_top_n = 1
+            new_entry_top_n = 3
         # allow_new_entries: True only at the start-of-day window
         # (between orderSubmitTime and a configurable cutoff, default
         # 09:45 ICT — gives the bot ~30 min after market open to make
-        # its single daily entry). The cutoff is in minutes after the
+        # its daily entries). The cutoff is in minutes after the
         # main trading session opens. After the cutoff the bot still
         # runs every cycle but only the partial-close / full-close
-        # paths can produce orders.
+        # paths can produce orders (plus the catch-up window, see
+        # below).
         try:
             start_of_day_cutoff_min = int(
                 os.environ.get("AUTOFIN_NEW_ENTRY_CUTOFF_MIN", "30") or "30"
@@ -3837,6 +5302,9 @@ class AutofinSignalAdapter(StrategyAdapter):
             actioned_deals=self._actioned_deals,
             autofin_closing_ids=closing_ids,
             autofin_fractions=autofin_fractions,
+            # 2026-10-30 (VOS incident): the full event text, used as
+            # the fallback when the short headline is not actionable.
+            autofin_event_texts=autofin_event_texts,
             # New-entry gating (user spec 2026-09-21):
             # - new_entry_top_n=0 disables new entries entirely
             #   (used outside the start-of-day window)
@@ -3880,6 +5348,51 @@ class AutofinSignalAdapter(StrategyAdapter):
         # 10. Update our persistent state. Note: decide_orders() returns
         # a deep-copied new_our_deals; we copy it back into our adapter's
         # state so subsequent calls see the new positions.
+        #
+        # 2026-10-30 (VOS incident): a DRY-RUN cycle must NOT consume
+        # the "already fired" markers. ``decide_orders`` records
+        # ``_last_recomment`` / ``_last_numberOfProfit`` on the deal
+        # the moment it PLANS a partial close. In a dry run nothing is
+        # ever submitted, so persisting the marker would silently
+        # swallow the real trim on the next LIVE cycle — the position
+        # would never be trimmed even though the reduce was seen.
+        #
+        # We therefore restore the pre-cycle markers for every planned
+        # partial close when ``live_submit`` is False. (In live mode
+        # the runner re-arms them again if the submit does not reach
+        # DNSE — see ``rearm_unsubmitted_actions``.)
+        if not live_submit:
+            restored = 0
+            # Collect the deal ids whose partial close was PLANNED
+            # this cycle. Matching on the deal id (not on "any order
+            # is a partial") keeps this to the deals that actually
+            # fired.
+            planned_dids: set[str] = set()
+            for o in all_orders:
+                reason = str(o.get("reason") or "")
+                if not (
+                    reason.startswith("autofin_partial:deal#")
+                    or "autofin_partial_event:" in reason
+                ):
+                    continue
+                _did = _extract_deal_id(reason)
+                if _did:
+                    planned_dids.add(_did)
+            for did in planned_dids:
+                sig = new_our_deals.get(did)
+                if sig is None:
+                    continue
+                sig.pop("_last_recomment", None)
+                sig.pop("_last_numberOfProfit", None)
+                sig.pop("_last_partial_fraction", None)
+                sig.pop("_last_partial_step_key", None)
+                restored += 1
+            if restored:
+                print(
+                    f"[autofin_signal] dry-run: restored the action "
+                    f"markers for {restored} planned partial close(s) so "
+                    f"the live cycle still acts on them"
+                )
         self._our_deals = new_our_deals
         new_orders = [o for o in all_orders if o.get("side") == "NB" and "tp:" not in o.get("reason", "") and "sl:" not in o.get("reason", "")]
         partial_orders = [
@@ -3941,6 +5454,44 @@ class AutofinSignalAdapter(StrategyAdapter):
             } for i, r in enumerate(all_orders)],
         }, indent=2, ensure_ascii=False))
 
+        # 11b. SNAPSHOT THE RAW AUTOFIN PAYLOADS + THE DECISION (2026-10-29).
+        #
+        # The user asked: "everytime we do a decision, let snapshot the
+        # response from autofin and log that so that we can track later
+        # if the error is from us or from autofin".
+        #
+        # The raw bundle holds every autofin response this cycle used.
+        # The summary holds what WE decided and why, including the
+        # recommendation kind we derived from autofin's text. Comparing
+        # the two after an incident answers "was autofin wrong, or did
+        # we misread autofin?".
+        snapshot_summary = self._build_decision_summary(
+            raw_payloads=raw_payloads,
+            holding=holding,
+            signals=signals,
+            closing=closing,
+            risk=risk,
+            refresh_report=refresh_report,
+            all_orders=all_orders,
+            new_orders=new_orders,
+            partial_orders=partial_orders,
+            close_orders=close_orders,
+            deals_actioned=deals_actioned,
+            our_deals=self._our_deals,
+            positions=positions,
+            nav=nav,
+            account=account,
+            trade_date=today,
+            allow_new_entries=allow_new_entries,
+            new_entry_top_n=new_entry_top_n,
+            current_prices=current_prices,
+            orphan_deals=list(self._orphan_deals),
+        )
+        self._write_decision_snapshot(
+            config.dataDir, raw_payloads, snapshot_summary,
+        )
+        self._log_decision_summary(snapshot_summary)
+
         # 12. send per-order Telegram notifications for any newly-detected
         # action since the last cycle. The EOD summary will still bundle
         # everything in one message at 15:15 ICT.
@@ -3979,6 +5530,13 @@ class AutofinSignalAdapter(StrategyAdapter):
                 "partial_symbols": [r["symbol"] for r in partial_orders],
                 "account": account,
                 "nav": nav,
+                # 2026-11-04: the orphan deals — the ones we track
+                # that autofin's /signal-static-holding no longer
+                # lists. The operator confirmed these are an autofin
+                # DATA-LOSS case (the deal WAS there, autofin lost
+                # it) and will trade them MANUALLY. The EOD report
+                # names them.
+                "orphan_deals": list(self._orphan_deals),
             },
             "deals_actioned": deals_actioned,
         }
@@ -4101,6 +5659,69 @@ class AutofinSignalAdapter(StrategyAdapter):
             lines.append(
                 f"⚠️  {sig['autofin_risk']} positions risk-flagged (see risk endpoint)"
             )
+            lines.append("")
+
+        # 2026-11-05 (corrected): the ORPHAN DEALS notice.
+        #
+        # An orphan is a position we hold for a DEAL that autofin can
+        # no longer give us detail for (the operator's definition:
+        # "we cannot get detail with that deal or ticker anymore").
+        # It is NOT simply "missing from the static holding list".
+        #
+        # Two flavours, and they need different handling:
+        #
+        #   * DEAL LOST  — autofin has no recommendation for the
+        #     position. The bot CANNOT act on it. Manual only.
+        #   * LIST LOST  — the deal is still on autofin and still
+        #     open; only the static holding list dropped it. The bot
+        #     recovers it and can still act, but autofin's own
+        #     dashboard does not show the position.
+        #
+        # The notice is here because an orphan stops being visible:
+        # autofin publishes no recommendation for it, so nothing in
+        # the bot's normal output says the position is still open.
+        orphan_deals = sig.get("orphan_deals") or []
+        if orphan_deals:
+            _lost = [o for o in orphan_deals if not o.get("recovered")]
+            _list = [o for o in orphan_deals if o.get("recovered")]
+            lines.append(
+                f"🧩 ORPHAN DEALS ({len(orphan_deals)}) — "
+                f"autofin can no longer give us detail for these"
+            )
+            if _lost:
+                lines.append(
+                    f"   ⚠️ {len(_lost)} position(s) have NO autofin "
+                    f"recommendation — TRADE MANUALLY:"
+                )
+                for od in _lost[:15]:
+                    _sym = od.get("symbol", "?")
+                    _did = od.get("deal_id", "?")
+                    _qty = int(od.get("qty", 0) or 0)
+                    _line = f"  • {_sym}  [deal#{_did}]"
+                    if _qty:
+                        _line += f"  qty={_qty:,}"
+                    _line += f"  — {od.get('reason', 'detail lost')}"
+                    lines.append(_line)
+                if len(_lost) > 15:
+                    lines.append(f"  + {len(_lost) - 15} more")
+            if _list:
+                lines.append(
+                    f"   ℹ️ {len(_list)} position(s) still tradeable by the "
+                    f"bot (the deal exists, only the holding list lost it):"
+                )
+                for od in _list[:15]:
+                    _sym = od.get("symbol", "?")
+                    _did = od.get("deal_id", "?")
+                    _qty = int(od.get("qty", 0) or 0)
+                    _rec = od.get("last_recomment") or ""
+                    _line = f"  • {_sym}  [deal#{_did}]"
+                    if _qty:
+                        _line += f"  qty={_qty:,}"
+                    lines.append(_line)
+                    if _rec:
+                        lines.append(f"    last autofin signal: {_rec[:90]}")
+                if len(_list) > 15:
+                    lines.append(f"  + {len(_list) - 15} more")
             lines.append("")
 
         lines.append(f"📁 Orders file: {result.get('latestOrdersCsv', '?')}")

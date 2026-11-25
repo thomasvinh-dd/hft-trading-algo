@@ -84,6 +84,34 @@ def should_refresh_token(moment: datetime, done_for_date: str | None, schedule: 
     return is_trading_day(moment, holidays) and done_for_date != today and local_time(moment) >= schedule.tokenTime
 
 
+def is_auction_session(session: "TradingSession") -> bool:
+    """True for the ATO / ATC auction windows.
+
+    2026-10-31: the bot must NOT trade in an auction.
+
+    Two reasons, both of which showed up in the live ledger:
+
+    1. An auction order is submitted with ``price=0`` — the auction
+       price is decided at the close of the window, not by us. We
+       lose all control over the fill price. The VOS BUY on
+       2026-10-29 09:01:17 was submitted that way and filled at
+       11,800 (the ATO price) while the continuous-market bid was
+       ~10,800.
+
+    2. ``price=0`` on a BUY means "buy at ANY price" to DNSE. That
+       is an unbounded risk, not a bounded one.
+
+    The user asked for this explicitly: no orders in ATO or ATC.
+    Protective STOPs are included — the decision is to block ALL
+    orders, not just trades. A stop planned in the window is
+    deferred to the next continuous session.
+
+    Post-close (14:45-15:00) is NOT an auction — it is a normal LO
+    session on HOSE (PLO) with a real price — so it stays tradeable.
+    """
+    return session in (TradingSession.ATO, TradingSession.ATC)
+
+
 def should_submit_orders(moment: datetime, done_for_date: str | None, schedule: TradingSchedule = TradingSchedule(), holidays: set[str] | None = None) -> bool:
     today = local_date(moment)
     return (
@@ -130,22 +158,68 @@ def should_run_start_of_day(
     return today != last_date and local_time(moment) >= schedule.startOfDayTime
 
 
+# 2026-10-31: the mid-day poll cadence.
+#
+# The bot used to re-run the strategy once per hour. The user asked
+# for every 30 minutes instead ("now seem like the trading session
+# for each 1 hour, i wanna change it to 30 mins").
+#
+# 30 minutes is the sweet spot: it halves the worst-case latency
+# between autofin publishing a signal (a reduce, a TP, a close) and
+# the bot acting on it, without doubling the load on the autofin
+# gateway — which intermittently 502s under repeated calls.
+#
+# Overridable per environment via ``AUTOFIN_POLL_INTERVAL_SECONDS``.
+DEFAULT_POLL_INTERVAL_SECONDS = 1800
+
+
+def poll_interval_seconds() -> int:
+    """The mid-day poll cadence in seconds (default 30 minutes).
+
+    2026-10-31: was 3600 (1 hour); the user asked for 30 minutes.
+    Tunable via ``AUTOFIN_POLL_INTERVAL_SECONDS`` so it can be
+    changed per environment without a code edit.
+    """
+    import os
+
+    raw = os.environ.get("AUTOFIN_POLL_INTERVAL_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_POLL_INTERVAL_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_POLL_INTERVAL_SECONDS
+    # Guard against a zero/negative interval, which would make the bot
+    # poll on EVERY loop (the bot's own sleep is 60 s) and hammer the
+    # autofin gateway.
+    if value < 60:
+        return DEFAULT_POLL_INTERVAL_SECONDS
+    return value
+
+
 def should_poll_strategy(
     moment: datetime,
     last_poll_time: datetime | str | None,
-    min_interval_seconds: int = 3600,
+    min_interval_seconds: int | None = None,
     schedule: TradingSchedule = TradingSchedule(),
     holidays: set[str] | None = None,
 ) -> bool:
     """Return True if we should re-run the strategy now.
 
     Fires during main trading phases only, with at least ``min_interval_seconds``
-    between polls (default 1 hour). Use this to detect mid-day signal changes
-    (e.g. autofin partial closes) without spamming Telegram on every loop.
+    between polls (default 30 minutes — see ``poll_interval_seconds``).
+    Use this to detect mid-day signal changes (e.g. autofin partial
+    closes) without spamming Telegram on every loop.
 
     ``last_poll_time`` may be a ``datetime`` or an ISO-8601 string (the
     latter is what we persist in the strategy state file).
+
+    ``min_interval_seconds=None`` means "use the configured default"
+    (``AUTOFIN_POLL_INTERVAL_SECONDS``, else 1800 s). Pass an explicit
+    value to override it in a test.
     """
+    if min_interval_seconds is None:
+        min_interval_seconds = poll_interval_seconds()
     if not is_main_trading_phase(moment, schedule, holidays):
         return False
     if last_poll_time is None:

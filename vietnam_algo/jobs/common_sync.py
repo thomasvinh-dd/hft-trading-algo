@@ -102,22 +102,122 @@ def _load_ca_index() -> list[dict]:
     return []
 
 
-def run() -> CommonSyncResult:
+def _mirror_symbols_to_db(data_dir: Path) -> int:
+    """Mirror ``symbols.json`` into the Postgres ``symbols`` table.
+
+    Same best-effort contract as the price mirror — a Postgres outage
+    must not break the sync.
+    """
+    import os
+
+    if os.environ.get("HFT_MIRROR_TO_DB", "1") == "0":
+        return 0
+    try:
+        from vietnam_algo.libs.db import DbClient
+        from vietnam_algo.libs.db_sync import mirror_symbols
+        from vietnam_algo.libs.data import read_json
+    except ImportError as exc:  # pragma: no cover — psycopg2 missing
+        print(f"[common_sync] skipping Postgres symbol mirror: {exc}")
+        return 0
+
+    path = data_dir / "symbols.json"
+    if not path.exists():
+        return 0
+    try:
+        payload = read_json(path)
+    except Exception as exc:
+        print(f"[common_sync] symbol mirror read: {exc}")
+        return 0
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not items:
+        return 0
+
+    db = DbClient.from_default()
+    count = mirror_symbols(db, items)
+    if count:
+        print(f"[common_sync] symbols mirrored to Postgres: {count}")
+    return count or 0
+
+
+def _mirror_prices_to_db(
+    symbols: list[str],
+    data_dir: Path,
+    paths: list[Path],
+) -> int:
+    """Mirror freshly-written price JSON files into the Postgres mirror.
+
+    Postgres is the intended source of truth for market data (see
+    ``vietnam_algo/db.py``), but only ``daily_engine.update_dataset()``
+    fed it — and the cron drives prices through ``common_sync``, which
+    calls ``sync_prices_incremental`` directly. So ``prices_dnse`` sat
+    empty while the JSON files were current.
+
+    The ticker is taken from each path's own stem — NOT zipped against
+    ``symbols``. ``sync_prices_incremental`` returns only the files it
+    actually changed, in its own iteration order, so zipping the two
+    lists paired every symbol with some OTHER symbol's price file. That
+    silently wrote ticker A's prices under ticker B (visible as e.g.
+    MWG priced at 8,300 VND when it trades at 72,300) and wrecked the
+    backtest: max drawdown -21% -> -70%.
+
+    Best-effort: a Postgres outage must not break the sync. The
+    ``mirror_*`` helpers swallow ``DbError`` and log.
+
+    Set ``HFT_MIRROR_TO_DB=0`` to disable.
+    """
+    import os
+
+    if os.environ.get("HFT_MIRROR_TO_DB", "1") == "0":
+        return 0
+    try:
+        from vietnam_algo.libs.db import DbClient
+        from vietnam_algo.libs.db_sync import mirror_prices
+        from vietnam_algo.libs.data import read_json
+    except ImportError as exc:  # pragma: no cover — psycopg2 missing
+        print(f"[common_sync] skipping Postgres mirror (no psycopg2): {exc}")
+        return 0
+
+    db = DbClient.from_default()
+    touched = 0
+    for path in paths:
+        # The file name IS the ticker — never zip against ``symbols``.
+        symbol = path.stem.upper()
+        try:
+            payload = read_json(path)
+        except Exception as exc:
+            print(f"[common_sync] mirror read {symbol}: {exc}")
+            continue
+        bars = payload.get("items") if isinstance(payload, dict) else None
+        if not bars:
+            continue
+        if mirror_prices(db, symbol, bars):
+            touched += 1
+    return touched
+
+
+def run(force_prices: bool = False) -> CommonSyncResult:
     """Do the day's common sync. Skips already-done work.
 
     Steps:
       1. Refresh symbols.json (sync_symbols).
       2. Refresh the price series for each symbol (sync_prices with
          ``skip_existing=True`` so we only fill what's missing).
-      3. Run the CA sync (incremental).
-      4. Stamp ``data_ready_for_eod`` with current mtime.
+      3. Mirror symbols + prices into Postgres.
+      4. Run the CA sync (incremental).
+      5. Stamp ``data_ready_for_eod`` with current mtime.
+
+    ``force_prices=True`` bypasses the trading-day guard. The cron only
+    runs on weekdays, but a missed Friday (or a deploy that clobbered
+    the data) leaves the mirror stale over the weekend, and there is no
+    cron slot to repair it until Monday. This flag lets an operator
+    backfill out of hours.
 
     Returns a CommonSyncResult summary. Exits non-zero only on a hard
     failure (e.g., empty universe, network down).
     """
     now = vietnam_now()
     today = local_date(now)
-    if already_done_today(today):
+    if already_done_today(today) and not force_prices:
         print(f"[common_sync] already done for {today}; re-stamping sentinel")
         SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         SENTINEL_PATH.write_text(datetime.now(tz=timezone.utc).isoformat())
@@ -130,7 +230,7 @@ def run() -> CommonSyncResult:
             sentinel=str(SENTINEL_PATH),
         )
 
-    if not is_trading_day(now):
+    if not is_trading_day(now) and not force_prices:
         # On weekends / holidays we still want the sentinel present
         # (Friday's plan should be readable on Monday morning), but
         # skipping the heavy work saves cost.
@@ -152,6 +252,11 @@ def run() -> CommonSyncResult:
     print(f"[common_sync] symbols: {len(symbols)}")
     if not symbols:
         raise RuntimeError("sync_symbols returned 0 symbols — aborting")
+
+    # Mirror the symbol universe into Postgres too — the ``symbols``
+    # table only had a single leftover test row, so a DB-side reader
+    # had no idea which tickers exist.
+    _mirror_symbols_to_db(DATA_DIR)
 
     # Surface the denylist size for log observability — when DNSE stops
     # carrying a symbol it lands here and is skipped on future syncs.
@@ -181,6 +286,21 @@ def run() -> CommonSyncResult:
             f"to the invalid-symbol denylist"
         )
     print(f"[common_sync] prices refreshed: {len(paths)} (incremental)")
+
+    # Mirror the refreshed prices into Postgres.
+    #
+    # Before this, only ``daily_engine.update_dataset()`` mirrored
+    # prices to the DB — but the cron drives prices through
+    # ``common_sync`` (which calls ``sync_prices_incremental``
+    # directly). So the mirror never ran on the cron path and
+    # ``prices_dnse`` sat empty (0 rows) even though the JSON files
+    # were current. Postgres is meant to be the source of truth for
+    # downstream readers, so it has to be fed here.
+    mirrored = _mirror_prices_to_db(symbols, DATA_DIR, paths)
+    print(
+        f"[common_sync] prices mirrored to Postgres: {mirrored}/{len(paths)}"
+    )
+
     if fetch_errors:
         # Separate 'invalid symbol' rejections (permanent — DNSE will
         # never carry these tickers) from real failures (network, 5xx,
@@ -298,11 +418,16 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(description="Refresh shared price + CA data and stamp the EOD sentinel")
     parser.add_argument("--force", action="store_true", help="Re-run even if already done today (does NOT skip sentinel)")
+    parser.add_argument(
+        "--force-prices", action="store_true",
+        help="Refresh prices even on a non-trading day (weekend/holiday). "
+             "Use to backfill a missed Friday or repair the Postgres mirror.",
+    )
     args = parser.parse_args(argv)
     if args.force:
         TRADE_STATE.unlink(missing_ok=True)
     try:
-        result = run()
+        result = run(force_prices=args.force_prices)
     except Exception as exc:
         # Surface hard failures (network down, 0 symbols, etc.) to
         # Telegram so an operator notices even when the cron run is

@@ -57,6 +57,35 @@ AMBIGUOUS_LEDGER_STATUSES = {"prepared", "submitting", "unknown"}
 # unrelated orders.
 TOKEN_REJECTED_STATUS = "token_rejected"
 
+# 2026-10-31 (the VOS T+2.5 case): a dedicated status for orders DNSE
+# rejected because the shares are not settled yet.
+#
+# DNSE answers a too-early SELL with HTTP 400
+# ``TRADE_QUANTITY_NOT_ENOUGH``. That is an HTTP 400, so it used to be
+# classified as a plain "rejected" — a TERMINAL status. The ledger's
+# dedup key (run_id, sourceOrderId, symbol, side) matches on any
+# terminal status, so the order became permanently un-retryable and
+# was silently lost.
+#
+# That is exactly what would have happened to the VOS trim: bought
+# Friday 2026-10-29, autofin published the reduce the same day, and
+# the bot tried to sell on Monday 2026-11-02 09:00 — before the
+# T+2.5 settlement cleared at 12:00 that day. The rejection was
+# terminal, so the trim was lost forever.
+#
+# Like TOKEN_REJECTED_STATUS this status is deliberately NEITHER
+# terminal nor unsafe:
+#
+#   * Not TERMINAL — the order can be re-attempted once settlement
+#     clears.
+#   * Not UNSAFE — ``unsafe_existing_orders`` would short-circuit the
+#     ENTIRE submit run, blocking every other order.
+#
+# The re-attempt is driven by the strategy: a planned partial close
+# whose submit did not reach DNSE is re-armed by
+# ``rearm_unsubmitted_actions``, so the next cycle plans it again.
+T2_REJECTED_STATUS = "t2_rejected"
+
 
 @dataclass(frozen=True)
 class LedgerOrder:

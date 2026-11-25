@@ -415,13 +415,39 @@ def classify_recomment(rec_text: str) -> str:
          capital_protect.
       3. If text contains "Chốt lãi" (with the 💰 icon, even without
          "bảo toàn vốn") → tp.
-      4. If text contains "Hạ " + "%" + "tỉ trọng" → reduce.
+      4. If text contains "Hạ" AND "tỉ trọng"/"tỷ trọng" → reduce.
       5. If text contains "khuyến nghị" (case-insensitive) → entry.
       6. Otherwise → unknown (be conservative: not an entry).
+
+    2026-10-29 (VOS incident): autofin publishes TWO spellings of the
+    reduce headline —
+        "⚠️ Hạ 50 % tỉ trọng lần 1"   (with the percentage)
+        "⚠️ Hạ tỷ trọng lần 2"       (WITHOUT the percentage)
+    The second form was classified as ``unknown`` because the old rule
+    required a literal "%" between "hạ" and "tỉ trọng". The VOS deal's
+    headline used exactly that form, so the bot never saw it as a
+    reduce signal. The rule now matches on the "hạ" + "tỉ trọng"
+    pair alone and accepts both spellings of "tỷ trọng".
+
+    2026-10-29 (same incident): the ENTRY CARD
+        "Ngày khuyến nghị: 22/10/2026 ... 🎯 Vùng chốt lãi: 13,100 - 14,800 ..."
+    contains the substring "chốt lãi" (inside "Vùng chốt lãi"), so the
+    old rule 3 classified it as ``tp`` — rule 3 fired before rule 5.
+    That is wrong: the card IS the entry recommendation. We now
+    recognise the card explicitly and classify it as ``entry``.
+
+    The card is recognised by its structure — it always carries the
+    "Ngày khuyến nghị:" date prefix together with the "Vùng mua:"
+    (buy zone) field. The TP headlines never carry "Vùng mua".
     """
     if not rec_text:
         return RECOMMENT_KIND_UNKNOWN
     text = rec_text.lower()
+    # 0. The ENTRY CARD — checked FIRST because it contains both
+    #    "khuyến nghị" and (inside "Vùng chốt lãi") "chốt lãi".
+    #    Without this, rule 3 misclassified it as a TP step.
+    if "khuyến nghị" in text and "vùng mua" in text:
+        return RECOMMENT_KIND_ENTRY
     # 1. Full close — check before TP because the full-close text
     # usually embeds the TP price ("Đóng DEAL chạm điểm chặn lãi (Lãi: X %)").
     if "đóng deal" in text:
@@ -433,8 +459,10 @@ def classify_recomment(rec_text: str) -> str:
     if "chốt lãi" in text or "💰" in rec_text:
         if "chốt lãi" in text or "💰" in rec_text:
             return RECOMMENT_KIND_TP
-    # 4. Reduce ("⚠️ Hạ X % tỉ trọng lần N")
-    if "hạ" in text and "tỉ trọng" in text:
+    # 4. Reduce ("⚠️ Hạ X % tỉ trọng lần N" / "⚠️ Hạ tỷ trọng lần N")
+    #    Both the "tỉ trọng" and "tỷ trọng" spellings occur in
+    #    autofin's headlines, and the percentage is optional.
+    if "hạ" in text and ("tỉ trọng" in text or "tỷ trọng" in text):
         return RECOMMENT_KIND_REDUCE
     # 5. Fresh entry ("Khuyến nghị đầu tư" / "Ngày khuyến nghị: ...")
     if "khuyến nghị" in text:

@@ -570,6 +570,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="force a fresh run even if the same day's run already "
              "happened (does not skip the sentinel re-stamp).",
     )
+    common_sync_parser.add_argument(
+        "--force-prices",
+        action="store_true",
+        help="refresh prices even on a non-trading day (weekend/holiday). "
+             "Use to backfill a missed session or repair the Postgres mirror.",
+    )
 
     return parser
 
@@ -1868,10 +1874,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run-common-sync":
         from .jobs import common_sync
         # See note on run-get-otp above; the dispatch here hands the
-        # already-parsed --force through to common_sync.
+        # already-parsed flags through to common_sync.
+        flags = []
         if getattr(args, "force", False):
-            return common_sync.main(["--force"])
-        return common_sync.main(argv=[])
+            flags.append("--force")
+        if getattr(args, "force_prices", False):
+            flags.append("--force-prices")
+        return common_sync.main(flags)
 
     return 2
 

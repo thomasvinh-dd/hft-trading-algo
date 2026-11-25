@@ -22,6 +22,7 @@ from .market_calendar import live_trading_dates
 from .notifier import daily_generation_message, notify, submit_message, portfolio_snapshot_message
 from .order_ledger import (
     LedgerOrder,
+    T2_REJECTED_STATUS,
     TOKEN_REJECTED_STATUS,
     dnse_order_id,
     ledger_key,
@@ -410,13 +411,41 @@ def trading_token_from_email(client: DnseClient, otp_type: str = "email_otp") ->
 
 
 def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[str, LedgerOrder], trading_token: str | None = None) -> tuple[dict[str, LedgerOrder], list[dict[str, object]]]:
+    """Refresh the live status of every non-terminal ledger row.
+
+    2026-10-29 (ABB incident): the poll MUST use the order's own
+    ``orderCategory``. A STOP order cannot be resolved with the
+    default ``orderCategory=NORMAL`` — DNSE answers HTTP 404
+    "Order not found" — and this function used to do exactly that.
+
+    The consequence was severe and silent:
+
+      1. Every STOP row was forced back to ``status="unknown"``.
+      2. ``unknown`` is an AMBIGUOUS ledger status.
+      3. ``unsafe_existing_orders`` blocks the WHOLE submit run when
+         any row for that run_id is ambiguous.
+      4. So the T+2 retry could not place the missing ABB protective
+         stop — the two existing STOP orders (TCB, VOS) blocked it.
+
+    That is exactly what happened: a live ABB position had no stop for
+    16 days while the bot reported "T+2 due: 1, resubmitted: 0" every
+    cycle with no error.
+
+    The poll now passes the row's own category, mirroring the order
+    monitor in ``bots/runner.py`` (which was already fixed for this on
+    2026-10-28).
+    """
     updates: list[dict[str, object]] = []
     now = utc_now()
     for key, item in list(ledger.items()):
         if not item.dnseOrderId or item.status not in {"submitted", "open", "partial", "unknown", "submitting"}:
             continue
         try:
-            detail = client.order_detail(account_no, item.dnseOrderId, trading_token=trading_token)
+            detail = client.order_detail(
+                account_no, item.dnseOrderId, trading_token=trading_token,
+                # A STOP order is only resolvable with orderCategory=STOP.
+                order_category=(getattr(item, "orderCategory", "NORMAL") or "NORMAL").upper(),
+            )
             status = normalize_ledger_status(order_status_from_detail(detail))
             ledger[key] = LedgerOrder(
                 runId=item.runId,
@@ -433,9 +462,15 @@ def reconcile_ledger_orders(client: DnseClient, account_no: str, ledger: dict[st
                 updatedAt=now,
                 lastDetail=detail,
                 error=item.error,
+                orderCategory=getattr(item, "orderCategory", "NORMAL") or "NORMAL",
+                stopPrice=getattr(item, "stopPrice", 0) or 0,
+                strategy=getattr(item, "strategy", "") or "",
             )
             updates.append({"sourceOrderId": item.sourceOrderId, "symbol": item.symbol, "status": status, "dnseOrderId": item.dnseOrderId})
         except Exception as exc:
+            # Keep the row's own category on the error path too — a
+            # dropped orderCategory would make the NEXT poll fail the
+            # same way.
             ledger[key] = LedgerOrder(**{**item.__dict__, "status": "unknown", "updatedAt": now, "error": str(exc)})
             updates.append({"sourceOrderId": item.sourceOrderId, "symbol": item.symbol, "status": "unknown", "error": str(exc)})
     return ledger, updates
@@ -496,6 +531,17 @@ def execute_orders_with_ledger(
             # 2026-10-29: tag the owning strategy so each bot's
             # order monitor only reports its own orders.
             strategy=strategy,
+            # 2026-10-29 (ABB incident): persist the DNSE conditional
+            # (STOP) fields. Without them the ledger row says
+            # ``orderCategory=NORMAL`` / ``stopPrice=0``, and the
+            # order monitor then polls the order with the WRONG
+            # category — DNSE answers HTTP 404 for a STOP order
+            # requested as NORMAL — so a perfectly good protective
+            # stop shows up as an error and its row is forced back to
+            # the ambiguous "unknown" status, which blocks every
+            # subsequent submit run.
+            orderCategory=str(payload.get("orderCategory") or "NORMAL"),
+            stopPrice=int(payload.get("stopPrice") or 0),
         )
         save_ledger(ledger, data_dir)
         try:
@@ -508,9 +554,33 @@ def execute_orders_with_ledger(
                 price=float(payload["price"]),
                 loan_package_id=int(payload["loanPackageId"]),
                 order_type=str(payload["orderType"]),
+                # 2026-10-28: native DNSE conditional (STOP) order
+                # fields. A protective stop-loss must be submitted as a
+                # conditional order that rests at the broker, NOT as a
+                # plain limit sell — a limit sell at the stop level is
+                # marketable whenever the market is above it (the
+                # 2026-10-28 ORS incident: an LO @ 14,400 against a
+                # 15,150 bid filled instantly, liquidating 200
+                # shares instead of protecting them).
+                #
+                # Only passed when the order actually IS a stop; a
+                # normal order leaves the defaults in place.
+                order_category=str(
+                    payload.get("orderCategory") or "NORMAL"
+                ).upper(),
+                stop_price=payload.get("stopPrice") or None,
+                condition_operator=payload.get("conditionOperator") or None,
+                duration_type=payload.get("durationType") or None,
+                duration_date_time=payload.get("durationDateTime") or None,
             )
             order_id = dnse_order_id(response)
-            detail = client.order_detail(account_no, order_id, trading_token=trading_token) if order_id else response
+            detail = client.order_detail(
+                account_no, order_id, trading_token=trading_token,
+                # A STOP order must be resolved with its own category.
+                order_category=str(
+                    payload.get("orderCategory") or "NORMAL"
+                ).upper(),
+            ) if order_id else response
             status = normalize_ledger_status(order_status_from_detail(detail)) if order_id else "unknown"
             ledger[key] = LedgerOrder(**{**ledger[key].__dict__, "status": status, "dnseOrderId": order_id, "updatedAt": utc_now(), "lastDetail": detail})
             results.append({"status": "submitted", "order": payload, "response": response, "detail": detail})
@@ -550,15 +620,33 @@ def execute_orders_with_ledger(
             # cron refreshes it) and not unsafe (so it doesn't block
             # other orders).
             is_token_rejection = "INVALID_TRADING_TOKEN" in err_text
+            # 2026-10-31 (the VOS T+2.5 case): a SELL for shares that
+            # have not settled yet is rejected with HTTP 400
+            # ``TRADE_QUANTITY_NOT_ENOUGH``. That is NOT permanent —
+            # the very same payload succeeds once the T+2.5
+            # settlement clears (typically a few hours later on the
+            # same day, or the next trading day after a weekend).
+            #
+            # Classifying it as a plain "rejected" (terminal) made the
+            # order permanently un-retryable: the ledger's dedup key
+            # matches on any terminal status, so the VOS trim would
+            # have been silently lost after one too-early submit.
+            #
+            # It gets its own status: not terminal (re-attemptable
+            # after settlement), not unsafe (it must not block the
+            # other orders in the run).
+            is_t2_rejection = "TRADE_QUANTITY_NOT_ENOUGH" in err_text
             is_permanent_rejection = (
                 "HTTP 400" in err_text
                 or "HTTP 401" in err_text
                 or "HTTP 403" in err_text
                 or "HTTP 404" in err_text
                 or "HTTP 422" in err_text
-            ) and not is_token_rejection
+            ) and not is_token_rejection and not is_t2_rejection
             if is_token_rejection:
                 terminal_status = TOKEN_REJECTED_STATUS
+            elif is_t2_rejection:
+                terminal_status = T2_REJECTED_STATUS
             else:
                 terminal_status = "rejected" if is_permanent_rejection else "unknown"
             ledger[key] = LedgerOrder(**{
@@ -568,6 +656,52 @@ def execute_orders_with_ledger(
                 "error": err_text,
             })
             results.append({"status": terminal_status, "order": payload, "error": err_text})
+            # 2026-11-02 (TVN incident): a SYNCHRONOUS rejection must
+            # notify the operator.
+            #
+            # The order monitor only notifies on a status CHANGE, and
+            # it skips rows whose ledger status is already terminal. A
+            # 4xx rejection is written as ``rejected`` right here — so
+            # the monitor never polls the row and NEVER sends a
+            # Telegram message. The TVN protective stop was rejected
+            # with ``INVALID_PRICE_LOT|Invalid price lot`` and the
+            # operator got no notification at all: the position
+            # silently lost its stop-loss.
+            #
+            # A rejected PROTECTIVE leg is the dangerous case — the
+            # position is now UNPROTECTED — so it always notifies.
+            try:
+                _is_stop = str(
+                    payload.get("orderCategory") or "NORMAL"
+                ).upper() == "STOP"
+                _is_protective = _is_stop or str(
+                    (payload.get("reason") or "")
+                ).startswith(("autofin_sl:", "autofin_user_sl:"))
+                if terminal_status == "rejected" and _is_protective:
+                    _sym = str(payload.get("symbol") or "?")
+                    _qty = int(payload.get("quantity") or 0)
+                    _px = int(payload.get("price") or 0)
+                    _stop_px = int(payload.get("stopPrice") or 0)
+                    _err_line = err_text.split("\n")[0][:220]
+                    try:
+                        notify(
+                            "🚨 Vietnam Algo: PROTECTIVE STOP REJECTED by DNSE "
+                            "— the position is UNPROTECTED\n"
+                            f"symbol: {_sym}\n"
+                            f"quantity: {_qty}\n"
+                            f"stop level: {_stop_px:,} VND\n"
+                            f"order limit: {_px:,} VND\n"
+                            f"err: {_err_line}\n"
+                            "The stop-loss was NOT placed. Place it manually, "
+                            "or fix the cause (price lot / quantity / "
+                            "settlement) so the retry can succeed."
+                        )
+                    except Exception:
+                        # A Telegram failure must not break the submit
+                        # loop — the row is already recorded.
+                        pass
+            except Exception:
+                pass
         save_ledger(ledger, data_dir)
     complete = submission_complete(ledger, run_id)
     return results, reconciliation, complete
