@@ -28,7 +28,8 @@ class _StubLedger:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def __call__(self, *, client, account_no, trading_token, orders, data_dir, run_id):
+    def __call__(self, *, client, account_no, trading_token, orders, data_dir,
+                 run_id, strategy: str = ""):
         from vietnam_algo.libs.trading_engine import DnseOrder
         self.calls.append(
             dict(
@@ -141,7 +142,19 @@ def test_empty_deals_actioned_short_circuits(stub_ledger):
         data_dir=Path("/tmp"),
         trade_date="2026-10-06",
     )
-    assert result == {"submitted": [], "skipped_existing": 0, "unknown": 0, "total": 0}
+    # 2026-10-30: the result also carries ``submitted_symbols`` — the
+    # symbols whose orders actually reached DNSE. The caller uses it to
+    # re-arm planned-but-not-submitted partial closes.
+    # 2026-10-31: and ``settlement_deferred`` — the SELLS that were
+    # held back because the shares have not settled yet (T+2.5).
+    assert result == {
+        "submitted": [],
+        "submitted_symbols": [],
+        "skipped_existing": 0,
+        "unknown": 0,
+        "total": 0,
+        "settlement_deferred": [],
+    }
     assert stub_ledger.calls == []
 
 
@@ -363,7 +376,8 @@ def test_invalid_orders_skipped(stub_ledger, stub_client, in_continuous_session)
 def test_skipped_existing_and_unknown_counts(monkeypatch, in_continuous_session):
     """The result dict must surface skipped_existing_ledger and unknown counts."""
 
-    def stub_ledger(client, account_no, trading_token, orders, data_dir, run_id):
+    def stub_ledger(client, account_no, trading_token, orders, data_dir, run_id,
+                    strategy: str = ""):
         return [
             {"status": "submitted", "response": {"id": "A1"}, "detail": {"id": "A1"}},
             {"status": "skipped_existing_ledger", "ledgerStatus": "open"},

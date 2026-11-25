@@ -115,7 +115,12 @@ def _run(tmp_path: Path, client: MagicMock, today_iso: str = "2026-10-30"):
     return retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso=today_iso,
-        now_time=datetime.time(9, 0),
+        # 2026-10-31: 14:00 ICT — a continuous session. The old value
+        # was 09:00, which is exactly the ATO auction window start;
+        # the bot no longer places orders in an auction, so the retry
+        # would have returned early and every assertion below would
+        # have failed for the wrong reason.
+        now_time=datetime.time(14, 0),
     )
 
 

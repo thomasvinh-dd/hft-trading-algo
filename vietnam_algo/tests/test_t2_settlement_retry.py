@@ -187,7 +187,7 @@ def test_retry_resubmits_sl_when_t2_cleared(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["t2_blocked"] == 1
     assert summary["t2_due"] == 1
@@ -235,7 +235,7 @@ def test_retry_skips_non_t2_rejections(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["t2_blocked"] == 0
     assert summary["t2_due"] == 0
@@ -250,7 +250,7 @@ def test_retry_skips_filled_or_open_sls(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["scanned"] == 0
     assert summary["resubmitted"] == 0
@@ -262,7 +262,7 @@ def test_retry_handles_no_ledger(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["scanned"] == 0
     assert summary["resubmitted"] == 0
@@ -285,7 +285,7 @@ def test_retry_skips_sl_with_no_matching_buy(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["t2_blocked"] == 1
     assert summary["t2_due"] == 0
@@ -301,7 +301,7 @@ def test_retry_resubmits_multiple_sls(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["t2_due"] == 2
     assert summary["resubmitted"] == 2
@@ -347,7 +347,7 @@ def test_retry_uses_dnse_cash_package_lookup(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["resubmitted"] == 1
     client.get_cash_loan_package_id.assert_called_with("0003937868", "ABB")
@@ -367,7 +367,7 @@ def test_retry_records_4xx_rejection_on_resubmit(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["t2_due"] == 1
     assert summary["resubmitted"] == 0
@@ -409,7 +409,7 @@ def test_retry_skips_sl_when_buy_never_filled(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     # T+2 cleared but BUY never filled → don't retry.
     assert summary["t2_blocked"] == 1
@@ -451,7 +451,7 @@ def test_retry_reads_dnse_tradequantity_field(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-23",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     # We hold 100 ABB and the SL wants 100 → retry must proceed.
     assert summary["stale_no_position"] == 0, (
@@ -480,7 +480,7 @@ def test_retry_skips_sl_when_position_already_closed(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-23",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["t2_blocked"] == 1
     # Not due for retry — the position is gone.
@@ -521,7 +521,7 @@ def test_retry_reads_openquantity_for_unsettled_shares(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-28",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     # We DO hold 200 → the SL must not be treated as stale.
     assert summary["stale_no_position"] == 0, summary["stale_details"]
@@ -538,7 +538,7 @@ def test_retry_skips_sl_when_held_qty_below_sl_qty(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-23",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["t2_due"] == 0
     assert summary["stale_no_position"] == 1
@@ -557,7 +557,7 @@ def test_retry_proceeds_when_position_lookup_fails(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-23",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     # Lookup unavailable → treated as "unknown", so we still retry.
     assert summary["stale_no_position"] == 0
@@ -598,7 +598,7 @@ def test_retry_source_order_id_is_stable_across_retries(tmp_path) -> None:
     retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-23",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     after_first = load_ledger(tmp_path)
     assert len(after_first) == before_rows + 1, (
@@ -620,7 +620,7 @@ def test_retry_source_order_id_is_stable_across_retries(tmp_path) -> None:
     summary2 = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-23",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     after_second = load_ledger(tmp_path)
     assert len(after_second) == len(after_first), (
@@ -689,7 +689,7 @@ def test_retry_skips_sl_when_buy_qty_mismatch(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     # Only the qty-matching SL is retried.
     assert summary["t2_blocked"] == 2
@@ -711,7 +711,7 @@ def test_retry_includes_settled_today(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-15",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["t2_due"] == 1
     assert summary["resubmitted"] == 1

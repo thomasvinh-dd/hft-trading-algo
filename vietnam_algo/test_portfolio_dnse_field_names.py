@@ -21,7 +21,7 @@ from vietnam_algo.libs.portfolio import build_portfolio_snapshot
 
 
 def _stub_client(*, positions_payload, balances=None, accounts=None,
-                 latest_quote=None) -> MagicMock:
+                 latest_quote=None, close_price=None) -> MagicMock:
     """Return a mock DnseClient that returns the given payloads."""
     client = MagicMock()
     client.get_accounts.return_value = accounts or {"name": "Test"}
@@ -36,6 +36,10 @@ def _stub_client(*, positions_payload, balances=None, accounts=None,
     if latest_quote is None:
         latest_quote = {"quotes": [{"bid": [{"price": 17500}], "offer": [{"price": 17600}]}]}
     client.get_latest_quote.return_value = latest_quote
+    if close_price is None:
+        client.get_close_price.side_effect = RuntimeError("not configured")
+    else:
+        client.get_close_price.return_value = close_price
     return client
 
 
@@ -322,6 +326,91 @@ def test_real_baf_abf_portfolio_pnl_correct() -> None:
     assert snap["totals"]["stockValue"] == expected_stock
     expected_pnl = 10000 + (-10000)
     assert snap["totals"]["totalUnrealizedPnl"] == expected_pnl
+
+
+def test_session_close_wins_over_stale_positions_market_price() -> None:
+    """A stale positions marketPrice must not override the session close."""
+    payload = {
+        "positions": [
+            {
+                "symbol": "AAS", "openQuantity": 300,
+                "accumulateQuantity": 300, "closedQuantity": 0,
+                "breakEvenPrice": 10314.3242,
+                "marketPrice": 9900,
+                "modifiedDate": "2026-11-09T12:00:40Z",
+            }
+        ]
+    }
+    client = _stub_client(
+        positions_payload=payload,
+        close_price={"prices": [{"boardId": "G1", "closePrice": 10.7}]},
+    )
+    snap = build_portfolio_snapshot(client, "0003937868")
+    pos = snap["positions"][0]
+    assert pos["marketPrice"] == 10700
+    assert pos["marketValue"] == 300 * 10700
+    assert pos["unrealizedPnl"] == pytest.approx(115702.74, abs=1.0)
+
+
+def test_session_close_prefers_g1_board() -> None:
+    """The current-session close must use G1 rather than board ordering."""
+    payload = {
+        "positions": [
+            {"symbol": "TCB", "openQuantity": 200, "costPrice": 22535,
+             "marketPrice": 21600}
+        ]
+    }
+    client = _stub_client(
+        positions_payload=payload,
+        close_price={
+            "prices": [
+                {"boardId": "G4", "closePrice": 21.8},
+                {"boardId": "G1", "closePrice": 22.0},
+            ]
+        },
+    )
+    snap = build_portfolio_snapshot(client, "0003937868")
+    assert snap["positions"][0]["marketPrice"] == 22000
+
+
+def test_live_quote_fallback_prefers_g1_board() -> None:
+    """Without a close price, the live midpoint must prefer G1."""
+    payload = {
+        "positions": [
+            {"symbol": "TCB", "openQuantity": 200, "costPrice": 22535}
+        ]
+    }
+    client = _stub_client(
+        positions_payload=payload,
+        latest_quote={
+            "quotes": [
+                {"boardId": "G4", "bid": [{"price": 21.85}], "offer": [{"price": 21.95}]},
+                {"boardId": "G1", "bid": [{"price": 21.95}], "offer": [{"price": 22.0}]},
+            ]
+        },
+    )
+    snap = build_portfolio_snapshot(client, "0003937868")
+    assert snap["positions"][0]["marketPrice"] == 21975
+
+
+def test_live_quote_fallback_skips_g4_with_empty_book() -> None:
+    """A non-G1 board with no bid must not suppress the valid G1 book."""
+    payload = {
+        "positions": [
+            {"symbol": "CTP", "openQuantity": 300, "costPrice": 7412}
+        ]
+    }
+    client = _stub_client(
+        positions_payload=payload,
+        latest_quote={
+            "quotes": [
+                {"boardId": "G4", "bid": None, "offer": [{"price": 7.3}]},
+                {"boardId": "G1", "bid": [{"price": 7.3}], "offer": [{"price": 7.4}]},
+            ]
+        },
+    )
+    snap = build_portfolio_snapshot(client, "0003937868")
+    assert snap["positions"][0]["marketPrice"] == 7350
 
 
 # -----------------------------------------------------------------------------

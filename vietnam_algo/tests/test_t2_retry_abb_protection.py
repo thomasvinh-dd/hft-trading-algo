@@ -173,7 +173,7 @@ def test_abb_retry_places_a_protective_stop(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-29",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
 
     assert summary["t2_due"] == 1, summary
@@ -213,7 +213,7 @@ def test_abb_retry_clamps_and_recomputes(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-29",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
 
     clamped = summary.get("clamped_sl_qty", [])
@@ -250,7 +250,7 @@ def test_deliberately_liquidated_position_is_still_skipped(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-29",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
 
     assert summary["t2_due"] == 0, summary
@@ -267,7 +267,7 @@ def test_fully_closed_position_is_skipped(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-29",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     assert summary["resubmitted"] == 0
     assert summary["stale_no_position"] >= 1
@@ -282,7 +282,7 @@ def test_filled_buy_is_preferred_over_the_latest_buy(tmp_path) -> None:
     summary = retry_t2_settlement_sl_orders(
         client=client, account_no="0003937868", trading_token="tok",
         data_dir=tmp_path, today_iso="2026-10-29",
-        now_time=datetime.time(14, 30),
+        now_time=datetime.time(14, 0),
     )
     # If the CANCELLED 500-share BUY had been used, the settlement
     # date check would still pass (same date) but the quantity check

@@ -70,3 +70,29 @@ def test_hose_tick_rounds_down_not_up():
     assert _hose_price_tick(30_849) == 30_800
     assert _hose_price_tick(30_850) == 30_850   # already aligned
     assert _hose_price_tick(30_851) == 30_850
+
+
+def test_stx_hnx_uses_a_flat_100_vnd_tick():
+    """DNSE labels HNX equities STX (the 2026-11-16 CTP incident).
+
+    HNX requires a multiple of 100 at every price level. The HOSE
+    ladder would turn CTP's 6,633 into 6,630, which DNSE rejected with
+    INVALID_PRICE_LOT.
+    """
+    assert _hose_price_tick(6_633, "STX") == 6_600
+    assert _hose_price_tick(6_630, "STX") == 6_600
+    assert _hose_price_tick(8_613, "STX") == 8_600
+    assert _hose_price_tick(1_633, "stx") == 1_600
+    # A failed market lookup must use the conservative 100-VND grid,
+    # not guess the HOSE 10-VND grid.
+    assert _hose_price_tick(6_633, "UNKNOWN_100") == 6_600
+
+
+def test_stx_does_not_change_the_hose_ladder():
+    """The STX fix must not alter valid HOSE prices."""
+    assert _hose_price_tick(6_633, "STO") == 6_630
+    assert _hose_price_tick(6_633, None) == 6_630
+    assert _hose_price_tick(9_995, "STO") == 9_990
+    assert _hose_price_tick(30_640, "STO") == 30_600
+    assert _hose_price_tick(49_999, "STO") == 49_950
+    assert _hose_price_tick(57_777, "STO") == 57_700

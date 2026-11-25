@@ -166,12 +166,14 @@ class _StubLedger:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def __call__(self, *, client, account_no, trading_token, orders, data_dir, run_id):
+    def __call__(self, *, client, account_no, trading_token, orders, data_dir,
+                 run_id, strategy: str = ""):
         from vietnam_algo.libs.trading_engine import DnseOrder
         self.calls.append(
             dict(
                 client=client, account_no=account_no, trading_token=trading_token,
                 orders=list(orders), data_dir=data_dir, run_id=run_id,
+                strategy=strategy,
             )
         )
         return [
@@ -280,42 +282,98 @@ def test_submit_in_continuous_uses_LO_with_signal_price(stub_ledger, stub_client
     assert o.loanPackageId == 1036  # cash package id from stub
 
 
-def test_submit_in_ato_uses_ATO_with_price_zero(stub_ledger, stub_client, monkeypatch) -> None:
-    """ATO auction window: orderType overridden to ATO, price forced to 0."""
+def test_submit_in_ato_is_blocked(stub_ledger, stub_client, monkeypatch) -> None:
+    """ATO auction window: NO order is submitted at all.
+
+    2026-10-31: the user asked for this explicitly — "we should not
+    do trade in ato and atc session".
+
+    An auction order is sent with ``price=0``: the fill price is
+    decided by the auction, not by us. The live ledger shows the
+    damage — the VOS BUY submitted at 2026-10-29 09:01:17 was an
+    ATO order and filled at 11,800 while the continuous-market bid
+    was ~10,800. On a BUY, ``price=0`` means "buy at ANY price".
+    """
     _patch_now(monkeypatch, 2026, 10, 8, 9, 5)  # 09:05 ICT, ATO
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+
+    notify_calls: list[str] = []
+    monkeypatch.setattr(
+        "vietnam_algo.bots.runner.notify", lambda msg: notify_calls.append(msg)
+    )
+
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(price=14100)],
         account_no="0003937868", loan_package_id=1775,
         trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
-    assert result["total"] == 1
-    o = stub_ledger.calls[0]["orders"][0]
-    assert o.orderType == "ATO"
-    assert o.price == 0
-    assert o.loanPackageId == 1036  # cash package id from stub
-    # The reason string preserves the original signal price for audit.
-    assert "session=ATO" in o.reason
-    assert "signal_price=14100" in o.reason
+    assert result["total"] == 0
+    assert result["submitted"] == []
+    assert stub_ledger.calls == [], "the ledger must NOT be called in an auction"
+    assert result.get("skipped_auction") == 1
+    assert len(notify_calls) == 1
+    assert "ATO" in notify_calls[0]
 
 
-def test_submit_in_atc_uses_ATC_with_price_zero(stub_ledger, stub_client, monkeypatch) -> None:
-    """ATC closing auction: orderType overridden to ATC, price forced to 0."""
+def test_submit_in_atc_is_blocked(stub_ledger, stub_client, monkeypatch) -> None:
+    """ATC closing auction: NO order is submitted at all."""
     _patch_now(monkeypatch, 2026, 10, 8, 14, 35)  # 14:35 ICT, ATC
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+
+    notify_calls: list[str] = []
+    monkeypatch.setattr(
+        "vietnam_algo.bots.runner.notify", lambda msg: notify_calls.append(msg)
+    )
+
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(price=14100)],
         account_no="0003937868", loan_package_id=1775,
         trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
-    assert result["total"] == 1
-    o = stub_ledger.calls[0]["orders"][0]
-    assert o.orderType == "ATC"
-    assert o.price == 0
-    assert o.loanPackageId == 1036
-    assert "session=ATC" in o.reason
+    assert result["total"] == 0
+    assert result["submitted"] == []
+    assert stub_ledger.calls == [], "the ledger must NOT be called in an auction"
+    assert result.get("skipped_auction") == 1
+    assert len(notify_calls) == 1
+    assert "ATC" in notify_calls[0]
+
+
+def test_submit_in_ato_blocks_protective_stop_too(stub_ledger, stub_client, monkeypatch) -> None:
+    """A protective STOP is also blocked in an auction.
+
+    2026-10-31: the user's explicit choice — "Block ALL orders
+    incl. stops". A stop planned during the window is deferred to
+    the next continuous session by the re-arm logic.
+
+    (The VOS protective stop was in fact created at 2026-10-29
+    09:01:17 — in the ATO session.)
+    """
+    _patch_now(monkeypatch, 2026, 10, 8, 9, 5)  # 09:05 ICT, ATO
+    from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+
+    monkeypatch.setattr("vietnam_algo.bots.runner.notify", lambda msg: None)
+
+    stop_deal = {
+        "action": "partial_close",
+        "symbol": "VOS",
+        "deal_id": "1792627200:VOS",
+        "dnse_orders": [{
+            "symbol": "VOS", "side": "NS", "price": 10550,
+            "quantity": 300, "kind": "sl",
+            "reason": "autofin_sl:deal#1792627200:VOS:10550",
+        }],
+    }
+    result = _submit_autofin_deals_to_dnse(
+        [stop_deal],
+        account_no="0003937868", loan_package_id=1775,
+        trading_token="t", client=stub_client, data_dir=Path("/tmp"),
+        trade_date="2026-10-08",
+    )
+    assert result["total"] == 0
+    assert stub_ledger.calls == [], "a stop must NOT be placed in an auction"
+    assert result.get("skipped_auction") == 1
 
 
 def test_submit_in_post_close_uses_LO(stub_ledger, stub_client, monkeypatch) -> None:
@@ -481,73 +539,62 @@ def test_place_stock_order_keeps_price_for_LO(monkeypatch) -> None:
 # -----------------------------------------------------------------------------
 
 
-def test_submit_in_atc_uses_LO_for_upcom_symbol(stub_ledger, stub_client, monkeypatch) -> None:
-    """UPCOM symbols (e.g. ABB) must use LO even during the ATC window.
-    The 14:31 ICT ABB live-submit attempt at ATC returned HTTP 400
-    ``INVALID_ORDER_TYPE_FOR_THE_EXCHANGE`` before this fix.
+def test_submit_in_atc_is_blocked_for_upcom_symbol(stub_ledger, stub_client, monkeypatch) -> None:
+    """UPCOM symbols (e.g. ABB) are blocked in the ATC window too.
+
+    2026-10-31: the auction gate is market-agnostic — no order is
+    submitted in an auction window, whatever the board.
+
+    (Historically UPCOM needed LO during ATC because ATC is not
+    supported on UPCOM — the 14:31 ICT ABB live-submit attempt
+    returned HTTP 400 ``INVALID_ORDER_TYPE_FOR_THE_EXCHANGE``. Now
+    the window is simply skipped entirely.)
     """
     stub_client.market_by_symbol["ABB"] = "UPX"
     _patch_now(monkeypatch, 2026, 10, 8, 14, 35)  # 14:35 ICT, ATC
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+    monkeypatch.setattr("vietnam_algo.bots.runner.notify", lambda msg: None)
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(symbol="ABB", price=17500)],
         account_no="0003937868", loan_package_id=1775,
         trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
-    assert result["total"] == 1
-    o = stub_ledger.calls[0]["orders"][0]
-    assert o.symbol == "ABB"
-    assert o.orderType == "LO", (
-        f"UPCOM symbol ABB must use LO during ATC, got {o.orderType}"
-    )
-    assert o.price == 17500, (
-        f"LO with the signal price (not 0); UPCOM doesn't have auctions"
-    )
+    assert result["total"] == 0
+    assert stub_ledger.calls == []
 
 
-def test_submit_in_ato_uses_LO_for_hnx_symbol(stub_ledger, stub_client, monkeypatch) -> None:
-    """HNX symbols (e.g. SHB) must use LO during ATO since HNX has no
-    opening auction.
+def test_submit_in_ato_is_blocked_for_hnx_symbol(stub_ledger, stub_client, monkeypatch) -> None:
+    """HNX symbols (e.g. SHB) are blocked in the ATO window too.
+
+    2026-10-31: the auction gate is market-agnostic. (Historically
+    HNX needed LO during ATO since HNX has no opening auction.)
     """
     stub_client.market_by_symbol["SHB"] = "HNX"
     _patch_now(monkeypatch, 2026, 10, 8, 9, 5)  # 09:05 ICT, ATO
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+    monkeypatch.setattr("vietnam_algo.bots.runner.notify", lambda msg: None)
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(symbol="SHB", price=10000)],
         account_no="0003937868", loan_package_id=1775,
         trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
-    assert result["total"] == 1
-    o = stub_ledger.calls[0]["orders"][0]
-    assert o.symbol == "SHB"
-    assert o.orderType == "LO", (
-        f"HNX symbol SHB must use LO during ATO (no opening auction), "
-        f"got {o.orderType}"
-    )
-    assert o.price == 10000
+    assert result["total"] == 0
+    assert stub_ledger.calls == []
 
 
-def test_submit_in_atc_uses_ATC_for_hose_symbol(stub_ledger, stub_client, monkeypatch) -> None:
-    """HOSE symbols (e.g. VCB) must keep using ATC during the ATC window.
-    The market-aware override must NOT downgrade HOSE — only UPCOM (LO
-    only) and HNX-during-ATO (no ATO support).
-    """
+def test_submit_in_atc_is_blocked_for_hose_symbol(stub_ledger, stub_client, monkeypatch) -> None:
+    """HOSE symbols (e.g. VCB) are blocked in the ATC window too."""
     stub_client.market_by_symbol["VCB"] = "HSX"
     _patch_now(monkeypatch, 2026, 10, 8, 14, 35)  # 14:35 ICT, ATC
     from vietnam_algo.bots.runner import _submit_autofin_deals_to_dnse
+    monkeypatch.setattr("vietnam_algo.bots.runner.notify", lambda msg: None)
     result = _submit_autofin_deals_to_dnse(
         [_entry_deal(symbol="VCB", price=60000)],
         account_no="0003937868", loan_package_id=1775,
         trading_token="t", client=stub_client, data_dir=Path("/tmp"),
         trade_date="2026-10-08",
     )
-    assert result["total"] == 1
-    o = stub_ledger.calls[0]["orders"][0]
-    assert o.symbol == "VCB"
-    assert o.orderType == "ATC", (
-        f"HOSE symbol VCB must keep using ATC during ATC window, "
-        f"got {o.orderType}"
-    )
-    assert o.price == 0  # ATC requires price=0
+    assert result["total"] == 0
+    assert stub_ledger.calls == []

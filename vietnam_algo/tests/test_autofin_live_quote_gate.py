@@ -258,9 +258,13 @@ def test_live_gate_drops_new_entry_when_ask_below_zone_tolerance(
 def test_live_gate_lets_through_when_ask_within_tolerance(
     monkeypatch, in_continuous_session,
 ):
-    """Ask 14,500 VND is above 14,100 but within 14,100*1.05 = 14,805 → pass.
-    (Same as the ABW live case at 14,500 ask — bot's LO at 14,100 still
-    makes sense as a passive buy.)"""
+    """Ask 14,200 VND is above 14,100 but within 14,100*1.01 = 14,241 → pass.
+
+    2026-10-31: the live-quote gate tolerance was tightened from 3 %
+    to 1 % to match the planning-time zone gate. The old test used
+    an ask of 14,500, which was inside the 3 % band (14,100*1.03 =
+    14,323) but is OUTSIDE the 1 % band.
+    """
     captured: dict = {}
     _patch_executor(monkeypatch, captured)
 
@@ -270,7 +274,7 @@ def test_live_gate_lets_through_when_ask_within_tolerance(
                 {
                     "symbol": symbol,
                     "boardId": "G1",
-                    "offer": [{"price": 14.5, "quantity": 100}],
+                    "offer": [{"price": 14.2, "quantity": 100}],
                 }
             ]
         }
@@ -493,12 +497,17 @@ def test_live_gate_skips_when_supply_zone_undeclared(monkeypatch, in_continuous_
 
 
 def test_live_gate_partial_drop_one_through_one_dropped(monkeypatch, in_continuous_session):
-    """Mixed batch: ABW pass, HDB drop."""
+    """Mixed batch: ABW pass, HDB drop.
+
+    2026-10-31: the gate tolerance is now 1 %. ABW's ask of 14,200
+    is inside 14,100*1.01 = 14,241; HDB's ask of 28,000 is way above
+    its zone [24,000, 25,500].
+    """
     captured: dict = {}
     _patch_executor(monkeypatch, captured)
 
     def _q_factory(symbol: str) -> dict:
-        asks = {"ABW": 14.5, "HDB": 28.0}  # HDB ask too high for zone [24, 25.5]
+        asks = {"ABW": 14.2, "HDB": 28.0}  # HDB ask too high for zone [24, 25.5]
         return {
             "quotes": [
                 {

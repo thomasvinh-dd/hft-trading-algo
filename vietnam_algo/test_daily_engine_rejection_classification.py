@@ -41,17 +41,23 @@ def _make_order(symbol: str, side: str, quantity: int, price: int,
 
 
 def test_4xx_error_marks_ledger_as_rejected_not_unknown(tmp_path) -> None:
-    """A 4xx HTTP error (e.g. TRADE_QUANTITY_NOT_ENOUGH) → status=rejected.
+    """A PERMANENT 4xx HTTP error → status=rejected (terminal).
 
     This is the 2026-10-13 fix: a permanent rejection must be
     terminal so ``unsafe_existing_orders`` doesn't keep blocking
     future submits for the same run_id.
+
+    2026-10-31: ``TRADE_QUANTITY_NOT_ENOUGH`` is NO LONGER in this
+    bucket — it is the T+2.5 settlement case and gets its own
+    retryable ``t2_rejected`` status, because the same payload
+    succeeds once the settlement clears. See
+    ``test_t2_rejection_is_retryable_not_terminal``.
     """
     _make_ledger(tmp_path)
     client = MagicMock()
     client.place_stock_order.side_effect = RuntimeError(
         'DNSE POST /accounts/0003937868/orders -> HTTP 400 '
-        '{"status":400,"code":"TRADE_QUANTITY_NOT_ENOUGH","message":"deal not found"}'
+        '{"status":400,"code":"INVALID_PRICE_LOT","message":"Invalid price lot"}'
     )
 
     order = _make_order("BAF", "NS", 200, 27900, source_order_id=12345,
@@ -71,6 +77,51 @@ def test_4xx_error_marks_ledger_as_rejected_not_unknown(tmp_path) -> None:
     payload = json.loads(ledger_path.read_text())
     assert payload["items"][0]["status"] == "rejected"
     assert payload["items"][0]["error"]
+
+
+def test_t2_rejection_is_retryable_not_terminal(tmp_path) -> None:
+    """A T+2.5 settlement rejection → status=t2_rejected (retryable).
+
+    2026-10-31 (the VOS case): the shares bought on Friday
+    2026-10-29 are not sellable until 12:00 ICT on Monday
+    2026-11-02. A trim submitted on Monday morning is rejected with
+    HTTP 400 ``TRADE_QUANTITY_NOT_ENOUGH`` — and the very same
+    payload succeeds a few hours later.
+
+    Classifying it as the terminal "rejected" made it permanently
+    un-retryable (the ledger's dedup key matches on any terminal
+    status), so the trim was silently lost.
+    """
+    from vietnam_algo.libs.order_ledger import (
+        AMBIGUOUS_LEDGER_STATUSES,
+        T2_REJECTED_STATUS,
+        TERMINAL_LEDGER_STATUSES,
+    )
+
+    _make_ledger(tmp_path)
+    client = MagicMock()
+    client.place_stock_order.side_effect = RuntimeError(
+        'DNSE POST /accounts/0003937868/orders -> HTTP 400 '
+        '{"status":400,"code":"TRADE_QUANTITY_NOT_ENOUGH","message":"Trade quantity not enough"}'
+    )
+
+    order = _make_order("VOS", "NS", 200, 11100, source_order_id=12345,
+                        reason="autofin_partial:deal#1792627200:VOS:reduce_lap:lap2:pct50")
+    results, _reconciliation, _complete = execute_orders_with_ledger(
+        client=client, account_no="0003937868", trading_token="tok",
+        orders=[order], data_dir=tmp_path, run_id="2026-11-02",
+    )
+
+    assert len(results) == 1
+    assert results[0]["status"] == T2_REJECTED_STATUS
+    # Neither terminal (must stay re-attemptable) nor unsafe (must
+    # not block the other orders in the run).
+    assert T2_REJECTED_STATUS not in TERMINAL_LEDGER_STATUSES
+    assert T2_REJECTED_STATUS not in AMBIGUOUS_LEDGER_STATUSES
+
+    ledger_path = tmp_path / "live" / "order_ledger.json"
+    payload = json.loads(ledger_path.read_text())
+    assert payload["items"][0]["status"] == T2_REJECTED_STATUS
 
 
 def test_5xx_error_marks_ledger_as_unknown_for_retry(tmp_path) -> None:
@@ -132,13 +183,18 @@ def test_4xx_rejection_unblocks_subsequent_submits(tmp_path) -> None:
     short-circuit with ``return [], [...], False``. After the fix,
     the 4xx rejection is "rejected" (terminal) and the next call
     can proceed.
+
+    2026-10-31: a permanent 4xx is used here. The T+2.5 settlement
+    rejection (``TRADE_QUANTITY_NOT_ENOUGH``) has its own retryable
+    status and is covered by
+    ``test_t2_rejection_is_retryable_not_terminal``.
     """
     _make_ledger(tmp_path)
     client = MagicMock()
     # First call: 4xx rejection
     client.place_stock_order.side_effect = RuntimeError(
         'DNSE POST /accounts/0003937868/orders -> HTTP 400 '
-        '{"status":400,"code":"TRADE_QUANTITY_NOT_ENOUGH","message":"deal not found"}'
+        '{"status":400,"code":"INVALID_PRICE_LOT","message":"Invalid price lot"}'
     )
     order1 = _make_order("BAF", "NS", 200, 27900, source_order_id=11111)
     results1, _r1, complete1 = execute_orders_with_ledger(

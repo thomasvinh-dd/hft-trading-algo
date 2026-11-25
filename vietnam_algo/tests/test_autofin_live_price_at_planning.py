@@ -119,13 +119,14 @@ def _dnse_quote_response(symbol: str, g1_offer_kvnd: float) -> dict:
 # -----------------------------------------------------------------------------
 
 
-def test_zone_tolerance_is_3_percent_in_decide_orders(monkeypatch, tmp_path) -> None:
-    """``decide_orders`` must use 3% tolerance, not 5%.
+def test_zone_tolerance_is_1_percent_in_decide_orders(monkeypatch, tmp_path) -> None:
+    """``decide_orders`` must use 1% tolerance, not 3%.
 
-    Pins the user-facing 2026-10-09 change: the entry-zone gate
-    now uses 3% (both upper and lower) instead of 5%. We use
-    boundary values (3% above supply_T → still enter; 3.5% above
-    → skip) to pin the exact threshold.
+    Pins the user-facing 2026-10-31 change: the entry-zone gate now
+    uses 1% (both upper and lower) — the user asked to tighten it
+    from "+-3 %" to "+-1 %". We use boundary values (1% above
+    supply_T → still enter; just above → skip) to pin the exact
+    threshold.
     """
     from vietnam_algo.algos.autofin_signal import decide_orders
     from vietnam_algo.libs.autofin_signals import AutofinSignal
@@ -146,43 +147,43 @@ def test_zone_tolerance_is_3_percent_in_decide_orders(monkeypatch, tmp_path) -> 
     )
 
     # Upper bound test
-    # At exactly 3% above supply_T=17400 → 17400*1.03 = 17922.
+    # At exactly 1% above supply_T=17400 → 17400*1.01 = 17574.
     # This must be the inclusive limit.
     all_orders, _, _ = decide_orders(
         holding=[], signals=[sig], our_deals={},
         our_positions={}, nav=100_000_000,
-        current_prices={"ABB": 17922.0},  # exactly at 3% upper edge
+        current_prices={"ABB": 17574.0},  # exactly at 1% upper edge
         data_dir=tmp_path, actioned_deals=set(),
     )
     buys = [o for o in all_orders if o["side"] == "NB"]
-    assert len(buys) == 1, "at exactly 3% above supply_T, should still enter"
+    assert len(buys) == 1, "at exactly 1% above supply_T, should still enter"
 
-    # Just above 3% (17923) → skip.
+    # Just above 1% (17575) → skip.
     all_orders, _, _ = decide_orders(
         holding=[], signals=[sig], our_deals={},
         our_positions={}, nav=100_000_000,
-        current_prices={"ABB": 17923.0},  # 3.005% above
+        current_prices={"ABB": 17575.0},  # 1.006% above
         data_dir=tmp_path, actioned_deals=set(),
     )
-    assert all_orders == [], "just above 3% tolerance, should skip"
+    assert all_orders == [], "just above 1% tolerance, should skip"
 
-    # Lower bound test: 17100 * 0.97 = 16587. At 16587 → enter.
+    # Lower bound test: 17100 * 0.99 = 16929. At 16929 → enter.
     all_orders, _, _ = decide_orders(
         holding=[], signals=[sig], our_deals={},
         our_positions={}, nav=100_000_000,
-        current_prices={"ABB": 16587.0},
+        current_prices={"ABB": 16929.0},
         data_dir=tmp_path, actioned_deals=set(),
     )
     assert len([o for o in all_orders if o["side"] == "NB"]) == 1
 
-    # Just below (16586) → skip.
+    # Just below (16928) → skip.
     all_orders, _, _ = decide_orders(
         holding=[], signals=[sig], our_deals={},
         our_positions={}, nav=100_000_000,
-        current_prices={"ABB": 16586.0},
+        current_prices={"ABB": 16928.0},
         data_dir=tmp_path, actioned_deals=set(),
     )
-    assert all_orders == [], "just below 3% lower tolerance, should skip"
+    assert all_orders == [], "just below 1% lower tolerance, should skip"
 
 
 # -----------------------------------------------------------------------------
@@ -198,6 +199,8 @@ def test_entry_price_is_market_price_not_capped(monkeypatch, tmp_path) -> None:
     Now the entry price is whatever the market shows (within 3%
     of the zone). The zone check is the gate; the entry price
     reflects the actual market, not an artificial cap.
+
+    2026-10-31: the tolerance was tightened from 3 % to 1 %.
     """
     from vietnam_algo.algos.autofin_signal import decide_orders
     from vietnam_algo.libs.autofin_signals import AutofinSignal
@@ -221,18 +224,23 @@ def test_entry_price_is_market_price_not_capped(monkeypatch, tmp_path) -> None:
     # tolerance, so the entry happens. Previously the price was
     # capped at min(17,600, 17,400) = 17,400; now it should be
     # the market price 17,600.
+    #
+    # 2026-10-31: the tolerance was tightened from 3 % to 1 %, so
+    # 17,600 (1.15 % above supply_T=17,400) is now OUTSIDE the band.
+    # The price used here is 17,550 — 0.86 % above supply_T, inside
+    # the 1 % tolerance.
     all_orders, _, _ = decide_orders(
         holding=[], signals=[sig], our_deals={},
         our_positions={}, nav=100_000_000,
-        current_prices={"ABB": 17600.0},
+        current_prices={"ABB": 17550.0},
         data_dir=tmp_path, actioned_deals=set(),
     )
     buys = [o for o in all_orders if o["side"] == "NB"]
     assert len(buys) == 1
     # 2026-10-09 fix: entry price is the live market price.
     # Previously (pre-fix) this was capped at supply_T=17400.
-    assert buys[0]["price"] == 17600, (
-        f"expected entry at live market price 17600, got {buys[0]['price']}. "
+    assert buys[0]["price"] == 17550, (
+        f"expected entry at live market price 17550, got {buys[0]['price']}. "
         f"The pre-2026-10-09 code capped the price at min(cur, s_hi)={17400}."
     )
 

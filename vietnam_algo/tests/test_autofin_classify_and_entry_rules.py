@@ -239,11 +239,11 @@ def test_plan_new_positions_cash_gate_5pct():
 
 
 def test_plan_new_positions_top_n_filter():
-    """``top_n=1`` (default) means only the first signal in the list
-    can produce an entry — even if subsequent signals also qualify.
+    """``top_n=1`` means only the first signal in the list can produce
+    an entry — even if subsequent signals also qualify.
 
-    User spec 2026-09-21: "check the signal suggestion on autofin for
-    top suggestion" — exactly one entry attempt per call.
+    The DEFAULT is now 3 (2026-10-29: "let use top 3"), so the
+    single-entry behaviour is asserted with an explicit ``top_n=1``.
     """
     sig_a = _make_signal("AAA", 0.15, deal_id="1", supply_to=10000)
     sig_b = _make_signal("BBB", 0.15, deal_id="2", supply_to=10000)
@@ -252,6 +252,7 @@ def test_plan_new_positions_top_n_filter():
         selected=[sig_a, sig_b, sig_c],
         nav_vnd=1_000_000_000,
         our_positions={},
+        top_n=1,
     )
     # Each entry emits BUY + SL bracket (2 orders).
     # top_n=1 → 1 entry → 2 orders.
@@ -262,6 +263,33 @@ def test_plan_new_positions_top_n_filter():
     )
     assert buys[0]["symbol"] == "AAA", "first signal wins"
     assert len(sells) == 1, "BUY + SL bracket pair"
+
+
+def test_plan_new_positions_default_allows_three_entries():
+    """2026-10-29: the default entry budget is the top 3.
+
+    User request: "currently we are using top 1 when check entry, let
+    use top 3".
+    """
+    sigs = [
+        _make_signal(f"S{i}", 0.15, deal_id=str(i), supply_to=10000)
+        for i in range(5)
+    ]
+    rows = _plan_orders_for_new_positions(
+        selected=sigs,
+        nav_vnd=1_000_000_000,
+        our_positions={},
+    )
+    buys = [r for r in rows if r["side"] == "NB"]
+    assert len(buys) == 3, (
+        f"the default should produce 3 BUYs, got {len(buys)}"
+    )
+    assert [b["symbol"] for b in buys] == ["S0", "S1", "S2"], (
+        "the first three qualifying suggestions win, in order"
+    )
+    # Each entry emits a BUY + SL bracket.
+    sells = [r for r in rows if r["side"] == "NS"]
+    assert len(sells) == 3, sells
 
 
 def test_plan_new_positions_top_n_can_be_increased():
