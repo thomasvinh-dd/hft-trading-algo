@@ -109,6 +109,38 @@ def save_cache(cache: WebCache, path: Path = CACHE_PATH) -> None:
     path.write_text(json.dumps(cache.to_dict(), indent=2, default=str))
 
 
+def cache_age_hours(last_updated: str) -> Optional[float]:
+    """Age of a cache timestamp in hours, or None if it cannot be parsed.
+
+    Used to decide whether the cache needs refreshing and to age out the
+    stale-cache alert. An empty or unparseable timestamp means "unknown
+    age" — the caller should treat that as stale.
+    """
+    if not last_updated:
+        return None
+    try:
+        ts = datetime.fromisoformat(last_updated)
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - ts
+    return delta.total_seconds() / 3600.0
+
+
+def is_cache_stale(last_updated: str, max_age_seconds: int = CACHE_MAX_AGE_SECONDS) -> bool:
+    """Whether the cache is older than ``max_age_seconds``.
+
+    A missing or unparseable timestamp counts as stale — that is the
+    dangerous case, because it means the cache was never written or the
+    write failed.
+    """
+    age = cache_age_hours(last_updated)
+    if age is None:
+        return True
+    return age * 3600.0 > max_age_seconds
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -171,6 +203,34 @@ def _open_position_to_dict(t, deal_seq: int = 0) -> Dict[str, Any]:
     }
 
 
+def load_market_index_bars(cfg):
+    """Load the market index bars for the entry filters.
+
+    Returns (market_bars, volatility_bars). The two filters have
+    SEPARATE index paths on purpose: the regime filter is harmful and
+    must stay independently switchable.
+
+    The scan paths call generate_signal() directly, so without this
+    they would NOT apply the market filters and would report signals
+    the backtest would never take.
+    """
+    from pathlib import Path
+
+    from darvas_box_strategy.darvas.data_loader import load_price_bars
+
+    market_bars = None
+    volatility_bars = None
+    if cfg.breakout.regime_index_path:
+        p = Path(cfg.breakout.regime_index_path)
+        if p.exists():
+            market_bars = load_price_bars(p)
+    if cfg.breakout.volatility_index_path:
+        p = Path(cfg.breakout.volatility_index_path)
+        if p.exists():
+            volatility_bars = load_price_bars(p)
+    return market_bars, volatility_bars
+
+
 def get_current_signals(lookback: int = 0,
                           cfg=None) -> List[Dict[str, Any]]:
     """Scan the latest bar(s) for breakout signals across HOSE blue chips.
@@ -182,6 +242,7 @@ def get_current_signals(lookback: int = 0,
         cfg = build_default_config()
     tickers = load_blue_chips()
     filtered = filter_universe(tickers, cfg)
+    market_bars, volatility_bars = load_market_index_bars(cfg)
     signals: List[Dict[str, Any]] = []
     for ticker in filtered:
         bars = _load_bars_safe(ticker)
@@ -196,6 +257,8 @@ def get_current_signals(lookback: int = 0,
             continue
         sig = generate_signal(
             bars, base, nav=cfg.backtest.start_nav, cfg=cfg, as_of_idx=idx,
+            market_bars=market_bars,
+            volatility_bars=volatility_bars,
         )
         if sig is None:
             continue
@@ -234,6 +297,7 @@ def get_recent_signals(days: int = 7, cfg=None) -> List[Dict[str, Any]]:
         cfg = build_default_config()
     tickers = load_blue_chips()
     filtered = filter_universe(tickers, cfg)
+    market_bars, volatility_bars = load_market_index_bars(cfg)
     out: List[Dict[str, Any]] = []
     for ticker in filtered:
         bars = _load_bars_safe(ticker)
@@ -258,6 +322,8 @@ def get_recent_signals(days: int = 7, cfg=None) -> List[Dict[str, Any]]:
             # Try to generate a signal at breakout_idx
             sig = generate_signal(
                 bars, base, nav=cfg.backtest.start_nav, cfg=cfg, as_of_idx=breakout_idx,
+                market_bars=market_bars,
+                volatility_bars=volatility_bars,
             )
             if sig is not None:
                 break  # found the most recent one
@@ -383,6 +449,7 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
     last_bar_date = bars[-1].date
     scanner = BaseScanner(bars, cfg.base, ticker=ticker)
     deals: List[Dict[str, Any]] = []
+    market_bars, volatility_bars = load_market_index_bars(cfg)
 
     # Track sequence numbers per (ticker, entry_date) to keep deal_id
     # unique when the strategy somehow opens twice on the same day.
@@ -402,6 +469,8 @@ def get_ticker_history(ticker: str, cfg=None) -> Dict[str, Any]:
             continue
         sig = generate_signal(
             bars, base, nav=cfg.backtest.start_nav, cfg=cfg, as_of_idx=i,
+            market_bars=market_bars,
+            volatility_bars=volatility_bars,
         )
         if sig is None:
             continue

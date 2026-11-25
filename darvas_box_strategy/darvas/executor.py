@@ -197,13 +197,32 @@ def simulate_trade(signal, bars_after, cfg, *, dividend_per_share=None, atr_valu
             if trail_cfg.trail_floor_lock_profit:
                 trail_threshold = max(trail_threshold, trail_floor)
             if effective_close <= trail_threshold:
-                proceeds = remaining * effective_close
-                pnl = (effective_close - signal.entry_price) * remaining
+                # The trail is a stop order: it should fill at the trail
+                # price, not at whatever the close happened to be.
+                #
+                # Filling at the close was the old behaviour and it is wrong
+                # in two ways:
+                #   1. On a gap-down the close can be far BELOW the trail
+                #      price, so the exit slips (measured: up to -20pp
+                #      against the intended stop).
+                #   2. On a close that is only just below the trail, the
+                #      exit gives away more than the stop width.
+                #
+                # The stop legs (sl_T / sl_mid / sl_F) already fill at their
+                # stop price, so the trail now does the same for consistency.
+                #
+                # If the bar's low is below the trail price the market gapped
+                # through the stop, so the fill is the low — we cannot sell
+                # above the market. Otherwise the stop was touched intraday
+                # and the fill is the trail price itself.
+                trail_fill = bar.low if bar.low < trail_threshold else trail_threshold
+                proceeds = remaining * trail_fill
+                pnl = (trail_fill - signal.entry_price) * remaining
                 cost = proceeds * cost_rate * 0.5
                 cumulative_proceeds += proceeds - cost
                 cumulative_pnl += pnl - cost
                 fills.append(FillEvent(
-                    date=bar.date, kind="TRAIL", level=effective_close, shares=-remaining,
+                    date=bar.date, kind="TRAIL", level=trail_fill, shares=-remaining,
                     proceeds=proceeds - cost, fraction_of_pos=1.0,
                     cumulative_proceeds=cumulative_proceeds, realized_pnl=pnl - cost,
                     remaining=0,  # closing everything

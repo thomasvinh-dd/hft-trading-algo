@@ -13,6 +13,7 @@ shares) is defined here for backward compat.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -70,6 +71,56 @@ def _conviction(volume, avg_vol, cfg):
     if volume >= cfg.high_conviction_mult * avg_vol:
         return "high"
     return "low"
+
+
+def _market_volatility_pct(market_bars, target_date, window):
+    """Realized daily volatility of the index at ``target_date``, in percent.
+
+    Returns None when there is not enough history.
+    """
+    if not market_bars:
+        return None
+    relevant = [b for b in market_bars if b.date <= target_date]
+    if len(relevant) < window + 1:
+        return None
+    rets = []
+    for i in range(len(relevant) - window, len(relevant)):
+        prev, cur = relevant[i - 1].close, relevant[i].close
+        if prev > 0:
+            rets.append(cur / prev - 1)
+    if len(rets) < window - 1:
+        return None
+    return statistics.pstdev(rets) * 100
+
+
+def _market_volatility_ok(breakout_bar, cfg, market_bars):
+    """Require the market to be volatile enough (and not too volatile).
+
+    Off unless ``min_market_volatility_pct`` (or the max) is set.
+
+    ``market_volatility_avoid_band_pct`` is the opposite shape: it
+    REJECTS trades whose volatility falls INSIDE the band. That is the
+    shape the data actually supports — the losing trades cluster in the
+    "half-dead" middle, not at the low end.
+    """
+    min_pct = getattr(cfg.breakout, "min_market_volatility_pct", 0.0) or 0.0
+    max_pct = getattr(cfg.breakout, "max_market_volatility_pct", 0.0) or 0.0
+    band = getattr(cfg.breakout, "market_volatility_avoid_band_pct", ()) or ()
+    if min_pct <= 0 and max_pct <= 0 and not band:
+        return True
+    window = getattr(cfg.breakout, "market_volatility_window", 20) or 20
+    vol = _market_volatility_pct(market_bars, breakout_bar.date, window)
+    if vol is None:
+        return True  # not enough data — allow trading
+    if min_pct > 0 and vol < min_pct:
+        return False
+    if max_pct > 0 and vol > max_pct:
+        return False
+    if band:
+        low, high = band[0], band[1]
+        if low <= vol <= high:
+            return False
+    return True
 
 
 def _regime_ok(breakout_bar, cfg, market_bars):
@@ -171,7 +222,8 @@ def _vol_targeted_size_pct(atr_value, entry_price, cfg, conviction):
 
 
 def generate_signal(bars, base, *args, as_of_idx=None, upcoming_ca=None,
-                    market_bars=None, sector_momentum_by_date=None,
+                    market_bars=None, volatility_bars=None,
+                    sector_momentum_by_date=None,
                     ml_model=None, nav=None, cfg=None):
     """Generate a Signal.
 
@@ -214,6 +266,7 @@ def generate_signal(bars, base, *args, as_of_idx=None, upcoming_ca=None,
     sig = _generate_pure_signal(
         bars, base, cfg, as_of_idx=as_of_idx,
         upcoming_ca=upcoming_ca, market_bars=market_bars,
+        volatility_bars=volatility_bars,
         sector_momentum_by_date=sector_momentum_by_date,
         ml_model=ml_model,
     )
@@ -229,7 +282,8 @@ def generate_signal(bars, base, *args, as_of_idx=None, upcoming_ca=None,
 
 
 def _generate_pure_signal(bars, base, cfg, *, as_of_idx, upcoming_ca,
-                           market_bars, sector_momentum_by_date, ml_model):
+                           market_bars, volatility_bars,
+                           sector_momentum_by_date, ml_model):
     """Pure signal: no sizing, just the opportunity with exit levels."""
     breakout_idx = base.end_idx + 1
     if as_of_idx is None:
@@ -268,6 +322,11 @@ def _generate_pure_signal(bars, base, cfg, *, as_of_idx, upcoming_ca,
     if not _regime_ok(breakout_bar, cfg, market_bars):
         return None
 
+    # Market volatility filter. Off by default; see BreakoutConfig for
+    # why volatility is the one market feature that helps.
+    if not _market_volatility_ok(breakout_bar, cfg, volatility_bars):
+        return None
+
     # Sector rotation filter
     if not _sector_ok(breakout_bar, base.ticker, cfg, sector_momentum_by_date):
         return None
@@ -294,24 +353,48 @@ def _generate_pure_signal(bars, base, cfg, *, as_of_idx, upcoming_ca,
     # ATR at signal time (for ATR-based trailing stop and vol-targeting)
     atr_value = _atr(bars[: breakout_idx + 1], window=cfg.trailing.trail_atr_window)
 
+    # Entry price and date.
+    #
+    # The signal fires on the breakout bar, but the position is entered on
+    # the NEXT bar. The fill price is that bar's OPEN — the price we would
+    # actually have paid when the order was placed at the previous close.
+    #
+    # The old code used the breakout bar's CLOSE as the entry price while
+    # dating the entry to the next bar. That is wrong in two ways:
+    #   - it ignores the overnight gap, so entries are recorded at a price
+    #     that was no longer available (measured across 3,719 signals:
+    #     next-bar close vs signal-bar close has p75 +1.85%, p90 +4.75%,
+    #     max +40.93%);
+    #   - the stop levels and tier targets are computed from that
+    #     optimistic price, so the whole trade is measured against a fill
+    #     that never happened.
+    #
+    # Using the next bar's open makes the sizing, the stops and the P&L
+    # all consistent with a real order.
+    if breakout_idx + 1 < len(bars):
+        entry_bar = bars[breakout_idx + 1]
+        entry_date = entry_bar.date
+        entry_price = entry_bar.open
+    else:
+        # No bar after the signal — the position cannot be opened. The
+        # caller skips signals with no room left to trade.
+        entry_date = breakout_bar.date
+        entry_price = breakout_bar.close
+
     sl_buffer = 1.0 - cfg.exits.sl_buffer_pct
     if cfg.exits.use_entry_anchored_stops:
-        sl_F = breakout_bar.close * (1.0 - cfg.exits.sl_F_pct)
-        sl_T = breakout_bar.close * (1.0 - cfg.exits.sl_T_pct)
+        # Anchored to the fill price, not the signal-bar close.
+        sl_F = entry_price * (1.0 - cfg.exits.sl_F_pct)
+        sl_T = entry_price * (1.0 - cfg.exits.sl_T_pct)
     else:
         sl_F = base.base_low * sl_buffer
-        sl_T = (base.base_low + breakout_bar.close) / 2.0
-
-    if breakout_idx + 1 < len(bars):
-        entry_date = bars[breakout_idx + 1].date
-    else:
-        entry_date = breakout_bar.date
+        sl_T = (base.base_low + entry_price) / 2.0
 
     return Signal(
         ticker=base.ticker,
         signal_date=breakout_bar.date,
         entry_date=entry_date,
-        entry_price=breakout_bar.close,
+        entry_price=entry_price,
         base=base,
         sl_F=round(sl_F, 4),
         sl_T=round(sl_T, 4),

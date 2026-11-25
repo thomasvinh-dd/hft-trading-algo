@@ -126,16 +126,71 @@ class DefaultConfigTests(unittest.TestCase):
         self.assertEqual(cfg.backtest.max_concurrent_positions, 10)
         self.assertEqual(cfg.backtest.cooldown_bars_after_stop, 5)
         self.assertEqual(cfg.backtest.vol_target_pct, 0.0)  # OFF: fixed sizing wins
-        # size_low=0.15, size_high=0.30 — see tools/sweep_dd.py
-        # (was 0.20/0.40; reduced to lower drawdown without
-        #  sacrificing return; see README for the trade-off table)
-        self.assertEqual(cfg.backtest.size_low, 0.15)
-        self.assertEqual(cfg.backtest.size_high, 0.30)
+        # size_low=0.10, size_high=0.20 + max_total_exposure_pct=0.50
+        # (2026-11-11, re-tuned 2026-11-23) — the drawdown cap. Capping
+        # the NUMBER of open positions does not cap the risk: smaller
+        # positions mean more of them fit, so exposure rises exactly when
+        # losers cluster. See README "Reducing the drawdown".
+        self.assertEqual(cfg.backtest.size_low, 0.10)
+        self.assertEqual(cfg.backtest.size_high, 0.20)
+        self.assertEqual(cfg.backtest.max_total_exposure_pct, 0.50)
         self.assertEqual(cfg.trailing.trail_mode, "pct")
         self.assertEqual(cfg.trailing.trail_from_peak_pct, 0.10)  # trail after partial cut
         self.assertTrue(cfg.exits.use_entry_anchored_stops)
         self.assertEqual(cfg.exits.sl_T_pct, 0.10)
         self.assertEqual(cfg.exits.sl_F_pct, 0.18)
+
+    def test_default_config_enables_the_market_volatility_filter(self):
+        """The market-volatility filter is ON in production.
+
+        It is the only market feature whose separation runs the
+        expected direction, and on the corrected NAV accounting it
+        raises the return AND cuts the drawdown.
+
+        It is a BAND filter, not a one-sided minimum. Bucketing all 350
+        unfiltered trades by the market volatility at entry:
+
+            regime              n    win%   sum ret%
+            <0.8 (dead)        65   78.5%        +4%
+            0.8-1.2 (calm)    100   46.0%        -1%   <- the only loser
+            1.2-1.6 (normal)   87   63.2%        +1%
+            >=1.6 (wild)       98   70.4%        +3%
+
+        The danger zone is a BAND, not a low level. A one-sided minimum
+        of 1.2 went silent for 48 consecutive bars and blocked every
+        signal, while throwing away the 78%-win-rate trades below 0.8.
+        """
+        from darvas_box_strategy.bot.cli import build_default_config
+        cfg = build_default_config()
+        self.assertEqual(
+            tuple(cfg.breakout.market_volatility_avoid_band_pct), (0.7, 1.3),
+        )
+        self.assertEqual(cfg.breakout.min_market_volatility_pct, 0.0,
+                         "the one-sided minimum must be OFF")
+        self.assertEqual(cfg.breakout.market_volatility_window, 20)
+        self.assertTrue(
+            cfg.breakout.volatility_index_path,
+            "the volatility filter needs an index to read",
+        )
+
+    def test_default_config_does_not_enable_the_harmful_regime_filter(self):
+        """The regime filter (index above its MA) removes the GOOD trades.
+
+        A feature screen over 256 trades found the separation running
+        the wrong way for every trend/level feature: trades taken in a
+        WEAKER market did better. It must stay off, and it must stay
+        independently switchable from the volatility filter.
+        """
+        from darvas_box_strategy.bot.cli import build_default_config
+        cfg = build_default_config()
+        self.assertEqual(cfg.breakout.regime_index_path, "")
+
+    def test_the_market_index_file_exists(self):
+        """The volatility filter reads the index from disk."""
+        from pathlib import Path
+        from darvas_box_strategy.bot.cli import build_default_config
+        cfg = build_default_config()
+        self.assertTrue(Path(cfg.breakout.volatility_index_path).exists())
 
 
 class ReportFormatTests(unittest.TestCase):

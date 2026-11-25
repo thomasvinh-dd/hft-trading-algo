@@ -55,6 +55,8 @@ def test_upcom_uses_a_flat_100_vnd_tick() -> None:
     assert _hose_price_tick(9_313, "UPX") == 9_300
     assert _hose_price_tick(9_313, "upx") == 9_300
     assert _hose_price_tick(9_313, "HNX") == 9_300
+    # DNSE's actual HNX market id is STX (2026-11-16 CTP incident).
+    assert _hose_price_tick(9_313, "STX") == 9_300
 
     # The HOSE ladder would have produced the invalid 9,310.
     assert _hose_price_tick(9_313) == 9_310

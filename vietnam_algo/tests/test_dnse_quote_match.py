@@ -49,6 +49,26 @@ def test_quote_match_price_handles_missing_side() -> None:
     assert quote_match_price(empty, "NS") is None
 
 
+def test_quote_match_price_prefers_g1_when_g4_is_first() -> None:
+    """DNSE may return G4 before G1; the G1 order book must win."""
+    quote = {
+        "quotes": [
+            {
+                "boardId": "G4",
+                "bid": [{"price": 21.85}],
+                "offer": [{"price": 21.95}],
+            },
+            {
+                "boardId": "G1",
+                "bid": [{"price": 21.95}],
+                "offer": [{"price": 22.0}],
+            },
+        ]
+    }
+    assert quote_match_price(quote, "NB") == 22
+    assert quote_match_price(quote, "NS") == 22
+
+
 def test_quote_match_price_handles_none() -> None:
     assert quote_match_price(None, "NB") is None
     assert quote_match_price({}, "NB") is None

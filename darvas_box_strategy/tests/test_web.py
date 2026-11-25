@@ -198,6 +198,66 @@ class WebCacheTests(unittest.TestCase):
         self.assertEqual(c.backtest, {})
 
 
+class MarketIndexInScanTests(unittest.TestCase):
+    """The web scan paths must apply the same market filters as the
+    backtest.
+
+    The scan paths call generate_signal() directly. Without the index
+    bars the market-volatility filter is a no-op there, so the dashboard
+    would report signals the backtest would never take — and the
+    Telegram entry alerts would fire on trades the strategy would not
+    have made.
+    """
+
+    def test_load_market_index_bars_returns_the_volatility_index(self):
+        from darvas_box_strategy.bot.cli import build_default_config
+        from darvas_box_strategy.web.data import load_market_index_bars
+        cfg = build_default_config()
+        market_bars, volatility_bars = load_market_index_bars(cfg)
+        self.assertIsNone(market_bars,
+                          "the regime filter is off, so no regime index is loaded")
+        self.assertIsNotNone(volatility_bars,
+                             "the volatility filter needs the index")
+        self.assertGreater(len(volatility_bars), 100)
+
+    def test_load_market_index_bars_handles_a_missing_file(self):
+        """A missing index must not raise — it just leaves the filter off."""
+        from darvas_box_strategy.bot.cli import build_default_config
+        from darvas_box_strategy.web.data import load_market_index_bars
+        from dataclasses import replace
+        cfg = build_default_config()
+        br = replace(cfg.breakout, volatility_index_path="/nonexistent/x.json")
+        cfg = replace(cfg, breakout=br)
+        market_bars, volatility_bars = load_market_index_bars(cfg)
+        self.assertIsNone(volatility_bars)
+
+    def test_every_generate_signal_call_passes_the_index(self):
+        """Guard against a new call site forgetting the index bars."""
+        import ast
+        from pathlib import Path
+        src = Path("darvas_box_strategy/web/data.py").read_text()
+        tree = ast.parse(src)
+
+        calls = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "id", None) or getattr(func, "attr", None)
+            if name != "generate_signal":
+                continue
+            calls.append(node)
+
+        self.assertGreaterEqual(len(calls), 3,
+                                "expected the three scan call sites")
+        for call in calls:
+            kws = {k.arg for k in call.keywords}
+            self.assertIn("market_bars", kws,
+                          "generate_signal() call is missing market_bars")
+            self.assertIn("volatility_bars", kws,
+                          "generate_signal() call is missing volatility_bars")
+
+
 class SignalToDictTests(unittest.TestCase):
     """Validate the _signal_to_dict shape — this dict is consumed by the
     frontend and breaking it would silently break the UI."""
@@ -295,6 +355,382 @@ class DealEndpointTests(unittest.TestCase):
         r = self.client.get("/api/deal/XXXX_2099-01-01")
         # Either 404 (no history) or 200 with empty data — both ok
         self.assertIn(r.status_code, (200, 404))
+
+
+class UrlPrefixTests(unittest.TestCase):
+    """The dashboard can be served under a path prefix, e.g. /darvas.
+
+    The reverse proxy strips the prefix before forwarding, so Flask still
+    sees its normal routes, but the app must know the prefix in order to
+    generate correct asset and API URLs. Without this the dashboard's CSS,
+    JavaScript and fetch() calls all resolve to the site root and break.
+    """
+
+    def _client(self):
+        from darvas_box_strategy.web.app import create_app
+        return create_app().test_client()
+
+    def test_prefix_from_forwarded_header(self):
+        """X-Forwarded-Prefix sets the prefix."""
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        with c.application.test_request_context(
+            "/", headers={"X-Forwarded-Prefix": "/darvas"}
+        ):
+            self.assertEqual(url_prefix(), "/darvas")
+
+    def test_no_prefix_by_default(self):
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        with c.application.test_request_context("/"):
+            self.assertEqual(url_prefix(), "")
+
+    def test_env_var_fallback(self):
+        """DARVAS_URL_PREFIX is used when no header is present."""
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        with patch.dict(os.environ, {"DARVAS_URL_PREFIX": "/darvas"}):
+            with c.application.test_request_context("/"):
+                self.assertEqual(url_prefix(), "/darvas")
+
+    def test_header_wins_over_env(self):
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        with patch.dict(os.environ, {"DARVAS_URL_PREFIX": "/from-env"}):
+            with c.application.test_request_context(
+                "/", headers={"X-Forwarded-Prefix": "/from-header"}
+            ):
+                self.assertEqual(url_prefix(), "/from-header")
+
+    def test_prefix_is_normalised(self):
+        from darvas_box_strategy.web.app import url_prefix
+        c = self._client()
+        for raw, expected in (
+            ("darvas", "/darvas"),
+            ("/darvas/", "/darvas"),
+            ("/darvas//", "/darvas"),
+            ("/", ""),
+            ("", ""),
+        ):
+            with self.subTest(raw=raw):
+                with c.application.test_request_context(
+                    "/", headers={"X-Forwarded-Prefix": raw}
+                ):
+                    self.assertEqual(url_prefix(), expected)
+
+    def test_index_renders_base_href(self):
+        """With a prefix the page must carry a <base href> so relative
+        URLs resolve against the prefix."""
+        c = self._client()
+        r = c.get("/", headers={"X-Forwarded-Prefix": "/darvas"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'<base href="/darvas/">', r.data)
+
+    def test_index_without_prefix_has_no_base_href(self):
+        """At the site root there is no prefix and no base tag."""
+        c = self._client()
+        r = c.get("/")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(b"<base href=", r.data)
+
+    def test_static_urls_include_prefix(self):
+        """Asset URLs must be prefixed, otherwise they bypass the mount
+        point and 404."""
+        c = self._client()
+        r = c.get("/", headers={"X-Forwarded-Prefix": "/darvas"})
+        self.assertIn(b'href="/darvas/static/styles.css"', r.data)
+        self.assertIn(b'src="/darvas/static/app.js"', r.data)
+
+    def test_static_urls_unchanged_without_prefix(self):
+        c = self._client()
+        r = c.get("/")
+        self.assertIn(b'href="/static/styles.css"', r.data)
+        self.assertIn(b'src="/static/app.js"', r.data)
+
+    def test_api_routes_still_work_with_prefix(self):
+        """The proxy strips the prefix, so the app's own routes are
+        unchanged — the prefix only affects generated URLs."""
+        c = self._client()
+        r = c.get("/api/health", headers={"X-Forwarded-Prefix": "/darvas"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["ok"])
+
+    def test_js_derives_api_base_from_base_href(self):
+        """The JS must build API URLs from the <base href>, not from a
+        hard-coded site root."""
+        js_path = Path(__file__).resolve().parents[1] / "web" / "static" / "app.js"
+        js = js_path.read_text()
+        self.assertIn("API_BASE", js)
+        self.assertIn('document.querySelector("base")', js)
+        # Every API call must go through the api() helper.
+        self.assertNotIn('fetchJSON("/api/', js)
+        self.assertNotIn("fetchJSON(`/api/", js)
+
+    def test_static_url_helper_outside_request_context(self):
+        """static_url is also reachable from a background thread, where
+        there is no request context — it must not raise."""
+        from darvas_box_strategy.web.app import static_url
+        c = self._client()
+        with c.application.test_request_context("/"):
+            self.assertEqual(static_url("app.js"), "/static/app.js")
+
+
+class CacheStalenessTests(unittest.TestCase):
+    """The dashboard cache must be detected as stale by AGE, not only by
+    emptiness.
+
+    Regression: the refresh trigger used to be ``if not cache.signals``.
+    A cache that still held signals from an old run therefore never
+    triggered a refresh, so the dashboard served data that was days old
+    with no indication anything was wrong. The cache age is now the
+    trigger, using CACHE_MAX_AGE_SECONDS.
+    """
+
+    def setUp(self):
+        # The "a refresh is already running" flag is module-level state.
+        # A refresh started by an earlier test would otherwise block the
+        # refreshes these tests are trying to observe.
+        from darvas_box_strategy.web import app as app_module
+        app_module._refresh_running = False
+
+    def tearDown(self):
+        from darvas_box_strategy.web import app as app_module
+        app_module._refresh_running = False
+
+    def test_cache_age_hours_parses_iso(self):
+        from darvas_box_strategy.web.data import cache_age_hours
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(
+            timespec="seconds"
+        )
+        age = cache_age_hours(ts)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 3.0, delta=0.1)
+
+    def test_cache_age_hours_empty_is_none(self):
+        from darvas_box_strategy.web.data import cache_age_hours
+        self.assertIsNone(cache_age_hours(""))
+
+    def test_cache_age_hours_garbage_is_none(self):
+        from darvas_box_strategy.web.data import cache_age_hours
+        self.assertIsNone(cache_age_hours("not-a-timestamp"))
+
+    def test_naive_timestamp_treated_as_utc(self):
+        """A timestamp without a timezone must still be comparable."""
+        from darvas_box_strategy.web.data import cache_age_hours
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(
+            tzinfo=None
+        ).isoformat(timespec="seconds")
+        age = cache_age_hours(ts)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 2.0, delta=0.1)
+
+    def test_is_cache_stale_by_age(self):
+        from darvas_box_strategy.web.data import is_cache_stale
+        from datetime import datetime, timezone, timedelta
+        old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(
+            timespec="seconds"
+        )
+        new = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(
+            timespec="seconds"
+        )
+        self.assertTrue(is_cache_stale(old))
+        self.assertFalse(is_cache_stale(new))
+
+    def test_missing_timestamp_counts_as_stale(self):
+        """A missing timestamp is the dangerous case — treat it as stale."""
+        from darvas_box_strategy.web.data import is_cache_stale
+        self.assertTrue(is_cache_stale(""))
+        self.assertTrue(is_cache_stale("garbage"))
+
+    def test_signals_endpoint_triggers_refresh_when_stale(self):
+        """A stale cache with signals in it must still start a refresh."""
+        from darvas_box_strategy.web import app as app_module
+        from darvas_box_strategy.web.data import WebCache
+        from datetime import datetime, timezone, timedelta
+
+        old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(
+            timespec="seconds"
+        )
+        stale_cache = WebCache(
+            last_updated=old,
+            signals=[{"ticker": "MSN"}],  # non-empty — the old bug
+            open_positions=[],
+        )
+
+        app = app_module.create_app()
+        c = app.test_client()
+
+        started = []
+        orig = app_module._safe_refresh
+
+        def _spy():
+            started.append(True)
+
+        app_module._safe_refresh = _spy
+        try:
+            with patch(
+                "darvas_box_strategy.web.app.load_cache", return_value=stale_cache
+            ):
+                c.get("/api/signals")
+        finally:
+            app_module._safe_refresh = orig
+
+        self.assertTrue(
+            started,
+            "a stale cache must trigger a background refresh even when "
+            "it still holds signals",
+        )
+
+    def test_fresh_cache_does_not_trigger_refresh(self):
+        from darvas_box_strategy.web import app as app_module
+        from darvas_box_strategy.web.data import WebCache
+        from datetime import datetime, timezone, timedelta
+
+        new = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(
+            timespec="seconds"
+        )
+        fresh_cache = WebCache(
+            last_updated=new,
+            signals=[{"ticker": "MSN"}],
+            open_positions=[],
+        )
+
+        app = app_module.create_app()
+        c = app.test_client()
+
+        started = []
+        orig = app_module._safe_refresh
+
+        def _spy():
+            started.append(True)
+
+        app_module._safe_refresh = _spy
+        try:
+            with patch(
+                "darvas_box_strategy.web.app.load_cache", return_value=fresh_cache
+            ):
+                c.get("/api/signals")
+        finally:
+            app_module._safe_refresh = orig
+
+        self.assertFalse(started, "a fresh cache must not trigger a refresh")
+
+    def test_fresh_cache_without_signals_does_not_trigger_refresh(self):
+        """A cache with no signals on the latest bar is normal.
+
+        The old trigger was "cache.signals is empty", which made every
+        request start a ~5 minute backtest whenever there was no breakout
+        signal — including right after a service restart.
+        """
+        from darvas_box_strategy.web import app as app_module
+        from darvas_box_strategy.web.data import WebCache
+        from datetime import datetime, timezone, timedelta
+
+        new = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(
+            timespec="seconds"
+        )
+        fresh_cache = WebCache(
+            last_updated=new,
+            signals=[],          # no signals — a normal condition
+            open_positions=[{"ticker": "MSN"}],
+        )
+
+        app = app_module.create_app()
+        c = app.test_client()
+
+        started = []
+        orig = app_module._safe_refresh
+
+        def _spy():
+            started.append(True)
+
+        app_module._safe_refresh = _spy
+        try:
+            with patch(
+                "darvas_box_strategy.web.app.load_cache", return_value=fresh_cache
+            ):
+                c.get("/api/signals")
+        finally:
+            app_module._safe_refresh = orig
+
+        self.assertFalse(
+            started,
+            "a fresh cache with no signals must not trigger a refresh",
+        )
+
+    def test_health_reports_cache_age(self):
+        """The health endpoint must expose the cache age so staleness is
+        observable without opening the dashboard."""
+        app = app_module_create()
+        c = app.test_client()
+        r = c.get("/api/health")
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertIn("cache_age_hours", data)
+        self.assertIn("cache_stale", data)
+        self.assertIn("cache_max_age_hours", data)
+
+    def test_refresh_lock_prevents_concurrent_refreshes(self):
+        """Two concurrent requests must not start two backtests.
+
+        The refresh is a ~5 minute backtest, so a stampede would be very
+        expensive. The spy below blocks until the test releases it, which
+        keeps the first refresh "running" while the second request arrives.
+        """
+        import threading
+
+        from darvas_box_strategy.web import app as app_module
+        from darvas_box_strategy.web.data import WebCache
+        from datetime import datetime, timezone, timedelta
+
+        old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(
+            timespec="seconds"
+        )
+        stale_cache = WebCache(last_updated=old, signals=[{"ticker": "MSN"}])
+
+        app = app_module.create_app()
+        c = app.test_client()
+
+        started = []
+        started_lock = threading.Lock()
+        release = threading.Event()
+        first_refresh_entered = threading.Event()
+
+        def _spy():
+            with started_lock:
+                started.append(True)
+            first_refresh_entered.set()
+            # Hold the refresh open so the second request sees it running.
+            release.wait(timeout=5)
+
+        orig = app_module._safe_refresh
+        app_module._safe_refresh = _spy
+        try:
+            with patch(
+                "darvas_box_strategy.web.app.load_cache", return_value=stale_cache
+            ):
+                c.get("/api/signals")
+                # Wait until the first refresh is actually in flight.
+                self.assertTrue(
+                    first_refresh_entered.wait(timeout=5),
+                    "the first refresh never started",
+                )
+                c.get("/api/signals")
+        finally:
+            release.set()
+            app_module._safe_refresh = orig
+
+        self.assertEqual(
+            len(started), 1,
+            "only one background refresh may run at a time",
+        )
+
+
+def app_module_create():
+    from darvas_box_strategy.web.app import create_app
+    return create_app()
 
 
 if __name__ == "__main__":

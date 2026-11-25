@@ -65,15 +65,27 @@ def quote_match_price(quote: dict[str, Any] | list[Any], side: str) -> int | Non
       2. Bare list:   ``[ {bid: [...], offer: [...]} ]`` or ``[ {quotes: [...]} ]``
       3. Legacy flat: ``{bidPrice1, askPrice1, ...}`` or ``{askPrice, bidPrice, ...}``
     """
-    # Unwrap DNSE list-wrapper: {"quotes": [board0, board1, ...]} -> board0
+    # Unwrap DNSE board wrapper. Prefer G1 explicitly because DNSE does
+    # not guarantee board ordering; G4 may precede G1 and have a different
+    # (or empty) order book.
+    def _prefer_g1(boards: list[Any]) -> dict[str, Any] | None:
+        valid = [b for b in boards if isinstance(b, dict)]
+        return next(
+            (b for b in valid if str(b.get("boardId") or "").upper() == "G1"),
+            valid[0] if valid else None,
+        )
+
     if isinstance(quote, dict) and "quotes" in quote and isinstance(quote["quotes"], list) and quote["quotes"]:
-        quote = quote["quotes"][0]
+        preferred = _prefer_g1(quote["quotes"])
+        if preferred is not None:
+            quote = preferred
     # Unwrap bare list
     if isinstance(quote, list) and quote:
         first = quote[0]
         if isinstance(first, dict):
             if "quotes" in first and isinstance(first["quotes"], list) and first["quotes"]:
-                first = first["quotes"][0]
+                preferred = _prefer_g1(first["quotes"])
+                first = preferred or first
             if "bid" in first or "ask" in first or "bidPrice1" in first or "askPrice1" in first:
                 quote = first
             elif "bid" not in quote and "ask" not in quote:

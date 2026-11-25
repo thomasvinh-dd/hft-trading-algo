@@ -157,35 +157,6 @@ comes from the first cut. This is why the worst single-trade loss
 in the backtest is **-13%** (not -18% as a single hard stop would
 imply).
 
-#### Board lots and the residual rule (no stranded stubs)
-
-Every partial exit is rounded **down** to the HOSE board lot of 100
-shares. Repeated 50% cuts therefore converge on a small residue —
-a 10,700-share position walks
-
-```
-10,700 → 5,400 → 2,700 → 1,400 → 700 → 400 → 200
-```
-
-A residue that small has **no exit left**: the profit tiers were
-never reached (so the trailing stop never armed) and the price may
-never revisit `sl_T` / `sl_mid` / `sl_F` again. The stub would then
-stay OPEN forever, blocking the ticker for months and showing up on
-the dashboard as a mark-to-market row for a position that cannot
-be exited.
-
-To prevent this, `ExitsConfig.min_residual_lots` (default **2**)
-sets the smallest residue a partial exit may leave. When a cut would
-leave **2 lots (200 shares) or fewer**, the **whole remaining
-position is liquidated at that price** instead of leaving a stub.
-
-Set `min_residual_lots = 0` to disable the rule and restore the old
-stub-leaving behaviour.
-
-The same rule is applied by all three execution paths — the backtest
-executor, the live `Portfolio`, and the Telegram exit scanner — via
-the shared helper `darvas.executor._scale_out_cut`.
-
 ### Step 6 — Trade management summary
 
 For each bar after entry, the strategy runs this priority order:
@@ -238,21 +209,6 @@ happened.
 | **TIME_STOP** | Time stop fired | `bars_held ≥ max_holding_bars` AND close still below entry | -all remaining |
 | **DIVIDEND** | Cash dividend received | Ticker has a dividend event on this bar | unchanged (income credited) |
 | **EXHAUST** | Backtest ran out of data | No more bars | -all remaining (at last close) |
-| **MARK** | Display-only mark-to-market of a still-open position | The `EXHAUST` fill of a deal that is still open | unchanged (0 shares sold) |
-
-> **MARK** is not a trade. The backtest engine has to close out every
-> simulated deal so its accounting balances, so a position that
-> survives to the end of the price data gets a synthetic `EXHAUST`
-> fill. For a position that is **actually still held** that fill
-> would be a lie, so the web layer rewrites it to `MARK`:
-> `shares = 0`, `remaining` = the shares still held, `pnl_delta = 0`,
-> and the note *"Position still open — N sh marked at last close"*.
-> It is a snapshot, not a sale.
->
-> After the residual-lot fix (see
-> [Board lots and the residual rule](#board-lots-and-the-residual-rule-no-stranded-stubs))
-> a position should rarely stay open this long — a stub small enough
-> to have no exit left is now liquidated instead of being stranded.
 
 ### Detailed explanation of each event
 
@@ -274,6 +230,15 @@ Today (next bar after the signal):
   remaining stays at sh
   cumulative_pnl = 0
 ```
+
+> **Fixed 2026-11-10.** The code used the *signal bar's close* as the
+> entry price while dating the entry to the next bar. The price was
+> therefore one bar stale, and the stop levels and tier targets were
+> computed from that stale price — so the whole trade was measured
+> against a fill that never happened. Across 3,719 signals the next
+> bar's close differs from the signal bar's close by p75 +1.85%,
+> p90 +4.75%, max +40.93%. The entry price is now the next bar's open,
+> and the stops are anchored to it. See `darvas/signal_generator.py`.
 
 **The trade is now "open" and will be checked on every bar
 until all shares are sold.**
@@ -332,8 +297,13 @@ trail_threshold = peak_close × (1 - trail_from_peak_pct)   ← default 10%
 if trail_floor_lock_profit:
     trail_threshold = max(trail_threshold, trail_floor)   ← never below tier 1
 if bar.close ≤ trail_threshold:
-    TRAIL fires — close all remaining at bar.close
+    TRAIL fires — close all remaining at the trail price
 ```
+
+The trail is a **stop order**, so it fills at the trail price, not at
+whatever the close happened to be. The only exception is a gap: if the
+bar's low is below the trail price, the market opened through the stop
+and the fill is the low — we cannot sell above the market.
 
 ```
 Entry = 100,000, peak so far = 130,000
@@ -341,11 +311,22 @@ trail_from_peak_pct = 0.10
 trail_threshold = 130,000 × 0.90 = 117,000
 trail_floor = 106,300 (tier 1 = 1.063 × entry)
 
-If bar.close = 115,000:
+If bar.close = 115,000 and bar.low = 114,500:
   trail_threshold = 117,000
-  115,000 < 117,000 → TRAIL fires
-  remaining shares sold at 115,000
-  pnl_delta = (115,000 - 100,000) × remaining = +15,000 per share
+  115,000 ≤ 117,000 → TRAIL fires
+  the market traded down through 117,000 intraday, so the fill is 117,000
+  remaining shares sold at 117,000
+  pnl_delta = (117,000 - 100,000) × remaining = +17,000 per share
+
+If the bar gapped: bar.low = 112,000 (below the threshold):
+  the stop was opened through, so the fill is 112,000
+```
+
+> **Fixed 2026-11-10.** The trail used to fill at `bar.close`, which gave
+> away more than the stop width on any close below the threshold and up to
+> -20pp on a gap-down. The stop legs (`sl_T` / `sl_mid` / `sl_F`) already
+> filled at their stop price; the trail now does the same. See
+> `darvas/executor.py`, `darvas/portfolio.py` and `bot/exits.py`.
 
 If tier 1 was set higher (say tier 1 = 1.20 = 120,000):
   trail_floor = 120,000
@@ -734,9 +715,14 @@ weaker setups.
 | `high_conviction_mult` | 3.0 | Volume mult above which conviction is "high" |
 | `require_ma200` | True | Require close > 200-day MA |
 | `require_close_above_ma` | 20 | Require close > 20-day MA |
-| `regime_index_path` | "" | Optional path to a market index for regime filter |
+| `regime_index_path` | "" | Optional path to a market index for regime filter. **Off** — this filter removes the good trades, see [The market volatility filter](#the-market-volatility-filter-2026-11-13-revised-2026-11-23) |
 | `regime_ma_window` | 50 | MA window for the regime filter |
 | `regime_require_above_ma` | True | Only allow signals when index > MA |
+| `volatility_index_path` | `data/market_index.json` | Path to the market index the volatility filter reads |
+| `market_volatility_avoid_band_pct` | (0.7, 1.3) | Skip trades whose market volatility falls INSIDE this band. `()` = off |
+| `min_market_volatility_pct` | 0.0 | Only trade when the market's daily volatility is at least this (%). 0 = off |
+| `max_market_volatility_pct` | 0.0 | Reject trades above this volatility. 0 = no upper bound |
+| `market_volatility_window` | 20 | Bars used for the volatility calculation |
 
 ### Profit-taking (`ExitsConfig.tiers`)
 
@@ -756,7 +742,6 @@ default 9-tier ladder takes 10% at +6.3%, then 30% at +12.5%, then
 | `use_entry_anchored_stops` | True | Stop is anchored to entry (not base low) |
 | `t_plus_n_bars` | 0 | T+2.5 settlement lock-up (3 = T+2.5) |
 | `max_holding_bars` | 0 | Time stop after N bars underwater (0 = off) |
-| `min_residual_lots` | 2 | Liquidate the whole position when a partial exit would leave ≤ 2 board lots (200 shares) — prevents stranded stubs with no exit left. 0 = disable |
 
 ### Trailing stop (`TrailingConfig`)
 
@@ -773,9 +758,10 @@ default 9-tier ladder takes 10% at +6.3%, then 30% at +12.5%, then
 | Knob | Default | What it does |
 |---|---:|---|
 | `start_nav` | 1e9 | Initial capital (1B VND) |
-| `size_low` | 0.15 | Position size as fraction of NAV (regular conviction) |
-| `size_high` | 0.30 | Position size as fraction of NAV (high conviction) |
+| `size_low` | 0.10 | Position size as fraction of NAV (regular conviction) |
+| `size_high` | 0.20 | Position size as fraction of NAV (high conviction) |
 | `max_concurrent_positions` | 10 | Max open positions at once |
+| `max_total_exposure_pct` | 0.50 | Cap on total open exposure as a fraction of NAV. 0 = off. Bounds the damage from a cluster of simultaneous losers — see [Reducing the drawdown](#reducing-the-drawdown-2026-11-11) |
 | `cooldown_bars_after_stop` | 5 | Bars to skip after a stop-out before re-entry |
 | `cost_bps` | 25.0 | Round-trip cost (slippage + commission) |
 | `board_lot` | 100 | Round share count down to 100-share lot (HOSE) |
@@ -786,9 +772,9 @@ default 9-tier ladder takes 10% at +6.3%, then 30% at +12.5%, then
 
 | Want | Tweak |
 |---|---|
-| Less drawdown | Lower `size_low` to 0.10 and `size_high` to 0.20 |
-| More return (more risk) | Raise `size_high` to 0.40 |
-| Fewer losing trades | Tighten `sl_T` to 0.05 (5% stop) |
+| Less drawdown | Set `max_total_exposure_pct=0.5-0.75` **together with** smaller `size_low`/`size_high` — either alone makes it worse |
+| More return (more risk) | Raise `size_high` to 0.40 and set `max_total_exposure_pct=0` |
+| Fewer losing trades | Tighten `sl_T` to 0.05 (5% stop) — but note a tighter stop makes the *drawdown* much worse |
 | Slower take-profit | Skip tier 1 (set `(1.125, 0.40)` as first) |
 | VN reality | Set `daily_price_limit_pct=0.07` (costs ~16% return) |
 | T+2.5 settlement | Set `t_plus_n_bars=3` (costs ~25% return) |
@@ -1073,6 +1059,497 @@ Lessons:
 2. **Vol-targeting is NOT always helpful** — fixed sizing can win in trend markets
 3. **Wider trail (12%) beats tighter (7%)** — let winners compound
 4. **Liquidity filter is essential** — HOSE blue chips only for live
+
+## The 2026 drawdown — what it is, and what it is not
+
+In 2026 the strategy's win rate fell from the historical ~65-75% to
+**36%**, and the stop-out rate doubled from 24% to 52%. This section
+records the investigation, because the conclusion is counter-intuitive
+and it would be easy to "fix" it in the wrong way.
+
+### What the strategy actually returns
+
+| Period | Return | CAGR | Max DD | Win rate |
+|---|---:|---:|---:|---:|
+| 2019-2026 | +142.1% | 12.36% | -26.0% | 65.3% |
+
+Full-universe trade stats:
+
+```
+avg win  +9.54%   (n=167)
+avg loss -9.48%   (n=89)
+payoff    1.006   ← a small edge over break-even (49.8% win rate needed)
+```
+
+The edge is thin but real, and it is **concentrated**: the best 10 trades
+out of 251 produce 53% of all P&L. The median trailing-stop exit is
+only +5.7%, so the strategy depends on a small number of large winners.
+
+### Two execution bugs fixed (2026-11-10)
+
+Both made the backtest disagree with a live order. See the commit
+"Fix two execution bugs in the Darvas Box backtest".
+
+1. **Trailing stop filled at the bar's close** instead of at the trail
+   price. Measured slippage against the intended stop reached -20pp on
+   a single trade.
+2. **Entry price was the signal bar's close** while the entry was dated
+   to the next bar — one bar stale, and the stops were anchored to it.
+
+Together these recovered **+11.3pp** of return (130.8% → 142.1%) and
+moved the payoff ratio from 0.995 to 1.006.
+
+### Hypothesis A — is it the market? YES
+
+The blue-chip universe fell ~17% in 2026 and the strategy lost 7.4%, so
+it **outperformed its benchmark by ~10pp**. The strategy is not failing
+because of a bug; it is losing less than the market does.
+
+The strategy's monthly P&L correlates only **+0.13** with the market's
+monthly return, so it is not simply a market-beta play that fell with
+the index.
+
+### Hypothesis B — can an entry filter fix it? NO
+
+Two candidate explanations were tested:
+
+**B1 — "breakouts fail more in a downtrend, so filter entries by
+regime."** Rejected by the data. Splitting every trade by the market's
+state at entry:
+
+| Market state at entry | n | Win% | Avg | Stop rate |
+|---|---:|---:|---:|---:|
+| Index ABOVE MA50 | 150 | 62.0% | +1.91% | 31.3% |
+| Index BELOW MA50 | 106 | **69.8%** | **+4.37%** | **23.6%** |
+
+Trades taken while the market was **below** its MA performed *better*.
+A regime filter would remove the good trades.
+
+Confirmed by running the filter end-to-end (full 2019-2026):
+
+| Config | Return | CAGR | Max DD | Trades |
+|---|---:|---:|---:|---:|
+| **baseline (no filter)** | **+142.1%** | **12.36%** | -26.0% | 251 |
+| index ABOVE MA50 | +67.8% | 7.06% | -34.4% | 211 |
+| index ABOVE MA100 | +28.3% | 3.34% | -27.4% | 212 |
+| index ABOVE MA200 | +70.0% | 7.24% | -23.8% | 193 |
+| index BELOW MA50 | +103.0% | 9.78% | -29.2% | 150 |
+
+Every variant cuts return. MA200 trades the least and has a slightly
+better drawdown (-23.8% vs -26.0%), but it costs 72pp of return for it.
+This matches the earlier sweep in this file (regime 200-day MA
++186.8% vs baseline +227.0%) — the filter has never helped.
+
+**B2 — "the entries themselves are bad."** Rejected. The 2026 losers
+are not worse *entries*; they are the ordinary ~24% stop rate applied
+to a thinner sample. Only 33 trades were taken in 2026 (vs ~37/year
+over 2020-2025), so a couple of unlucky runs dominate the year's stats.
+
+### Conclusion
+
+There is no config change that fixes 2026, and looking for one would be
+overfitting to a single bad year — the failure mode this file already
+warns about twice ("always run walk-forward before committing to a
+config", and the ML filter's "-37% ret" when it was fitted to
+2023-2026).
+
+The honest reading is that the strategy has a **thin, concentrated edge**
+(1.006 payoff, half the P&L in the top 10 trades) and 2026 was a year
+where the winners did not show up. The -26% drawdown is what that
+structure produces when the tail does not appear.
+
+If the tail risk is unacceptable, the lever is **position sizing**, not
+entry filtering: `size_low` / `size_high` scale the whole curve.
+
+## Reducing the drawdown (2026-11-11)
+
+The `-26%` max drawdown was investigated and reduced to **-18.5%** by
+capping total exposure. The current production config is
+`size_low=0.10, size_high=0.20, max_total_exposure_pct=0.75`.
+
+### Why the obvious levers backfire
+
+Sweeping the "obvious" knobs on the full 2019-2026 period:
+
+| Config | Return | Max DD | Win% |
+|---|---:|---:|---:|
+| **baseline 15/30 max10** | **+142.1%** | **-25.96%** | 65.3% |
+| size 10/20 max10 | +102.6% | **-33.44%** | 64.5% |
+| size 8/15 max10 | +87.7% | -23.41% | 64.6% |
+| size 15/30 max6 | +70.3% | -29.46% | 63.7% |
+| size 10/20 max6 | +38.3% | -33.59% | 60.2% |
+| size 10/20 max5 | +52.5% | -24.46% | 63.8% |
+| **sl 7%/13% (tighter stop)** | +125.1% | **-46.84%** | 58.3% |
+
+Three things to note:
+
+1. **Smaller positions made the drawdown WORSE.** `size 10/20` went from
+   -26.0% to -33.4%.
+2. **A tighter stop made it much worse** — -46.8%, and the win rate fell
+   to 58.3%. The stops are what the payoff depends on.
+3. **Fewer concurrent positions made it worse** too, and cost a lot of
+   return.
+
+### The actual mechanism
+
+Capping the **number** of open positions does not cap the **risk**.
+Smaller positions mean more of them fit, so total exposure rises exactly
+when losers cluster:
+
+| Config | Mean concurrent positions | Max DD |
+|---|---:|---:|
+| size 15/30 max10 | 4.95 | -26.0% |
+| size 10/20 max10 | 6.78 | -33.4% |
+| size 8/15 max10 | 7.63 | -23.4% |
+
+The 15/30 sizing was **self-limiting**: bigger positions meant fewer
+slots could be filled, which bounded the damage from a cluster of
+simultaneous losers. Reducing the size without adding a cap removed that
+protection.
+
+The fix is `BacktestConfig.max_total_exposure_pct` — a cap on the open
+exposure as a fraction of NAV, independent of how many positions are
+open. `0` = off.
+
+### The sweep
+
+| Config | Return | CAGR | Max DD | Win% | Trades |
+|---|---:|---:|---:|---:|---:|
+| baseline 15/30 max10 | +142.1% | 12.36% | -25.96% | 65.3% | 251 |
+| exposure 1.00 | +142.1% | 12.36% | -25.96% | 65.3% | 251 |
+| exposure 0.75 | +133.1% | 11.80% | -28.16% | 66.2% | 207 |
+| exposure 0.50 | +73.8% | 7.55% | -22.12% | 67.8% | 143 |
+| **exposure 0.75 + size 10/20** | **+93.4%** | **9.08%** | **-18.49%** | **66.9%** | 260 |
+| exposure 0.50 + size 10/20 | +42.2% | 4.76% | -25.59% | 64.1% | 195 |
+
+### Walk-forward validation
+
+A full-period result is how the earlier overfitting mistakes were made
+(vol-targeting and the ML filter both looked great in-sample and failed
+out-of-sample). So the candidates were re-run walk-forward —
+TRAIN 2019-2022, TEST 2023-2026:
+
+| Config | TRAIN ret | TRAIN DD | TRAIN win | TEST ret | TEST DD | TEST win |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline 15/30 max10 | +58.7% | -23.22% | 66.7% | +142.1% | -25.96% | 65.3% |
+| exposure 0.75 | +63.0% | -21.82% | 67.0% | +133.1% | **-28.16%** | 66.2% |
+| **exposure 0.75 + size 10/20** | +53.4% | **-16.96%** | **70.0%** | +93.4% | **-18.49%** | **66.9%** |
+| exposure 0.65 + size 10/20 | +31.4% | -12.62% | 68.7% | +65.4% | -18.81% | 67.1% |
+| exposure 0.75 + size 12/25 | +49.5% | -18.03% | 69.0% | +76.8% | -22.06% | 65.5% |
+
+**`exposure 0.75 + size 10/20` is the only configuration that improves
+the drawdown on both halves of the split**, and its win rate is higher
+in both (66.7% → 70.0% train, 65.3% → 66.9% test).
+
+Note that **the exposure cap on its own fails the test** — it improves
+train but makes the test drawdown *worse* (-26.0% → -28.2%). The cap
+only pays off in combination with smaller positions, because that is
+what keeps the number of simultaneous losers from climbing.
+
+### The trade-off
+
+```
+                     return   max DD   win%
+before                +142.1%  -25.96%  65.3%
+after                  +93.4%  -18.49%  66.9%
+```
+
+The drawdown improves by 7.5pp and the win rate goes **up**. The cost is
+return: roughly a third of the total return is given up.
+
+If a `-18.5%` drawdown is still too much, `exposure 0.65 + size 10/20`
+gives `-18.8%` on test and `-12.6%` on train — but the return drops to
++65.4%, so the extra risk reduction is not worth it on the test period.
+
+## The NAV double-counting bug (2026-11-13)
+
+Every drawdown number above this section was **too pessimistic**. The
+portfolio overstated its NAV by up to **207M (21% of NAV)**, which made
+the reported max drawdown `-18.49%` when the real one was `-13.25%`.
+
+### What was wrong
+
+`Portfolio.get_nav()` computed
+
+```python
+cash + sum(p.shares * p.last_close for p in open_positions.values())
+```
+
+using the **original** share count — while the proceeds of the shares
+already sold by the take-profit ladder were only credited to `cash`
+when the position **fully** closed. Until then:
+
+- `cash` still had the whole entry cost debited, and
+- the shares already sold were still counted at the current price.
+
+So every partially-sold position was counted **twice**: once as a
+mark-to-market position and once via the cash that had not yet been
+credited. The longer a position ran through the tier ladder, the bigger
+the phantom NAV.
+
+`get_open_exposure()` had the same defect, so the total-exposure cap
+was binding against an overstated exposure — it was rejecting valid
+trades early. That is why the trade count jumped from 260 to 344 once
+the bug was fixed.
+
+### The fix
+
+- `_sell_partial` credits the cash as each sale happens, so the entry
+  cost and the sale proceeds are never both missing or both counted.
+- `_archive_position` no longer credits `cumulative_proceeds` a second
+  time.
+- `get_nav()` and `get_open_exposure()` use `p.remaining`, not `p.shares`.
+
+### What it changes
+
+| | before the fix | after the fix |
+|---|---:|---:|
+| return (2019-2026) | +92.7% | +80.8% |
+| max DD (2019-2026) | -18.49% | **-17.78%** |
+| max DD (train 2019-2022) | -16.96% | **-11.00%** |
+| trades | 260 | 344 |
+
+The return falls because the exposure cap was rejecting trades it should
+not have rejected, and because a position that is partly sold is now
+marked correctly — the strategy is taking slightly more risk, so the
+return is a more honest number too.
+
+Six regression tests in `PortfolioNavTests` cover the round trip, the
+partial sale, the exposure and the mark-to-market. They were checked
+against the pre-fix code: the NAV test detects a 110,000,000 error.
+
+## The market volatility filter (2026-11-13, revised 2026-11-23)
+
+The production config skips trades taken in the **"half-dead" market** —
+the one where the index is moving just enough to produce false breakouts,
+but not enough for the winners to run:
+
+```python
+breakout=BreakoutConfig(
+    volatility_index_path="darvas_box_strategy/data/market_index.json",
+    market_volatility_avoid_band_pct=(0.7, 1.3),  # skip this band
+    market_volatility_window=20,
+)
+```
+
+The band is the index's realised daily volatility over 20 bars, in
+percent. The filter is **point-in-time** — only bars up to the signal
+date are used — and a missing index leaves trading unrestricted rather
+than silently blocking every signal.
+
+### Why a band and not a minimum
+
+The first version of this filter was one-sided:
+`min_market_volatility_pct=1.2` — "only trade when the market is
+moving enough". It worked on the backtest (+110.6% / -15.01%) and it
+was adopted.
+
+**Then the bot went silent for 48 consecutive bars.** The market
+volatility sat at 1.01-1.09% from 2026-09-16 to 2026-11-20, below the
+threshold, so every signal was blocked. There *were* real breakouts
+(7 in the last 20 bars) — the filter threw them all away.
+
+Bucketing all 350 unfiltered trades by the market volatility at entry
+showed why the one-sided threshold was the wrong shape:
+
+| regime | n | win% | sum ret% |
+|---|---:|---:|---:|
+| <0.8 (dead) | 65 | **78.5%** | +4% |
+| 0.8-1.2 (calm) | 100 | **46.0%** | -1% |
+| 1.2-1.6 (normal) | 87 | 63.2% | +1% |
+| >=1.6 (wild) | 98 | 70.4% | +3% |
+
+The danger zone is a **band**, not a low level. A barely-moving market
+(vol < 0.8) is *fine* — 78.5% of those trades win, the best bucket of
+all. It is the "half-dead" 0.8-1.2 market that breaks them. A one-sided
+minimum throws away the best trades to avoid the worst ones, and in a
+structurally quiet market it stops trading altogether.
+
+The band filter skips only the losing middle:
+
+| filter | bars allowed | last 48 bars |
+|---|---:|---:|
+| `minvol 1.2` (one-sided) | 38% | **0/48** |
+| `band 0.7-1.3` | 61% | 14/48 |
+| `band 0.9-1.3` | 75% | 30/48 |
+
+### Why volatility and not "is the market strong?"
+
+The obvious filter is "only trade when the market is up". A screen over
+256 trades (2019-2026) split every trade by market feature and compared
+the two halves:
+
+| feature | low win% | high win% | low avg | high avg |
+|---|---:|---:|---:|---:|
+| index vs MA50 | 69.8% | 62.0% | +4.37% | +1.91% |
+| index momentum 20/60 | 65.6% | 64.8% | +3.24% | +2.62% |
+| index drawdown from peak | 69.2% | 62.5% | +3.59% | +2.38% |
+| breadth, % above MA50 | 67.2% | 63.3% | +4.08% | +1.78% |
+| **index volatility 20/60** | **62.5%** | **68.0%** | **+2.53%** | **+3.32%** |
+
+For **every trend and level feature the separation runs the wrong way**:
+the trades taken in the *weaker* market did better. A "trade only in a
+strong market" filter removes the good trades — running it end to end
+cost 39-114pp of return. Volatility is the only feature where the
+separation points the way the intuition expects.
+
+That makes sense mechanically: a breakout needs movement. A quiet
+market gives false breakouts that stop out, while a moving market lets
+the winners run.
+
+### Walk-forward validation
+
+70 HOSE blue chips, TRAIN 2019-2022 / TEST 2023-2026, on the corrected
+NAV accounting. The band filter with a re-tuned exposure cap:
+
+| config | FULL ret | FULL DD | TRAIN DD | win% | trades |
+|---|---:|---:|---:|---:|---:|
+| 10/20 exp0.75 (no filter) | +81.3% | -17.78% | -11.00% | 63.1% | 344 |
+| minvol 1.2 + exp0.75 | +111.1% | -15.01% | -8.99% | 66.8% | 217 |
+| band 0.7-1.3 + exp0.75 | +164.4% | -13.81% | -8.98% | 69.6% | 270 |
+| band 0.7-1.3 + exp0.65 | +128.1% | -13.31% | -8.06% | 68.3% | 227 |
+| band 0.7-1.3 + exp0.55 | +112.6% | -10.83% | -6.77% | 69.0% | 197 |
+| **band 0.7-1.3 + exp0.50** | **+117.7%** | **-9.52%** | **-5.20%** | **72.7%** | 194 |
+
+`band 0.7-1.3 + exp0.50` improves the **drawdown in 8 of 8 walk-forward
+windows** (full period -15.01% → -9.52%) with a higher return in 5 of 8:
+
+| window | minvol 1.2 exp0.75 | band 0.7-1.3 exp0.50 | ΔDD |
+|---|---:|---:|---:|
+| FULL 2019-2026 | +111.1% / -15.01% | +117.7% / -9.52% | **+5.49pp** |
+| A train ≤2020 | +13.6% / -6.07% | +15.7% / -5.20% | +0.87pp |
+| A test ≥2021 | +65.0% / -13.65% | +59.9% / -8.51% | +5.14pp |
+| B train ≤2021 | +27.9% / -6.45% | +39.4% / -5.20% | +1.25pp |
+| B test ≥2022 | +37.0% / -13.34% | +28.4% / -10.17% | +3.17pp |
+| C train ≤2023 | +43.8% / -10.07% | +73.4% / -7.54% | +2.53pp |
+| C test ≥2024 | +38.5% / -13.35% | +23.9% / -10.13% | +3.22pp |
+| D test ≥2020 | +61.3% / -13.23% | +103.9% / -9.57% | +3.66pp |
+
+### The threshold has to sit on a smooth surface
+
+A threshold picked on one split can be a spike fitted to noise. The
+surface at the adopted **10/20** sizing with the *old* one-sided filter:
+
+| minvol | FULL return | FULL DD | FULL win% | TRAIN DD | TRAIN win% |
+|---|---:|---:|---:|---:|---:|
+| no filter | +80.4% | -17.78% | 63.1% | -11.00% | 65.4% |
+| 0.9 | +67.0% | -15.46% | 61.6% | -11.49% | 63.2% |
+| 1.0 | +92.6% | -14.58% | 63.8% | -11.68% | 67.7% |
+| 1.05 | +76.0% | -17.17% | 63.0% | -11.49% | 64.6% |
+| 1.1 | +93.1% | -17.54% | 64.8% | -9.68% | 67.9% |
+| 1.15 | +95.7% | -15.99% | 66.8% | -9.21% | 67.3% |
+| **1.2** | **+110.4%** | **-15.01%** | **66.8%** | **-8.99%** | 66.0% |
+| 1.25 | +97.2% | -14.88% | 66.8% | -8.99% | 70.3% |
+| 1.3 | +106.8% | -16.79% | 66.8% | -9.00% | 68.5% |
+| 1.35 | +68.8% | -13.95% | 63.8% | -8.96% | 64.1% |
+| 1.4 | +63.3% | -13.78% | 63.7% | -9.01% | 65.8% |
+
+`1.2` sits on a plateau rather than a spike: 1.15 / 1.2 / 1.25 all beat
+the no-filter baseline on the drawdown, the win rate is flat at 66.8%
+across 1.15-1.3, and the train-half drawdown is flat at -8.99% to -9.21%
+across 1.15-1.4. Moving the threshold by 0.05 around 1.2 does not
+change the character of the result.
+
+The same sweep at **15/30** is spiky (the drawdown swings from -12.13%
+to -21.17% and the return from +81% to +169% as the threshold moves by
+0.1), and the 15/30 sizing also fails the walk-forward rule on
+alternative splits (its train-half drawdown is *worse* than the 10/20
+sizing on splits A, B and C). So 15/30 was rejected despite looking
+better on the primary split.
+
+### Validation on alternative splits
+
+The adopted config was tuned on TRAIN 2019-2022 / TEST 2023-2026, so
+the threshold has to survive splits it was not tuned on. Each split
+below truncates the price data, so the test half really is a test.
+
+The filter improves the **drawdown in every window** (13 of 13 across
+both sizings):
+
+| window | 10/20 no filter | 10/20 with filter | Δret | Δdd |
+|---|---:|---:|---:|---:|
+| FULL 2019-2026 | +80.4% / -17.78% | +110.4% / -15.01% | +30.0pp | +2.77pp |
+| A train ≤2020 | +15.2% / -8.90% | +13.6% / -6.07% | -1.6pp | +2.83pp |
+| A test ≥2021 | +21.9% / -19.08% | +64.4% / -13.65% | +42.5pp | +5.43pp |
+| B train ≤2021 | +43.2% / -8.90% | +27.9% / -6.45% | -15.3pp | +2.45pp |
+| B test ≥2022 | +21.3% / -17.81% | +36.6% / -13.34% | +15.3pp | +4.47pp |
+| C train ≤2023 | +42.6% / -13.17% | +43.8% / -10.07% | +1.2pp | +3.10pp |
+| C test ≥2024 | +8.8% / -16.37% | +38.0% / -13.35% | +29.2pp | +3.02pp |
+| D test ≥2020 | +49.3% / -20.91% | +60.8% / -13.23% | +11.5pp | +7.68pp |
+
+The filter costs some return on the short train windows (there are only
+33-62 trades there, so a handful of filtered trades is a large share)
+and makes a lot on the test windows.
+
+### The band edges have to sit on a smooth surface
+
+Moving the band edges or the exposure cap by 0.05 does not change the
+character of the result:
+
+| config | FULL ret | FULL DD | FULL win% | TRAIN DD |
+|---|---:|---:|---:|---:|
+| band 0.65-1.3 exp0.55 | +99.9% | -11.09% | 67.0% | -6.77% |
+| band 0.70-1.3 exp0.55 | +112.6% | -10.83% | 69.0% | -6.77% |
+| band 0.75-1.3 exp0.55 | +83.8% | -10.97% | 68.3% | -6.77% |
+| band 0.70-1.25 exp0.55 | +122.9% | -9.92% | 69.1% | -6.55% |
+| band 0.70-1.35 exp0.55 | +117.2% | -9.57% | 69.0% | -6.51% |
+| band 0.70-1.3 exp0.60 | +107.2% | -11.91% | 70.3% | -7.90% |
+| band 0.70-1.3 exp0.65 | +128.1% | -13.31% | 68.3% | -8.06% |
+| **band 0.70-1.3 exp0.50** | **+117.7%** | **-9.52%** | **72.7%** | **-5.20%** |
+
+Every variant keeps the drawdown between -9.5% and -13.3% — a plateau,
+not a spike.
+
+### Why 15/30 sizing was rejected
+
+`15/30 + exp0.75 + minvol 1.2` looks better on the primary split
+(+148.1% / -14.57% vs +110.4% / -15.01%). It was still rejected:
+
+- its **train-half drawdown is worse** than the 10/20 sizing on splits
+  A (-7.60% vs -6.07%), B (-7.60% vs -6.45%) and C (-12.90% vs
+  -10.07%) — it fails the same rule the exposure cap had to pass;
+- its threshold surface is spiky (above), so the result is more likely
+  fitted to noise.
+
+The 10/20 sizing with the filter is the config that survives every
+check.
+
+### The index has to be fresh
+
+The filter reads the market's *recent* volatility, so a stale index
+means it judges today's market on old data. The index is rebuilt by:
+
+```bash
+python3 -m darvas_box_strategy.tools.build_market_index
+```
+
+The `refresh-cache` command runs this before the backtest, and a daily
+cron job (17:20 ICT) rebuilds it. The bundled index is the equal-weight
+mean close of the 70 blue chips, on every date where at least 30 of
+them have a bar.
+
+> **Operational note.** A failed `refresh-cache` leaves the previous
+> cache in place, so the dashboard keeps serving the old numbers. The
+> `check-stale` job (09:20 ICT) alerts on Telegram when that happens —
+> it fired once on 2026-11-13 when a refresh failed mid-edit. If the
+> dashboard shows old numbers after a config change, check
+> `/root/logs/darvas_cache.log` before assuming the change did not
+> work.
+
+### The regime filter stays off
+
+The regime filter (`regime_index_path`) is the "index above its MA"
+filter, and it is the one that **hurts**. It stays off, and it reads
+its **own** index path (`regime_index_path` vs
+`volatility_index_path`) so it can be switched on without affecting
+the volatility filter.
+
+> The `web/data.py` scan and position paths call `generate_signal`
+> without the index bars, so the filter does not apply to the
+> *dashboard's* current-signal list — only to the backtest. The signal
+> count on the dashboard can therefore be higher than the number of
+> trades the backtest would take. That is a reporting difference, not a
+> strategy difference.
 
 ## Tests
 

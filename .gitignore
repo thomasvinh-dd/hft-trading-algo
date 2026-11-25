@@ -9,9 +9,7 @@ venv/
 env/
 
 # Secrets / env files
-vietnam_algo/env/*
-# ...but the credentials TEMPLATE is tracked (the real file is not).
-!vietnam_algo/env/.env.autofin-signal.example
+vietnam_algo/env/
 .env
 .env.*
 
@@ -36,5 +34,50 @@ backups/
 
 # Secrets left at project root — DO NOT COMMIT
 dnse.txt
-# Off-site git bundles pulled down from the VPS
-.vps-backups/
+
+# One-off debug / inspection scripts (throwaway diagnostics).
+# They are handy while debugging on the VPS but they are not
+# project code — they would just add noise to the history.
+/check_autofin_state.py
+/check_dates.py
+/check_price.py
+/check_state.py
+/check_trc.py
+/check_trc2.py
+/debug2.py
+/debug_momentum_apply.py
+/debug_notifier.py
+/find_drops.py
+/inspect_backtest.py
+/inspect_eq.py
+/list_autofin_orders.py
+/list_deals.py
+/list_notifications.py
+/mom_test.py
+/seed_actioned_deals.py
+/show_eq.py
+/show_momentum_state.py
+/show_orders.py
+/show_state.py
+/show_states.py
+/stream_file.py
+/test_apply_only.py
+/test_ca_flow.py
+/test_ca_pagesize.py
+/test_eod_momentum.py
+/test_full_eod.py
+/test_headers.py
+/test_momentum_on_vps.py
+/test_pagesize.py
+/test_poll.py
+/test_regex.py
+/test_sync_debug.py
+/test_sync_exact.py
+/test_sync_run.py
+/test_sync_trace.py
+/test_token_reuse.py
+/test_token_single_use.py
+/test_vps_notification.py
+/scripts/launch_autofin.sh.bak.dup
+/launch_momentum.sh
+/launch_autofin.sh

@@ -262,12 +262,41 @@ class Portfolio:
     # ----- Read-only accessors -----
 
     def get_nav(self) -> float:
+        """Cash plus the market value of the shares still held.
+
+        Uses ``remaining``, NOT ``shares``: the take-profit ladder sells
+        part of a position, and the proceeds of those sales are credited
+        to ``cash`` as they happen (see ``_sell_partial``). Counting the
+        original share count here would double-count the sold shares —
+        their proceeds are in cash AND they would be marked a second
+        time. That overstatement reached 207M (21% of NAV) and made the
+        reported max drawdown -18.49% when the real one was -13.25%.
+        """
         return self.cash + sum(
-            p.shares * p.last_close for p in self.open_positions.values()
+            p.remaining * p.last_close for p in self.open_positions.values()
         )
 
     def get_open_positions(self) -> List[Position]:
         return list(self.open_positions.values())
+
+    def get_open_exposure(self) -> float:
+        """Market value of the shares still held.
+
+        Uses ``remaining``, not ``shares`` — the same reason as
+        ``get_nav()``: the proceeds of partially-sold shares are already
+        in cash, so counting the original share count would overstate
+        the exposure and make the exposure cap bind at the wrong time.
+        """
+        return sum(
+            p.remaining * p.last_close for p in self.open_positions.values()
+        )
+
+    def get_exposure_pct(self) -> float:
+        """Open exposure as a fraction of NAV."""
+        nav = self.get_nav()
+        if nav <= 0:
+            return 0.0
+        return self.get_open_exposure() / nav
 
     def get_history(self) -> List[Trade]:
         return list(self.history)
@@ -316,6 +345,18 @@ class Portfolio:
             return None
 
         cost = shares * signal.entry_price
+
+        # Total-exposure cap. Capping the NUMBER of open positions does not
+        # cap the risk: smaller positions mean more of them fit, so exposure
+        # rises exactly when losers cluster. This bounds the damage from a
+        # cluster of simultaneous losers regardless of the position count.
+        exposure_cap = getattr(self.cfg.backtest, "max_total_exposure_pct", 0.0) or 0.0
+        if exposure_cap > 0 and nav > 0:
+            current_exposure = self.get_open_exposure()
+            if current_exposure + cost > exposure_cap * nav:
+                self.skipped_signals += 1
+                return None
+
         if cost > self.cash:
             self.skipped_signals += 1
             return None
@@ -360,14 +401,21 @@ class Portfolio:
 
     def process_bar(
         self, bar_date, prices_by_ticker: Dict[str, float],
+        lows_by_ticker: Optional[Dict[str, float]] = None,
     ) -> List[Order]:
         """Process one bar of market data.
 
         Updates MTM, runs each open position through the exit logic,
         and returns any sell orders generated. Advances state.
+
+        ``lows_by_ticker`` supplies the bar's low price per ticker. It is
+        used by the trailing stop to model a gap: when the low is below the
+        trail price the market gapped through the stop, so the fill is the
+        low rather than the trail price.
         """
         self._current_date = bar_date
         self._current_prices = dict(prices_by_ticker)
+        lows = dict(lows_by_ticker or {})
         orders: List[Order] = []
 
         # 1) Close any positions whose exit_date has been reached.
@@ -391,7 +439,9 @@ class Portfolio:
             pos.peak_close = max(pos.peak_close, price)
             pos.bars_held += 1
 
-            exit_orders = self._apply_exits(pos, price, bar_date)
+            exit_orders = self._apply_exits(
+                pos, price, bar_date, low=lows.get(ticker),
+            )
             orders.extend(exit_orders)
 
         # 3) Record daily NAV
@@ -399,12 +449,15 @@ class Portfolio:
         return orders
 
     def _apply_exits(
-        self, pos: Position, price: float, bar_date,
+        self, pos: Position, price: float, bar_date, low: Optional[float] = None,
     ) -> List[Order]:
         """Run the signal-level exit logic on one position.
 
         Returns 0 or more sell Orders. Mutates pos in-place.
         The order of checks: trail > tier > sl_T > sl_F > time stop.
+
+        ``low`` is the bar's low price, used by the trailing stop to model
+        a gap through the stop.
         """
         sig = pos.signal
         cfg = self.cfg
@@ -458,8 +511,20 @@ class Portfolio:
             if trail_cfg.trail_floor_lock_profit:
                 trail_threshold = max(trail_threshold, pos.trail_floor)
             if effective_price <= trail_threshold:
+                # The trail is a stop order: fill at the trail price, not at
+                # whatever the close happened to be. See the same fix in
+                # darvas/executor.py — filling at the close let the exit slip
+                # by up to -20pp against the intended stop on gap-downs.
+                #
+                # If the bar's low is below the trail price the market gapped
+                # through the stop, so the fill is the low. Otherwise the
+                # stop was touched intraday and the fill is the trail price.
+                if low is not None and low < trail_threshold:
+                    trail_fill = low
+                else:
+                    trail_fill = trail_threshold
                 order = self._sell_partial(
-                    pos, effective_price, pos.remaining, "TRAIL",
+                    pos, trail_fill, pos.remaining, "TRAIL",
                     bar_date, cost_rate, effective_price,
                 )
                 orders.append(order)
@@ -552,6 +617,12 @@ class Portfolio:
         pos.cumulative_pnl += pnl - cost
         pos.realized_fees += cost
         pos.remaining -= shares
+        # Credit the cash as the shares are sold, not at archive time.
+        # The entry cost was debited in full when the position opened, so
+        # the proceeds of a partial sale have to land in cash at the same
+        # time or the NAV counts the sold shares twice (once via cash,
+        # once via the share count). See get_nav().
+        self.cash += net_proceeds
         order = Order(
             ticker=pos.ticker,
             side="sell",
@@ -580,7 +651,9 @@ class Portfolio:
         bar_date,
     ) -> None:
         """Move a fully-closed position into history and update cash."""
-        self.cash += pos.cumulative_proceeds
+        # NOTE: the sale proceeds were already credited to cash in
+        # _sell_partial as each sale happened. Do not credit them again
+        # here or the position's proceeds would be counted twice.
         avg_exit_price = (
             pos.signal.entry_price + pos.cumulative_pnl / pos.shares
         )

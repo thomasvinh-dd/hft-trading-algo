@@ -52,6 +52,54 @@ class BreakoutConfig:
     regime_index_path: str = ""      # path to market index JSON; "" = off
     regime_ma_window: int = 50       # MA window for regime check
     regime_require_above_ma: bool = True  # require index > MA at signal time
+    # Separate path for the volatility filter. It is deliberately NOT
+    # shared with regime_index_path: the regime filter is harmful (it
+    # removes the good trades) and must stay off independently.
+    volatility_index_path: str = ""  # path to market index JSON; "" = off
+    # Market VOLATILITY filter. 0 = off.
+    #
+    # This is the only market feature whose separation runs in the
+    # expected direction. A feature screen over 256 trades (2019-2026)
+    # split each trade by market feature and compared the buckets:
+    #
+    #   feature                 low win%  high win%   low avg   high avg
+    #   index vs MA50            69.8%      62.0%     +4.37%    +1.91%
+    #   index momentum 20/60     65.6%      64.8%     +3.24%    +2.62%
+    #   index drawdown peak      69.2%      62.5%     +3.59%    +2.38%
+    #   breadth % above MA50     67.2%      63.3%     +4.08%    +1.78%
+    #   index volatility 20/60   62.5%      68.0%     +2.53%    +3.32%  <- only one
+    #
+    # Every trend/level feature had the separation running the WRONG way:
+    # trades taken in a WEAKER market did better, so a "trade only when the
+    # market is strong" filter removes the good trades. Market volatility
+    # is the exception — breakouts work better in a moving market.
+    #
+    # The threshold is the index's daily stdev over the window, as a
+    # percentage (1.4 = 1.4% daily standard deviation).
+    min_market_volatility_pct: float = 0.0
+    max_market_volatility_pct: float = 0.0  # 0 = no upper bound
+    market_volatility_window: int = 20       # bars for the volatility calc
+    # Market-volatility BAND to avoid, as (low, high). 0 = off.
+    #
+    # A one-sided MINIMUM threshold assumes "more volatility is always
+    # better". The trade-level data says otherwise — bucketing all 350
+    # unfiltered trades by the market volatility at entry:
+    #
+    #   regime              n    win%   sum ret%
+    #   <0.8 (dead)        65   78.5%        +4%
+    #   0.8-1.2 (calm)    100   46.0%        -1%   <- the only loser
+    #   1.2-1.6 (normal)   87   63.2%        +1%
+    #   >=1.6 (wild)       98   70.4%        +3%
+    #
+    # The danger zone is a BAND, not a low level. A barely-moving market
+    # (vol < 0.8) is fine — 78.5% of those trades win. It is the
+    # "half-dead" 0.8-1.2 market that breaks them.
+    #
+    # This matters operationally: with a one-sided min threshold of 1.2,
+    # the filter went SILENT for 48 consecutive bars (the market sat at
+    # 1.01-1.09%), blocking every signal while throwing away the
+    # 78%-win-rate trades below 0.8.
+    market_volatility_avoid_band_pct: tuple = ()  # (low, high) to reject
     sector_data_path: str = ""       # path to symbols.json with sectorName; "" = off
     sector_momentum_window: int = 60  # days for sector momentum calculation
     sector_min_momentum: float = 0.0  # filter: only trade sectors with momentum > this
@@ -171,6 +219,19 @@ class BacktestConfig:
     size_high: float = 0.30
     cost_bps: float = 25.0  # round-trip cost (slippage + commission); applied at exit
     max_concurrent_positions: int = 10
+    max_total_exposure_pct: float = 0.0  # cap on total open exposure as a fraction of NAV.
+                                       # 0 = off (only max_concurrent_positions applies).
+                                       #
+                                       # Why this exists: capping the NUMBER of open
+                                       # positions does not cap the RISK. Smaller
+                                       # positions mean more of them fit, so total
+                                       # exposure rises exactly when losers cluster.
+                                       # Measured on the 70 blue chips (2019-2026):
+                                       #   size 15/30, max 10 -> mean 4.95 concurrent, max DD -26.0%
+                                       #   size 10/20, max 10 -> mean 6.78 concurrent, max DD -33.4%
+                                       # A total-exposure cap bounds the damage from a
+                                       # cluster of simultaneous losers regardless of
+                                       # how many positions are open.
     cooldown_bars_after_stop: int = 5  # bars to skip after SL_HARD/SL_SCALE exit
     max_holding_bars: int = 0  # time stop: close if not profitable after N bars; 0 = off
     vol_target_pct: float = 0.0  # OFF: fixed 2x sizing (size_low/size_high) beats vol-targeting

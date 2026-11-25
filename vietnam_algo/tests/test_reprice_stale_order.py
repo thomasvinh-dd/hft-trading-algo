@@ -100,12 +100,14 @@ class _StubClient:
         place_response: dict | None = None,
         place_error: Exception | None = None,
         cash_pkg_id: int = 1036,
+        market_id: str = "STO",
     ) -> None:
         self._latest_quote = latest_quote if latest_quote is not None else QUOTE_ABOVE_17500
         self._cancel_error = cancel_error
         self._place_response = place_response if place_response is not None else {"id": "new-123", "orderStatus": "New"}
         self._place_error = place_error
         self._cash_pkg_id = cash_pkg_id
+        self._market_id = market_id
         self.calls: list[dict] = []
 
     def get_latest_quote(self, symbol: str) -> dict:
@@ -129,6 +131,10 @@ class _StubClient:
     def get_cash_loan_package_id(self, *args, **kwargs):
         self.calls.append({"method": "get_cash_loan_package_id", "args": args, "kwargs": kwargs})
         return self._cash_pkg_id
+
+    def get_market_id(self, symbol: str) -> str:
+        self.calls.append({"method": "get_market_id", "symbol": symbol})
+        return self._market_id
 
 
 def _make_order(
@@ -207,10 +213,36 @@ def test_reprice_works_for_sell_orders() -> None:
     assert summary["side"] == "NS"
 
 
-def test_sell_skips_when_bid_above_current_limit() -> None:
-    """SELL: if the bid is at or above our limit, the order
-    has a chance to fill naturally — don't re-price DOWN.
+def test_stx_reprice_uses_hnx_price_lot() -> None:
+    """A replacement for an HNX/STX symbol must use a 100-VND lot.
+
+    Regression for the 2026-11-16 CTP INVALID_PRICE_LOT incident:
+    sending the raw best bid can violate the exchange price grid.
     """
+    order = LedgerOrder(
+        runId="2026-11-16", sourceOrderId=42, sourceDate="2026-11-16",
+        symbol="CTP", side="NS", quantity=100, price=6700,
+        reason="autofin_tp:test", status="open", dnseOrderId="old-ctp",
+        createdAt=(datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat().replace("+00:00", "Z"),
+        originalPrice=6700, repriceCount=0,
+    )
+    client = _StubClient(
+        latest_quote={"quotes": [{"boardId": "G1", "bid": [{"price": 6.63}]}]},
+        place_response={"id": "new-ctp", "orderStatus": "New"},
+        market_id="STX",
+    )
+    summary = _maybe_reprice_stale_order(
+        client, "A", "tok", order,
+        now_epoch=datetime.now(timezone.utc).timestamp(),
+        reprice_tolerance_pct=0.03,
+    )
+    assert summary["action"] == "replaced"
+    assert summary["new_price"] == 6600
+    place = next(c for c in client.calls if c["method"] == "place_stock_order")
+    assert place["kwargs"]["price"] == 6600
+
+
+def test_sell_skips_when_bid_above_current_limit() -> None:
     order = _make_order(side="NS", price=20000, original_price=20000)
     client = _StubClient(latest_quote=QUOTE_BID_ABOVE_20000)
     summary = _maybe_reprice_stale_order(

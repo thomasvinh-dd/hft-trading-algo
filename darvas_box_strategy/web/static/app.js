@@ -1,5 +1,16 @@
 // Darvas Box dashboard — vanilla JS, no build step.
 
+// The API base is derived from the document's <base href>, which the server
+// sets when the app is served from a sub-path (e.g. /darvas). At the site
+// root there is no <base> element and the API lives at /api.
+const API_BASE = (() => {
+  const base = document.querySelector("base");
+  const href = base ? base.getAttribute("href") : "";
+  return href ? href.replace(/\/$/, "") : "";
+})();
+
+const api = path => `${API_BASE}${path}`;
+
 const VND = n => n.toLocaleString("en-US", { maximumFractionDigits: 0 });
 const PCT = (n, d = 2) => (n >= 0 ? "+" : "") + n.toFixed(d) + "%";
 
@@ -209,9 +220,9 @@ function setStatus(iso) {
 async function load() {
   try {
     const [sigR, posR, btR] = await Promise.all([
-      fetchJSON("/api/signals"),
-      fetchJSON("/api/positions"),
-      fetchJSON("/api/backtest"),
+      fetchJSON(api("/api/signals")),
+      fetchJSON(api("/api/positions")),
+      fetchJSON(api("/api/backtest")),
     ]);
     renderSignals(sigR.signals);
     renderRecentSignals(sigR.recent);
@@ -314,7 +325,7 @@ async function refresh() {
   btn.textContent = "Refreshing…";
   setText("#cache-status", "Refreshing (this takes ~3 min)…");
   try {
-    const r = await fetchJSON("/api/refresh", { method: "POST" });
+    const r = await fetchJSON(api("/api/refresh"), { method: "POST" });
     setText("#cache-status",
       `Refreshed in ${r.elapsed_seconds}s — ${r.signal_count} signals, ${r.position_count} open`);
     await load();
@@ -398,7 +409,7 @@ async function openTickerModal(ticker) {
   $("#modal-deals-table tbody").innerHTML = "";
 
   try {
-    const r = await fetchJSON(`/api/ticker/${encodeURIComponent(ticker)}`);
+    const r = await fetchJSON(api(`/api/ticker/${encodeURIComponent(ticker)}`));
     renderTickerHistory(r);
   } catch (e) {
     setText("#modal-ticker-subtitle", `Error: ${e.message}`);
@@ -431,7 +442,7 @@ async function openDealModal(dealId) {
   $("#deal-fills-table tbody").innerHTML = "";
 
   try {
-    const d = await fetchJSON(`/api/deal/${encodeURIComponent(dealId)}`);
+    const d = await fetchJSON(api(`/api/deal/${encodeURIComponent(dealId)}`));
     renderDealDetail(d);
   } catch (e) {
     setText("#deal-modal-subtitle", `Error: ${e.message}`);

@@ -38,6 +38,13 @@ class ExitEvent:
         return f"{self.kind}:{self.tier_index if self.tier_index is not None else ''}"
 
 
+def _round_down_lot(value: float, lot: int) -> int:
+    """Round a share count DOWN to the nearest board lot (HOSE = 100)."""
+    if lot <= 1:
+        return int(value)
+    return (int(value) // lot) * lot
+
+
 def evaluate_exits(
     pos: LivePosition,
     bars: Sequence,
@@ -126,7 +133,18 @@ def evaluate_exits(
             if trail_cfg.trail_floor_lock_profit:
                 threshold = max(threshold, trail_floor)
             if bar.close <= threshold:
-                ev = _sell("TRAIL", remaining, bar.close,
+                # The trail is a stop order: fill at the trail price, not at
+                # whatever the close happened to be. Filling at the close let
+                # the exit slip by up to -20pp against the intended stop.
+                # The stop legs (sl_T / sl_F) already fill at their stop
+                # price, so the trail does the same.
+                #
+                # If the bar's low is below the trail price the market gapped
+                # through the stop, so the fill is the low — we cannot sell
+                # above the market. Otherwise the stop was touched intraday
+                # and the fill is the trail price itself.
+                trail_fill = bar.low if bar.low < threshold else threshold
+                ev = _sell("TRAIL", remaining, trail_fill,
                            note=f"trail from peak {peak_close:,.0f}")
                 if ev and ev.dedupe_key not in already:
                     events.append(ev)

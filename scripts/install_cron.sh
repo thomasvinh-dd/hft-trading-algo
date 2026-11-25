@@ -137,52 +137,98 @@ _guard_utc() {
 }
 
 # ---------------------------------------------------------------------------
+# The cron minute MUST equal the guard's minute
+# ---------------------------------------------------------------------------
+# The guard compares the wall clock in the job's own timezone, so cron still
+# has to fire the entry during the very minute the guard accepts.  A cron
+# minute that disagrees with the guard's minute makes the job PERMANENTLY
+# DEAD: the entry fires at minute 0 while the guard only accepts "HH:05", so
+# the two can never both be true.  The job then never runs and never errors
+# — which is exactly how scan-exits (09:05 / 15:25 ICT) and check-stale
+# (09:20 ICT) stayed silent while their log files never appeared.
+#
+# Deriving the cron minute from the guard time keeps ONE source of truth per
+# job: change the guard and the trigger follows automatically.
+#
+#   _minute_of "09:05" -> "5"
+#   _minute_of "23:00" -> "0"
+_minute_of() {
+    local _m="${1##*:}"
+    printf '%s' "$((10#$_m))"
+}
+
+# ---------------------------------------------------------------------------
 # Job definitions
 # ---------------------------------------------------------------------------
 # Each entry is "<schedule> <guard><command>".  The schedule's hour field
 # is "*" on purpose: the guard — not the hour — decides when the job runs.
 _mk_get_otp() {
-    printf '30 * * * * %s cd %s && %s && PYTHONPATH=%s python3 -u -m vietnam_algo.main run-get-otp >> %s/get_otp.log 2>&1\n' \
-        "$(_guard_ict 08:30)" "$PROJECT_DIR" "$_env_sources" "$PROJECT_DIR" "$LOG_DIR"
+    printf '%s * * * * %s cd %s && %s && PYTHONPATH=%s python3 -u -m vietnam_algo.main run-get-otp >> %s/get_otp.log 2>&1\n' \
+        "$(_minute_of 08:30)" "$(_guard_ict 08:30)" "$PROJECT_DIR" "$_env_sources" "$PROJECT_DIR" "$LOG_DIR"
 }
 _mk_common_sync() {
-    printf '15 * * * * %s cd %s && %s && DNSE_PROXY_HTTP_URL="" PYTHONPATH=%s python3 -u -m vietnam_algo.main run-common-sync --force >> %s/common_sync.log 2>&1\n' \
-        "$(_guard_ict 15:15)" "$PROJECT_DIR" "$_env_sources" "$PROJECT_DIR" "$LOG_DIR"
+    printf '%s * * * * %s cd %s && %s && DNSE_PROXY_HTTP_URL="" PYTHONPATH=%s python3 -u -m vietnam_algo.main run-common-sync --force >> %s/common_sync.log 2>&1\n' \
+        "$(_minute_of 15:15)" "$(_guard_ict 15:15)" "$PROJECT_DIR" "$_env_sources" "$PROJECT_DIR" "$LOG_DIR"
 }
 _mk_darvas_scan() {
-    printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> %s/darvas_signals.log 2>&1\n' \
-        "$(_guard_ict 09:00)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+    printf '%s * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-signals --lookback 1 >> %s/darvas_signals.log 2>&1\n' \
+        "$(_minute_of 09:00)" "$(_guard_ict 09:00)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
 }
 _mk_darvas_report() {
-    printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli send-report >> %s/darvas_report.log 2>&1\n' \
-        "$(_guard_ict 16:00)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+    printf '%s * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli send-report >> %s/darvas_report.log 2>&1\n' \
+        "$(_minute_of 16:00)" "$(_guard_ict 16:00)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
 }
 # Exit-event scanner (TIER / TRAIL / SL_SCALE / SL_HARD notifications).
 # Runs right after the pre-market scan and again after the close so
 # exit events are picked up on the same trading day they fire.
 _mk_darvas_exits() {
-    printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-exits >> %s/darvas_exits.log 2>&1\n' \
-        "$(_guard_ict 09:05)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+    printf '%s * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-exits >> %s/darvas_exits.log 2>&1\n' \
+        "$(_minute_of 09:05)" "$(_guard_ict 09:05)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
 }
 _mk_darvas_exits_eod() {
-    printf '0 * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-exits >> %s/darvas_exits.log 2>&1\n' \
-        "$(_guard_ict 15:25)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+    printf '%s * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli scan-exits >> %s/darvas_exits.log 2>&1\n' \
+        "$(_minute_of 15:25)" "$(_guard_ict 15:25)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
 }
 _mk_pg_backup() {
-    printf '0 * * * * %s%s/scripts/backup_postgres.sh >> /var/log/hft-postgres-backup.log 2>&1\n' \
-        "$(_guard_utc 23:00)" "$PROJECT_DIR"
+    printf '%s * * * * %s%s/scripts/backup_postgres.sh >> /var/log/hft-postgres-backup.log 2>&1\n' \
+        "$(_minute_of 23:00)" "$(_guard_utc 23:00)" "$PROJECT_DIR"
+}
+# Rebuild the web dashboard cache (scan + backtest, ~5 min).
+#
+# Runs at 16:05 ICT — after the 15:15 common_sync job that refreshes the
+# prices, and after the 16:00 Telegram report. Without this job the cache
+# is only rewritten when somebody clicks the dashboard's refresh button,
+# and the dashboard silently serves stale data.
+#
+# The command is idempotent: it exits immediately if the cache is still
+# fresh, so a manual run does not cause a second backtest.
+_mk_darvas_refresh_cache() {
+    printf '%s * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli refresh-cache >> %s/darvas_cache.log 2>&1\n' \
+        "$(_minute_of 16:05)" "$(_guard_ict 16:05)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
+}
+# Alert when the dashboard cache is too old.
+#
+# This is a separate signal from the Vietnam Algo staleness alert, which
+# covers the price data. The price data can be fresh while the darvas
+# cache is days old, and the price alert stays silent in that case.
+# The check itself is cheap; the alert is sent at most once a day.
+_mk_darvas_check_stale() {
+    printf '%s * * * * %s cd %s && set -a && . %s/darvas_box_strategy/data/bot.env && set +a && PYTHONPATH=%s python3 -u -m darvas_box_strategy.bot.cli check-stale >> %s/darvas_stale.log 2>&1\n' \
+        "$(_minute_of 09:20)" "$(_guard_ict 09:20)" "$PROJECT_DIR" "$PROJECT_DIR" "$PROJECT_DIR" "$LOG_DIR"
 }
 _mk_watchdog() {
     printf '*/5 * * * * %s\n' "$_watchdog"
 }
 
 _mk_entries() {
-    printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         "$(_mk_pg_backup)" \
         "$(_mk_darvas_scan)" \
         "$(_mk_darvas_exits)" \
         "$(_mk_darvas_exits_eod)" \
         "$(_mk_darvas_report)" \
+        "$(_mk_darvas_refresh_cache)" \
+        "$(_mk_darvas_check_stale)" \
         "$(_mk_get_otp)" \
         "$(_mk_common_sync)" \
         "$(_mk_watchdog)"
@@ -204,7 +250,7 @@ _mk_entries() {
 # covered by it.
 _filter_managed() {
     printf '%s\n' "$1" \
-        | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum\|scan-signals\|scan-exits\|send-report\|backup_postgres\|CRON_TZ=' \
+        | grep -v 'run-get-otp\|run-common-sync\|bot_watchdog\|launch_autofin\|launch_momentum\|scan-signals\|scan-exits\|send-report\|refresh-cache\|check-stale\|backup_postgres\|CRON_TZ=' \
         | sed '/^[[:space:]]*$/d' \
         || true
 }

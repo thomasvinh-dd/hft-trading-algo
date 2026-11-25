@@ -95,7 +95,12 @@ class ExitEventTests(unittest.TestCase):
         self.assertEqual(events, [])
 
     def test_trail_fires_after_tier_activated(self):
-        """Trail activates on TP1, then fires when price drops 10% from peak."""
+        """Trail activates on TP1, then fires when price drops 10% from peak.
+
+        The bar gaps through the trail: peak 12,000 → trail threshold
+        10,800, but the bar's low is 10,500. We cannot sell above the
+        market, so the fill is 10,500 — the bar's low.
+        """
         pos = _pos(remaining=700, tier_idx=1, trailing_active=True,
                    peak_close=12_000.0, last_close=12_000.0)
         bars = [_bar(date(2026, 1, 3), 12_000, 12_000, 10_500, 10_600)]
@@ -103,7 +108,26 @@ class ExitEventTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].kind, "TRAIL")
         self.assertEqual(events[0].shares, 700)
-        self.assertEqual(events[0].price, 10_600.0)
+        self.assertEqual(events[0].price, 10_500.0)
+
+    def test_trail_fills_at_the_trail_price_not_the_close(self):
+        """A trail that is not gapped fills at the trail price.
+
+        Regression: the trail used to fill at the bar's CLOSE, which gave
+        away more than the stop width on any close below the threshold.
+        Peak 12,000 → trail threshold 10,800. The bar's low is 10,900 and
+        its close is 10,700 — the close is below the threshold but the
+        market never traded that low, so the stop was touched intraday
+        at 10,800 and that is where the fill belongs.
+        """
+        pos = _pos(remaining=700, tier_idx=1, trailing_active=True,
+                   peak_close=12_000.0, last_close=12_000.0)
+        bars = [_bar(date(2026, 1, 3), 12_000, 12_000, 10_900, 10_700)]
+        events = evaluate_exits(pos, bars, _cfg())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "TRAIL")
+        # 12,000 * (1 - 0.10) = 10,800 — not the 10,700 close.
+        self.assertEqual(events[0].price, 10_800.0)
 
     def test_trail_not_active_before_first_tier(self):
         """Trail is inactive until TP1 is hit — no TRAIL event yet."""

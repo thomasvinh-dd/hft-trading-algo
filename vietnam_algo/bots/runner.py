@@ -769,8 +769,14 @@ def _hose_price_tick(price_vnd: int, market_id: str | None = None) -> int:
         return 0
     # 2026-11-02: UPCOM (UPX) uses a flat 100-VND tick at every
     # price level. HNX also uses 100.
+    #
+    # 2026-11-16 (CTP incident): DNSE labels HNX equities ``STX``,
+    # not ``HNX``. The old set therefore never matched HNX symbols,
+    # so CTP below 10,000 VND used the HOSE 10-VND ladder and sent
+    # 6,630. HNX requires a multiple of 100 at every price level, so
+    # the correct sell price is 6,600.
     mid = str(market_id or "").strip().upper()
-    if mid in ("UPX", "HNX"):
+    if mid in ("UPX", "HNX", "STX", "UNKNOWN_100"):
         tick = 100
     elif p < 10_000:
         tick = 10
@@ -1271,24 +1277,41 @@ def _submit_autofin_deals_to_dnse(
             f"the gate will not block any SELL"
         )
 
+    def _market_id_for(sym: str) -> str:
+        """Resolve and cache DNSE's market id for ``sym``.
+
+        This must run before board-dependent price rounding. Previously
+        the SELL-at-market override read ``market_cache`` before this
+        lookup happened, so the first order for every symbol could use
+        the wrong exchange price ladder.
+        """
+        if sym in market_cache:
+            return market_cache[sym]
+        try:
+            market_id = str(client.get_market_id(sym) or "").strip().upper()
+        except Exception as exc:
+            market_lookup_errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:200]}")
+            print(
+                f"[autofin_market_id] {sym}: market lookup failed "
+                f"({type(exc).__name__}: {str(exc)[:200]}); using the "
+                f"conservative 100-VND price ladder"
+            )
+            # UNKNOWN is deliberately handled by the conservative flat
+            # 100-VND ladder. Guessing the HOSE 10-VND grid here caused
+            # the CTP INVALID_PRICE_LOT rejection on 2026-11-16.
+            market_id = "UNKNOWN_100"
+        market_cache[sym] = market_id
+        return market_id
+
     def _order_type_for_symbol(sym: str, default_otype: str) -> str:
         """Return the orderType DNSE will accept for this symbol+session.
         UPCOM always uses ``LO`` (no auction support).
         """
-        if sym in market_cache:
-            market_id = market_cache[sym]
-        else:
-            try:
-                market_id = client.get_market_id(sym)
-                market_cache[sym] = market_id
-            except Exception as exc:
-                market_lookup_errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:200]}")
-                market_cache[sym] = "UNKNOWN"
-                market_id = "UNKNOWN"
+        market_id = _market_id_for(sym)
         if market_id == "UPX":
             # UPCOM only supports LO. Send LO with the signal price.
             return "LO"
-        if market_id == "HNX" and default_otype == "ATO":
+        if market_id in ("HNX", "STX") and default_otype == "ATO":
             # HNX doesn't have an opening auction; downgrade to LO.
             return "LO"
         return default_otype
@@ -1401,6 +1424,9 @@ def _submit_autofin_deals_to_dnse(
             # TP/SL price) when the live quote is unavailable, so
             # network blips don't block the SELL.
             sell_price = signal_price  # default
+            # Resolve the symbol's market before any board-dependent
+            # price rounding. DNSE returns HNX equities as ``STX``.
+            market_id = _market_id_for(sym)
             # Env-var kill switch: setting AUTOFIN_SELL_AT_MARKET=0
             # reverts to the pre-2026-10-13 behavior (use autofin's
             # recomment price, no live-bid override). Default enabled.
@@ -1434,7 +1460,7 @@ def _submit_autofin_deals_to_dnse(
                         # BOARD — UPCOM uses a flat 100-VND tick even
                         # below 10,000 VND, so we pass the market id.
                         sell_price = _hose_price_tick(
-                            raw_sell_price, market_cache.get(sym),
+                            raw_sell_price, market_id,
                         )
                         print(
                             f"[autofin_sell_at_market] {sym} SELL price "
@@ -1684,6 +1710,9 @@ def _submit_autofin_deals_to_dnse(
         # 2026-10-31: SELLS deferred because the shares have not
         # settled yet (T+2.5).
         "settlement_deferred": settlement_deferred,
+        # Surface market-id lookup failures instead of silently falling
+        # back to a possibly invalid exchange price ladder.
+        "market_lookup_errors": market_lookup_errors,
     }
 
 
@@ -1872,6 +1901,28 @@ def _is_t2_rejection(error: str) -> bool:
     return any(code in error for code in _T2_REJECT_CODES)
 
 
+# DNSE price-validation errors. A rejected SELL carrying one of these
+# codes can often be recovered by re-pricing it against the live best
+# bid using the correct exchange price lot.
+_PRICE_REJECT_CODES = (
+    "INVALID_PRICE_LOT",
+    "INVALID_PRICE",
+    "INVALID_PRICE_FOR_SYMBOL",
+)
+
+# Provenance marker for the one-shot marketable-SELL fallback. It is
+# stripped before deriving the retry id so repeated passes converge on
+# the same ledger key instead of creating an endless retry chain.
+_PRICE_RETRY_MARKER_RE = re.compile(r"\s*\[price-retry from [^\]]+\]")
+
+
+def _is_price_rejection(error: str) -> bool:
+    """Return True when DNSE rejected an order because of its price."""
+    if not error:
+        return False
+    return any(code in error for code in _PRICE_REJECT_CODES)
+
+
 def _extract_deal_id_from_reason(reason: str) -> str | None:
     """Pull the ``deal#NNNNNNNNNN:SYM`` token from a reason string.
 
@@ -1885,6 +1936,222 @@ def _extract_deal_id_from_reason(reason: str) -> str | None:
     import re as _re
     m = _re.search(r"deal#(\d+:[A-Z]+)", reason)
     return m.group(1) if m else None
+
+
+def retry_price_rejected_sell_orders(
+    client: Any,
+    account_no: str,
+    trading_token: str,
+    data_dir: Path,
+    today_iso: str,
+    *,
+    loan_package_id: int = 0,
+    loan_package_id_by_symbol: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Retry price-rejected discretionary SELLs at the live market price.
+
+    A synchronous DNSE rejection such as ``INVALID_PRICE_LOT`` is
+    terminal in the normal ledger. For a discretionary exit (TP, reduce
+    or full close), however, the action can safely be retried once as a
+    marketable limit SELL using the current best bid and the symbol's
+    exchange price lot.
+
+    Safety rules:
+      * SELL orders only; BUY orders are never retried here.
+      * Protective STOP legs are never converted into a market sell.
+      * A rejected order must have no DNSE order id, so it never reached
+        the exchange and cannot duplicate an existing order.
+      * One retry per symbol/reason per day; the retry marker makes the
+        operation idempotent across bot cycles and restarts.
+      * The retry quantity is capped by the live DNSE position.
+    """
+    from vietnam_algo.libs.order_ledger import (
+        load_ledger as _load_led,
+        save_ledger as _save_led,
+    )
+
+    summary: dict[str, Any] = {
+        "retried": [],
+        "skipped": [],
+        "failed": [],
+        "total": 0,
+    }
+    try:
+        ledger = _load_led(data_dir)
+    except Exception as exc:
+        summary["failed"].append({"error": f"load_ledger failed: {exc}"})
+        return summary
+
+    # A synchronous rejection has no DNSE order id. A row with an id
+    # may still be live at the broker, so retrying it could over-sell.
+    candidates: list[Any] = []
+    for item in ledger.values():
+        if item.side != "NS" or item.status != "rejected":
+            continue
+        if item.dnseOrderId:
+            continue
+        if not _is_price_rejection(item.error or ""):
+            continue
+        if str(item.orderCategory or "NORMAL").upper() == "STOP":
+            continue
+        if _is_protective_reason(item.reason):
+            continue
+        if _PRICE_RETRY_MARKER_RE.search(item.reason or ""):
+            continue
+        if item.strategy not in ("", "autofin_signal"):
+            continue
+        candidates.append(item)
+
+    if not candidates:
+        return summary
+
+    # Multiple strategy legs can describe the same action (for example
+    # ``autofin_partial:`` and ``autofin_partial_event:`` for the same
+    # CTP deal). Only retry one candidate per symbol and cap the total
+    # quantity by the live holding.
+    market_cache: dict[str, str] = {}
+    cash_pkg_cache: dict[str, int] = dict(loan_package_id_by_symbol or {})
+    seen_symbols: set[str] = set()
+    today_marker = f"[price-retry from {today_iso}]"
+
+    for item in candidates:
+        sym = str(item.symbol or "").upper().strip()
+        if not sym or sym in seen_symbols:
+            continue
+        seen_symbols.add(sym)
+
+        quote = None
+        try:
+            quote = client.get_latest_quote(sym)
+        except Exception as exc:
+            summary["failed"].append({
+                "symbol": sym,
+                "error": f"get_latest_quote failed: {type(exc).__name__}: {str(exc)[:160]}",
+            })
+            continue
+        bid = _extract_best_bid_in_vnd(quote)
+        if not bid or bid <= 0:
+            summary["skipped"].append({"symbol": sym, "reason": "no live best bid"})
+            continue
+
+        if sym in market_cache:
+            market_id = market_cache[sym]
+        else:
+            try:
+                market_id = str(client.get_market_id(sym) or "").strip().upper()
+            except Exception as exc:
+                market_id = "UNKNOWN_100"
+                summary["failed"].append({
+                    "symbol": sym,
+                    "error": f"get_market_id failed: {type(exc).__name__}: {str(exc)[:160]}",
+                })
+            market_cache[sym] = market_id
+
+        discount = float(os.environ.get("AUTOFIN_SELL_BID_DISCOUNT_PCT", "0.99"))
+        raw_price = int(round(bid * discount))
+        price = _hose_price_tick(raw_price, market_id)
+        if price <= 0:
+            summary["skipped"].append({"symbol": sym, "reason": "invalid rounded market price"})
+            continue
+
+        # Do not retry more shares than the account currently holds.
+        quantity = int(item.quantity or 0)
+        held: int | None = None
+        try:
+            positions = client.get_positions(account_no)
+            rows = positions.get("positions") if isinstance(positions, dict) else None
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("symbol") or "").upper().strip() != sym:
+                    continue
+                held = int(row.get("openQuantity") or 0)
+                break
+        except Exception as exc:
+            summary["failed"].append({
+                "symbol": sym,
+                "error": f"get_positions failed: {type(exc).__name__}: {str(exc)[:160]}",
+            })
+            continue
+        if held is None or held <= 0:
+            summary["skipped"].append({"symbol": sym, "reason": "no live position"})
+            continue
+        quantity = min(quantity, held)
+        if quantity <= 0:
+            summary["skipped"].append({"symbol": sym, "reason": "live position is zero"})
+            continue
+
+        if sym in cash_pkg_cache:
+            loan_package = cash_pkg_cache[sym]
+        else:
+            try:
+                loan_package = int(client.get_cash_loan_package_id(account_no, sym))
+            except Exception:
+                loan_package = int(loan_package_id or 0)
+            cash_pkg_cache[sym] = loan_package
+
+        base_reason = _PRICE_RETRY_MARKER_RE.sub("", item.reason or "").strip()
+        import hashlib
+        source_id = int(hashlib.sha1(
+            f"price-retry|{today_iso}|{sym}|{quantity}|{base_reason}".encode("utf-8")
+        ).hexdigest()[:12], 16)
+
+        from vietnam_algo.libs.trading_engine import DnseOrder
+        retry_order = DnseOrder(
+            symbol=sym,
+            side="NS",
+            quantity=quantity,
+            price=price,
+            loanPackageId=loan_package,
+            orderType="LO",
+            sourceOrderId=source_id,
+            sourceDate=today_iso,
+            reason=f"{base_reason} {today_marker}",
+        )
+
+        try:
+            from vietnam_algo.libs.daily_engine import execute_orders_with_ledger
+            results, _, _ = execute_orders_with_ledger(
+                client=client,
+                account_no=account_no,
+                trading_token=trading_token,
+                orders=[retry_order],
+                data_dir=data_dir,
+                run_id=today_iso,
+                strategy="autofin_signal",
+            )
+        except Exception as exc:
+            summary["failed"].append({
+                "symbol": sym,
+                "error": f"retry submit failed: {type(exc).__name__}: {str(exc)[:200]}",
+            })
+            continue
+
+        result = results[0] if results else {}
+        status = str(result.get("status") or "")
+        if status == "submitted":
+            summary["retried"].append({
+                "symbol": sym,
+                "quantity": quantity,
+                "price": price,
+                "market_id": market_id,
+                "bid": bid,
+            })
+            print(
+                f"[price-retry] {sym}: SELL retried at market price "
+                f"{price:,.0f} VND ({market_id}, bid {bid:,.0f}), "
+                f"qty={quantity}"
+            )
+        else:
+            error = str(result.get("error") or status)
+            summary["failed"].append({"symbol": sym, "error": error[:240]})
+            print(
+                f"[price-retry] {sym}: retry was not submitted "
+                f"(status={status}, err={error[:180]})"
+            )
+
+    summary["total"] = len(summary["retried"]) + len(summary["failed"])
+    return summary
 
 
 def _buy_settled_by_t2(
@@ -3202,6 +3469,19 @@ def _maybe_reprice_stale_order(
         # default or skip the re-price.
         cash_pkg_id = 0
 
+    # Round the replacement price to the symbol's exchange price lot.
+    # A raw best bid/ask is not necessarily a valid HOSE/HNX/UPCOM
+    # price and DNSE rejects it with INVALID_PRICE_LOT.
+    try:
+        market_id = str(client.get_market_id(item.symbol) or "").strip().upper()
+    except Exception as exc:
+        summary["reason"] = f"get_market_id failed: {type(exc).__name__}: {str(exc)[:120]}"
+        return summary
+    replacement_price = _hose_price_tick(market_price, market_id)
+    if replacement_price <= 0:
+        summary["reason"] = "invalid replacement price after tick rounding"
+        return summary
+
     try:
         new_resp = client.place_stock_order(
             account_no=account_no,
@@ -3209,7 +3489,7 @@ def _maybe_reprice_stale_order(
             symbol=item.symbol,
             side=item.side,
             quantity=item.quantity,
-            price=market_price,
+            price=replacement_price,
             loan_package_id=cash_pkg_id,
             order_type="LO",
         )
@@ -3225,7 +3505,7 @@ def _maybe_reprice_stale_order(
         new_order_status = normalize_ledger_status(str(new_order_status_raw))
 
     summary["action"] = "replaced"
-    summary["new_price"] = market_price
+    summary["new_price"] = replacement_price
     summary["new_dnse_order_id"] = new_order_id
     summary["new_status"] = new_order_status
     return summary
@@ -4553,6 +4833,34 @@ def run_auto_bot(
                                 f"{submit_result.get('settlement_deferred') and len(submit_result['settlement_deferred']) or 0} settlement-deferred "
                                 f"(of {submit_result['total']} planned)"
                             )
+                            # 2026-11-16: if DNSE rejected a discretionary
+                            # SELL because of its price (for example
+                            # INVALID_PRICE_LOT), retry it once as a
+                            # marketable limit SELL using the live best
+                            # bid and the correct exchange price lot.
+                            # Protective STOP legs are excluded by the
+                            # retry helper itself.
+                            if submit_result.get("rejected", 0) and token:
+                                try:
+                                    price_retry = retry_price_rejected_sell_orders(
+                                        client,
+                                        account_no,
+                                        token,
+                                        engine_config.dataDir,
+                                        today,
+                                        loan_package_id=loan_package_id,
+                                    )
+                                    if price_retry.get("retried"):
+                                        print(
+                                            f"[{now.isoformat()}] price-retry: "
+                                            f"{len(price_retry['retried'])} SELL order(s) "
+                                            f"retried at the live market price"
+                                        )
+                                except Exception as exc:
+                                    print(
+                                        f"[{now.isoformat()}] price-retry failed: "
+                                        f"{type(exc).__name__}: {str(exc)[:200]}"
+                                    )
                             # 2026-10-30 (VOS incident): the strategy
                             # marks a partial close as "fired" when it
                             # PLANS it, before we know whether it
@@ -5079,6 +5387,29 @@ def run_auto_bot(
                         f"{submit_result.get('skipped_auction', 0)} skipped-auction "
                         f"(of {submit_result['total']} planned)"
                     )
+                    # 2026-11-16: recover price-rejected discretionary
+                    # SELLs with one marketable-price retry.
+                    if submit_result.get("rejected", 0) and token:
+                        try:
+                            price_retry = retry_price_rejected_sell_orders(
+                                client,
+                                account_no,
+                                token,
+                                engine_config.dataDir,
+                                today,
+                                loan_package_id=loan_package_id,
+                            )
+                            if price_retry.get("retried"):
+                                print(
+                                    f"[{now.isoformat()}] eod price-retry: "
+                                    f"{len(price_retry['retried'])} SELL order(s) "
+                                    f"retried at the live market price"
+                                )
+                        except Exception as exc:
+                            print(
+                                f"[{now.isoformat()}] eod price-retry failed: "
+                                f"{type(exc).__name__}: {str(exc)[:200]}"
+                            )
                     # 2026-10-30 (VOS incident): re-arm the partial
                     # closes that were planned but NOT submitted, so
                     # they are planned again on the next cycle instead

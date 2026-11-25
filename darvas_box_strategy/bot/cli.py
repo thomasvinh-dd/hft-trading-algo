@@ -28,6 +28,12 @@ from darvas_box_strategy.darvas.data_loader import derive_meta, passes_universe
 from darvas_box_strategy.darvas.db_prices import load_bars
 
 from .telegram import TelegramConfig, load_telegram_config, send, send_telegram
+
+
+def _now_iso() -> str:
+    """Current UTC time as an ISO-8601 string with second precision."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 from .report import (
     chunk_message,
     format_backtest_report,
@@ -57,6 +63,7 @@ from .messages import (
 
 PRICES_DIR = ROOT / "vietnam_algo" / "data" / "prices"
 DEFAULT_BLUE_CHIPS = ROOT / "darvas_box_strategy" / "data" / "hose_blue_chips.json"
+DEFAULT_MARKET_INDEX = ROOT / "darvas_box_strategy" / "data" / "market_index.json"
 
 
 def load_blue_chips(path: Path = DEFAULT_BLUE_CHIPS) -> List[str]:
@@ -69,13 +76,21 @@ def load_blue_chips(path: Path = DEFAULT_BLUE_CHIPS) -> List[str]:
 def build_default_config() -> StrategyConfig:
     """Return the OOS-validated default config.
 
-    OOS validation on 70 HOSE blue chips (TRAIN 2019-2022, TEST 2023-2026):
+    OOS validation on 70 HOSE blue chips (TRAIN 2019-2022, TEST 2023-2026),
+    on the corrected NAV accounting (the portfolio used to double-count
+    partially-sold shares, which inflated every drawdown by up to 5.2pp
+    and made the exposure cap reject trades it should not have):
+
     - vol_target=0% (off) — fixed 2x sizing beats vol-targeting
     - trail=10% — let winners compound after partial cut
-    - size 0.20/0.40 — 2x conviction sizing
+    - size 0.10/0.20 + max_total_exposure_pct=0.55 — caps the drawdown
+      on BOTH halves of the split
+    - market_volatility_avoid_band_pct=(0.7, 1.3) — skip trades in the
+      "half-dead" market, keep them everywhere else. Raises the return
+      AND cuts the drawdown (see "The market volatility filter")
     - sl_T=10%, sl_F=18% — entry-anchored stops (was base-anchored, buggy)
     - board_lot=100 — HOSE 100-share lots; small signals dropped
-    - t_plus_n_bars=0 (off) — opt-in: T+2.5 settlement costs ~25% return
+    - t_plus_n_bars=3 — T+2.5 settlement, as required for VN
     - daily_price_limit_pct=0 (off) — opt-in: ±7% price cap costs ~16% return
     """
     return StrategyConfig(
@@ -84,7 +99,19 @@ def build_default_config() -> StrategyConfig:
             volume_mult=2.0, high_conviction_mult=3.0,
             require_ma200=True, min_history_days=200,
             require_close_above_ma=20,
-        ),
+            # Market-volatility entry filter. The index is rebuilt by
+            # `python3 -m darvas_box_strategy.tools.build_market_index`
+            # and must be refreshed regularly — the filter reads the
+            # market's recent volatility, so a stale index means it is
+            # judging today's market on old data.
+            volatility_index_path=str(DEFAULT_MARKET_INDEX),
+            # Skip the "half-dead" market, keep the calm and the wild
+            # ones. A one-sided minimum threshold (this used to be
+            # min_market_volatility_pct=1.2) went silent for 48
+            # consecutive bars and blocked every signal while throwing
+            # away the 78%-win-rate trades taken below 0.8.
+            market_volatility_avoid_band_pct=(0.7, 1.3),
+            market_volatility_window=20,        ),
         exits=ExitsConfig(
             sl_T_pct=0.10,        # 10% partial stop from entry
             sl_F_pct=0.18,        # 18% hard stop from entry
@@ -98,7 +125,28 @@ def build_default_config() -> StrategyConfig:
             max_concurrent_positions=10,
             cooldown_bars_after_stop=5,
             cost_bps=25.0,
-            size_low=0.15, size_high=0.30,
+            # Sizing + total-exposure cap (2026-11-11, re-validated on the
+            # corrected NAV accounting 2026-11-13, and again with the
+            # volatility band filter on 2026-11-23).
+            #
+            # Capping the NUMBER of open positions does not cap the risk:
+            # smaller positions mean more of them fit, so exposure rises
+            # exactly when losers cluster. The 15/30 sizing was
+            # self-limiting; reducing it without a cap made the drawdown
+            # WORSE, not better.
+            #
+            # The cap was re-tuned with the volatility band filter on,
+            # because that filter takes a different set of trades, so it
+            # needs a different cap to hold the drawdown:
+            #   band 0.7-1.3 + exp0.75  -> FULL +164.4% / -13.81%
+            #   band 0.7-1.3 + exp0.55  -> FULL +112.6% / -10.83%
+            #   band 0.7-1.3 + exp0.50  -> FULL +117.7% /  -9.52%
+            #
+            # exp0.50 has a BETTER drawdown in 8 of 8 walk-forward windows
+            # (full period -15.01% -> -9.52%) and a higher return in 5
+            # of 8.
+            size_low=0.10, size_high=0.20,
+            max_total_exposure_pct=0.50,
             vol_target_pct=0.0,  # OFF: fixed sizing beats vol-targeting
             vol_target_floor=0.05, vol_target_ceiling=0.30,
             board_lot=100,  # HOSE board lot: shares rounded down to 100s
@@ -214,6 +262,50 @@ def cmd_send_test(args) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _report_no_signals(cfg, filtered, n_no_base, n_filtered,
+                       market_bars, volatility_bars) -> None:
+    """Explain WHY a scan produced no signals.
+
+    A silent scan is ambiguous: it can mean the market has no breakouts
+    (fine) or that an entry filter is blocking everything (a problem).
+    On 2026-11-23 the volatility filter had been blocking every signal
+    for 48 consecutive sessions and the only symptom was a daily
+    "No breakout signals" message.
+
+    This prints the breakdown so the cause is visible in the log.
+    """
+    from darvas_box_strategy.darvas.signal_generator import _market_volatility_pct
+
+    print("No signals. Breakdown:")
+    print(f"  tickers scanned           : {len(filtered)}")
+    print(f"  no base found              : {n_no_base}")
+    print(f"  base found but filtered out: {n_filtered}")
+
+    band = tuple(getattr(cfg.breakout, "market_volatility_avoid_band_pct", ()) or ())
+    min_pct = getattr(cfg.breakout, "min_market_volatility_pct", 0.0) or 0.0
+    max_pct = getattr(cfg.breakout, "max_market_volatility_pct", 0.0) or 0.0
+    window = getattr(cfg.breakout, "market_volatility_window", 20) or 20
+
+    if volatility_bars:
+        last = volatility_bars[-1]
+        vol = _market_volatility_pct(volatility_bars, last.date, window)
+        print(f"  market volatility          : "
+              f"{vol:.3f}% (as of {last.date})" if vol is not None
+              else "  market volatility          : unknown")
+        if vol is not None:
+            if band and band[0] <= vol <= band[1]:
+                print(f"  -> BLOCKED by the volatility band {band}: "
+                      f"the market is in the 'half-dead' zone")
+            if min_pct > 0 and vol < min_pct:
+                print(f"  -> BLOCKED by min_market_volatility_pct={min_pct}: "
+                      f"the market is too quiet")
+            if max_pct > 0 and vol > max_pct:
+                print(f"  -> BLOCKED by max_market_volatility_pct={max_pct}: "
+                      f"the market is too wild")
+    if cfg.breakout.regime_index_path:
+        print("  note: the regime filter is also enabled")
+
+
 def cmd_scan_signals(args) -> int:
     """Scan the most recent bar for breakout signals and send alerts."""
     config = load_telegram_config(
@@ -233,9 +325,30 @@ def cmd_scan_signals(args) -> int:
     from darvas_box_strategy.darvas.base_detector import BaseScanner
     from darvas_box_strategy.darvas.signal_generator import generate_signal
 
+    # Load the market index so the entry filters see the same market
+    # context the backtest does. Without this the scan would alert
+    # signals that the volatility filter would reject.
+    market_bars = None
+    volatility_bars = None
+    if cfg.breakout.regime_index_path:
+        from darvas_box_strategy.darvas.data_loader import load_price_bars
+        p = Path(cfg.breakout.regime_index_path)
+        if p.exists():
+            market_bars = load_price_bars(p)
+    if cfg.breakout.volatility_index_path:
+        from darvas_box_strategy.darvas.data_loader import load_price_bars
+        p = Path(cfg.breakout.volatility_index_path)
+        if p.exists():
+            volatility_bars = load_price_bars(p)
+
     # Scan the last few bars for breakout signals
     as_of_offset = args.lookback  # 0 = today, 1 = yesterday, etc.
     signals = []
+    # Count WHY there were no signals, so a silent scan is explainable
+    # instead of just reporting "No breakout signals". A filter that
+    # blocks everything looks identical to a market with no breakouts.
+    n_no_base = 0
+    n_filtered = 0
     for ticker in filtered:
         bars = load_bars(ticker)
         if len(bars) < cfg.breakout.min_history_days:
@@ -246,14 +359,22 @@ def cmd_scan_signals(args) -> int:
         scanner = BaseScanner(bars, cfg.base, ticker=ticker)
         base = scanner.find_base(as_of_idx=idx)
         if base is None or base.end_idx >= idx:
+            n_no_base += 1
             continue
         signal = generate_signal(
             bars, base, nav=cfg.backtest.start_nav, cfg=cfg,
             as_of_idx=idx,
+            market_bars=market_bars,
+            volatility_bars=volatility_bars,
         )
         if signal is None:
+            n_filtered += 1
             continue
         signals.append(signal)
+
+    if not signals:
+        _report_no_signals(cfg, filtered, n_no_base, n_filtered,
+                           market_bars, volatility_bars)
 
     # Load live position state so we can (a) avoid re-alerting on the
     # same breakout and (b) start tracking new positions for exit events.
@@ -274,6 +395,27 @@ def cmd_scan_signals(args) -> int:
 
     if not fresh_signals:
         lines = ["📭 *Darvas Box: No breakout signals* on last bar"]
+        # Say WHY, so a filter that is blocking everything does not look
+        # like a market with no breakouts.
+        from darvas_box_strategy.darvas.signal_generator import _market_volatility_pct
+        band = tuple(getattr(cfg.breakout, "market_volatility_avoid_band_pct", ()) or ())
+        min_pct = getattr(cfg.breakout, "min_market_volatility_pct", 0.0) or 0.0
+        window = getattr(cfg.breakout, "market_volatility_window", 20) or 20
+        if volatility_bars:
+            last = volatility_bars[-1]
+            vol = _market_volatility_pct(volatility_bars, last.date, window)
+            if vol is not None:
+                if band and band[0] <= vol <= band[1]:
+                    lines.append(
+                        f"_Market volatility {vol:.2f}% is inside the "
+                        f"blocked band {band[0]}-{band[1]}% — the market is "
+                        f"in the half-dead zone, so entries are skipped_"
+                    )
+                elif min_pct > 0 and vol < min_pct:
+                    lines.append(
+                        f"_Market volatility {vol:.2f}% is below the "
+                        f"minimum {min_pct}% — entries are skipped_"
+                    )
     else:
         lines = [f"🚨 *Darvas Box: {len(fresh_signals)} breakout signal(s)*"]
         lines.append(f"_Universe_: HOSE blue chips ({len(filtered)} tickers)")
@@ -466,6 +608,158 @@ def cmd_positions(args) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_refresh_cache(args) -> int:
+    """Rebuild the web dashboard cache (scan + backtest) and persist it.
+
+    This is the scheduled counterpart of the dashboard's "Refresh data"
+    button. The cache is what the web UI reads; without this job it only
+    changes when somebody clicks the button, and the dashboard silently
+    serves stale data.
+
+    The backtest is the expensive part (~5 minutes), so the command is
+    idempotent: if the cache is still fresh enough it exits without doing
+    the work, unless --force is given.
+    """
+    from darvas_box_strategy.web.data import (
+        CACHE_MAX_AGE_SECONDS,
+        CACHE_PATH,
+        cache_age_hours,
+        load_cache,
+        refresh_cache,
+    )
+
+    if not args.force:
+        cache = load_cache()
+        age = cache_age_hours(cache.last_updated)
+        if age is not None and age < CACHE_MAX_AGE_SECONDS / 3600:
+            print(
+                f"cache is fresh ({age:.1f}h old, limit "
+                f"{CACHE_MAX_AGE_SECONDS / 3600:.0f}h) — nothing to do"
+            )
+            return 0
+        if age is not None:
+            print(f"cache is stale ({age:.1f}h old) — refreshing")
+
+    t0 = time.time()
+
+    # Rebuild the market index FIRST. The market-volatility entry filter
+    # reads the index's recent volatility, so a stale index means the
+    # filter is judging today's market on old data. The index is cheap
+    # to rebuild (a few seconds) and the backtest below depends on it.
+    try:
+        from darvas_box_strategy.tools.build_market_index import main as build_index
+        print("rebuilding the market index...")
+        build_index(["--quiet"])
+        print("  market index rebuilt")
+    except Exception as exc:
+        # A failed index rebuild must not stop the refresh: the previous
+        # index is still usable, it is just staler than ideal.
+        print(f"WARN: market index rebuild failed: {exc}", file=sys.stderr)
+
+    try:
+        new_cache = refresh_cache()
+    except Exception as exc:
+        print(f"ERROR: refresh failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"cache refreshed in {time.time() - t0:.1f}s -> {CACHE_PATH} "
+        f"(last_updated={new_cache.last_updated}, "
+        f"signals={len(new_cache.signals)}, "
+        f"positions={len(new_cache.open_positions)})"
+    )
+    return 0
+
+
+def cmd_check_stale(args) -> int:
+    """Alert when the web dashboard cache is too old.
+
+    The existing Vietnam Algo staleness alert covers the *price* data, and
+    that data can be perfectly fresh while the darvas web cache is days
+    old — the cache is only rewritten by the dashboard's refresh button or
+    by the scheduled refresh-cache job. A stale cache means the dashboard
+    silently shows old signals and an old equity curve, so it needs its own
+    alert.
+
+    Exits non-zero when the cache is stale, so a monitoring wrapper can act
+    on it.
+    """
+    from darvas_box_strategy.web.data import (
+        CACHE_MAX_AGE_SECONDS,
+        CACHE_PATH,
+        cache_age_hours,
+        is_cache_stale,
+        load_cache,
+    )
+
+    cache = load_cache()
+    age = cache_age_hours(cache.last_updated)
+    stale = is_cache_stale(cache.last_updated)
+    limit_h = CACHE_MAX_AGE_SECONDS / 3600
+
+    if not stale:
+        print(
+            f"cache OK: {cache.last_updated} "
+            f"({age:.1f}h old, limit {limit_h:.0f}h)"
+        )
+        return 0
+
+    # Once-per-day gating: the alert would otherwise repeat on every cron
+    # run while the cache stays stale.
+    today = date.today().isoformat()
+    alert_state_path = ROOT / "darvas_box_strategy" / "data" / "cache_alert_state.json"
+    alert_state = {}
+    if alert_state_path.exists():
+        try:
+            alert_state = json.loads(alert_state_path.read_text())
+        except Exception:
+            alert_state = {}
+
+    if alert_state.get("staleAlertSentDate") == today and not args.force:
+        print(
+            f"cache is stale but the alert was already sent today "
+            f"({today}) — not sending again"
+        )
+        return 1
+
+    if age is not None:
+        message = (
+            "⚠️ Darvas Box: dashboard cache STALE\n"
+            f"cache: {cache.last_updated}\n"
+            f"age: {age:.1f}h (threshold {limit_h:.0f}h)"
+        )
+    else:
+        message = (
+            "⚠️ Darvas Box: dashboard cache MISSING or unparseable\n"
+            f"cache file: {CACHE_PATH}"
+        )
+    print(message)
+
+    if args.dry_run:
+        print("DRY RUN — would send:")
+        print(message)
+        return 1
+
+    config = load_telegram_config(
+        env_path=ROOT / "vietnam_algo" / "env" / ".env.telegram"
+    )
+    if config is None:
+        print("ERROR: No Telegram config — cannot send the stale alert",
+              file=sys.stderr)
+        return 1
+
+    result = send_telegram(config, message)
+    print(json.dumps(result, indent=2))
+
+    if result.get("ok"):
+        alert_state["staleAlertSentDate"] = today
+        alert_state["lastAlertSentAt"] = _now_iso()
+        alert_state_path.parent.mkdir(parents=True, exist_ok=True)
+        alert_state_path.write_text(json.dumps(alert_state, indent=2))
+
+    return 1
+
+
 def cmd_show_config(args) -> int:
     """Print the default config in human-readable form."""
     cfg = build_default_config()
@@ -515,6 +809,29 @@ def main(argv=None) -> int:
 
     p_show = sub.add_parser("show-config", help="Print default config")
     p_show.set_defaults(func=cmd_show_config)
+
+    p_refresh = sub.add_parser(
+        "refresh-cache",
+        help="Rebuild the web dashboard cache (scan + backtest) and persist it",
+    )
+    p_refresh.add_argument(
+        "--force",
+        action="store_true",
+        help="Refresh even if the cache is still fresh",
+    )
+    p_refresh.set_defaults(func=cmd_refresh_cache)
+
+    p_stale = sub.add_parser(
+        "check-stale",
+        help="Alert (via Telegram) when the web dashboard cache is too old",
+    )
+    p_stale.add_argument("--dry-run", action="store_true")
+    p_stale.add_argument(
+        "--force",
+        action="store_true",
+        help="Send the alert even if it was already sent today",
+    )
+    p_stale.set_defaults(func=cmd_check_stale)
 
     p_serve = sub.add_parser("serve-web", help="Start the web dashboard (Flask)")
     p_serve.add_argument("--host", default="0.0.0.0")
