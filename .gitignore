@@ -9,7 +9,9 @@ venv/
 env/
 
 # Secrets / env files
-vietnam_algo/env/
+vietnam_algo/env/*
+# ...but the credentials TEMPLATE is tracked (the real file is not).
+!vietnam_algo/env/.env.autofin-signal.example
 .env
 .env.*
 
