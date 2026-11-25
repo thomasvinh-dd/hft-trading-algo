@@ -99,10 +99,19 @@ def _round_up_to_lots(quantity: int, board_lot: int = DEFAULT_BOARD_LOT) -> int:
     position", ``10% × 600 = 60`` shares but Vietnamese boards trade
     in lots of 100. Rounding down would skip the order entirely;
     rounding up emits the smallest lot that exceeds the desired qty.
+
+    2026-10-30 (VOS incident): the old formula
+    ``((quantity + board_lot - 1) // board_lot) * board_lot`` rounded
+    EXACT multiples up by a whole extra lot — 150 became 200 and 100
+    became 200. The fix rounds up only when the quantity is NOT
+    already a multiple of the lot.
     """
     if quantity <= 0:
         return 0
-    return ((quantity + board_lot - 1) // board_lot) * board_lot
+    remainder = quantity % board_lot
+    if remainder == 0:
+        return quantity
+    return quantity + (board_lot - remainder)
 
 
 def _extract_partial_fraction(
@@ -684,7 +693,8 @@ def _expand_signals_with_held_unentered(
     holding: list[dict[str, Any]],
     our_deals: dict[str, dict[str, Any]],
     current_prices: dict[str, float],
-    above_zone_tolerance_pct: float = 0.03,
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+    above_zone_tolerance_pct: float = 0.01,
 ) -> list[AutofinSignal]:
     """Augment ``signals`` with held-but-not-entered deals that are
     currently in the buy zone.
@@ -766,8 +776,9 @@ def _plan_orders_for_new_positions(
     min_order_value_vnd: float = 1_000_000,
     user_sl_pct: float = 0.0,
     current_prices: dict[str, float] | None = None,
-    above_zone_tolerance_pct: float = 0.03,
-    below_zone_tolerance_pct: float = 0.03,
+    # 2026-10-31: the buy-zone tolerance is +-1 % (was +-3 %).
+    above_zone_tolerance_pct: float = 0.01,
+    below_zone_tolerance_pct: float = 0.01,
     already_planned_symbols: set[str] | None = None,
     available_cash_vnd: float | None = None,
     new_entry_min_cash_pct: float = 0.05,
@@ -1666,7 +1677,10 @@ def _plan_partial_close_orders(
             "kind": order_kind,
             "reason": (
                 f"autofin_partial:deal#{did}:{action.action}:"
-                f"lap{action.lap}:pct{int(round(action.percent * 100))}:{rec[:60]}"
+                # 2026-10-30: ``action.percent`` is a PERCENTAGE (50.0),
+                # not a fraction — the old code multiplied by 100 again
+                # and wrote "pct5000" for a 50 % trim.
+                f"lap{action.lap}:pct{int(round(action.percent))}:{rec[:60]}"
             ),
         })
         sig["_last_numberOfProfit"] = cur_nP
@@ -1805,7 +1819,10 @@ def _event_to_partial_orders(
         "kind": order_kind,
         "reason": (
             f"autofin_partial_event:{our_match_id}:{action.action}:"
-            f"lap{action.lap}:pct{int(round(action.percent * 100))}:"
+            # 2026-10-30: ``action.percent`` is a PERCENTAGE (50.0),
+            # not a fraction — the old code multiplied by 100 again
+            # and wrote "pct5000" for a 50 % trim.
+            f"lap{action.lap}:pct{int(round(action.percent))}:"
             f"{(event_title or '')[:60]}"
         ),
     }]

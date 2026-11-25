@@ -41,6 +41,67 @@ def _safe_call(client, method_name: str, *args, **kwargs):
         return None
 
 
+def _session_close_vnd(client: Any, symbol: str) -> float | None:
+    """Return the current session close in absolute VND, preferring G1.
+
+    DNSE's positions endpoint can contain a stale ``marketPrice`` when the
+    position was not touched during the latest session (2026-11-10: AAS
+    reported 9,900 from the prior close instead of 10,700). The close
+    endpoint is authoritative for the current session and returns kVND.
+    """
+    res = _safe_call(client, "get_close_price", symbol)
+    if not isinstance(res, dict):
+        return None
+
+    rows = res.get("prices") or []
+    fallback: float | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        close = _float(row.get("closePrice"))
+        if close <= 0:
+            continue
+        if fallback is None:
+            fallback = close
+        if str(row.get("boardId") or "").upper() == "G1":
+            return close * 1000.0
+    return fallback * 1000.0 if fallback else None
+
+
+def _quote_mid_vnd(client: Any, symbol: str) -> float | None:
+    """Return the live bid/offer midpoint in absolute VND, preferring G1.
+
+    DNSE does not guarantee board ordering; G4 may precede G1 and can have
+    a different (or empty) order book. Quote levels are returned in kVND.
+    """
+    res = _safe_call(client, "get_latest_quote", symbol)
+    if not isinstance(res, dict):
+        return None
+
+    boards = [b for b in (res.get("quotes") or []) if isinstance(b, dict)]
+    target = next(
+        (b for b in boards if str(b.get("boardId") or "").upper() == "G1"),
+        None,
+    )
+    if target is None:
+        target = next(
+            (b for b in boards if b.get("bid") and b.get("offer")),
+            None,
+        )
+    if target is None:
+        return None
+
+    bid_levels = target.get("bid") or []
+    offer_levels = target.get("offer") or []
+    if not bid_levels or not offer_levels:
+        return None
+    bid = _float(bid_levels[0].get("price"))
+    offer = _float(offer_levels[0].get("price"))
+    if bid <= 0 or offer <= 0:
+        return None
+    return (bid + offer) / 2.0 * 1000.0
+
+
 def build_portfolio_snapshot(
     client: Any,
     account_no: str,
@@ -184,8 +245,9 @@ def build_portfolio_snapshot(
         #   - /accounts/{acc}/positions returns ``marketPrice`` /
         #     ``costPrice`` / ``breakEvenPrice`` in absolute VND
         #     (e.g. ``31050`` = 31,050 VND).
-        #   - /price/{sym}/quotes/latest returns bid/offer in
-        #     THOUSANDS OF VND (kVND), so ``31.1`` = 31,100 VND.
+        #   - /price/{sym}/quotes/latest and /price/{sym}/close
+        #     return prices in THOUSANDS OF VND (kVND), so
+        #     ``31.1`` = 31,100 VND.
         #
         # The previous portfolio code used ``get_latest_quote``
         # directly without the ``× 1000`` conversion, so the
@@ -195,40 +257,22 @@ def build_portfolio_snapshot(
         # position in the EOD report (2026-10-13 21:25 ICT
         # incident).
         #
-        # Fix: prefer the positions endpoint's own ``marketPrice``
-        # field — it's already in absolute VND and reflects the
-        # last trade / close, which is the right thing for an
-        # EOD report. Fall back to the latest quote (with the
-        # ``× 1000`` conversion) only when the positions endpoint
-        # doesn't return a market price (e.g. delisted stock or
-        # a stale cache). This also drops N+1 API calls per
-        # EOD cycle — we no longer need to hit ``/quotes/latest``
-        # for every held symbol.
-        market_price: float | None = None
-        positions_mkt = _float(_first_field(row, ("marketPrice", "market_price", "lastPrice")))
-        if positions_mkt and positions_mkt > 0:
-            market_price = positions_mkt
-        else:
-            # Fallback: fetch the live quote and convert kVND→VND.
-            for m in ("get_latest_quote", "get_close_price"):
-                res = _safe_call(client, m, symbol)
-                if isinstance(res, dict):
-                    boards = res.get("quotes") or []
-                    if boards and isinstance(boards[0], dict):
-                        bid_levels = boards[0].get("bid") or []
-                        offer_levels = boards[0].get("offer") or []
-                        if bid_levels and offer_levels:
-                            bid = _float(bid_levels[0].get("price"))
-                            offer = _float(offer_levels[0].get("price"))
-                            if bid > 0 and offer > 0:
-                                # kVND × 1000 = absolute VND
-                                market_price = (bid + offer) / 2.0 * 1000.0
-                                break
+        # 2026-11-10 fix: do not blindly trust the positions endpoint's
+        # ``marketPrice``. DNSE only refreshes that field when a position
+        # is touched, so an untouched position can retain the previous
+        # session's close (AAS reported 9,900 instead of the real 10,700).
+        # Prefer the authoritative current-session close, then use the
+        # positions field, then a G1-preferred live quote as fallbacks.
+        market_price: float | None = _session_close_vnd(client, symbol)
+        if not market_price or market_price <= 0:
+            positions_mkt = _float(_first_field(row, ("marketPrice", "market_price", "lastPrice")))
+            if positions_mkt and positions_mkt > 0:
+                market_price = positions_mkt
+        if not market_price or market_price <= 0:
+            market_price = _quote_mid_vnd(client, symbol)
         # Last-resort fallback: if neither source returned a
         # market price, use the cost basis (so unrealized P&L
-        # is 0 instead of misleadingly negative). This is
-        # rare in practice — DNSE always returns a market
-        # price for active positions.
+        # is 0 instead of misleadingly negative).
         if not market_price or market_price <= 0:
             market_price = avg_price if avg_price and avg_price > 0 else 0.0
         market_value = market_price * quantity if market_price else 0.0
