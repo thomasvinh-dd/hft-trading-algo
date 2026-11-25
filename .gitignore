@@ -34,3 +34,5 @@ backups/
 
 # Secrets left at project root — DO NOT COMMIT
 dnse.txt
+# Off-site git bundles pulled down from the VPS
+.vps-backups/
