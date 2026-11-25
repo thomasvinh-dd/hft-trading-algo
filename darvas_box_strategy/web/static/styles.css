@@ -434,6 +434,12 @@ footer code {
   background: rgba(125, 133, 144, 0.15);
   color: var(--muted);
 }
+/* MARK = mark-to-market on a still-open position (not a sale). */
+.fill-kind-MARK {
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+  font-style: italic;
+}
 .fill-kind-CLOSE {
   background: var(--text);
   color: var(--bg);

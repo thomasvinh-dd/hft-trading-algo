@@ -48,9 +48,39 @@
 # Watchdog: scripts/install_cron.sh installs a */5 cron entry that
 # pgrep's the autofin bot and relaunches via this script if dead.
 set -e
+PROJECT_DIR="${PROJECT_DIR:-/root/hft-trading-algo}"
+
+# 2026-10-29: guard against a DOUBLE launch.
+#
+# The old sequence was:
+#
+#     pkill -9 ...autofin_signal...
+#     sleep 2
+#     <start the new bot>
+#
+# which leaves a ~2 second window with NO autofin bot running. The
+# */5 watchdog cron fires every 5 minutes; if it lands in that window
+# its pgrep finds nothing and it starts a SECOND bot — and the
+# launcher's own pkill has already run, so nothing kills it.
+#
+# That happened at 2026-10-29 05:35 CEST: two --live-submit autofin
+# bots ran simultaneously (PIDs 2013334 and 2013358). Two live bots
+# on one DNSE account can plan the same order from the same ledger
+# and submit it twice.
+#
+# Fix: take an exclusive lock for the whole launch sequence, so a
+# manual launch and a watchdog launch serialise instead of
+# overlapping. The second one then finds the first's freshly-started
+# bot and its pkill replaces it cleanly (one bot at the end).
+LOCK_FILE="${AUTOFIN_LAUNCH_LOCK:-/tmp/autofin_launch.lock}"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "another autofin launch is in progress — waiting for it"
+    flock 9
+fi
+
 pkill -9 -f "auto-trading-bot.*--strategy autofin_signal" 2>/dev/null || true
 sleep 2
-PROJECT_DIR="${PROJECT_DIR:-/root/hft-trading-algo}"
 LOG_DIR="${LOG_DIR:-/root/logs}"
 mkdir -p "$LOG_DIR"
 
@@ -66,6 +96,19 @@ echo "DNSE_API_KEY=${DNSE_API_KEY:0:10}..."
 echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID"
 echo "AUTOFIN_USER_SL_PCT=$AUTOFIN_USER_SL_PCT"
 
+# 2026-10-29: the lock fd must NOT be inherited by the bot.
+#
+# The bot is started as a child of this script, so it inherits fd 9
+# (the open lock). The flock is then held for the bot's ENTIRE
+# lifetime, not just for the launch sequence — and every later launch
+# (manual or watchdog) blocks forever on ``flock 9``. We hit exactly
+# that: after the first launch the lock was still held by the running
+# bot (PID 2014827) and no subsequent launch could proceed.
+#
+# Closing fd 9 in the child (``9>&-``) releases the lock as soon as
+# this script exits, while keeping it held for the whole launch
+# sequence. The wait-until-up loop below still guarantees the
+# watchdog never observes a gap.
 nohup env PYTHONUNBUFFERED=1 \
     DNSE_API_KEY="$DNSE_API_KEY" \
     DNSE_API_SECRET="$DNSE_API_SECRET" \
@@ -82,6 +125,7 @@ nohup env PYTHONUNBUFFERED=1 \
         --account-no 0003937868 --loan-package-id 1775 \
         --sleep-seconds 60 --no-sync-data --strategy autofin_signal \
         --live-submit \
+    9>&- \
     > "$LOG_DIR/autofin.log" 2>&1 &
 disown
 sleep 8
@@ -89,3 +133,14 @@ echo "--- ps ---"
 ps -ef | grep auto-trading-bot | grep -v grep
 echo "--- log ---"
 head -15 "$LOG_DIR/autofin.log"
+
+# 2026-10-29: wait until the bot is actually running before we
+# release the lock. Otherwise the watchdog's next pgrep (up to 5
+# minutes later) could still land in a gap and start a duplicate.
+for _ in $(seq 1 20); do
+    if pgrep -f "auto-trading-bot.*--strategy autofin_signal" >/dev/null 2>&1; then
+        echo "autofin bot is up"
+        break
+    fi
+    sleep 1
+done
