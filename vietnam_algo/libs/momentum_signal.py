@@ -424,6 +424,28 @@ def compute_signal_orders(
         price_table, dates, index, strategy_config, nav,
     )
 
+    # The TOTAL exposure cap. The backtest sizes each entry at
+    # ``exposure_cap / max_positions`` but ALSO caps the total book:
+    #
+    #     exposure_cap = compute_exposure_cap(equity, regime, config, curve)
+    #     available_exposure = max(exposure_cap - current_positions_value, 0)
+    #     if available_exposure <= 0: break
+    #     order_value = min(target_value, available_exposure)
+    #
+    # Without the ``available_exposure`` gate the live engine would keep
+    # buying on top of a book that is already at the regime's exposure
+    # limit.
+    exposure_cap, vol_scalar = compute_exposure_cap(
+        nav, regime, strategy_config, equity_curve,
+    )
+    target_value = exposure_cap / max_positions if max_positions > 0 else 0.0
+    current_positions_value = sum(
+        p.quantity * (close_price(p.symbol, signal_date, price_table)
+                      or p.entry_price)
+        for p in positions.values() if p.quantity > 0
+    )
+    available_exposure = max(exposure_cap - current_positions_value, 0.0)
+
     entries: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     breakout_added = 0
@@ -498,6 +520,19 @@ def compute_signal_orders(
             })
             continue
 
+        # The total exposure cap. The backtest breaks out of the entry
+        # loop when the book is already at the regime's exposure limit.
+        if available_exposure <= 0:
+            blocked.append({
+                "symbol": symbol,
+                "reason": "exposure cap reached",
+            })
+            break
+
+        # The order value is capped by what is left of the exposure
+        # budget, exactly as the backtest does
+        # (``order_value = min(target_value, available_exposure)``).
+        order_value = min(target_value, available_exposure)
         quantity = _entry_quantity(
             symbol=symbol,
             price=price,
@@ -506,6 +541,7 @@ def compute_signal_orders(
             nav=nav,
             equity_curve=equity_curve,
             max_positions=max_positions,
+            target_value=order_value,
         )
         if quantity <= 0:
             blocked.append({"symbol": symbol, "reason": "size below one board lot"})
@@ -522,6 +558,10 @@ def compute_signal_orders(
             "rank": rank_by_symbol.get(symbol),
         })
         sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        available_exposure = max(
+            available_exposure - (price * quantity) * (1 + strategy_config.feeRate),
+            0.0,
+        )
         if reason == "volume_breakout":
             breakout_added += 1
 
@@ -573,6 +613,12 @@ def compute_signal_orders(
         "exits": exits,
         "blocked": blocked,
         "nav": nav,
+        "exposure": {
+            "cap": exposure_cap,
+            "volScalar": vol_scalar,
+            "currentPositionsValue": current_positions_value,
+            "available": available_exposure,
+        },
         "notes": notes,
     }
 
@@ -749,6 +795,7 @@ def _entry_quantity(
     nav: float,
     equity_curve: list[Any] | None = None,
     max_positions: int = 0,
+    target_value: float | None = None,
 ) -> int:
     """Size an entry exactly the way the backtest does.
 
@@ -763,14 +810,19 @@ def _entry_quantity(
 
     We reuse the backtest's own ``compute_exposure_cap`` so the live
     sizing cannot drift from the backtested sizing.
+
+    ``target_value`` lets the caller pass the already-capped order
+    value (``min(target_value, available_exposure)``), which is what
+    the backtest buys.
     """
     if price <= 0 or max_positions <= 0:
         return 0
 
-    exposure_cap, _vol_scalar = compute_exposure_cap(
-        nav, regime, strategy_config, equity_curve or [],
-    )
-    target_value = exposure_cap / max_positions
+    if target_value is None:
+        exposure_cap, _vol_scalar = compute_exposure_cap(
+            nav, regime, strategy_config, equity_curve or [],
+        )
+        target_value = exposure_cap / max_positions
     if target_value <= 0:
         return 0
 
