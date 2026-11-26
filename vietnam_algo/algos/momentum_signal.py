@@ -65,6 +65,29 @@ from vietnam_algo.libs.daily_engine import EngineConfig
 from .base import StrategyAdapter
 
 
+def _live_client():
+    """Build a DNSE client from the environment.
+
+    Returns ``(client, account_no)``. The client is ``None`` when the
+    credentials are missing — the engine then falls back to the
+    tracked state and the backtest's (fictional) cash balance, and the
+    cycle summary says so.
+    """
+    import os
+
+    api_key = os.environ.get("DNSE_API_KEY", "").strip()
+    api_secret = os.environ.get("DNSE_API_SECRET", "").strip()
+    account_no = os.environ.get("DNSE_ACCOUNT_NO", "").strip()
+    if not api_key or not api_secret or not account_no:
+        return None, account_no
+    try:
+        from vietnam_algo.libs.dnse.client import DnseClient
+
+        return DnseClient(api_key, api_secret), account_no
+    except Exception:
+        return None, account_no
+
+
 class MomentumSignalAdapter(StrategyAdapter):
     """Signal-driven liquid momentum rotation.
 
@@ -117,11 +140,24 @@ class MomentumSignalAdapter(StrategyAdapter):
 
         today = trade_date or datetime.now(timezone.utc).date().isoformat()
 
+        # The live DNSE client, so the engine can read the real
+        # portfolio and the real NAV. Sizing against the backtest's
+        # fictional cash balance would order many times the money that
+        # is actually in the account.
+        client = None
+        account_no = ""
+        try:
+            client, account_no = _live_client()
+        except Exception:
+            client = None
+
         result = compute_signal_orders(
             data_dir=config.dataDir,
             strategy_config=strategy_config,
             trade_date=today,
             live_submit=live_submit,
+            client=client,
+            account_no=account_no,
         )
 
         # 1. write the per-strategy order files the dry-run replay and

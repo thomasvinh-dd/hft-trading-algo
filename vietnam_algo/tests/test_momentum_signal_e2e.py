@@ -238,6 +238,59 @@ class TestRebalanceGate:
         assert result["entries"], result["blocked"]
 
 
+class TestLiveNavSizing:
+    """The order size must be based on the LIVE NAV, not the backtest's.
+
+    The backtest sizes against ``StrategyConfig.initialCash`` = 1B VND.
+    That number is FICTIONAL — the live account holds ~22M VND. Sizing
+    a live order against 1B would order ~45x the money that is actually
+    in the account.
+    """
+
+    def test_the_nav_falls_back_to_initial_cash_without_a_live_value(
+        self, tmp_path: Path
+    ) -> None:
+        from vietnam_algo.libs.momentum_signal import _nav_from_positions
+
+        nav = _nav_from_positions({}, StrategyConfig(initialCash=1_000_000_000.0))
+        assert nav == pytest.approx(1_000_000_000.0)
+
+    def test_the_live_nav_is_used_when_known(self, tmp_path: Path) -> None:
+        from vietnam_algo.libs.momentum_signal import _nav_from_positions
+
+        nav = _nav_from_positions(
+            {}, StrategyConfig(initialCash=1_000_000_000.0),
+            live_nav=22_159_907.0,
+        )
+        assert nav == pytest.approx(22_159_907.0), (
+            "the live NAV must win over the backtest's fictional cash"
+        )
+
+    def test_a_missing_live_nav_is_reported(self, tmp_path: Path) -> None:
+        """The failure mode must be visible, not silent."""
+        _write_dataset(tmp_path, {"AAA": _rising_bars("AAA", step=300.0)})
+        result = compute_signal_orders(
+            data_dir=tmp_path, strategy_config=_config(), trade_date="2026-06-30",
+        )
+        assert any("live NAV unavailable" in n for n in result["notes"]), (
+            result["notes"]
+        )
+
+    def test_the_entry_size_scales_with_the_live_nav(self, tmp_path: Path) -> None:
+        """A 45x smaller NAV must produce a ~45x smaller order."""
+        from vietnam_algo.libs.momentum_signal import _entry_quantity
+
+        cfg = _config()
+        big = _entry_quantity(symbol="AAA", price=10_000.0, regime="bull",
+                              strategy_config=cfg, nav=1_000_000_000.0,
+                              max_positions=5)
+        small = _entry_quantity(symbol="AAA", price=10_000.0, regime="bull",
+                                strategy_config=cfg, nav=22_000_000.0,
+                                max_positions=5)
+        assert small < big
+        assert small * 40 < big, (small, big)
+
+
 class TestPositionCap:
 
     def test_the_position_cap_limits_the_entries(self, tmp_path: Path) -> None:

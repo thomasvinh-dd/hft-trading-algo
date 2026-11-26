@@ -294,14 +294,41 @@ def compute_signal_orders(
     rank_by_symbol = {sym: rank for rank, (sym, _) in enumerate(ranked, start=1)}
 
     # ------------------------------------------------------------------
-    # 4. the live portfolio (for exits and for the position cap)
+    # 4. the live portfolio (for exits, the position cap and the sizing)
     # ------------------------------------------------------------------
     state = load_signal_state(data_dir)
+
+    # The LIVE NAV. The backtest sizes against a fictional 1B-VND cash
+    # balance; the live account holds ~22M VND. Sizing against the
+    # backtest's number would order ~45x the money that is actually in
+    # the account, so we take the live portfolio value when we can.
+    live_nav: float | None = None
+    portfolio_snapshot: dict[str, Any] | None = None
+    if client is not None and account_no:
+        try:
+            from vietnam_algo.libs.portfolio import build_portfolio_snapshot
+
+            portfolio_snapshot = build_portfolio_snapshot(client, account_no)
+            totals = portfolio_snapshot.get("totals") or {}
+            candidate = totals.get("portfolioValue")
+            if candidate and candidate > 0:
+                live_nav = float(candidate)
+        except Exception:
+            live_nav = None
+
+    if live_nav is None:
+        notes.append(
+            "live NAV unavailable — sizing against the backtest's "
+            "fictional cash balance (StrategyConfig.initialCash); "
+            "the order sizes will NOT match the live account"
+        )
+
     positions = _resolve_positions(
         state=state,
         live_positions=live_positions,
         client=client,
         account_no=account_no,
+        portfolio_snapshot=portfolio_snapshot,
     )
     held_symbols = {p.symbol for p in positions.values() if p.quantity > 0}
 
@@ -419,7 +446,7 @@ def compute_signal_orders(
     # The equity curve drives the vol-targeting scalar. We build it from
     # the live NAV history so the live exposure cap matches the
     # backtest's method of computing it.
-    nav = _nav_from_positions(positions, strategy_config)
+    nav = _nav_from_positions(positions, strategy_config, live_nav)
     equity_curve = _build_equity_curve(
         price_table, dates, index, strategy_config, nav,
     )
@@ -719,6 +746,7 @@ def _resolve_positions(
     live_positions: list[dict[str, Any]] | None,
     client: Any,
     account_no: str,
+    portfolio_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, SignalPosition]:
     """Reconcile the tracked state with the live portfolio.
 
@@ -729,6 +757,8 @@ def _resolve_positions(
     """
     tracked = dict(state.positions)
 
+    if live_positions is None and portfolio_snapshot is not None:
+        live_positions = portfolio_snapshot.get("positions") or []
     if live_positions is None and client is not None and account_no:
         try:
             from vietnam_algo.libs.portfolio import build_portfolio_snapshot
@@ -781,8 +811,21 @@ def _resolve_positions(
 def _nav_from_positions(
     positions: dict[str, SignalPosition],
     strategy_config: StrategyConfig,
+    live_nav: float | None = None,
 ) -> float:
-    """The NAV used for sizing: cash + the market value of the book."""
+    """The NAV used for sizing.
+
+    The backtest sizes against its own cash balance
+    (``StrategyConfig.initialCash`` = 1B VND by default). That number is
+    FICTIONAL — the live account holds ~22M VND. Sizing a live order
+    against 1B would order 45x the money that is actually in the
+    account.
+
+    So when the live NAV is known we use it. The book's market value
+    is added on top of the LIVE CASH, which the caller passes in.
+    """
+    if live_nav is not None and live_nav > 0:
+        return float(live_nav)
     stock_value = sum(
         p.quantity * max(p.entry_price, p.peak_price)
         for p in positions.values()
