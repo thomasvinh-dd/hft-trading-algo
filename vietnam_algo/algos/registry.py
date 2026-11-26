@@ -30,12 +30,14 @@ from __future__ import annotations
 from .autofin_signal import AutofinSignalAdapter
 from .base import StrategyAdapter
 from .momentum import MomentumRotationAdapter
+from .momentum_signal import MomentumSignalAdapter
 
 # Registry — add new algorithms here. The order here is also the
 # ordering in ``list_strategies()`` output.
 STRATEGY_REGISTRY: dict[str, StrategyAdapter] = {
     "momentum": MomentumRotationAdapter(),
     "autofin_signal": AutofinSignalAdapter(),
+    "momentum_signal": MomentumSignalAdapter(),
 }
 
 
