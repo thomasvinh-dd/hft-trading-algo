@@ -439,10 +439,15 @@ def compute_signal_orders(
         nav, regime, strategy_config, equity_curve,
     )
     target_value = exposure_cap / max_positions if max_positions > 0 else 0.0
+    # The positions being sold today were already zeroed by the exit
+    # loop above, so the exposure budget sees the book as it will be
+    # AFTER today's sells — exactly as the backtest does, whose exit
+    # loop also runs before its entry loop.
     current_positions_value = sum(
         p.quantity * (close_price(p.symbol, signal_date, price_table)
                       or p.entry_price)
-        for p in positions.values() if p.quantity > 0
+        for p in positions.values()
+        if p.quantity > 0
     )
     available_exposure = max(exposure_cap - current_positions_value, 0.0)
 
