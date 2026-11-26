@@ -38,6 +38,8 @@ from typing import Any
 
 from vietnam_algo.libs.backtest import (
     allowed_positions_for_regime,
+    build_corporate_action_lookup,
+    build_corporate_action_table,
     close_price,
     compute_exposure_cap,
     exposure_percent_for_regime,
@@ -47,15 +49,19 @@ from vietnam_algo.libs.backtest import (
     precompute_market_proxy,
     regime_exit_reason,
     resolve_universe_for_date,
+    risky_corporate_action_symbols,
     sorted_trading_dates,
+    symbol_sector_map,
     trailing_stop_percent_for_regime,
 )
 from vietnam_algo.libs.config import StrategyConfig
 from vietnam_algo.libs.strategy_math import (
     MomentumWithBreakoutStrategy,
     VolumeBreakoutStrategy,
+    bars_until,
     breakout_symbols,
     rank_symbols,
+    too_extended_from_sma50,
 )
 
 # The CSV schema the rest of the pipeline expects (see
@@ -118,6 +124,15 @@ class SignalState:
             last_week=str(raw.get("last_week") or ""),
             updated_at=str(raw.get("updated_at") or ""),
         )
+
+
+def _flatten_ca_events(corporate_actions: dict) -> list:
+    """Flatten the corporate-action table into a single event list."""
+    out = []
+    for by_date in (corporate_actions or {}).values():
+        for events in by_date.values():
+            out.extend(events)
+    return out
 
 
 def _with_point_in_time_universe(config: StrategyConfig) -> StrategyConfig:
@@ -413,6 +428,33 @@ def compute_signal_orders(
     blocked: list[dict[str, Any]] = []
     breakout_added = 0
 
+    # The corporate-action guard: the backtest refuses to buy a symbol
+    # that has a non-cash corporate action inside the buy window (a
+    # dividend or rights issue changes the effective price).
+    corporate_actions = build_corporate_action_table(data_dir, strategy_config)
+    _, ca_ex_index = build_corporate_action_lookup(
+        _flatten_ca_events(corporate_actions), dates,
+    )
+    standard_blocked = risky_corporate_action_symbols(
+        corporate_actions, signal_date,
+        strategy_config.corporateActionBuyWindowDays,
+        trading_dates=dates, precomputed_ex_index=ca_ex_index,
+    )
+    high_risk_blocked = risky_corporate_action_symbols(
+        corporate_actions, signal_date,
+        strategy_config.corporateActionHighRiskBuyWindowDays,
+        high_risk_only=True, trading_dates=dates,
+        precomputed_ex_index=ca_ex_index,
+    )
+    blocked_buys = standard_blocked | high_risk_blocked
+
+    # The sector cap, as the backtest applies it.
+    sector_by_symbol = symbol_sector_map(data_dir)
+    sector_counts: dict[str, int] = {}
+    for held_symbol in held_after_exits:
+        sector = sector_by_symbol.get(held_symbol, "unknown")
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
     for symbol in decision.target_symbols:
         reason = decision.entry_reasons.get(symbol, "top_rank")
         if symbol in held_after_exits:
@@ -420,6 +462,12 @@ def compute_signal_orders(
             continue
         if symbol in exiting_symbols:
             blocked.append({"symbol": symbol, "reason": "exiting today"})
+            continue
+        if symbol in blocked_buys:
+            blocked.append({
+                "symbol": symbol,
+                "reason": "corporate action inside the buy window",
+            })
             continue
         if len(entries) >= room:
             blocked.append({
@@ -431,6 +479,23 @@ def compute_signal_orders(
         price = close_price(symbol, signal_date, price_table)
         if price is None:
             blocked.append({"symbol": symbol, "reason": "no price"})
+            continue
+
+        # The backtest refuses a name that is too extended from its
+        # SMA50 — chasing an already-run price is the classic momentum
+        # blow-up.
+        symbol_bars = bars_until(price_table.get(symbol, {}), dates, index)
+        if too_extended_from_sma50(symbol_bars, strategy_config):
+            blocked.append({"symbol": symbol, "reason": "too extended from SMA50"})
+            continue
+
+        # The sector cap.
+        sector = sector_by_symbol.get(symbol, "unknown")
+        if sector_counts.get(sector, 0) >= strategy_config.maxSectorPositions:
+            blocked.append({
+                "symbol": symbol,
+                "reason": f"sector cap reached ({strategy_config.maxSectorPositions} in {sector})",
+            })
             continue
 
         quantity = _entry_quantity(
@@ -456,6 +521,7 @@ def compute_signal_orders(
             "entryReason": reason,
             "rank": rank_by_symbol.get(symbol),
         })
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
         if reason == "volume_breakout":
             breakout_added += 1
 
